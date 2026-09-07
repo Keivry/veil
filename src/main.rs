@@ -1,9 +1,10 @@
 //! 二进制入口：配置 fail-closed 校验 → sqlite 初始化 → 单 serve 启动。
 
 use {
-    std::process::ExitCode,
+    std::{process::ExitCode, sync::Arc},
     veil::{
-        config::Config,
+        config::{Config, KeepassBackendKind, resolve_kdbx},
+        keepass::{RealKeePass, tpm_password_provider},
         router::build_router,
         service::tpm::startup_tpm,
         state::{AppState, init_sqlite},
@@ -46,7 +47,25 @@ async fn main() -> ExitCode {
         );
     }
 
-    let state = AppState::new(config, outcome);
+    let mut state = AppState::new(config, outcome);
+    if state.config.keepass_backend == KeepassBackendKind::Real {
+        let resolved = resolve_kdbx(&state.config.db_dir);
+        let (db_path, keyfile_path) = match &resolved {
+            Some(found) => (found.db_path.clone(), found.keyfile_path.clone()),
+            None => {
+                tracing::warn!(
+                    "DB_DIR 无 .kdbx（{}），凭据接口返回 503 密码库未配置",
+                    state.config.db_dir.display()
+                );
+                (state.config.db_dir.join("veil.kdbx"), None)
+            }
+        };
+        let provider = tpm_password_provider(state.config.tpm_dir.clone(), allow_mock_tpm);
+        state = state.with_keepass(Arc::new(RealKeePass::new(db_path, keyfile_path, provider)));
+    } else {
+        tracing::warn!("VEIL_KEEPASS_BACKEND=mock：以 Mock KeePass 运行，禁止生产使用");
+        state = state.with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
+    }
     let _orphan_sweeper = state.approval.spawn_sweeper();
     let app = build_router(state);
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:8877").await {

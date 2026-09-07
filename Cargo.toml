@@ -25,6 +25,9 @@ hex = "0.4.3"
 regex = "1.13.1"
 fancy-regex = "0.19.1"
 moka = { version = "0.12.16", features = ["future"] }
+# veil-keepass-real：真实 kdbx 后端（KDBX3/4 + keyfile，纯 Rust 无系统依赖）+ 密钥零化。
+keepass = { version = "0.13", features = ["save_kdbx4"] }
+zeroize = "1"
 # §4 轻量流式构造（SSE 帧按需 yield），禁重型运行时依赖。
 async-stream = "0.3"
 bytes = "1"
