@@ -217,6 +217,145 @@ pub fn should_inject_placeholders(
     is_chat && redaction_enabled && body_has_values
 }
 
+pub fn has_placeholder_tokens(body: &[u8]) -> bool {
+    let mut i = 0;
+    while i < body.len() {
+        if body[i..].starts_with(b"__PII_") || body[i..].starts_with(b"__VG_CRED_") {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn append_prompt_text(field: &mut Value, prompt: &str) {
+    match field {
+        Value::String(s) => {
+            if s.is_empty() {
+                *s = prompt.to_string();
+            } else {
+                s.push_str("\n\n");
+                s.push_str(prompt);
+            }
+        }
+        Value::Array(arr) => {
+            if let Some(Value::Object(last)) = arr.last_mut()
+                && last.get("type").and_then(|v| v.as_str()) == Some("text")
+                && let Some(text) = last.get_mut("text")
+                && let Some(t) = text.as_str()
+            {
+                let merged = if t.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!("{t}\n\n{prompt}")
+                };
+                last.insert("text".to_string(), Value::String(merged));
+                return;
+            }
+            arr.push(serde_json::json!({"type": "text", "text": prompt}));
+        }
+        _ => {}
+    }
+}
+
+pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol) -> bool {
+    if protocol == Protocol::Anthropic {
+        let Some(map) = body.as_object_mut() else {
+            return false;
+        };
+        if let Some(sys) = map.get_mut("system") {
+            if matches!(sys, Value::String(_) | Value::Array(_)) {
+                append_prompt_text(sys, prompt);
+                return true;
+            }
+            return false;
+        }
+        map.insert("system".to_string(), Value::String(prompt.to_string()));
+        return true;
+    }
+    let key = if protocol == Protocol::Responses {
+        "input"
+    } else {
+        "messages"
+    };
+    let Some(map) = body.as_object_mut() else {
+        return false;
+    };
+    let Some(msgs) = map.get_mut(key).and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    if msgs.is_empty() {
+        msgs.push(serde_json::json!({"role": "system", "content": prompt}));
+        return true;
+    }
+    if let Some(Value::Object(first)) = msgs.first_mut()
+        && first.get("role").and_then(|v| v.as_str()) == Some("system")
+    {
+        match first.get_mut("content") {
+            Some(content @ (Value::String(_) | Value::Array(_))) => {
+                append_prompt_text(content, prompt);
+            }
+            Some(other) => {
+                let base = other.as_str().unwrap_or_default().to_string();
+                let merged = if base.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!("{base}\n\n{prompt}")
+                };
+                first.insert("content".to_string(), Value::String(merged));
+            }
+            None => {
+                first.insert("content".to_string(), Value::String(prompt.to_string()));
+            }
+        }
+        return true;
+    }
+    msgs.insert(0, serde_json::json!({"role": "system", "content": prompt}));
+    true
+}
+
+pub fn placeholder_schema_ok(body: &Value, protocol: Protocol) -> bool {
+    let Some(map) = body.as_object() else {
+        return false;
+    };
+    match protocol {
+        Protocol::Anthropic => match map.get("system") {
+            None => true,
+            Some(Value::String(_)) | Some(Value::Array(_)) => true,
+            Some(_) => false,
+        },
+        Protocol::Responses => map.get("input").is_some_and(|v| v.is_array()),
+        Protocol::Chat => map.get("messages").is_some_and(|v| v.is_array()),
+        Protocol::NonDialog => false,
+    }
+}
+
+pub fn inject_placeholder_prompt(
+    body_text: &str,
+    prompt: &str,
+    protocol: Protocol,
+) -> Option<String> {
+    if body_text.is_empty() || prompt.is_empty() {
+        return None;
+    }
+    let stripped = body_text.trim_start_matches('\u{feff}').trim_start();
+    if !(stripped.starts_with('{') || stripped.starts_with('[')) {
+        return None;
+    }
+    let mut obj: Value = serde_json::from_str(body_text.trim_start_matches('\u{feff}')).ok()?;
+    if !obj.is_object() {
+        return None;
+    }
+    if !placeholder_inject_obj(&mut obj, prompt, protocol) {
+        return None;
+    }
+    if !placeholder_schema_ok(&obj, protocol) {
+        tracing::warn!("占位符说明注入 schema 校验失败，回退不注入");
+        return None;
+    }
+    serde_json::to_string(&obj).ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Usage {
     pub prompt_tokens: u64,
@@ -224,31 +363,81 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+fn as_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+}
+
 fn usage_from_obj(obj: &serde_json::Map<String, Value>) -> Option<Usage> {
+    let has_known = [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "total",
+    ]
+    .iter()
+    .any(|k| obj.contains_key(*k));
+    if !has_known {
+        return None;
+    }
+    let prompt = obj
+        .get("prompt_tokens")
+        .and_then(as_u64)
+        .or_else(|| obj.get("input_tokens").and_then(as_u64))
+        .unwrap_or(0);
+    let completion = obj
+        .get("completion_tokens")
+        .and_then(as_u64)
+        .or_else(|| obj.get("output_tokens").and_then(as_u64))
+        .unwrap_or(0);
+    let total = obj
+        .get("total_tokens")
+        .and_then(as_u64)
+        .or_else(|| obj.get("total").and_then(as_u64))
+        .unwrap_or_else(|| prompt.saturating_add(completion));
     Some(Usage {
-        prompt_tokens: obj
-            .get("prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        completion_tokens: obj
-            .get("completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        total_tokens: obj
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
     })
+}
+
+fn usage_in(obj: &serde_json::Map<String, Value>) -> Option<Usage> {
+    obj.get("usage")?.as_object().and_then(usage_from_obj)
+}
+
+fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
+    match acc {
+        Some(a) => {
+            a.prompt_tokens = a.prompt_tokens.saturating_add(next.prompt_tokens);
+            a.completion_tokens = a.completion_tokens.saturating_add(next.completion_tokens);
+            a.total_tokens = a.total_tokens.saturating_add(next.total_tokens);
+        }
+        None => *acc = Some(next),
+    }
 }
 
 pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage> {
     match protocol {
         Protocol::Chat => body.get("usage")?.as_object().and_then(usage_from_obj),
-        Protocol::Responses => body
-            .get("response")?
-            .get("usage")?
-            .as_object()
-            .and_then(usage_from_obj),
+        Protocol::Responses => {
+            let outer = body.get("response")?.as_object()?;
+            if let Some(u) = outer
+                .get("usage")
+                .and_then(|v| v.as_object())
+                .and_then(usage_from_obj)
+            {
+                return Some(u);
+            }
+            outer
+                .get("response")?
+                .as_object()?
+                .get("usage")?
+                .as_object()
+                .and_then(usage_from_obj)
+        }
         Protocol::Anthropic => {
             if let Some(u) = body
                 .get("usage")
@@ -263,6 +452,64 @@ pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage
                 .and_then(usage_from_obj)
         }
         Protocol::NonDialog => None,
+    }
+}
+
+/// 流式 SSE 事件载荷捕获 usage（对标 Python `_capture_usage_ctx`）。
+///
+/// 口径：顶层 `usage` 优先；Responses 单层 `response.usage` 优先、双层
+/// `response.response.usage` 回退；Anthropic `delta.usage` / `message.usage`
+/// 回退；缺失返回 `None` 不估算。数值归一与 [`extract_usage_nonstream`] 同口径
+/// （`input_tokens`/`output_tokens`/`total` 回退，`total` 缺失时 `prompt+completion`）。
+pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage> {
+    let obj = payload.as_object()?;
+    // 快路径：无 usage/cached_tokens 的心跳分片直接跳过，避免全量归一。
+    let raw = payload.to_string();
+    if !raw.contains("\"usage\"") && !raw.contains("\"cached_tokens\"") {
+        return None;
+    }
+    if let Some(u) = usage_in(obj) {
+        return Some(u);
+    }
+    match protocol {
+        Protocol::Chat => None,
+        Protocol::Responses => {
+            let resp = obj.get("response")?.as_object()?;
+            if let Some(u) = resp
+                .get("usage")
+                .and_then(|v| v.as_object())
+                .and_then(usage_from_obj)
+            {
+                return Some(u);
+            }
+            resp.get("response")?
+                .as_object()?
+                .get("usage")?
+                .as_object()
+                .and_then(usage_from_obj)
+        }
+        Protocol::Anthropic => {
+            if let Some(u) = obj
+                .get("delta")
+                .and_then(|v| v.as_object())
+                .and_then(usage_in)
+            {
+                return Some(u);
+            }
+            obj.get("message")?
+                .as_object()?
+                .get("usage")?
+                .as_object()
+                .and_then(usage_from_obj)
+        }
+        Protocol::NonDialog => None,
+    }
+}
+
+/// 流式 usage 累加（Anthropic `message_start` + `message_delta` 两段式求和）。
+pub fn accumulate_usage(acc: &mut Option<Usage>, next: Option<Usage>) {
+    if let Some(u) = next {
+        merge_usage(acc, u);
     }
 }
 
@@ -862,6 +1109,95 @@ mod tests {
     }
 
     #[test]
+    fn 占位符注入三协议形态() {
+        let prompt = "PROMPT";
+        let openai = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&openai).unwrap(),
+            prompt,
+            Protocol::Chat,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["messages"][0]["role"], "system");
+        assert!(
+            v["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(prompt)
+        );
+
+        let sys_first = serde_json::json!({"messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"hi"}]});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&sys_first).unwrap(),
+            prompt,
+            Protocol::Chat,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+        assert!(
+            v["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("你是助手")
+        );
+        assert!(
+            v["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(prompt)
+        );
+
+        let empty_msgs = serde_json::json!({"messages":[]});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&empty_msgs).unwrap(),
+            prompt,
+            Protocol::Chat,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["messages"][0]["content"].as_str().unwrap(), prompt);
+
+        let anth = serde_json::json!({"model":"m","system":"你是助手"});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&anth).unwrap(),
+            prompt,
+            Protocol::Anthropic,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["system"].as_str().unwrap().contains(prompt));
+
+        let anth_none = serde_json::json!({"model":"m"});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&anth_none).unwrap(),
+            prompt,
+            Protocol::Anthropic,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["system"].as_str().unwrap(), prompt);
+
+        let resp = serde_json::json!({"input":[{"role":"user","content":"hi"}]});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&resp).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["input"][0]["role"], "system");
+
+        assert!(inject_placeholder_prompt("plain text", prompt, Protocol::Chat).is_none());
+        assert!(inject_placeholder_prompt("[1,2]", prompt, Protocol::Chat).is_none());
+        assert!(inject_placeholder_prompt("", prompt, Protocol::Chat).is_none());
+        assert!(!has_placeholder_tokens(b"no tokens here"));
+        assert!(has_placeholder_tokens(b"a __PII_1_ab12cd34__ b"));
+        assert!(has_placeholder_tokens(b"a __VG_CRED_000001__ b"));
+    }
+
+    #[test]
     fn 非流式usage同流式口径() {
         let chat =
             serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}});
@@ -896,6 +1232,53 @@ mod tests {
             2
         );
         assert!(extract_usage_nonstream(Protocol::NonDialog, &chat).is_none());
+    }
+
+    #[test]
+    fn responses双层回退与归一别名() {
+        let double = serde_json::json!({"response":{"response":{"usage":{"prompt_tokens":7,"completion_tokens":8,"total_tokens":15}}}});
+        let u = extract_usage_nonstream(Protocol::Responses, &double).unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (7, 8, 15)
+        );
+        let single = serde_json::json!({"response":{"usage":{"input_tokens":4,"output_tokens":6}}});
+        let u = extract_usage_nonstream(Protocol::Responses, &single).unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (4, 6, 10)
+        );
+        let stream_double = serde_json::json!({"type":"response.completed","response":{"response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}});
+        let u = extract_usage_stream(Protocol::Responses, &stream_double).unwrap();
+        assert_eq!(u.total_tokens, 5);
+        let stream_single = serde_json::json!({"type":"response.completed","response":{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}});
+        let u = extract_usage_stream(Protocol::Responses, &stream_single).unwrap();
+        assert_eq!(u.total_tokens, 3);
+        let chat_ev =
+            serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        assert!(extract_usage_stream(Protocol::Chat, &chat_ev).is_some());
+        assert!(extract_usage_stream(Protocol::Chat, &serde_json::json!({"delta":"hi"})).is_none());
+        let anth_delta = serde_json::json!({"delta":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}});
+        assert_eq!(
+            extract_usage_stream(Protocol::Anthropic, &anth_delta)
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(
+            &mut acc,
+            extract_usage_stream(
+                Protocol::Anthropic,
+                &serde_json::json!({"message":{"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}),
+            ),
+        );
+        accumulate_usage(
+            &mut acc,
+            extract_usage_stream(Protocol::Anthropic, &anth_delta),
+        );
+        let a = acc.unwrap();
+        assert_eq!((a.prompt_tokens, a.total_tokens), (15, 35));
     }
 
     #[test]
