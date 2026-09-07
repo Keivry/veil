@@ -4,6 +4,12 @@
 # 流程：cargo build → mock 上游（:0 随机端口）→ veil 二进制（固定 127.0.0.1:8877，
 # 必填 env 用 dummy 值，LLM_UPSTREAM 指 mock）→ openai/anthropic 官方 SDK 经网关
 # 消费三协议流式/非流式/tool call/阻断，断言 SDK 可解析且内容正确。
+# 取用相：pykeepass 现场建临时 kdbx（主密码取 Mock TPM 解封值，仅开发）→ DB_DIR
+# 指向固件验证整条目/单字段脱敏/原文/404/400/无库 503，固件随临时目录丢弃不入库。
+# pykeepass 把自定义 <String> 追加在 <AutoType> 之后，Rust 侧 quick-xml 要求同名
+# 元素相邻，故建固件时把 <String> 集中移到 <AutoType> 之前（与官方客户端一致）。
+# TPM 说明：无硬件 TPM 的开发机/CI 默认以 VEIL_ALLOW_MOCK_TPM=1 启动（仅开发）；
+# 若 TPM 门禁失败，脚本自动回退到 mock-TPM 重试一次并打印指引（生产必须接 TPM 硬件）。
 # 阻断触发说明：网关流式阻断由审计 hold 超限 fail-closed 触发（AUDIT_HOLD_MAX_BYTES=16
 # 极小值 + 危险 tool args），阻断相以 AUDIT_MODE=block 运行；responses 协议无 tool
 # 输出数组可供 hold 捕获，阻断相取空流截断合成 response.failed 路径。
@@ -264,6 +270,118 @@ def raw_post(path, payload):
         return r.read().decode("utf-8", "replace")
 
 
+def cred_post(payload, tag="conformance"):
+    import urllib.error
+    req = urllib.request.Request(
+        GATEWAY + "/credential",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "X-Get-Binary-Hash": "conformance-caller-%s" % tag,
+                 "X-Get-Binary-Secret": "veil-conformance-secret"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8", "replace"))
+
+
+def cred_auth(entry=None, field=None, token=None, tag="conformance"):
+    body = {"auth": {"caller_hash": "conformance-caller-%s" % tag,
+                     "caller_path": "/srv/conformance-%s.sh" % tag}}
+    if entry is not None:
+        body["entry"] = entry
+    if field is not None:
+        body["field"] = field
+    if token is not None:
+        body["token"] = token
+    return body
+
+
+def normalize_entry_strings(entry):
+    el = entry._element
+    strings = [c for c in el if c.tag == "String"]
+    for s in strings:
+        el.remove(s)
+    anchor = el.find("AutoType")
+    for s in strings:
+        if anchor is not None:
+            anchor.addprevious(s)
+        else:
+            el.append(s)
+
+
+def run_credential_phase(mock_port):
+    from pykeepass import create_database
+    work = tempfile.mkdtemp(prefix="veil-conformance-kdbx-")
+    master = "veil-dev-mock-tpm-seal"
+    kp = create_database(os.path.join(work, "ci.kdbx"), password=master)
+    entry = kp.add_entry(kp.root_group, "网易", "mail-user", "mail-secret-001",
+                         url="https://mail.example.com")
+    entry.set_custom_property("授权码", "authcode-abc-123", protect=True)
+    entry.set_custom_property("备注", "plain-note", protect=False)
+    normalize_entry_strings(entry)
+    kp.save()
+
+    def full_entry():
+        status, body = cred_post(cred_auth(entry="网易", tag="full"), tag="full")
+        assert status == 200, (status, body)
+        cred = body["credential"]
+        assert cred["title"] == "网易", cred
+        assert cred["username"] == "mail-user", cred
+        assert cred["password"].startswith("__VG_CRED_"), cred
+        assert "mail-secret-001" not in json.dumps(body), body
+        props = cred["custom_properties"]
+        assert props["授权码"].startswith("__VG_CRED_"), props
+        assert props["备注"] == "plain-note", props
+
+    def single_protected():
+        status, body = cred_post(cred_auth(entry="网易", field="授权码", tag="single"),
+                                 tag="single")
+        assert status == 200, (status, body)
+        assert body["credential"]["value"].startswith("__VG_CRED_"), body
+
+    def single_raw():
+        status, body = cred_post(cred_auth(entry="网易", field="授权码", token=False,
+                                           tag="raw"),
+                                 tag="raw")
+        assert status == 200, (status, body)
+        assert body["credential"]["value"] == "authcode-abc-123", body
+
+    def missing_entry():
+        status, body = cred_post(cred_auth(entry="不存在", tag="missing"), tag="missing")
+        assert status == 404, (status, body)
+        assert "不存在" in json.dumps(body, ensure_ascii=False), body
+
+    def missing_selector():
+        status, body = cred_post(cred_auth(tag="selector"), tag="selector")
+        assert status == 400, (status, body)
+
+    veil = start_veil({"DB_DIR": work,
+                       "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port})
+    try:
+        for name, fn in [("取用 整条目", full_entry), ("取用 单字段脱敏", single_protected),
+                         ("取用 原文", single_raw), ("取用 缺条目404", missing_entry),
+                         ("取用 缺entry400", missing_selector)]:
+            check(name, fn)
+    finally:
+        veil.terminate()
+        veil.wait(timeout=15)
+
+    def no_db():
+        status, body = cred_post(cred_auth(entry="网易", tag="nodb"), tag="nodb")
+        assert status == 503, (status, body)
+
+    veil_nodb = start_veil({"DB_DIR": os.path.join(work, "empty"),
+                            "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port})
+    try:
+        os.makedirs(os.path.join(work, "empty"), exist_ok=True)
+        check("取用 无库503", no_db)
+    finally:
+        veil_nodb.terminate()
+        veil_nodb.wait(timeout=15)
+
+
 def wait_healthy():
     for _ in range(150):
         try:
@@ -285,23 +403,43 @@ def free_port():
 
 def start_veil(env_extra):
     env = dict(os.environ)
-    env.update({
+    base = {
         "HOMESERVER": "https://matrix.example.com",
         "ROOM_ID": "!r:example.com",
         "MATRIX_ACCESS_TOKEN": "syt_dummy_veil_conformance",
         "OBSERVABILITY_ADMIN_TOKEN": "veil-conformance-admin-token-0123456789",
         "GET_BINARY_SECRET": "veil-conformance-secret",
         "DATA_DIR": tempfile.mkdtemp(prefix="veil-conformance-"),
-    })
+    }
+    if "VEIL_ALLOW_MOCK_TPM" not in env and "VEIL_ALLOW_MOCK_TPM" not in env_extra:
+        base["VEIL_ALLOW_MOCK_TPM"] = "1"
+    env.update(base)
     env.update(env_extra)
-    proc = subprocess.Popen([VEIL_BIN], env=env, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+
+    def _launch(env):
+        proc = subprocess.Popen([VEIL_BIN], env=env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        try:
+            wait_healthy()
+        except Exception:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except Exception:
+                proc.kill()
+            raise
+        return proc
+
     try:
-        wait_healthy()
+        return _launch(env)
     except Exception:
-        proc.terminate()
-        raise
-    return proc
+        if env.get("VEIL_ALLOW_MOCK_TPM") == "1":
+            raise
+        print("veil 网关未就绪：疑似 TPM 门禁失败（本机无 TPM 硬件）。"
+              "自动以 VEIL_ALLOW_MOCK_TPM=1（仅开发/CI，生产禁用）重试一次；"
+              "开发机可 export VEIL_ALLOW_MOCK_TPM=1 后重跑，生产必须接 TPM 2.0 硬件。")
+        env["VEIL_ALLOW_MOCK_TPM"] = "1"
+        return _launch(env)
 
 
 def run_normal_phase():
@@ -487,6 +625,7 @@ def main():
     finally:
         veil.terminate()
         veil.wait(timeout=15)
+    run_credential_phase(mock_port)
     veil_b = start_veil({"LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port,
                          "AUDIT_MODE": "block", "AUDIT_HOLD_MAX_BYTES": "16"})
     try:

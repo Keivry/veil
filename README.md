@@ -21,6 +21,73 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | `MATRIX_ACCESS_TOKEN` | Matrix Bot access token |
 | `OBSERVABILITY_ADMIN_TOKEN` | `/_admin` 鉴权 Token，须独立（不得复用 `MATRIX_ACCESS_TOKEN`），建议 ≥32 字符 |
 
+### 环境变量全表（PII/AUDIT/TPM/LLM）
+
+必填四项见上表；下表列出全部可选变量与默认值，未列出的变量二进制不读取。三大 fail-closed 约束：缺必填拒启动、
+`PII_CUSTOM_*` 缺文件或解析失败拒启动、无硬件 TPM 且未显式放行拒启动。
+
+| 分组 | 变量 | 默认 | 说明 |
+|:-----|:-----|:-----|:-----|
+| 认证 | `GET_BINARY_SECRET` / `CREDENTIAL_SECRET` | 空（兼容模式） | 三因子之部署密钥；前者优先 |
+| 认证 | `GET_BINARY_HASH` | 空 | 须与 `GET_BINARY_SECRET` 同时设置才生效 |
+| 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同 |
+| 认证 | `AUTO_APPROVE` | `true` | `true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批 |
+| 入口 | `VEIL_ENTRY_MODE` | `full` | `full` / `credential-only` / `llm-only` |
+| 入口 | `CALLER_REGISTRY_PATH` | `<DATA_DIR>/caller_registry.json` | 调用方注册表路径 |
+| 存储 | `DATA_DIR` | `/data` | sqlite、审计日志父目录；派生 `/data/tpm`（`seal.pub`+`seal.priv`）与 `/data/db`（`.kdbx`+`.key`） |
+| 存储 | `DB_DIR` / `TPM_DIR` | `<DATA_DIR>/db` / `<DATA_DIR>/tpm` | kdbx 库目录（扫描排序取末位 `.kdbx`，同名 `.key` 优先）与 TPM 密封目录 |
+| 存储 | `VEIL_KEEPASS_BACKEND` | `real` | `real` 真实 kdbx 后端；显式 `mock` 仅 CI 逃生（生产禁用） |
+| 脱敏 | `REDACTION_ENABLED` | 开启 | 脱敏总开关；显式 `0/false/no/off` 关闭 |
+| 脱敏 | `PII_REDACTION_ENABLED` | — | 原仓别名；仅当 `REDACTION_ENABLED` 为空时生效 |
+| 脱敏 | `PII_RESPONSE_SIDE` | 开启 | 响应侧新检出注册占位符；关闭后新 PII 原样透出 |
+| 脱敏 | `PII_FUZZY_RESTORE` | 关闭 | 残缺形态按序号回查还原 |
+| 脱敏 | `PII_DETECTION_HARDENING` | 关闭 | 严格边界复核，丢弃 ASCII 粘连与前导零 IPv4 |
+| 脱敏 | `PII_CUSTOM_RULES_FILE` / `PII_CUSTOM_RULES` | 空 | 自定义正则文件，前者优先；已配置但缺文件/不可读/JSON 非法/形态非法一律拒启动 |
+| 脱敏 | `PII_CUSTOM_PATTERNS_FILE` / `PII_CUSTOM_PATTERNS` | 空 | 同上（数组或 `{name: pattern}` 映射） |
+| 脱敏 | `PII_CUSTOM_DICT_FILE` / `PII_CUSTOM_DICT` | 空 | 同上（字典形态） |
+| 脱敏 | `PII_VALUE_SAMPLE_ENABLED` | 关闭 | 值级采样总开关 |
+| 脱敏 | `PII_VALUE_SAMPLE_PERSIST` | 开启 | 值级采样落盘 |
+| 脱敏 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 未设退化为 SHA256 |
+| 脱敏 | `PII_PLACEHOLDER_PROMPT` | 开启 | 占位符说明注入；`0/false/no` 关闭 |
+| 脱敏 | `PII_PLACEHOLDER_PROMPT_TEXT` | 内建默认 | 自定义文案（4KB 上限，超限截断；含合法占位符形态回退默认） |
+| 脱敏 | `PII_HOLD_MAX` | `64` | PII 保持上限（须 ≥1 正整数） |
+| 脱敏 | `NORMALIZE_JSON_WHITESPACE` | 关闭 | 仅 `"1"` 开启请求体空白归一 |
+| 审计 | `AUDIT_MODE` | `off` | `off` / `block` / `approve`；`approve` 必须配 `APPROVAL_WHITELIST` |
+| 审计 | `AUDIT_TIMEOUT` | `90`s | 禁止落在 `110`-`130`s 竞态区间，否则拒启动 |
+| 审计 | `AUDIT_HOLD_MAX_BYTES` | `1048576` | 审计 hold 上限字节（须 ≥1 正整数） |
+| 审计 | `AUDIT_POLICY_FILE` | 内建默认策略 | 审计策略文件路径 |
+| 审计 | `APPROVAL_WHITELIST` | 空 | 审批人 Matrix ID 逗号分隔（`@user:server`） |
+| TPM | `VEIL_ALLOW_MOCK_TPM` | 未设置（硬件强制） | 仅 `=1` 放行 Mock TPM，专供无硬件开发机与 CI；生产禁用（见下方指引） |
+| LLM | `LLM_UPSTREAM` | 空 | 缺省上游 URL；`scripts/api_conformance.py` 将其指向 mock 上游 |
+| LLM | `LLM_<port>`（如 `LLM_8878`/`LLM_8879`） | 见 compose | 按宿主机入口端口选择上游 |
+| LLM | `HTTP_TIMEOUT_SECS` | `30` | 上游转发整体超时（秒） |
+| LLM | `HTTP_POOL_MAX_IDLE_PER_HOST` | `16` | 每主机空闲连接上限 |
+| LLM | `HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | 空闲连接保活（秒） |
+| compose 专用 | `PORT_8877` / `PORT_8878` / `PORT_8879` | `8877/8878/8879` | 仅改宿主机映射端口，不改容器内监听 |
+| compose 专用 | `TPM_HOST_PATH` / `DB_HOST_PATH` | `./data/tpm` / `./data/db` | 宿主机只读挂载源 |
+
+### 端口语义：单端口运行时 vs compose 三端口映射
+
+- 本地直跑（二进制）：只监听 `127.0.0.1:8877` 一个端口（见 `src/main.rs`），凭据 API 与 LLM 代理共用该端口（LLM 按路径透传）。
+- compose 部署：容器内仍只监听 `8877`，三条映射（宿主机 `PORT_887x` → 容器 `8877`）只是宿主机入口区分；
+  `LLM_8878`/`LLM_8879` 按入口宿主机端口选择上游，`LLM_UPSTREAM` 为缺省上游。宿主机端口可经
+  `PORT_8877/8878/8879` 覆盖，回环绑定不变。
+- 不存在多端口运行时重构：多端口语义仅为文档声明，当前行为由 `resolve_upstream` 单测锁定。
+
+### 管理控制台说明（`admin.html` 范围）
+
+- `GET /_admin/` 返回 JSON 索引占位（六路由表与就绪说明），为终态形态；独立 `admin.html` 静态页为 Non-Goal，
+  本仓不交付（见 `observability-admin` spec），如需静态控制台由新 change 交付。
+- 管理面鉴权：请求头 `X-Admin-Token`（对应环境变量 `OBSERVABILITY_ADMIN_TOKEN`）优先，
+  其次 `__Host-admin_token` Cookie，最后仅 SSE 回退可用 `?access_token`；非 SSE 接口以 query 传 token 恒 401。
+
+### Mock TPM 指引（仅开发，生产禁用）
+
+- 无 TPM 硬件的开发机/CI：设置 `VEIL_ALLOW_MOCK_TPM=1`（精确等于 `1` 才放行，其余值仍走硬件门禁 fail-closed），
+  compose 下同时注释掉 `docker-compose.yml` 中 `devices` 两行。
+- 生产必须接 TPM 2.0 硬件且不得设置该变量；以 Mock TPM 运行会打 warn 日志，禁止生产使用。
+- `scripts/api_conformance.py` 已内建该回退：TPM 门禁失败时自动以 `VEIL_ALLOW_MOCK_TPM=1` 重试并打印本指引。
+
 ### 本地直跑
 
 ```bash
