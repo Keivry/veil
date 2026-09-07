@@ -22,6 +22,8 @@ pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
         "ok": true,
         "sqlite_ok": health.sqlite_ok,
         "sqlite_error": health.sqlite_error,
+        "status": if health.sqlite_ok { "ok" } else { "degraded" },
+        "unlocked": state.keepass.is_unlocked(),
     }))
 }
 
@@ -169,13 +171,9 @@ pub async fn emergency_revoke_handler(
         .admin_token
         .clone()
         .or_else(|| header_str(&headers, "x-admin-token"));
-    let peer_ip = peer.0.or_else(|| {
-        header_str(&headers, "x-forwarded-for")
-            .as_deref()
-            .and_then(|v| v.split(',').next())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    });
+    // 安全契约（security-compat-fix）：紧急吊销只认 TCP 远端 `ConnectInfo`，
+    // MUST NOT 回退 `X-Forwarded-For` 等代理头（伪造头可绕过内网豁免）。
+    let peer_ip = peer.0;
     let view = service::emergency_revoke(
         &state,
         &key,
@@ -209,6 +207,14 @@ pub struct CredentialRequestBody {
     pub secret: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthBlock>,
+    #[serde(default)]
+    pub entry: Option<String>,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub fields: Option<Value>,
+    #[serde(default)]
+    pub token: Option<bool>,
 }
 
 /// 通用网关 ingress JSON 上限 10MB（检查点：`llm_proxy_handler` 的 `to_bytes`）。
@@ -619,6 +625,9 @@ pub fn spawn_stream_pump(
         let mut rejected_sticky = false;
         let mut block_injected = false;
         let mut stream_usage: Option<llm_gateway::Usage> = None;
+        // Responses 终端去重旗：上游 `failed` 直接透传、`incomplete`/`error`
+        // 合成为单个 `response.failed`，恒恰其一。
+        let mut responses_failed_sent = false;
         while let Ok(chunk) = upstream.chunk().await {
             let bytes = match chunk {
                 Some(b) => b,
@@ -662,7 +671,13 @@ pub fn spawn_stream_pump(
                                     || ev.data.contains("message_delta")
                                     || ev.data.contains("message_stop")
                             }
-                            Protocol::Responses => ev.data.contains("response.completed"),
+                            Protocol::Responses => {
+                                ev.data.contains("response.completed")
+                                    || ev.data.contains("response.failed")
+                                    || ev.data.contains("response.incomplete")
+                                    || ev.data.contains("\"type\":\"error\"")
+                                    || ev.data.contains("\"type\": \"error\"")
+                            }
                             _ => false,
                         };
                         if terminal {
@@ -676,6 +691,45 @@ pub fn spawn_stream_pump(
                             || AuditHold::is_complete_event(&v))
                     {
                         continue;
+                    }
+                }
+                if protocol == Protocol::Responses && !ev.data.is_empty() {
+                    let is_failed = ev.data.contains("response.failed");
+                    let is_incomplete = ev.data.contains("response.incomplete");
+                    let is_error = ev.data.contains("\"type\":\"error\"")
+                        || ev.data.contains("\"type\": \"error\"");
+                    if is_incomplete || is_error {
+                        if !responses_failed_sent {
+                            responses_failed_sent = true;
+                            let fid = conv_id.clone().unwrap_or_else(|| {
+                                llm_gateway::resolve_conv_id(
+                                    None,
+                                    &serde_json::Value::Null,
+                                    Some(&metrics),
+                                    "failed",
+                                )
+                                .0
+                            });
+                            for f in block_inject::ensure_event_lines(
+                                block_inject::responses_truncated_frames(&fid),
+                            ) {
+                                metrics.add_sse_event();
+                                forwarded += 1;
+                                if pump_tx.send(f).await.is_err() {
+                                    break;
+                                }
+                            }
+                            block_inject::mark_terminal(&mut meta);
+                        }
+                        terminated = true;
+                        continue;
+                    }
+                    if is_failed {
+                        if responses_failed_sent {
+                            terminated = true;
+                            continue;
+                        }
+                        responses_failed_sent = true;
                     }
                 }
                 if !ev.data.is_empty() && ev.data.trim() != "[DONE]" {
@@ -937,9 +991,13 @@ async fn gateway_serve(
         .deflate(llm_gateway::DECODE_ENABLED)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let scope = Arc::new(Scope::new());
+    let scope = Arc::new(Scope::with_opts(
+        state.config.pii_response_side,
+        state.config.pii_fuzzy_restore,
+    ));
     let vault = Arc::new(CredentialVault::new());
     let detector = Arc::new(PiiDetector::new());
+    detector.set_hardening(state.config.pii_detection_hardening);
     let sqlite_precise = state.sqlite_ok();
     let hold_max = state.config.audit_hold_max_bytes.max(1) as usize;
 
@@ -1382,6 +1440,39 @@ mod gateway_units_tests {
             frames.iter().any(|f| f.contains("data: [DONE]")),
             "阻断事件后恒有终止帧"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_incomplete与error合成单个failed() {
+        let sse = b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r9\",\"status\":\"incomplete\"}}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (outcome, frames) = collect_pump(
+            upstream,
+            pump_ctx(Protocol::Responses, scope, vault, detector),
+        )
+        .await;
+        let joined = frames.join("");
+        assert!(
+            joined.contains("response.failed"),
+            "incomplete/error 须映射为 failed"
+        );
+        assert!(
+            !joined.contains("response.incomplete"),
+            "原始 incomplete 不得透出"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f.contains("response.failed"))
+                .count(),
+            1,
+            "恒恰一个 failed 终止帧"
+        );
+        assert!(outcome.terminal_injected, "映射后 terminal 须落位");
         server.abort();
     }
 
@@ -1846,5 +1937,69 @@ mod tests {
         assert!(err.is_err());
         let ok = axum::body::to_bytes(axum::body::Body::from(vec![b'x'; 16]), 16).await;
         assert!(ok.is_ok());
+    }
+
+    fn revoke_test_state() -> AppState {
+        let env = HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+        ]);
+        AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: PathBuf::from("/tmp/x.sqlite"),
+                memory_only: false,
+            },
+        )
+    }
+
+    fn revoke_body(key: &str) -> Json<EmergencyRevokeBody> {
+        Json(EmergencyRevokeBody {
+            key: Some(key.to_string()),
+            caller_path: None,
+            caller_hash: None,
+            admin_token: None,
+            file_present: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn 伪造代理头不绕过吊销判定() {
+        // 内网豁免只认 TCP 远端：公网对端携带伪造内网 XFF 仍转审批，不直接吊销。
+        let state = revoke_test_state();
+        service::register_caller(&state, "/s/xff.sh", "h-xff", "src-xff")
+            .await
+            .unwrap();
+        let mut forged = HeaderMap::new();
+        forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        let err = emergency_revoke_handler(
+            State(state.clone()),
+            PeerIp(Some("203.0.113.9".to_string())),
+            forged,
+            revoke_body("/s/xff.sh"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::ACCEPTED);
+        // 回环 TCP 对端无头时豁免路径仍可用。
+        let ok = emergency_revoke_handler(
+            State(state),
+            PeerIp(Some("127.0.0.1".to_string())),
+            HeaderMap::new(),
+            revoke_body("/s/xff.sh"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.0["ok"], true);
     }
 }
