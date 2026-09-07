@@ -49,6 +49,7 @@ pub struct AppState {
     pub register_hits: Arc<Mutex<HashMap<String, Instant>>>,
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
     pub admin: Arc<crate::service::admin::AdminState>,
+    pub http_client: Arc<reqwest::Client>,
 }
 
 impl AppState {
@@ -62,6 +63,7 @@ impl AppState {
             config.approval_whitelist.clone(),
             config.audit_timeout_secs.max(1) as u64,
         ));
+        let http_client = Arc::new(build_http_client(&config));
         Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),
@@ -76,6 +78,7 @@ impl AppState {
             register_hits: Arc::new(Mutex::new(HashMap::new())),
             gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
             admin,
+            http_client,
         }
     }
 
@@ -85,6 +88,21 @@ impl AppState {
         self.keepass = backend;
         self
     }
+}
+
+pub fn build_http_client(config: &Config) -> reqwest::Client {
+    use std::time::Duration;
+    reqwest::Client::builder()
+        .gzip(crate::service::llm_gateway::DECODE_ENABLED)
+        .brotli(crate::service::llm_gateway::DECODE_ENABLED)
+        .deflate(crate::service::llm_gateway::DECODE_ENABLED)
+        .timeout(Duration::from_secs(config.http_timeout_secs.max(1)))
+        .pool_max_idle_per_host(config.http_pool_max_idle_per_host.max(1))
+        .pool_idle_timeout(Duration::from_secs(
+            config.http_pool_idle_timeout_secs.max(1),
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// sqlite 初始化结果：健康或内存-only 降级。
@@ -295,5 +313,47 @@ mod tests {
             Err(anyhow::anyhow!("boom")),
         );
         assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn client_singleton_两次转发共享同一句柄() {
+        let dir = unique_temp_dir();
+        let env = std::collections::HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+            ("DATA_DIR".to_string(), dir.to_string_lossy().into_owned()),
+        ]);
+        let state = AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: dir.join("m.sqlite"),
+                memory_only: false,
+            },
+        );
+        let again = state.clone();
+        assert!(Arc::ptr_eq(&state.http_client, &again.http_client));
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let url = format!("http://{addr}/");
+        for _ in 0..2 {
+            let resp = again.http_client.get(&url).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+        }
+        handle.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

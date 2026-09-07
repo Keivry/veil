@@ -20,6 +20,12 @@ pub const PII_HOLD_MAX_DEFAULT: i64 = 64;
 pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: i64 = 1_048_576;
 /// 管理 token 建议最小长度，不足仅告警不断链。
 pub const ADMIN_TOKEN_MIN_LEN: usize = 32;
+/// 上游转发 `reqwest::Client` 整体超时默认值（秒，保守值）。
+pub const HTTP_TIMEOUT_SECS_DEFAULT: u64 = 30;
+/// 上游转发连接池每主机空闲连接上限默认值（保守值）。
+pub const HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT: usize = 16;
+/// 上游转发连接池空闲连接保活默认值（秒，保守值）。
+pub const HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT: u64 = 90;
 /// `PII_PLACEHOLDER_PROMPT_TEXT` 自定义文案长度上限（字节，4KB，超限截断并告警）。
 pub const PLACEHOLDER_PROMPT_MAX_LEN: usize = 4096;
 /// 内置默认占位符说明文案（对标原仓 `PII_PLACEHOLDER_PROMPT_DEFAULT`）：
@@ -135,6 +141,9 @@ pub struct Config {
     pub normalize_json_whitespace: bool,
     /// §6.1 审计策略文件路径（`AUDIT_POLICY_FILE`，缺省为内建默认策略）。
     pub audit_policy_file: Option<PathBuf>,
+    pub http_timeout_secs: u64,
+    pub http_pool_max_idle_per_host: usize,
+    pub http_pool_idle_timeout_secs: u64,
 }
 
 impl Config {
@@ -246,6 +255,18 @@ impl Config {
         let normalize_json_whitespace =
             matches!(get("NORMALIZE_JSON_WHITESPACE").as_deref(), Some("1"));
         let (placeholder_prompt_enabled, placeholder_prompt_text) = parse_placeholder_prompt(&get);
+        let http_timeout_secs =
+            parse_positive_u64(&get, "HTTP_TIMEOUT_SECS", HTTP_TIMEOUT_SECS_DEFAULT)?;
+        let http_pool_max_idle_per_host = parse_positive_usize(
+            &get,
+            "HTTP_POOL_MAX_IDLE_PER_HOST",
+            HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT,
+        )?;
+        let http_pool_idle_timeout_secs = parse_positive_u64(
+            &get,
+            "HTTP_POOL_IDLE_TIMEOUT_SECS",
+            HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT,
+        )?;
 
         Ok(Self {
             homeserver,
@@ -271,6 +292,9 @@ impl Config {
             audit_policy_file,
             placeholder_prompt_enabled,
             placeholder_prompt_text,
+            http_timeout_secs,
+            http_pool_max_idle_per_host,
+            http_pool_idle_timeout_secs,
         })
     }
 }
@@ -367,6 +391,36 @@ fn parse_positive(get: &dyn Fn(&str) -> Option<String>, var: &str, default: i64)
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string());
     match raw.parse::<i64>() {
+        Ok(v) if v >= 1 => Ok(v),
+        Ok(_) => Err(config_error(var, &format!("{var} 必须 ≥1 正整数: {raw:?}"))),
+        Err(_) => Err(config_error(var, &format!("{var} 非法整数: {raw:?}"))),
+    }
+}
+
+fn parse_positive_u64(
+    get: &dyn Fn(&str) -> Option<String>,
+    var: &str,
+    default: u64,
+) -> Result<u64> {
+    let raw = get(var)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string());
+    match raw.parse::<u64>() {
+        Ok(v) if v >= 1 => Ok(v),
+        Ok(_) => Err(config_error(var, &format!("{var} 必须 ≥1 正整数: {raw:?}"))),
+        Err(_) => Err(config_error(var, &format!("{var} 非法整数: {raw:?}"))),
+    }
+}
+
+fn parse_positive_usize(
+    get: &dyn Fn(&str) -> Option<String>,
+    var: &str,
+    default: usize,
+) -> Result<usize> {
+    let raw = get(var)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string());
+    match raw.parse::<usize>() {
         Ok(v) if v >= 1 => Ok(v),
         Ok(_) => Err(config_error(var, &format!("{var} 必须 ≥1 正整数: {raw:?}"))),
         Err(_) => Err(config_error(var, &format!("{var} 非法整数: {raw:?}"))),
@@ -638,5 +692,45 @@ mod tests {
         env.insert("PII_PLACEHOLDER_PROMPT_TEXT".to_string(), "   ".to_string());
         let cfg = Config::load_from(&env).unwrap();
         assert!(cfg.placeholder_prompt_text.is_empty());
+    }
+
+    #[test]
+    fn http_client配置缺省与覆盖均正常() {
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert_eq!(cfg.http_timeout_secs, HTTP_TIMEOUT_SECS_DEFAULT);
+        assert_eq!(
+            cfg.http_pool_max_idle_per_host,
+            HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT
+        );
+        assert_eq!(
+            cfg.http_pool_idle_timeout_secs,
+            HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT
+        );
+        let mut env = base_env();
+        env.insert("HTTP_TIMEOUT_SECS".to_string(), "10".to_string());
+        env.insert("HTTP_POOL_MAX_IDLE_PER_HOST".to_string(), "8".to_string());
+        env.insert("HTTP_POOL_IDLE_TIMEOUT_SECS".to_string(), "60".to_string());
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.http_timeout_secs, 10);
+        assert_eq!(cfg.http_pool_max_idle_per_host, 8);
+        assert_eq!(cfg.http_pool_idle_timeout_secs, 60);
+    }
+
+    #[test]
+    fn http_client配置非法拒启动() {
+        for (var, raw) in [
+            ("HTTP_TIMEOUT_SECS", "0"),
+            ("HTTP_TIMEOUT_SECS", "abc"),
+            ("HTTP_POOL_MAX_IDLE_PER_HOST", "0"),
+            ("HTTP_POOL_IDLE_TIMEOUT_SECS", "-5"),
+        ] {
+            let mut env = base_env();
+            env.insert(var.to_string(), raw.to_string());
+            let err = Config::load_from(&env).unwrap_err();
+            assert!(
+                err.to_string().contains(var),
+                "输入 {var}={raw} 报错须指明变量名"
+            );
+        }
     }
 }
