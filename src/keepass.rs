@@ -1,3 +1,11 @@
+//! 凭据后端抽象：`KeePassBackend` trait + `MockKeePass` 占位实现。
+//!
+//! Non-Goal（见 credential-api spec KeePass 条）：本 change 不接入真实
+//! KeePass kdbx 后端，不引入新 kdbx 依赖。`MockKeePass` 仅用于单测/CI 与
+//! 审批链路占位：未解锁返回 503，已解锁返回 `__MOCK_CRED_<caller>__`。
+//! 生产风险：占位载荷非真实密钥，生产部署前必须完成后继真实 kdbx 后端
+//! change（含 TPM 派生主密钥），否则不得上线。
+
 use {
     crate::error::{Result, VeilError},
     std::sync::atomic::{AtomicBool, Ordering},

@@ -210,7 +210,7 @@ impl AdminState {
     }
 
     /// 推入事件：摘要经单一路径 `redact → truncate` 后落环 + 广播。
-    /// TODO(§7): §6 审计 hook 接入时调用本函数（`kind`=`audit`），当前仅网关/单测直调。
+    /// 注：§6 审计落盘后如需同步推送审计事件，可调用本函数（`kind`=`audit`）。
     pub fn push_event(
         &self,
         kind: &str,
@@ -371,7 +371,7 @@ fn check_admin_rate(state: &AppState, ip: IpAddr) -> Option<Response> {
     }
 }
 
-/// `GET /_admin/`：静态页占位（§8 复用 `admin.html`，本任务只交付 JSON API + SSE 流）。
+/// `GET /_admin/`：JSON 索引占位（终态：返回六路由表与就绪说明，不交付 admin.html 静态页）。
 pub async fn admin_index(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -396,7 +396,7 @@ pub async fn admin_index(
         "ok": true,
         "admin": "veil observability",
         "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream"],
-        "note": "静态页占位：JSON API + SSE 流已就绪，admin.html 复用见后续部署事项",
+        "note": "JSON 索引占位终态：六路由 API + SSE 流已就绪（admin.html 为 Non-Goal）",
     }))
     .into_response()
 }
