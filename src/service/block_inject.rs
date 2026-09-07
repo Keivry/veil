@@ -11,6 +11,7 @@ pub fn chat_block_frames(reason: &str) -> Vec<String> {
 
 pub fn anthropic_block_frames(reason: &str) -> Vec<String> {
     vec![
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"blocked-0\",\"name\":\"blocked\",\"input\":{}}}\n\n".to_string(),
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n".to_string(),
         format!("event: message_stop\ndata: {{\"type\":\"message_stop\",\"reason\":\"{reason}\"}}\n\n"),
@@ -33,7 +34,8 @@ pub fn ensure_event_lines(frames: Vec<String>) -> Vec<String> {
     frames
         .into_iter()
         .map(|f| {
-            if f.lines().any(|l| l.starts_with("event:")) {
+            // DONE 裸帧豁免：Chat 终止符恒为裸 `data: [DONE]`，不得补 `event:`。
+            if is_done_frame(&f) || f.lines().any(|l| l.starts_with("event:")) {
                 f
             } else if let Some(pos) = f.find("data:") {
                 format!("event: message\n{}", &f[pos..])
@@ -46,7 +48,7 @@ pub fn ensure_event_lines(frames: Vec<String>) -> Vec<String> {
 
 pub fn mark_terminal(meta: &mut StreamMeta) { meta.terminal_injected = true; }
 
-pub fn chat_done_frame() -> String { "event: message\ndata: [DONE]\n\n".to_string() }
+pub fn chat_done_frame() -> String { "data: [DONE]\n\n".to_string() }
 
 pub fn is_done_frame(frame: &str) -> bool {
     frame.lines().any(|l| {
@@ -114,23 +116,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat阻断恒以done恰1个收尾() {
+    fn chat阻断恒以裸done恰1个收尾() {
         let frames = ensure_event_lines(chat_block_frames("policy"));
         assert_eq!(count_done(&frames), 1);
+        let done = frames
+            .iter()
+            .find(|f| is_done_frame(f))
+            .expect("须含 DONE 帧");
+        assert_eq!(
+            done.as_str(),
+            "data: [DONE]\n\n",
+            "DONE 恒为裸帧，不得带 event:"
+        );
         assert!(
             frames
                 .iter()
-                .all(|f| f.lines().any(|l| l.starts_with("event:")))
+                .filter(|f| !is_done_frame(f))
+                .all(|f| f.lines().any(|l| l.starts_with("event:"))),
+            "非 DONE 帧仍须带 event 行"
         );
     }
 
     #[test]
-    fn anthropic三件套终止() {
+    fn done裸帧豁免event补全() {
+        assert_eq!(chat_done_frame(), "data: [DONE]\n\n");
+        let raw = vec![
+            "data: [DONE]\n\n".to_string(),
+            "data:[DONE]\n\n".to_string(),
+        ];
+        let fixed = ensure_event_lines(raw);
+        assert!(fixed.iter().all(|f| !f.contains("event:")));
+        assert_eq!(count_done(&fixed), 2);
+    }
+
+    #[test]
+    fn anthropic四件套终止且顺序锁定() {
         let frames = ensure_event_lines(anthropic_block_frames("policy"));
         let joined = frames.join("");
-        assert!(joined.contains("content_block_stop"));
-        assert!(joined.contains("message_delta"));
-        assert!(joined.contains("message_stop"));
+        for key in [
+            "content_block_start",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ] {
+            assert!(joined.contains(key), "缺 {key}");
+        }
+        let pos = |k: &str| joined.find(k).unwrap();
+        assert!(
+            pos("content_block_start") < pos("content_block_stop")
+                && pos("content_block_stop") < pos("message_delta")
+                && pos("message_delta") < pos("message_stop"),
+            "顺序恒为 start/stop/delta/message_stop"
+        );
         assert!(
             frames
                 .iter()
@@ -179,8 +216,10 @@ mod tests {
         let norm = dedupe_terminal_frames(dup, "chat");
         assert_eq!(count_done(&norm), 1);
         assert!(norm.last().is_some_and(|f| is_done_frame(f)));
+        assert_eq!(norm.last().map(String::as_str), Some("data: [DONE]\n\n"));
         assert!(
             norm.iter()
+                .filter(|f| !is_done_frame(f))
                 .all(|f| f.lines().any(|l| l.starts_with("event:")))
         );
         assert!(has_chat_terminal(&norm));

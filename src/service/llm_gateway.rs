@@ -411,9 +411,9 @@ fn usage_in(obj: &serde_json::Map<String, Value>) -> Option<Usage> {
 fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
     match acc {
         Some(a) => {
-            a.prompt_tokens = a.prompt_tokens.saturating_add(next.prompt_tokens);
-            a.completion_tokens = a.completion_tokens.saturating_add(next.completion_tokens);
-            a.total_tokens = a.total_tokens.saturating_add(next.total_tokens);
+            a.prompt_tokens = a.prompt_tokens.max(next.prompt_tokens);
+            a.completion_tokens = a.completion_tokens.max(next.completion_tokens);
+            a.total_tokens = a.total_tokens.max(next.total_tokens);
         }
         None => *acc = Some(next),
     }
@@ -463,9 +463,13 @@ pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage
 /// （`input_tokens`/`output_tokens`/`total` 回退，`total` 缺失时 `prompt+completion`）。
 pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage> {
     let obj = payload.as_object()?;
-    // 快路径：无 usage/cached_tokens 的心跳分片直接跳过，避免全量归一。
+    // 快路径：无 usage/cached_tokens/裸 token 键的心跳分片直接跳过，避免全量归一。
     let raw = payload.to_string();
-    if !raw.contains("\"usage\"") && !raw.contains("\"cached_tokens\"") {
+    if !raw.contains("\"usage\"")
+        && !raw.contains("\"cached_tokens\"")
+        && !raw.contains("input_tokens")
+        && !raw.contains("output_tokens")
+    {
         return None;
     }
     if let Some(u) = usage_in(obj) {
@@ -506,7 +510,8 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
     }
 }
 
-/// 流式 usage 累加（Anthropic `message_start` + `message_delta` 两段式求和）。
+/// 流式 usage 累加（Anthropic `message_start` + `message_delta` 双段按字段单调 max，
+/// 上游累计语义下不双计；其余协议同样按 max 归一，单样本流与旧口径一致）。
 pub fn accumulate_usage(acc: &mut Option<Usage>, next: Option<Usage>) {
     if let Some(u) = next {
         merge_usage(acc, u);
@@ -1278,7 +1283,40 @@ mod tests {
             extract_usage_stream(Protocol::Anthropic, &anth_delta),
         );
         let a = acc.unwrap();
-        assert_eq!((a.prompt_tokens, a.total_tokens), (15, 35));
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+            (10, 20, 30),
+            "双段按字段单调 max，不求和双计"
+        );
+    }
+
+    #[test]
+    fn 流式usage双段单调max不双计且快路径兼查裸键() {
+        let start =
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5}}});
+        let delta = serde_json::json!({"type":"message_delta","usage":{"output_tokens":20}});
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &start));
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &delta));
+        let a = acc.unwrap();
+        assert_eq!((a.prompt_tokens, a.completion_tokens), (5, 20));
+        let bare = serde_json::json!({"delta":{"input_tokens":5}});
+        assert!(
+            extract_usage_stream(Protocol::Anthropic, &bare).is_none(),
+            "裸键分片过快路径门后仍按归一口径返回 None，不估算"
+        );
+        let heartbeat = serde_json::json!({"delta":"hi"});
+        assert!(extract_usage_stream(Protocol::Anthropic, &heartbeat).is_none());
+    }
+
+    #[test]
+    fn responses流式单层usage优先于双层() {
+        let both = serde_json::json!({"response":{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"response":{"usage":{"prompt_tokens":9,"completion_tokens":9,"total_tokens":18}}}});
+        let u = extract_usage_stream(Protocol::Responses, &both).unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (1, 1, 2)
+        );
     }
 
     #[test]
