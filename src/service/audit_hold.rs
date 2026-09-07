@@ -86,6 +86,27 @@ impl AuditHold {
         if payload.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls") {
             return true;
         }
+        if payload
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|choices| {
+                choices.iter().any(|ch| {
+                    ch.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls")
+                        || ch
+                            .get("delta")
+                            .and_then(|d| d.get("finish_reason"))
+                            .and_then(|v| v.as_str())
+                            == Some("tool_calls")
+                        || ch
+                            .get("message")
+                            .and_then(|m| m.get("finish_reason"))
+                            .and_then(|v| v.as_str())
+                            == Some("tool_calls")
+                })
+            })
+        {
+            return true;
+        }
         if let Some(t) = payload.get("type").and_then(|v| v.as_str())
             && matches!(
                 t,
@@ -148,6 +169,10 @@ pub struct RequestKeepalive {
 
 impl RequestKeepalive {
     pub fn spawn(tx: tokio::sync::mpsc::Sender<String>) -> Self {
+        Self::spawn_gated(tx, Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn spawn_gated(tx: tokio::sync::mpsc::Sender<String>, gate: Arc<AtomicBool>) -> Self {
         let live = Arc::new(AtomicBool::new(true));
         let flag = live.clone();
         let task = tokio::spawn(async move {
@@ -157,6 +182,9 @@ impl RequestKeepalive {
                 ticker.tick().await;
                 if !flag.load(Ordering::Relaxed) {
                     break;
+                }
+                if !gate.load(Ordering::Relaxed) {
+                    continue;
                 }
                 if tx.send(super::sse::keepalive_frame()).await.is_err() {
                     break;
@@ -209,6 +237,21 @@ mod tests {
         ));
         assert!(AuditHold::is_complete_event(
             &serde_json::json!({"type":"item_done"})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[{"message":{"finish_reason":"tool_calls"}}]})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[]})
         ));
         hold.mark_completed();
         assert!(!hold.held());
