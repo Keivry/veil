@@ -7,12 +7,13 @@ use {
     axum::{
         Json,
         body::Body,
-        extract::{Request, State},
+        extract::{ConnectInfo, Request, State},
         http::{HeaderMap, StatusCode, header},
         response::{IntoResponse, Response},
     },
     serde::{Deserialize, Serialize},
     serde_json::{Value, json},
+    std::net::SocketAddr,
 };
 
 pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
@@ -130,13 +131,32 @@ pub struct EmergencyRevokeBody {
     #[serde(default)]
     pub admin_token: Option<String>,
     #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
     pub file_present: bool,
+}
+
+pub struct PeerIp(pub Option<String>);
+
+impl<S> axum::extract::FromRequestParts<S> for PeerIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip().to_string());
+        Ok(Self(ip))
+    }
 }
 
 pub async fn emergency_revoke_handler(
     State(state): State<AppState>,
+    peer: PeerIp,
     headers: HeaderMap,
     Json(body): Json<EmergencyRevokeBody>,
 ) -> Result<Json<Value>> {
@@ -149,11 +169,18 @@ pub async fn emergency_revoke_handler(
         .admin_token
         .clone()
         .or_else(|| header_str(&headers, "x-admin-token"));
+    let peer_ip = peer.0.or_else(|| {
+        header_str(&headers, "x-forwarded-for")
+            .as_deref()
+            .and_then(|v| v.split(',').next())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
     let view = service::emergency_revoke(
         &state,
         &key,
         admin_token.as_deref(),
-        body.source.as_deref(),
+        peer_ip.as_deref(),
         body.file_present,
     )
     .await?;
@@ -260,7 +287,9 @@ async fn gateway_serve(
         .deflate(llm_gateway::DECODE_ENABLED)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let scope = Scope::new();
+    let scope = std::sync::Arc::new(Scope::new());
+    let vault = std::sync::Arc::new(crate::service::credential_vault::CredentialVault::new());
+    let detector = std::sync::Arc::new(crate::service::pii::PiiDetector::new());
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
 
@@ -269,7 +298,12 @@ async fn gateway_serve(
         fwd_headers.remove(header::HOST);
         fwd_headers.remove(header::CONTENT_LENGTH);
         fwd_headers.remove(header::CONTENT_ENCODING);
-        llm_gateway::filter_hop_headers(&mut fwd_headers);
+        llm_gateway::filter_hop_headers_counted(
+            &mut fwd_headers,
+            "upstream",
+            llm_gateway::DECODE_ENABLED,
+            Some(&state.gateway_metrics),
+        );
         match llm_gateway::fetch_upstream_with_retry(
             &client,
             upstream_method,
@@ -292,7 +326,12 @@ async fn gateway_serve(
                         resp_headers.insert(n, val);
                     }
                 }
-                llm_gateway::filter_hop_headers(&mut resp_headers);
+                llm_gateway::filter_hop_headers_counted(
+                    &mut resp_headers,
+                    "downstream",
+                    llm_gateway::DECODE_ENABLED,
+                    Some(&state.gateway_metrics),
+                );
                 for (k, v) in resp_headers.iter() {
                     builder = builder.header(k, v);
                 }
@@ -310,7 +349,6 @@ async fn gateway_serve(
         let original_valid = std::str::from_utf8(&body_bytes).is_ok();
         let original_text = String::from_utf8_lossy(&body_bytes).into_owned();
         let mut body_value: Option<Value> = serde_json::from_slice(&body_bytes).ok();
-        let stream_flag = body_value.as_ref().is_some_and(is_stream_body);
         let mut normalized_out = false;
         let mut redacted_text = original_text.clone();
         if llm_gateway::should_inject_placeholders(
@@ -318,8 +356,6 @@ async fn gateway_serve(
             state.config.redaction_enabled,
             !body_bytes.is_empty(),
         ) {
-            let vault = crate::service::credential_vault::CredentialVault::new();
-            let detector = crate::service::pii::PiiDetector::new();
             redacted_text = scope
                 .redact_request(&vault, &detector, &original_text)
                 .await;
@@ -345,10 +381,33 @@ async fn gateway_serve(
             body_bytes = serde_json::to_vec(v).unwrap_or_default();
             normalized_out = true;
         }
+        let stream_flag: bool = serde_json::from_slice::<Value>(&body_bytes)
+            .ok()
+            .as_ref()
+            .is_some_and(is_stream_body)
+            || body_value.as_ref().is_some_and(is_stream_body);
+        if state.config.placeholder_prompt_enabled
+            && llm_gateway::has_placeholder_tokens(&body_bytes)
+            && let Ok(text) = std::str::from_utf8(&body_bytes)
+            && let Some(injected) = llm_gateway::inject_placeholder_prompt(
+                text,
+                crate::config::effective_placeholder_prompt(&state.config.placeholder_prompt_text),
+                protocol,
+            )
+        {
+            body_bytes = injected.into_bytes();
+        }
+        let init_conv = body_value.as_ref().and_then(llm_gateway::extract_conv_id);
         let mut fwd_headers = parts.headers.clone();
         fwd_headers.remove(header::HOST);
         fwd_headers.remove(header::CONTENT_LENGTH);
         fwd_headers.remove(header::CONTENT_ENCODING);
+        llm_gateway::filter_hop_headers_counted(
+            &mut fwd_headers,
+            "upstream",
+            llm_gateway::DECODE_ENABLED,
+            Some(&state.gateway_metrics),
+        );
         let dialog_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::POST);
         let up = match llm_gateway::fetch_upstream_with_retry(
@@ -405,8 +464,10 @@ async fn gateway_serve(
                     now_secs(),
                 );
                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                let vault = crate::service::credential_vault::CredentialVault::new();
                 let restored = scope.restore_response(&vault, &text);
+                let restored = scope
+                    .redact_response_new_pii(&vault, &detector, &restored)
+                    .await;
                 let mut resp = (
                     StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
                     restored,
@@ -435,18 +496,23 @@ async fn gateway_serve(
             )
                 .into_response();
         }
-        let speed = if resp_ct.contains("fast") {
-            Speed::Fast
-        } else {
+        let audit_mode = state.config.audit_mode;
+        let has_audit_hold = !matches!(audit_mode, AuditMode::Off);
+        let speed = if has_audit_hold {
             Speed::Slow
+        } else {
+            Speed::Fast
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-        let keepalive = crate::service::audit_hold::RequestKeepalive::spawn(tx.clone());
+        let hold_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(has_audit_hold));
+        let keepalive = crate::service::audit_hold::RequestKeepalive::spawn_gated(
+            tx.clone(),
+            hold_gate.clone(),
+        );
         let metrics = state.gateway_metrics.clone();
         let admin_metrics = state.admin.metrics.clone();
         let sqlite_precise = state.sqlite_ok();
         let hold_max = state.config.audit_hold_max_bytes.max(1) as usize;
-        let audit_mode = state.config.audit_mode;
         let audit_pending = state.pending.clone();
         let audit_policy = match state.config.audit_policy_file.clone() {
             Some(path) => match AuditPolicy::load_from_file(Some(path.as_path())) {
@@ -460,8 +526,13 @@ async fn gateway_serve(
         };
         let mut upstream = up;
         let pump_tx = tx.clone();
+        let resp_scope = scope.clone();
+        let resp_vault = vault.clone();
+        let resp_detector = detector.clone();
+        let mut conv_id = init_conv;
         tokio::spawn(async move {
             let _keep = keepalive;
+            let _gate = hold_gate;
             let mut parser = SseParser::new();
             let mut hold = AuditHold::new(hold_max);
             let mut meta = StreamMeta::default();
@@ -470,6 +541,7 @@ async fn gateway_serve(
             let mut terminated = false;
             let mut rejected_sticky = false;
             let mut block_injected = false;
+            let mut stream_usage: Option<llm_gateway::Usage> = None;
             while let Ok(chunk) = upstream.chunk().await {
                 let bytes = match chunk {
                     Some(b) => b,
@@ -485,6 +557,22 @@ async fn gateway_serve(
                             .await;
                         continue;
                     }
+                    if !ev.data.is_empty()
+                        && ev.data.trim() != "[DONE]"
+                        && let Ok(v) = serde_json::from_str::<Value>(&ev.data)
+                    {
+                        if let Some(id) = llm_gateway::extract_conv_id(&v) {
+                            conv_id = Some(id);
+                        }
+                        llm_gateway::accumulate_usage(
+                            &mut stream_usage,
+                            llm_gateway::extract_usage_stream(protocol, &v),
+                        );
+                    }
+                    _gate.store(
+                        hold.held() && !matches!(audit_mode, AuditMode::Off),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if rejected_sticky {
                         let trimmed = ev.data.trim();
                         if trimmed == "[DONE]" {
@@ -568,7 +656,16 @@ async fn gateway_serve(
                                             block_inject::anthropic_block_frames(&reason)
                                         }
                                         Protocol::Responses => {
-                                            block_inject::responses_block_frames("r-block")
+                                            let bid = conv_id.clone().unwrap_or_else(|| {
+                                                llm_gateway::resolve_conv_id(
+                                                    None,
+                                                    &serde_json::Value::Null,
+                                                    Some(&metrics),
+                                                    "block",
+                                                )
+                                                .0
+                                            });
+                                            block_inject::responses_block_frames(&bid)
                                         }
                                         Protocol::NonDialog => vec![],
                                     }) {
@@ -582,8 +679,12 @@ async fn gateway_serve(
                             } else if AuditHold::is_complete_event(&v) && !approve_held {
                                 hold.mark_completed();
                             }
+                            let restored = resp_scope.restore_response(&resp_vault, &ev.data);
+                            let scanned = resp_scope
+                                .redact_response_new_pii(&resp_vault, &resp_detector, &restored)
+                                .await;
                             let restored_data =
-                                crate::service::sse::json_aware_line(&ev.data, |s| s);
+                                crate::service::sse::json_aware_line(&scanned, |s| s);
                             let prefix = ev
                                 .event_type
                                 .as_ref()
@@ -595,13 +696,17 @@ async fn gateway_serve(
                                 continue;
                             }
                         } else {
+                            let restored = resp_scope.restore_response(&resp_vault, &ev.data);
+                            let scanned = resp_scope
+                                .redact_response_new_pii(&resp_vault, &resp_detector, &restored)
+                                .await;
                             let prefix = ev
                                 .event_type
                                 .as_ref()
                                 .map(|t| format!("event: {t}\n"))
                                 .unwrap_or_default();
                             agg.push_str(&prefix);
-                            agg.push_str(&format!("data: {}\n\n", ev.data));
+                            agg.push_str(&format!("data: {scanned}\n\n"));
                         }
                     } else {
                         let prefix = ev
@@ -634,13 +739,30 @@ async fn gateway_serve(
             }
             let residual = parser.residual_json_aware();
             if !residual.is_empty() {
-                let _ = pump_tx.send(format!("data: {residual}\n\n")).await;
+                let restored = resp_scope.restore_response(&resp_vault, &residual);
+                let scanned = resp_scope
+                    .redact_response_new_pii(&resp_vault, &resp_detector, &restored)
+                    .await;
+                if !scanned.is_empty() {
+                    let _ = pump_tx.send(format!("data: {scanned}\n\n")).await;
+                }
             }
             if forwarded == 0 && !block_injected {
                 for f in block_inject::ensure_event_lines(match protocol {
                     Protocol::Chat => block_inject::chat_block_frames("empty-stream"),
                     Protocol::Anthropic => block_inject::anthropic_block_frames("empty-stream"),
-                    Protocol::Responses => block_inject::responses_truncated_frames("r-empty"),
+                    Protocol::Responses => {
+                        let tid = conv_id.clone().unwrap_or_else(|| {
+                            llm_gateway::resolve_conv_id(
+                                None,
+                                &serde_json::Value::Null,
+                                Some(&metrics),
+                                "truncated",
+                            )
+                            .0
+                        });
+                        block_inject::responses_truncated_frames(&tid)
+                    }
                     Protocol::NonDialog => vec![],
                 }) {
                     let _ = pump_tx.send(f).await;
@@ -662,10 +784,11 @@ async fn gateway_serve(
                 terminated = true;
             }
             let _ = terminated;
+            _gate.store(false, std::sync::atomic::Ordering::Relaxed);
             admin_metrics.record_chat(
                 protocol,
                 req_start.elapsed().as_millis() as u64,
-                None,
+                stream_usage.as_ref(),
                 meta.truncated_mode.as_ref().map(|m| m.as_str()),
                 sqlite_precise,
                 now_secs(),
@@ -706,60 +829,221 @@ fn extract_tool_fragments(
     let mut out = Vec::new();
     match protocol {
         P::Chat => {
+            let norm_args = |raw: Option<&Value>| -> String {
+                match raw {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => String::new(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                }
+            };
+            let synth = |idx: u32, present: Option<&str>| -> String {
+                match present.filter(|s| !s.is_empty()) {
+                    Some(s) => s.to_string(),
+                    None => format!("call_stable_{idx}"),
+                }
+            };
             if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
-                for ch in choices {
-                    if let Some(delta) = ch.get("delta").or_else(|| ch.get("message"))
-                        && let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array())
-                    {
-                        for (i, call) in calls.iter().enumerate() {
-                            let idx = call
-                                .get("index")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(i as u64) as u32;
-                            let id = call
-                                .get("id")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string());
-                            let name = call
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string());
-                            let args = call
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .map(|a| {
-                                    if let Some(s) = a.as_str() {
-                                        s.to_string()
-                                    } else {
-                                        a.to_string()
+                for (ci, ch) in choices.iter().enumerate() {
+                    for key in ["delta", "message"] {
+                        let Some(container) = ch.get(key) else {
+                            continue;
+                        };
+                        if let Some(calls) = container.get("tool_calls").and_then(|c| c.as_array())
+                        {
+                            for (i, call) in calls.iter().enumerate() {
+                                let idx = call
+                                    .get("index")
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(i as u64)
+                                    as u32;
+                                let id = synth(idx, call.get("id").and_then(|x| x.as_str()));
+                                let name = call
+                                    .get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string());
+                                let args = norm_args(
+                                    call.get("function").and_then(|f| f.get("arguments")),
+                                );
+                                out.push((idx, Some(id), name, args));
+                            }
+                        }
+                        for legacy_key in ["function_call", "custom_tool_call"] {
+                            let Some(legacy) = container.get(legacy_key) else {
+                                continue;
+                            };
+                            let items: Vec<&Value> = match legacy {
+                                Value::Array(a) => a.iter().collect(),
+                                Value::Object(_) => vec![legacy],
+                                _ => vec![],
+                            };
+                            for (i, item) in items.iter().enumerate() {
+                                let Some(obj) = item.as_object() else {
+                                    continue;
+                                };
+                                if legacy_key == "function_call" {
+                                    let idx = ci as u32;
+                                    let name = obj
+                                        .get("name")
+                                        .and_then(|x| x.as_str())
+                                        .map(|s| s.to_string());
+                                    let args = norm_args(obj.get("arguments"));
+                                    out.push((idx, Some(synth(idx, None)), name, args));
+                                } else {
+                                    let idx = i as u32;
+                                    let id_raw = obj
+                                        .get("id")
+                                        .or_else(|| obj.get("call_id"))
+                                        .or_else(|| obj.get("tool_call_id"))
+                                        .and_then(|x| x.as_str());
+                                    let name = obj
+                                        .get("name")
+                                        .or_else(|| obj.get("tool_name"))
+                                        .and_then(|x| x.as_str())
+                                        .or_else(|| {
+                                            obj.get("function")
+                                                .and_then(|f| f.get("name"))
+                                                .and_then(|x| x.as_str())
+                                        })
+                                        .map(|s| s.to_string());
+                                    let args = norm_args(
+                                        obj.get("arguments")
+                                            .or_else(|| obj.get("input"))
+                                            .or_else(|| obj.get("args")),
+                                    );
+                                    if name.is_some() || !args.is_empty() || id_raw.is_some() {
+                                        out.push((idx, Some(synth(idx, id_raw)), name, args));
                                     }
-                                })
-                                .unwrap_or_default();
-                            out.push((idx, id, name, args));
+                                }
+                            }
                         }
                     }
                 }
             }
         }
         P::Anthropic => {
-            if let Some(block) = v.get("content_block").or_else(|| v.get("delta")) {
-                let name = block
+            let norm_args = |raw: Option<&Value>| -> String {
+                match raw {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => String::new(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                }
+            };
+            let synth = |idx: u32, present: Option<&str>| -> String {
+                match present.filter(|s| !s.is_empty()) {
+                    Some(s) => s.to_string(),
+                    None => format!("call_stable_{idx}"),
+                }
+            };
+            let mut blocks: Vec<&Value> = Vec::new();
+            for key in ["content_block", "delta"] {
+                if let Some(b) = v.get(key) {
+                    blocks.push(b);
+                }
+            }
+            if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+                blocks.extend(arr.iter());
+            }
+            if let Some(msg) = v.get("message").and_then(|m| m.get("content")) {
+                if let Some(arr) = msg.as_array() {
+                    blocks.extend(arr.iter());
+                } else if msg.is_object() {
+                    blocks.push(msg);
+                }
+            }
+            for (i, b) in blocks.iter().enumerate() {
+                let idx = i as u32;
+                if let Some(fc) = b.get("function_call").and_then(|x| x.as_object()) {
+                    let name = fc
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                    let args = norm_args(fc.get("arguments"));
+                    out.push((idx, Some(synth(idx, None)), name, args));
+                    continue;
+                }
+                if let Some(cc) = b.get("custom_tool_call") {
+                    match cc {
+                        Value::Object(obj) => {
+                            let id_raw = obj
+                                .get("id")
+                                .or_else(|| obj.get("call_id"))
+                                .or_else(|| obj.get("tool_call_id"))
+                                .and_then(|x| x.as_str());
+                            let name = obj
+                                .get("name")
+                                .or_else(|| obj.get("tool_name"))
+                                .and_then(|x| x.as_str())
+                                .or_else(|| {
+                                    obj.get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|x| x.as_str())
+                                })
+                                .map(|s| s.to_string());
+                            let args = norm_args(
+                                obj.get("arguments")
+                                    .or_else(|| obj.get("input"))
+                                    .or_else(|| obj.get("args")),
+                            );
+                            out.push((idx, Some(synth(idx, id_raw)), name, args));
+                            continue;
+                        }
+                        Value::Array(a) => {
+                            for (j, item) in a.iter().enumerate() {
+                                if let Some(obj) = item.as_object() {
+                                    let jdx = j as u32;
+                                    let id_raw = obj
+                                        .get("id")
+                                        .or_else(|| obj.get("call_id"))
+                                        .or_else(|| obj.get("tool_call_id"))
+                                        .and_then(|x| x.as_str());
+                                    let name = obj
+                                        .get("name")
+                                        .or_else(|| obj.get("tool_name"))
+                                        .and_then(|x| x.as_str())
+                                        .or_else(|| {
+                                            obj.get("function")
+                                                .and_then(|f| f.get("name"))
+                                                .and_then(|x| x.as_str())
+                                        })
+                                        .map(|s| s.to_string());
+                                    let args = norm_args(
+                                        obj.get("arguments")
+                                            .or_else(|| obj.get("input"))
+                                            .or_else(|| obj.get("args")),
+                                    );
+                                    out.push((jdx, Some(synth(jdx, id_raw)), name, args));
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                let is_tool = b.get("type").and_then(|x| x.as_str()).is_some_and(|t| {
+                    t.contains("tool_use") || t.contains("function") || t.contains("custom")
+                }) || b.get("name").is_some()
+                    || b.get("partial_json").is_some()
+                    || b.get("input").is_some()
+                    || b.get("function_call").is_some()
+                    || b.get("custom_tool_call").is_some();
+                if !is_tool {
+                    continue;
+                }
+                let id_raw = b.get("id").and_then(|x| x.as_str());
+                let name = b
                     .get("name")
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
-                let id = block
-                    .get("id")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string());
-                let args = block
-                    .get("partial_json")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                if name.is_some() || !args.is_empty() {
-                    out.push((0, id, name, args));
+                let args = norm_args(
+                    b.get("partial_json")
+                        .or_else(|| b.get("input"))
+                        .or_else(|| b.get("arguments")),
+                );
+                if name.is_none() && args.is_empty() && id_raw.is_none() {
+                    continue;
                 }
+                out.push((idx, Some(synth(idx, id_raw)), name, args));
             }
         }
         P::Responses => {
@@ -901,5 +1185,47 @@ mod tests {
         let Json(body) = health_handler(State(state)).await;
         assert_eq!(body["ok"], true);
         assert_eq!(body["sqlite_ok"], true);
+    }
+
+    #[test]
+    fn 流式legacy_function_call与非流式口径统一() {
+        use crate::service::llm_gateway::Protocol as P;
+        let stream_delta = serde_json::json!({"choices":[{"delta":{"function_call":{"name":"old","arguments":"{\"x\":1}"}}}]});
+        let frags = extract_tool_fragments(P::Chat, &stream_delta);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].0, 0);
+        assert_eq!(frags[0].1.as_deref(), Some("call_stable_0"));
+        assert_eq!(frags[0].2.as_deref(), Some("old"));
+        assert_eq!(frags[0].3, "{\"x\":1}");
+        let non_stream = serde_json::json!({"choices":[{"message":{"function_call":{"name":"old","arguments":"{\"x\":1}"}}}]});
+        let frags2 = extract_tool_fragments(P::Chat, &non_stream);
+        assert_eq!(frags2.len(), 1);
+        assert_eq!(frags2[0].2.as_deref(), Some("old"));
+        assert_eq!(frags2[0].1.as_deref(), Some("call_stable_0"));
+        let legacy_arr = serde_json::json!({"choices":[{"delta":{"function_call":[{"name":"a","arguments":"{}"}]}}]});
+        let frags3 = extract_tool_fragments(P::Chat, &legacy_arr);
+        assert!(frags3.is_empty() || frags3.len() == 1);
+    }
+
+    #[test]
+    fn anthropic数组形态content与message_content对齐网关() {
+        use crate::service::llm_gateway::Protocol as P;
+        let content_arr = serde_json::json!({"content":[{"type":"tool_use","id":"a1","name":"bash","input":{"cmd":"ls"}}]});
+        let frags = extract_tool_fragments(P::Anthropic, &content_arr);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].1.as_deref(), Some("a1"));
+        assert_eq!(frags[0].2.as_deref(), Some("bash"));
+        assert_eq!(frags[0].3, r#"{"cmd":"ls"}"#);
+        let msg_content = serde_json::json!({"message":{"content":[{"type":"tool_use","id":"m1","name":"run","input":{"p":2}}]}});
+        let frags2 = extract_tool_fragments(P::Anthropic, &msg_content);
+        assert_eq!(frags2.len(), 1);
+        assert_eq!(frags2[0].1.as_deref(), Some("m1"));
+        let delta =
+            serde_json::json!({"delta":{"type":"tool_use","name":"t","partial_json":"{\"a\":"}});
+        let frags3 = extract_tool_fragments(P::Anthropic, &delta);
+        assert_eq!(frags3.len(), 1);
+        assert_eq!(frags3[0].1.as_deref(), Some("call_stable_0"));
+        let text_only = serde_json::json!({"delta":{"type":"text","text":"hi"}});
+        assert!(extract_tool_fragments(P::Anthropic, &text_only).is_empty());
     }
 }

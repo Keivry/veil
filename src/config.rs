@@ -20,6 +20,11 @@ pub const PII_HOLD_MAX_DEFAULT: i64 = 64;
 pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: i64 = 1_048_576;
 /// 管理 token 建议最小长度，不足仅告警不断链。
 pub const ADMIN_TOKEN_MIN_LEN: usize = 32;
+/// `PII_PLACEHOLDER_PROMPT_TEXT` 自定义文案长度上限（字节，4KB，超限截断并告警）。
+pub const PLACEHOLDER_PROMPT_MAX_LEN: usize = 4096;
+/// 内置默认占位符说明文案（对标原仓 `PII_PLACEHOLDER_PROMPT_DEFAULT`）：
+/// 静态文本，不含真实 PII 值；用 `*` 通配形态描述，不命中真实占位符形态。
+pub const PLACEHOLDER_PROMPT_DEFAULT: &str = "说明：消息中形如 __PII_*__ 和 __VG_CRED_*__ 的标记是安全网关的敏感信息脱敏占位符，代表被替换的原始值（如手机号、IP 地址、银行卡号、密钥等）。重要：这些占位符出现的位置，其原始内容已被安全网关替换，你无法直接看到原文；因此不要把占位符当作真实数据（不要用它做样例、比对、推断原文，也不要假设原文就是占位符形态）。请原样保留这些占位符（包括 content 与 tool calls/function 参数中的）：不要修改格式、不要校验其合法性、不要推断或补全内容，也不要视为输入错误。它们不是格式问题，直接使用即可。若你需要查看被替换的原文进行分析，请改用不经由此网关的通道（如直接在受信任环境执行命令），不要尝试从占位符本身还原。";
 
 /// 自动放行三态：`True` 放行 / `False` 拒绝 / `None` 转 Matrix 审批。
 /// 本 spec 禁用 `allow`/`deny`/`approve` 虚构命名，统一用此三态。
@@ -123,6 +128,8 @@ pub struct Config {
     pub llm_upstreams: HashMap<u16, String>,
     pub llm_default_upstream: Option<String>,
     pub redaction_enabled: bool,
+    pub placeholder_prompt_enabled: bool,
+    pub placeholder_prompt_text: String,
     /// FIX-5 字节契约开关（`NORMALIZE_JSON_WHITESPACE`，仅 `"1"` 开启；
     /// 默认关闭时请求体除 token 子串替换外保持字节一致）。
     pub normalize_json_whitespace: bool,
@@ -238,6 +245,7 @@ impl Config {
             .map(PathBuf::from);
         let normalize_json_whitespace =
             matches!(get("NORMALIZE_JSON_WHITESPACE").as_deref(), Some("1"));
+        let (placeholder_prompt_enabled, placeholder_prompt_text) = parse_placeholder_prompt(&get);
 
         Ok(Self {
             homeserver,
@@ -261,7 +269,79 @@ impl Config {
             redaction_enabled,
             normalize_json_whitespace,
             audit_policy_file,
+            placeholder_prompt_enabled,
+            placeholder_prompt_text,
         })
+    }
+}
+
+fn parse_placeholder_prompt(get: &dyn Fn(&str) -> Option<String>) -> (bool, String) {
+    let raw = get("PII_PLACEHOLDER_PROMPT").unwrap_or_default();
+    let enabled = !matches!(raw.trim().to_lowercase().as_str(), "0" | "false" | "no");
+    if !enabled {
+        return (false, String::new());
+    }
+    let text = get("PII_PLACEHOLDER_PROMPT_TEXT").unwrap_or_default();
+    if text.trim().is_empty() {
+        return (true, String::new());
+    }
+    if has_placeholder_token_shape(&text) {
+        tracing::warn!("PII_PLACEHOLDER_PROMPT_TEXT 含合法形态占位符，回退内置默认文案");
+        return (true, String::new());
+    }
+    if text.len() > PLACEHOLDER_PROMPT_MAX_LEN {
+        tracing::warn!(
+            "PII_PLACEHOLDER_PROMPT_TEXT 超长（{}>{}），截断到上限",
+            text.len(),
+            PLACEHOLDER_PROMPT_MAX_LEN
+        );
+        let mut end = PLACEHOLDER_PROMPT_MAX_LEN;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return (true, text[..end].to_string());
+    }
+    (true, text)
+}
+
+fn has_placeholder_token_shape(text: &str) -> bool {
+    fn is_hex8(b: &[u8]) -> bool { b.len() == 8 && b.iter().all(|c| c.is_ascii_hexdigit()) }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if text[i..].starts_with("__PII_") {
+            let rest = &text[i + 6..];
+            if let Some(us) = rest.find('_')
+                && rest[..us].bytes().all(|c| c.is_ascii_digit())
+                && !rest[..us].is_empty()
+            {
+                let after = &rest[us + 1..];
+                if after.len() >= 10
+                    && is_hex8(&after.as_bytes()[..8])
+                    && after[8..].starts_with("__")
+                {
+                    return true;
+                }
+            }
+        }
+        if text[i..].starts_with("__VG_CRED_") {
+            let rest = &text[i + 10..];
+            let digits: usize = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 && rest[digits..].starts_with("__") {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 当前生效的占位符说明文案：自定义非空用自定义，否则内置默认。
+pub fn effective_placeholder_prompt(custom: &str) -> &str {
+    if custom.trim().is_empty() {
+        PLACEHOLDER_PROMPT_DEFAULT
+    } else {
+        custom.trim()
     }
 }
 
@@ -491,5 +571,72 @@ mod tests {
         env.insert("AUDIT_MODE".to_string(), "allow".to_string());
         let msg = Config::load_from(&env).unwrap_err().to_string();
         assert!(msg.contains("AUDIT_MODE") && msg.contains("off/block/approve"));
+    }
+
+    #[test]
+    fn 占位符开关默认开启关闭短路() {
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert!(cfg.placeholder_prompt_enabled);
+        assert!(cfg.placeholder_prompt_text.is_empty());
+        for raw in ["0", "false", "no", "  No  "] {
+            let mut env = base_env();
+            env.insert("PII_PLACEHOLDER_PROMPT".to_string(), raw.to_string());
+            env.insert(
+                "PII_PLACEHOLDER_PROMPT_TEXT".to_string(),
+                "__PII_1_ab12cd34__".repeat(100),
+            );
+            let cfg = Config::load_from(&env).unwrap();
+            assert!(!cfg.placeholder_prompt_enabled, "{raw}");
+            assert!(cfg.placeholder_prompt_text.is_empty());
+        }
+        for raw in ["1", "true", "yes", ""] {
+            let mut env = base_env();
+            if raw.is_empty() {
+                env.remove("PII_PLACEHOLDER_PROMPT");
+            } else {
+                env.insert("PII_PLACEHOLDER_PROMPT".to_string(), raw.to_string());
+            }
+            let cfg = Config::load_from(&env).unwrap();
+            assert!(cfg.placeholder_prompt_enabled, "{raw}");
+        }
+    }
+
+    #[test]
+    fn 占位符文案上限与形态回退() {
+        let mut env = base_env();
+        env.insert(
+            "PII_PLACEHOLDER_PROMPT_TEXT".to_string(),
+            "Keep verbatim".to_string(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(
+            effective_placeholder_prompt(&cfg.placeholder_prompt_text),
+            "Keep verbatim"
+        );
+        for bad in [
+            "Keep __PII_1_ab12cd34__ verbatim",
+            "Keep __PII_1_AB12CD34__ verbatim",
+            "Keep __VG_CRED_42__ verbatim",
+        ] {
+            let mut env = base_env();
+            env.insert("PII_PLACEHOLDER_PROMPT_TEXT".to_string(), bad.to_string());
+            let cfg = Config::load_from(&env).unwrap();
+            assert!(cfg.placeholder_prompt_text.is_empty(), "{bad}");
+            assert!(
+                effective_placeholder_prompt(&cfg.placeholder_prompt_text).contains("__PII_*__")
+            );
+        }
+        let long = "x".repeat(PLACEHOLDER_PROMPT_MAX_LEN + 100);
+        let mut env = base_env();
+        env.insert("PII_PLACEHOLDER_PROMPT_TEXT".to_string(), long);
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(
+            cfg.placeholder_prompt_text.len(),
+            PLACEHOLDER_PROMPT_MAX_LEN
+        );
+        let mut env = base_env();
+        env.insert("PII_PLACEHOLDER_PROMPT_TEXT".to_string(), "   ".to_string());
+        let cfg = Config::load_from(&env).unwrap();
+        assert!(cfg.placeholder_prompt_text.is_empty());
     }
 }
