@@ -5,6 +5,7 @@ use {
     veil::{
         config::Config,
         router::build_router,
+        service::tpm::startup_tpm,
         state::{AppState, init_sqlite},
     },
 };
@@ -15,6 +16,18 @@ async fn main() -> ExitCode {
         Ok(config) => config,
         Err(err) => {
             eprintln!("启动失败: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let allow_mock_tpm = std::env::var("VEIL_ALLOW_MOCK_TPM").is_ok_and(|v| v.trim() == "1");
+    match startup_tpm(allow_mock_tpm) {
+        Ok(sealed) => {
+            tracing::info!("TPM 门禁通过（密封 {} 字节，明文已弃置）", sealed.len());
+            drop(sealed);
+        }
+        Err(err) => {
+            eprintln!("启动失败: TPM 门禁未通过: {err:#}");
             return ExitCode::from(1);
         }
     };
@@ -33,7 +46,9 @@ async fn main() -> ExitCode {
         );
     }
 
-    let app = build_router(AppState::new(config, outcome));
+    let state = AppState::new(config, outcome);
+    let _orphan_sweeper = state.approval.spawn_sweeper();
+    let app = build_router(state);
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:8877").await {
         Ok(listener) => listener,
         Err(err) => {

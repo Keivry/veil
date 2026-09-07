@@ -4,8 +4,9 @@
 //! `primary.ctx` 只落临时目录且用后删除，不持久化；TPM 不可用时启动失败，
 //! MUST NOT 软件回退。
 //!
-//! TODO(§6): KeePass 主密钥派生接入点需在 `keepass` 侧调用 [`require_hardware_tpm`]；
-//! 本文件只提供 TPM 能力，不改其文件。
+//! 接线：`main` 启动链经 [`startup_tpm`] 门禁 fail-closed（默认真实 TPM；
+//! `VEIL_ALLOW_MOCK_TPM=1` 仅 CI/本地联调显式放行 Mock）。KeePass 主密钥
+//! TPM 派生随真实 kdbx 后端延后（Non-Goal，见 credential-api spec）。
 
 use std::{fmt::Debug, path::PathBuf, process::Command, time::Duration};
 
@@ -146,6 +147,16 @@ pub fn require_hardware_tpm(tpm: &dyn TpmUnlock) -> anyhow::Result<Vec<u8>> {
     tpm.unseal()
 }
 
+/// main 启动链门禁选型：默认真实 TPM fail-closed；
+/// （`VEIL_ALLOW_MOCK_TPM=1`）仅 CI/本地联调显式放行，生产 MUST NOT 启用。
+pub fn startup_tpm(allow_mock: bool) -> anyhow::Result<Vec<u8>> {
+    if allow_mock {
+        tracing::warn!("VEIL_ALLOW_MOCK_TPM=1：以 Mock TPM 运行，禁止生产使用");
+        return MockTpm::unlocked(b"veil-dev-mock-tpm-seal").unseal();
+    }
+    require_hardware_tpm(&RealTpm::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +189,18 @@ mod tests {
         // primary.ctx 只允许出现在临时目录拼装路径中，仓库内不得存在持久化文件。
         assert!(!std::path::Path::new("primary.ctx").exists());
         assert!(!std::path::Path::new("/data/primary.ctx").exists());
+    }
+
+    #[test]
+    fn 启动门禁显式mock放行() {
+        let sealed = startup_tpm(true).unwrap();
+        assert!(!sealed.is_empty());
+    }
+
+    #[test]
+    fn 启动门禁默认真实无硬件失败() {
+        if !RealTpm::new().is_available() {
+            assert!(startup_tpm(false).is_err());
+        }
     }
 }
