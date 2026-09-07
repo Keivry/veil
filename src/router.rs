@@ -118,7 +118,9 @@ mod tests {
             .header("X-Get-Binary-Hash", "routehashX")
             .header("X-Get-Binary-Secret", "s3cr3t")
             .json(&serde_json::json!({
-                "auth": {"caller_hash": "routehashX", "caller_path": "/srv/other.sh"}
+                "auth": {"caller_hash": "routehashX", "caller_path": "/srv/other.sh"},
+                "entry": "网易",
+                "field": "授权码"
             }))
             .send()
             .await
@@ -279,7 +281,9 @@ mod tests {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
-            "auth": {"caller_hash": "rlhash1", "caller_path": "/srv/rl.sh"}
+            "auth": {"caller_hash": "rlhash1", "caller_path": "/srv/rl.sh"},
+            "entry": "网易",
+            "field": "授权码"
         });
         let first = client
             .post(format!("{base}/credential"))
@@ -300,6 +304,73 @@ mod tests {
             .unwrap();
         assert_eq!(second.status().as_u16(), 429);
         assert!(second.headers().contains_key("retry-after"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn go互操作镜像与entry指引() {
+        let (base, handle) = serve_and_client(test_app(&[])).await;
+        let client = reqwest::Client::new();
+
+        let go_ok = client
+            .post(format!("{base}/credential"))
+            .json(&serde_json::json!({
+                "auth": {
+                    "caller_hash": "gohash9",
+                    "caller_path": "/srv/go.sh",
+                    "get_binary_hash": "gohash9",
+                    "get_binary_secret": "s3cr3t"
+                },
+                "entry": "网易",
+                "field": "授权码"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(go_ok.status().as_u16(), 200);
+
+        let no_entry = client
+            .post(format!("{base}/credential"))
+            .header("X-Get-Binary-Hash", "gohash9")
+            .header("X-Get-Binary-Secret", "s3cr3t")
+            .json(&serde_json::json!({
+                "auth": {"caller_hash": "gohash9", "caller_path": "/srv/go.sh"}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_entry.status().as_u16(), 400);
+        let hint: serde_json::Value = no_entry.json().await.unwrap();
+        assert!(
+            hint["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("entry")
+        );
+        assert!(hint["error_detail"].is_string());
+
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status().as_u16(), 200);
+        let hbody: serde_json::Value = health.json().await.unwrap();
+        assert_eq!(hbody["ok"], true);
+        assert_eq!(hbody["sqlite_ok"], true);
+        assert_eq!(hbody["status"], "ok");
+        assert_eq!(hbody["unlocked"], true);
+
+        let forbidden = client
+            .post(format!("{base}/credential"))
+            .json(&serde_json::json!({
+                "auth": {"caller_hash": "gohash9", "caller_path": "/srv/go.sh"},
+                "entry": "网易",
+                "field": "授权码"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status().as_u16(), 403);
+        let ebody: serde_json::Value = forbidden.json().await.unwrap();
+        assert!(ebody["error_detail"].is_string());
+
         handle.abort();
     }
 

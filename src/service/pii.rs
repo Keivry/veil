@@ -19,7 +19,12 @@ use {
     rand::{rand_core::TryRngCore as _, rngs::OsRng},
     std::{
         collections::{HashMap, HashSet, VecDeque},
-        sync::{Mutex, OnceLock, RwLock},
+        sync::{
+            Mutex,
+            OnceLock,
+            RwLock,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     },
 };
@@ -412,7 +417,50 @@ impl PiiScope {
     /// 还原请求期注册 token；响应期/未注册/格式不符原样保留。
     /// 只查本 Scope，绝不触达全局凭据映射。
     /// 残留宽松形态补扫审计（聚合计数，落盘限流由调用方负责）。
-    pub fn restore(&self, text: &str) -> String {
+    pub fn restore(&self, text: &str) -> String { self.restore_with_fuzzy(text, false) }
+
+    /// 宽松还原：`fuzzy=false` 与 [`PiiScope::restore`] 一致；`fuzzy=true`
+    /// （`PII_FUZZY_RESTORE`）时残留宽松形态按序号回查请求表，截断/改写后的
+    /// token 仍可还原；响应表与未知序号一律原样保留。
+    pub fn restore_with_fuzzy(&self, text: &str, fuzzy: bool) -> String {
+        let restored = self.restore_exact(text);
+        if !fuzzy {
+            return restored;
+        }
+        let inner = self.inner.lock().expect("PII scope 锁无毒");
+        if inner.pii_t2p.is_empty() {
+            return restored;
+        }
+        let known: HashSet<String> = inner
+            .pii_t2p
+            .keys()
+            .chain(inner.resp_t2p.keys())
+            .cloned()
+            .collect();
+        let seq_map: HashMap<usize, String> = inner
+            .pii_t2p
+            .iter()
+            .filter_map(|(tok, plain)| parse_pii_seq(tok).map(|s| (s, plain.clone())))
+            .collect();
+        drop(inner);
+        if seq_map.is_empty() {
+            return restored;
+        }
+        pii_loose_re()
+            .replace_all(&restored, |caps: &regex::Captures| {
+                let tok = &caps[0];
+                if known.contains(tok) {
+                    return tok.to_string();
+                }
+                parse_pii_seq(tok)
+                    .and_then(|s| seq_map.get(&s).cloned())
+                    .unwrap_or_else(|| tok.to_string())
+            })
+            .into_owned()
+    }
+
+    /// 精确还原本体（`restore`/`restore_with_fuzzy` 共用）。
+    fn restore_exact(&self, text: &str) -> String {
         if text.is_empty() {
             return text.to_string();
         }
@@ -729,11 +777,48 @@ pub struct PiiDetector {
     disabled: Mutex<HashSet<String>>,
     dict: RwLock<Vec<(String, String)>>,
     dict_re: RwLock<Option<regex::Regex>>,
+    hardening: AtomicBool,
+}
+
+/// 强化复核（`PII_DETECTION_HARDENING`）：数字类命中两侧紧贴 ASCII 字母数字
+/// 一律丢弃（防粘连误报），IPv4 另拒前导零段（八进制歧义）；邮箱/IPv6 保持原口径。
+fn hardened_keep(kind: &str, text: &str, s: usize, e: usize) -> bool {
+    match kind {
+        "phone" | "id_card" | "bank_card" | "api_key" => {
+            let ascii_alnum = |c: char| c.is_ascii_alphanumeric();
+            if text[..s].chars().next_back().is_some_and(ascii_alnum) {
+                return false;
+            }
+            if text[e..].chars().next().is_some_and(ascii_alnum) {
+                return false;
+            }
+            true
+        }
+        "ipv4" => {
+            let ascii_alnum = |c: char| c.is_ascii_alphanumeric();
+            if text[..s].chars().next_back().is_some_and(ascii_alnum) {
+                return false;
+            }
+            if text[e..].chars().next().is_some_and(ascii_alnum) {
+                return false;
+            }
+            text[s..e]
+                .split('.')
+                .all(|part| part.len() <= 1 || !part.as_bytes().starts_with(b"0"))
+        }
+        _ => true,
+    }
 }
 
 impl PiiDetector {
     /// 新建空检测器（自定义规则与字典经 load_* 注入）。
     pub fn new() -> Self { Self::default() }
+
+    /// 检测强化开关（`PII_DETECTION_HARDENING`）：开启后内置命中做严格边界复核。
+    pub fn set_hardening(&self, on: bool) { self.hardening.store(on, Ordering::Relaxed); }
+
+    /// 是否处于强化模式。
+    pub fn hardening(&self) -> bool { self.hardening.load(Ordering::Relaxed) }
 
     /// 是否含 `\b`（ASCII 词边界，中文紧贴下零命中，禁止使用）。
     fn has_word_boundary(pattern: &str) -> bool { pattern.contains("\\b") }
@@ -1053,6 +1138,9 @@ impl PiiDetector {
         let mut hits = scan_builtin(text, credential_p2t).await;
         hits.extend(self.scan_custom(text, credential_p2t).await);
         hits.extend(self.scan_dict_sync(text, credential_p2t));
+        if self.hardening() {
+            hits.retain(|(kind, _, s, e)| hardened_keep(kind, text, *s, *e));
+        }
         hits
     }
 
@@ -1064,6 +1152,9 @@ impl PiiDetector {
     ) -> Vec<PiiHit> {
         let mut hits = scan_builtin_sync(text, credential_p2t);
         hits.extend(self.scan_dict_sync(text, credential_p2t));
+        if self.hardening() {
+            hits.retain(|(kind, _, s, e)| hardened_keep(kind, text, *s, *e));
+        }
         hits
     }
 }
@@ -1248,6 +1339,32 @@ mod tests {
         assert!(hits.iter().all(|h| h.1 != "db-prod-01"));
         let hits = d.scan_dict_sync("主机 db-prod-01 在线", &empty_cred());
         assert!(hits.iter().any(|h| h.1 == "db-prod-01"));
+    }
+
+    #[test]
+    fn 强化模式丢弃粘连与前导零命中() {
+        // 默认关闭：粘连手机号仍命中（历史口径不变）。
+        let plain = detector();
+        assert!(!plain.hardening());
+        let hits = plain.scan_spans_sync("x13812345678y", &empty_cred());
+        assert!(kinds(&hits).contains(&"phone"), "{hits:?}");
+        // 开启后：两侧 ASCII 粘连丢弃，独立出现仍命中。
+        let hard = detector();
+        hard.set_hardening(true);
+        assert!(hard.hardening());
+        let hits = hard.scan_spans_sync("x13812345678y", &empty_cred());
+        assert!(!kinds(&hits).contains(&"phone"), "{hits:?}");
+        let hits = hard.scan_spans_sync("联系 13812345678 处理", &empty_cred());
+        assert!(kinds(&hits).contains(&"phone"), "{hits:?}");
+        // 前导零 IPv4：关闭命中，开启丢弃；正常公网 IP 两侧一致命中。
+        assert!(
+            kinds(&plain.scan_spans_sync("访问 8.008.008.008 获取", &empty_cred()))
+                .contains(&"ipv4")
+        );
+        let hits = hard.scan_spans_sync("访问 8.008.008.008 获取", &empty_cred());
+        assert!(!kinds(&hits).contains(&"ipv4"), "{hits:?}");
+        let hits = hard.scan_spans_sync("访问 8.8.8.8 获取", &empty_cred());
+        assert!(kinds(&hits).contains(&"ipv4"), "{hits:?}");
     }
 
     #[test]

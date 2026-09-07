@@ -18,14 +18,36 @@ use {
 
 /// 请求级作用域：PII 映射只活在本 Scope 内，请求结束即销毁，
 /// 跨请求 MUST NOT 互见；PII 还原只查本 Scope。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Scope {
     pii: PiiScope,
+    response_side: bool,
+    fuzzy_restore: bool,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            pii: PiiScope::new(),
+            response_side: true,
+            fuzzy_restore: false,
+        }
+    }
 }
 
 impl Scope {
     /// 新建请求作用域（每请求一个）。
     pub fn new() -> Self { Self::default() }
+
+    /// 按 `Config` 语义开关构造：`response_side` 关时响应新检出不再脱敏，
+    /// `fuzzy_restore` 开时残缺/宽松形态 token 按序号回查还原。
+    pub fn with_opts(response_side: bool, fuzzy_restore: bool) -> Self {
+        Self {
+            pii: PiiScope::new(),
+            response_side,
+            fuzzy_restore,
+        }
+    }
 
     /// 底层的请求级 PII 容器（高级用法/断言）。
     pub fn pii_scope(&self) -> &PiiScope { &self.pii }
@@ -79,21 +101,26 @@ impl Scope {
 
     /// 响应侧还原：凭据 token → PII 请求 token → 幻觉剥离 → 残缺清理。
     /// PII 完整形态一律保留（响应期新 token 原样保留语义）。
+    /// `fuzzy_restore` 开启时追加宽松形态按序号回查。
     pub fn restore_response(&self, vault: &CredentialVault, text: &str) -> String {
         let step1 = vault.restore(text);
-        let step2 = self.pii.restore(&step1);
+        let step2 = self.pii.restore_with_fuzzy(&step1, self.fuzzy_restore);
         let step3 = vault.strip_hallucinated(&step2);
         strip_partials(&step3)
     }
 
     /// 响应侧新检出：响应中出现的新 PII 注册进响应表（不进请求还原表），
     /// 以新占位符呈现，不还原为明文。
+    /// `PII_RESPONSE_SIDE=0` 时直接返回原文（响应侧脱敏关闭）。
     pub async fn redact_response_new_pii(
         &self,
         vault: &CredentialVault,
         detector: &PiiDetector,
         text: &str,
     ) -> String {
+        if !self.response_side {
+            return text.to_string();
+        }
         let cred_map = vault.snapshot_p2t();
         let custom_snapshot = prescan_custom_response(detector, &self.pii, text, &cred_map).await;
         let mut leaf =
@@ -374,6 +401,54 @@ mod tests {
         assert!(!cleaned.contains("__PII_2_ab"), "{cleaned}");
         let restored = scope.restore_response(&vault, "ok __VG_CRED_12");
         assert!(!restored.contains("__VG_CRED_12"), "{restored}");
+    }
+
+    #[tokio::test]
+    async fn 响应侧关闭透出原文() {
+        let vault = CredentialVault::new();
+        let detector = PiiDetector::new();
+        let scope = Scope::with_opts(false, false);
+        let resp = scope
+            .redact_response_new_pii(&vault, &detector, r#"{"ip":"8.8.8.8"}"#)
+            .await;
+        assert!(resp.contains("8.8.8.8"), "{resp}");
+        assert!(!resp.contains("__PII_"), "{resp}");
+        let open = Scope::with_opts(true, false);
+        let masked = open
+            .redact_response_new_pii(&vault, &detector, r#"{"ip":"8.8.8.8"}"#)
+            .await;
+        assert!(!masked.contains("8.8.8.8"), "{masked}");
+    }
+
+    #[test]
+    fn 宽松还原按序号回查() {
+        let vault = CredentialVault::new();
+        let plain = "13812345678";
+        let exact = Scope::with_opts(true, false);
+        let token = exact.pii_scope().register(plain, false).unwrap();
+        let seq: usize = token
+            .strip_prefix("__PII_")
+            .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
+            .flatten()
+            .expect("token 恒带序号");
+        let fuzzy_tok = format!("__PII_{seq}_zzzz__");
+        // 精确模式保留宽松形态。
+        assert!(
+            exact
+                .restore_response(&vault, &format!("回拨 {fuzzy_tok}"))
+                .contains(&fuzzy_tok)
+        );
+        // 宽松模式按序号还原明文。
+        let scope2 = Scope::with_opts(true, true);
+        let token2 = scope2.pii_scope().register(plain, false).unwrap();
+        let seq2: usize = token2
+            .strip_prefix("__PII_")
+            .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
+            .flatten()
+            .unwrap();
+        let restored = scope2.restore_response(&vault, &format!("回拨 __PII_{seq2}_zzzz__"));
+        assert!(restored.contains(plain), "{restored}");
+        assert!(!restored.contains("__PII_"), "{restored}");
     }
 
     #[test]

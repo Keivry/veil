@@ -50,6 +50,13 @@ pub struct AuthBlock {
     pub caller_hash: Option<String>,
     #[serde(default)]
     pub caller_path: Option<String>,
+    /// Go 互操作别名：`body.auth.get_binary_hash` 等价 `X-Get-Binary-Hash` 头。
+    #[serde(default)]
+    pub get_binary_hash: Option<String>,
+    /// Go 互操作别名：`body.auth.get_binary_secret` 等价 `X-Get-Binary-Secret` 头（及
+    /// `body.secret`）。
+    #[serde(default)]
+    pub get_binary_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,6 +65,18 @@ pub struct CredentialBody {
     pub secret: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthBlock>,
+    /// 取用选择器：条目名（Go `get credential <entry> <field>` 的 entry）。
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// 取用选择器：字段名单数形态。
+    #[serde(default)]
+    pub field: Option<String>,
+    /// 取用选择器：字段名复数形态（接受字符串或字符串数组，兼容 Go 侧形态）。
+    #[serde(default)]
+    pub fields: Option<serde_json::Value>,
+    /// 脱敏开关：`None` 默认 true；`password` 与受保护自定义属性按 `use_token` 脱敏。
+    #[serde(default)]
+    pub token: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,6 +129,52 @@ fn effective_secret(headers: &CredentialHeaders, body: &CredentialBody) -> Optio
         .clone()
         .filter(|v| !v.is_empty())
         .or_else(|| body.secret.clone().filter(|v| !v.is_empty()))
+        .or_else(|| {
+            body.auth
+                .as_ref()
+                .and_then(|a| a.get_binary_secret.clone())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+fn effective_binary_hash(headers: &CredentialHeaders, body: &CredentialBody) -> String {
+    let header_hash = headers.binary_hash.clone().unwrap_or_default();
+    if !header_hash.is_empty() {
+        return header_hash;
+    }
+    body.auth
+        .as_ref()
+        .and_then(|a| a.get_binary_hash.clone())
+        .unwrap_or_default()
+}
+
+fn entry_selector(body: &CredentialBody) -> (Option<String>, Option<String>) {
+    let entry = body
+        .entry
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let field = body
+        .field
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| match body.fields.as_ref() {
+            Some(serde_json::Value::String(s)) => {
+                let trimmed = s.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Some(serde_json::Value::Array(items)) => items.iter().find_map(|v| {
+                v.as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            }),
+            _ => None,
+        });
+    (entry, field)
 }
 
 fn approval_event_id(key: &str, reason: &str) -> String {
@@ -164,7 +229,7 @@ pub async fn handle_credential(
     state: &AppState,
     headers: &CredentialHeaders,
     body: &CredentialBody,
-) -> Result<String> {
+) -> Result<serde_json::Value> {
     if state.config.entry_mode == crate::config::EntryMode::LlmOnly {
         return Err(VeilError::Auth {
             message: "llm-only 纯代理入口，凭据接口不可用".to_string(),
@@ -198,12 +263,19 @@ pub async fn handle_credential(
             }
         }
     }
-    let header_hash = headers.binary_hash.clone().unwrap_or_default();
+    let header_hash = effective_binary_hash(headers, body);
     if header_hash.is_empty() {
         return Err(VeilError::Auth {
-            message: "三因子缺失：X-Get-Binary-Hash 必填".to_string(),
+            message: "三因子缺失：X-Get-Binary-Hash 必填（或 body.auth.get_binary_hash）"
+                .to_string(),
         });
     }
+    let (entry, field) = entry_selector(body);
+    let entry = entry.ok_or_else(|| VeilError::BadRequest {
+        message: "取用选择器缺失：entry 必填（POST /credential 须携带 entry，如 {\"entry\":\"网易\",\"field\":\"授权码\"}；缺 field 取整条目）"
+            .to_string(),
+    })?;
+    let use_token = body.token.unwrap_or(true);
 
     let pending_key = format!("{caller_path}:{caller_hash}");
     let decision = {
@@ -251,7 +323,95 @@ pub async fn handle_credential(
         CREDENTIAL_RATE_WINDOW_SECS,
     )?;
 
-    state.keepass.fetch_credential(&caller_path)
+    query_keepass(state, &entry, field.as_deref(), use_token).await
+}
+
+fn tokenize_field(
+    vault: &credential_vault::CredentialVault,
+    value: &str,
+    use_token: bool,
+) -> String {
+    if !use_token || value.is_empty() {
+        return value.to_string();
+    }
+    vault.register(value).unwrap_or_else(|_| value.to_string())
+}
+
+pub async fn query_keepass(
+    state: &AppState,
+    entry: &str,
+    field: Option<&str>,
+    use_token: bool,
+) -> Result<serde_json::Value> {
+    let snapshot = match state.keepass.fetch_entry(entry.to_string()).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            if matches!(
+                e,
+                VeilError::KeePass { .. } | VeilError::Storage { .. } | VeilError::Internal(_)
+            ) {
+                notify_keepass_failure(state, entry, &e.to_string());
+            }
+            return Err(e);
+        }
+    };
+    let vault = credential_vault::CredentialVault::new();
+    match field {
+        None => {
+            let mut custom_properties = serde_json::Map::new();
+            for prop in &snapshot.custom {
+                let value = if prop.protected {
+                    tokenize_field(&vault, &prop.value, use_token)
+                } else {
+                    prop.value.clone()
+                };
+                custom_properties.insert(prop.name.clone(), serde_json::Value::String(value));
+            }
+            Ok(serde_json::json!({
+                "title": snapshot.title,
+                "username": snapshot.username,
+                "password": tokenize_field(&vault, &snapshot.password, use_token),
+                "url": snapshot.url,
+                "custom_properties": custom_properties,
+            }))
+        }
+        Some(name) => {
+            let lowered = name.to_lowercase();
+            let (value, protect) = match lowered.as_str() {
+                "title" => (snapshot.title.clone(), false),
+                "username" | "user name" => (snapshot.username.clone(), false),
+                "password" => (snapshot.password.clone(), true),
+                "url" => (snapshot.url.clone(), false),
+                _ => match snapshot.custom.iter().find(|c| c.name == name) {
+                    Some(prop) => (prop.value.clone(), prop.protected),
+                    None => {
+                        return Err(VeilError::NotFound {
+                            message: format!("属性未找到: {entry}/{name}"),
+                        });
+                    }
+                },
+            };
+            let value = if protect {
+                tokenize_field(&vault, &value, use_token)
+            } else {
+                value
+            };
+            Ok(serde_json::json!({ "value": value }))
+        }
+    }
+}
+
+fn notify_keepass_failure(state: &AppState, entry: &str, detail: &str) {
+    let bot = matrix::MatrixBot::new(
+        state.config.homeserver.clone(),
+        state.config.room_id.clone(),
+        state.config.matrix_access_token.clone(),
+    );
+    let summary = format!("KeePass 查询失败 :: {entry} :: {detail}");
+    let text = bot.format_approval(matrix::MatrixBranch::Credential, Some(false), &summary);
+    tokio::spawn(async move {
+        let _ = bot.send_text(&text).await;
+    });
 }
 
 pub async fn list_registrations(
@@ -482,8 +642,18 @@ mod tests {
             auth: Some(AuthBlock {
                 caller_hash: Some(hash.to_string()),
                 caller_path: Some(path.to_string()),
+                get_binary_hash: None,
+                get_binary_secret: None,
             }),
+            entry: Some("网易".to_string()),
+            field: Some("授权码".to_string()),
+            fields: None,
+            token: None,
         }
+    }
+
+    fn credential_value(out: &serde_json::Value) -> &str {
+        out.get("value").and_then(|v| v.as_str()).unwrap_or("")
     }
 
     fn headers(hash: &str, secret: Option<&str>) -> CredentialHeaders {
@@ -501,7 +671,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.contains("/s/a.sh"));
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
     }
 
     #[tokio::test]
@@ -551,7 +721,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.contains("/s/b.sh"));
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
     }
 
     #[tokio::test]
@@ -566,6 +736,180 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn go体别名无头放行() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let body = CredentialBody {
+            secret: None,
+            auth: Some(AuthBlock {
+                caller_hash: Some("gohash1".to_string()),
+                caller_path: Some("/s/go.sh".to_string()),
+                get_binary_hash: Some("gohash1".to_string()),
+                get_binary_secret: Some("s3cr3t".to_string()),
+            }),
+            entry: Some("网易".to_string()),
+            field: Some("授权码".to_string()),
+            fields: None,
+            token: None,
+        };
+        let out = handle_credential(&state, &CredentialHeaders::new(None, None), &body)
+            .await
+            .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn go体别名密钥错仍403() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let body = CredentialBody {
+            secret: None,
+            auth: Some(AuthBlock {
+                caller_hash: Some("gohash2".to_string()),
+                caller_path: Some("/s/go2.sh".to_string()),
+                get_binary_hash: Some("gohash2".to_string()),
+                get_binary_secret: Some("wrong".to_string()),
+            }),
+            entry: Some("网易".to_string()),
+            field: Some("授权码".to_string()),
+            fields: None,
+            token: None,
+        };
+        let err = handle_credential(&state, &CredentialHeaders::new(None, None), &body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn 缺entry报400带指引() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let mut missing = body("entryless", "/s/none.sh", None);
+        missing.entry = None;
+        missing.field = None;
+        missing.fields = None;
+        let err = handle_credential(&state, &headers("entryless", Some("s3cr3t")), &missing)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.to_string().contains("entry"));
+    }
+
+    #[tokio::test]
+    async fn 缺field取整条目() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let mut full = body("nofield", "/s/nof.sh", None);
+        full.field = None;
+        full.fields = None;
+        let out = handle_credential(&state, &headers("nofield", Some("s3cr3t")), &full)
+            .await
+            .unwrap();
+        assert_eq!(out.get("title").and_then(|v| v.as_str()), Some("网易"));
+        assert!(
+            out.get("password")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.starts_with("__VG_CRED_"))
+        );
+        assert!(out.get("custom_properties").is_some());
+    }
+
+    #[tokio::test]
+    async fn fields复数形态放行() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let mut plural = body("plural1", "/s/p.sh", None);
+        plural.field = None;
+        plural.fields = Some(serde_json::json!(["授权码"]));
+        let out = handle_credential(&state, &headers("plural1", Some("s3cr3t")), &plural)
+            .await
+            .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn token假值返回原文() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let mut raw = body("raw1", "/s/raw.sh", None);
+        raw.token = Some(false);
+        let out = handle_credential(&state, &headers("raw1", Some("s3cr3t")), &raw)
+            .await
+            .unwrap();
+        assert_eq!(credential_value(&out), "__MOCK_CRED_网易-授权码__");
+        let mut full_body = body("raw2", "/s/raw2.sh", None);
+        full_body.token = Some(false);
+        full_body.field = None;
+        full_body.fields = None;
+        let full = handle_credential(&state, &headers("raw2", Some("s3cr3t")), &full_body)
+            .await
+            .unwrap();
+        assert_eq!(
+            full.get("password").and_then(|v| v.as_str()),
+            Some("__MOCK_CRED_网易__")
+        );
+    }
+
+    #[tokio::test]
+    async fn 缺属性报404具名() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let mut missing = body("noattr", "/s/na.sh", None);
+        missing.field = Some("不存在的字段".to_string());
+        let err = handle_credential(&state, &headers("noattr", Some("s3cr3t")), &missing)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+        assert!(err.to_string().contains("不存在的字段"));
+    }
+
+    #[tokio::test]
+    async fn 真实后端缺条目经服务报404() {
+        use zeroize::Zeroizing;
+        let dir = std::env::temp_dir().join(format!(
+            "veil-service-keepass-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("svc.kdbx");
+        crate::keepass::build_test_kdbx(&db_path, b"svc-pw", &[("网易", "u", "s", "", vec![])]);
+        let provider: crate::keepass::PasswordProvider =
+            std::sync::Arc::new(|| Ok(Zeroizing::new(b"svc-pw".to_vec())));
+        let env = cred_env(&[]);
+        let state = AppState::new(
+            Config::load_from(&env).unwrap(),
+            crate::state::SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: dir.join("x.sqlite"),
+                memory_only: false,
+            },
+        )
+        .with_keepass(Arc::new(crate::keepass::RealKeePass::new(
+            db_path, None, provider,
+        )));
+        let mut missing = body("svc1", "/s/svc.sh", None);
+        missing.entry = Some("不存在".to_string());
+        let err = handle_credential(&state, &headers("svc1", Some("s3cr3t")), &missing)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+        assert!(err.to_string().contains("不存在"));
+        let mut ok_body = body("svc2", "/s/svc2.sh", None);
+        ok_body.field = None;
+        ok_body.fields = None;
+        let ok = handle_credential(&state, &headers("svc2", Some("s3cr3t")), &ok_body)
+            .await
+            .unwrap();
+        assert_eq!(ok.get("title").and_then(|v| v.as_str()), Some("网易"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

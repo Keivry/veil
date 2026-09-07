@@ -59,6 +59,14 @@ pub enum VeilError {
     /// §2：请求体非法。
     #[error("请求非法: {message}")]
     BadRequest { message: String },
+
+    /// keepass-real：条目或属性缺失 → 404（消息具名 entry/attribute）。
+    #[error("未找到: {message}")]
+    NotFound { message: String },
+
+    /// keepass-real：自动放行路径 KDBX 查询失败 → 500（消息对外可见）。
+    #[error("KeePass 内部错误: {message}")]
+    KeePass { message: String },
 }
 
 impl VeilError {
@@ -77,6 +85,8 @@ impl VeilError {
             Self::PendingApproval { .. } => "E_PENDING",
             Self::Unavailable { .. } => "E_UNAVAILABLE",
             Self::BadRequest { .. } => "E_BAD_REQUEST",
+            Self::NotFound { .. } => "E_NOT_FOUND",
+            Self::KeePass { .. } => "E_KEEPASS",
         }
     }
 
@@ -94,6 +104,8 @@ impl VeilError {
             Self::PendingApproval { .. } => StatusCode::ACCEPTED,
             Self::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::NotFound { .. } => StatusCode::NOT_FOUND,
+            Self::KeePass { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Config { .. } | Self::Storage { .. } | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -115,6 +127,8 @@ impl VeilError {
             | Self::Conflict { message }
             | Self::PendingApproval { message }
             | Self::Unavailable { message }
+            | Self::NotFound { message }
+            | Self::KeePass { message }
             | Self::BadRequest { message } => message.clone(),
             Self::RateLimited { retry_after_secs } => {
                 format!("请求过于频繁，请 {retry_after_secs}s 后重试")
@@ -128,11 +142,13 @@ impl IntoResponse for VeilError {
     fn into_response(self) -> Response {
         tracing::error!(code = self.code(), error = ?self, "请求失败");
         let status = self.status_code();
+        let message = self.public_message();
         let body = Json(json!({
             "error": {
                 "code": self.code(),
-                "message": self.public_message(),
-            }
+                "message": message,
+            },
+            "error_detail": message,
         }));
         if let Self::RateLimited { retry_after_secs } = &self {
             let mut response = (status, body).into_response();
@@ -233,5 +249,20 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "E_AUTH");
+    }
+
+    #[tokio::test]
+    async fn 错误体带error_detail字符串镜像() {
+        let response = VeilError::Auth {
+            message: "拒绝".to_string(),
+        }
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["message"], "拒绝");
+        assert_eq!(value["error_detail"], "拒绝");
+        assert!(value["error_detail"].is_string());
     }
 }
