@@ -135,3 +135,15 @@
 #### Scenario: 审批后新哈希生效
 - **WHEN** 管理员经 `POST /approve-hash-change` 批准新哈希
 - **THEN** 后续以新哈希的请求恢复 200
+
+### Requirement: KeePass 真实 kdbx 后端 Non-Goal（Mock 边界）
+
+本 change SHALL NOT 接入真实 KeePass kdbx 后端（不引入新 kdbx 依赖）；凭据下发 SHALL 经 `KeePassBackend` trait 由 `MockKeePass` 占位实现：未解锁返回 503，已解锁返回 `__MOCK_CRED_<caller>__` 占位载荷。生产风险：占位载荷非真实密钥，生产部署 MUST 先完成真实 kdbx 后端 change 并经 TPM 派生主密钥（见 audit-tpm-matrix spec TPM 条），否则 SHALL NOT 上线。
+
+#### Scenario: 未解锁 503
+- **WHEN** `MockKeePass` 未解锁时请求 `POST /credential`
+- **THEN** 系统返回 503，不返回占位载荷
+
+#### Scenario: 真实 kdbx 延后
+- **WHEN** 调用方需要真实 kdbx 密钥
+- **THEN** 本 change 仅返回占位载荷，真实后端由后续 change 交付

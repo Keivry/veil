@@ -61,12 +61,12 @@
 
 - [x] 6.1 策略引擎（对应 audit-tpm-matrix spec SHALL：审计三模式默认 off + 危险模式规则：危险 shell、敏感路径写入、网络外传；参数规范化：空白合并、`\uXXXX`/`\xXX` 转义、拆链、单层变量展开、别名折叠、`..` O(n) 规范化；`AUDIT_POLICY_FILE` 加载 + `examples/audit-policy.yaml` 示例。Non-Goal：策略文件热重载不做，改配置重启生效）
   - 验收：规范化命中对照用例全绿；`find --delete` O(n) 无回溯；非法策略文件启动报错
-- [x] 6.2 阻断与审批模式（block 直接拦截；approve 复用 Matrix pending/超时：凭据 300s / 审计 90s（`AUDIT_TIMEOUT` 禁 110-130），默认拒绝；白名单 MXID 正则 + 发送者校验 + event id 精确匹配 + 幂等 + reaction 精确匹配，`_ask` 返回 None 立即 rejected 并清理）
-  - 验收：审批通过/拒绝/超时/发送失败四路径全绿；非白名单 reaction 被忽略；孤儿 pending 60s 清扫回收
+- [x] 6.2 阻断与审批模式（block 直接拦截；approve 复用 Matrix pending/超时：凭据 300s / 审计 90s（`AUDIT_TIMEOUT` 禁 110-130），默认拒绝；白名单 MXID 正则 + 发送者校验 + event id 精确匹配 + 幂等 + reaction 精确匹配，`_ask` 返回 None 立即 rejected 并清理；接线：`AppState.approval` 持网关（白名单/`AUDIT_TIMEOUT` 来自 Config），`record_pending` 建单 submit + Bot best-effort 发送后立即 202，问询经 `await_credential_approval`（300s）/`await_audit_approval`（90s 口径），`main` 常驻 60s 孤儿清扫）
+  - 验收：审批通过/拒绝/超时/发送失败四路径全绿；非白名单 reaction 被忽略；孤儿 pending 60s 清扫回收；建单落网关 + 凭据300s/审计90s 分表口径单测全绿
 - [x] 6.3 审计日志（`DATA_DIR/audit.log` JSONL：先脱敏后截断摘要、零明文、`\x00-\x1f` 剥离、0600、10MB x 5 轮转、写失败双层 fail-closed + 熔断计数）
   - 验收：日志行合法单 JSON；响应期新 PII 明文不落盘；`block` 仍阻断、`off` 不阻断
-- [x] 6.4 TPM 强制硬件（trait 化 `TpmUnlock`：真实 TPM 实现 + CI 用 mock TPM；TPM 不可用 SHALL 启动失败，MUST NOT 软件回退）
-  - 验收：CI 用 mock TPM 全绿；TPM 不可用启动失败；无软件回退验收项
+- [x] 6.4 TPM 强制硬件（trait 化 `TpmUnlock`：真实 TPM 实现 + CI 用 mock TPM；TPM 不可用 SHALL 启动失败，MUST NOT 软件回退；接线：`main` 启动链经 `startup_tpm` 门禁 fail-closed，默认真实 TPM，`VEIL_ALLOW_MOCK_TPM=1` 仅 CI/本地联调显式放行。Non-Goal：KeePass 真实 kdbx 后端 + 主密钥 TPM 派生随占位延后（`MockKeePass` 边界与生产风险见 credential-api spec KeePass 条））
+  - 验收：CI 用 mock TPM 全绿；TPM 不可用启动失败；无软件回退验收项；`startup_tpm(true)` 放行 / 无硬件 `startup_tpm(false)` 失败单测全绿
 - [x] 6.5 Matrix Bot（五分支解锁/注册/哈希变更/凭据/审计，标识 `✅`/`❎`/`🔓`；凭据审批白名单与审计同规则：MXID 正则 + 发送者校验 + event id 精确匹配 + 幂等；解锁与注册审批消息不含明文密钥/PII）
   - 验收：Matrix 集成测试（真实 reaction 路径）通过；审批摘要无明文
 
@@ -74,7 +74,7 @@
 
 - [x] 7.1 指标聚合（内存环 10k + rusqlite 日/小时聚合，覆盖式 UPSERT 不翻倍，仅对话端点计数，延迟 12 桶 p95 近似，`is_precise` 标记；`truncated_mode` 三态按 mode 分标签计数）
   - 验收：重启后 1h/24h 口径断言正确；`other` 桶不再含非对话数据；非流式 usage 同流式口径计入（responses 单层 `response.usage` + Anthropic `message.usage`）；快照/ring/覆盖 UPSERT 为继承行为不重定义；`truncated_mode` 三态分标签计数可观测
-- [x] 7.2 6 admin 路由（唯一表 `/_admin/`、`/_admin/health`、`/_admin/metrics`、`/_admin/series`、`/_admin/events`、`/_admin/events/stream`），鉴权（`X-Admin-Token` > `__Host-admin_token` Cookie > 仅 SSE 的 `?access_token`，非 SSE 带 query token 恒 401，HMAC 等长比较；token 名映射：服务端环境变量 `OBSERVABILITY_ADMIN_TOKEN` → 客户端请求头 `X-Admin-Token`），限流（10/min/IP 429 + Retry-After，SSE 5 并发/IP + 60s ping + 5min 强制重连）
+- [x] 7.2 6 admin 路由（唯一表 `/_admin/`（JSON 索引占位终态，独立 admin.html 为 Non-Goal，见 observability-admin spec）、`/_admin/health`、`/_admin/metrics`、`/_admin/series`、`/_admin/events`、`/_admin/events/stream`），鉴权（`X-Admin-Token` > `__Host-admin_token` Cookie > 仅 SSE 的 `?access_token`，非 SSE 带 query token 恒 401，HMAC 等长比较；token 名映射：服务端环境变量 `OBSERVABILITY_ADMIN_TOKEN` → 客户端请求头 `X-Admin-Token`），限流（10/min/IP 429 + Retry-After，SSE 5 并发/IP + 60s ping + 5min 强制重连）
   - 验收：鉴权优先级与 401 语义单测全绿；限流按直连对端 IP 计数（不读代理头）
 - [x] 7.3 摘要脱敏单一路径（对应 observability-admin spec SHALL：`redact→truncate` 先脱敏后截断，`__PII__`/`__VG_CRED__`/`sk-`/email → `[REDACTED:*]`，UTF-8 半字符保护，`_SECRET_PATTERNS` 覆盖 JSON 键形态。Non-Goal：采样 hover 展示归 7.4，不在本任务）
   - 验收：`{"password":"hunter2"}` 落盘形态为脱敏后；控制字符不产生伪造条目

@@ -6,7 +6,9 @@
 
 ### Requirement: /_admin 六路由唯一表
 
-`/_admin` SHALL 暴露恰六条管理路由，唯一表如下；未知子路径 SHALL 返回 404：`/_admin/`（静态页）、`/_admin/health`（存活探针）、`/_admin/metrics`（指标快照）、`/_admin/series`（时序查询）、`/_admin/events`（审计事件查询）、`/_admin/events/stream`（SSE 实时推送）。
+`/_admin` SHALL 暴露恰六条管理路由，唯一表如下；未知子路径 SHALL 返回 404：`/_admin/`（JSON 索引占位：返回六路由表与就绪说明）、`/_admin/health`（存活探针）、`/_admin/metrics`（指标快照）、`/_admin/series`（时序查询）、`/_admin/events`（审计事件查询）、`/_admin/events/stream`（SSE 实时推送）。
+
+独立 `admin.html` 静态文件 SHALL 为本 change Non-Goal：`/_admin/` 终态即 JSON 索引占位，不再交付静态页；后续如需静态控制台由新 change 交付。
 
 #### Scenario: 六路由可达
 - **WHEN** 鉴权通过后访问唯一表中六条路由之一
