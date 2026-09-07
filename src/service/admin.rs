@@ -142,15 +142,12 @@ impl std::fmt::Debug for AdminState {
 }
 
 impl AdminState {
-    /// 新建（`db_path` 与 metrics 共库；采样开关读进程环境，默认关闭）。
-    pub fn new(db_path: std::path::PathBuf) -> Self {
+    /// 新建（`db_path` 与 metrics 共库；采样开关由调用方经 `Config` 传入，默认关闭）。
+    pub fn new(db_path: std::path::PathBuf, sampler_cfg: PiiSamplerConfig) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             metrics: std::sync::Arc::new(MetricsStore::new(db_path.clone())),
-            sampler: std::sync::Arc::new(PiiValueSampler::new(
-                PiiSamplerConfig::from_env(),
-                db_path,
-            )),
+            sampler: std::sync::Arc::new(PiiValueSampler::new(sampler_cfg, db_path)),
             rate: Mutex::new(HashMap::new()),
             sse_count: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAP)),

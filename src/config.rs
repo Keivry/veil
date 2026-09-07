@@ -134,6 +134,27 @@ pub struct Config {
     pub llm_upstreams: HashMap<u16, String>,
     pub llm_default_upstream: Option<String>,
     pub redaction_enabled: bool,
+    /// 响应侧新检出脱敏开关（`PII_RESPONSE_SIDE`，默认开启；
+    /// 关闭时响应中新 PII 不再注册为占位符，原样透出）。
+    pub pii_response_side: bool,
+    /// 宽松还原开关（`PII_FUZZY_RESTORE`，默认关闭；
+    /// 开启时残缺/宽松形态 token 按序号回查请求表还原）。
+    pub pii_fuzzy_restore: bool,
+    /// 检测强化开关（`PII_DETECTION_HARDENING`，默认关闭；
+    /// 开启时内置命中做严格边界复核，丢弃 ASCII 粘连与前导零 IPv4）。
+    pub pii_detection_hardening: bool,
+    /// 自定义正则规则文件（`PII_CUSTOM_RULES_FILE` 或 `PII_CUSTOM_RULES`，JSON 数组）。
+    pub pii_custom_rules_file: Option<PathBuf>,
+    /// 自定义模式文件（`PII_CUSTOM_PATTERNS_FILE` 或 `PII_CUSTOM_PATTERNS`，数组或映射）。
+    pub pii_custom_patterns_file: Option<PathBuf>,
+    /// 自定义字典文件（`PII_CUSTOM_DICT_FILE` 或 `PII_CUSTOM_DICT`，数组或映射）。
+    pub pii_custom_dict_file: Option<PathBuf>,
+    /// 值级采样开关（`PII_VALUE_SAMPLE_ENABLED`，默认关闭，热重载不支持）。
+    pub pii_value_sample_enabled: bool,
+    /// 值级采样落盘开关（`PII_VALUE_SAMPLE_PERSIST`，默认开启）。
+    pub pii_value_sample_persist: bool,
+    /// 值级采样 HMAC 键（`PII_VALUE_SAMPLE_HMAC_KEY`，未设退化为 SHA256）。
+    pub pii_value_sample_hmac_key: Option<String>,
     pub placeholder_prompt_enabled: bool,
     pub placeholder_prompt_text: String,
     /// FIX-5 字节契约开关（`NORMALIZE_JSON_WHITESPACE`，仅 `"1"` 开启；
@@ -144,6 +165,69 @@ pub struct Config {
     pub http_timeout_secs: u64,
     pub http_pool_max_idle_per_host: usize,
     pub http_pool_idle_timeout_secs: u64,
+    pub db_dir: PathBuf,
+    pub tpm_dir: PathBuf,
+    pub keepass_backend: KeepassBackendKind,
+}
+
+/// KeePass 后端选型：默认 real，显式 `VEIL_KEEPASS_BACKEND=mock` 仅 CI 逃生。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepassBackendKind {
+    #[default]
+    Real,
+    Mock,
+}
+
+impl std::str::FromStr for KeepassBackendKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "real" => Ok(Self::Real),
+            "mock" => Ok(Self::Mock),
+            other => Err(format!(
+                "VEIL_KEEPASS_BACKEND 非法: {other:?}（取值 real/mock）"
+            )),
+        }
+    }
+}
+
+/// DB 选择结果：排序取末的 `.kdbx` + 同名 `.key`（存在才带）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKdbx {
+    pub db_path: PathBuf,
+    pub keyfile_path: Option<PathBuf>,
+}
+
+/// 扫描 `DB_DIR` 下 `*.kdbx`，排序取末位；同名 `.key` 优先；多库打 warn；无库返回 None。
+pub fn resolve_kdbx(db_dir: &std::path::Path) -> Option<ResolvedKdbx> {
+    let entries = std::fs::read_dir(db_dir).ok()?;
+    let mut kdbx: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("kdbx"))
+        })
+        .collect();
+    kdbx.sort();
+    let db_path = kdbx.pop()?;
+    if !kdbx.is_empty() {
+        tracing::warn!(
+            "DB_DIR 存在多个 .kdbx（{} 个），按排序取末位: {}",
+            kdbx.len() + 1,
+            db_path.display()
+        );
+    }
+    let keyfile_path = db_path.with_extension("key").is_file().then(|| {
+        let key = db_path.with_extension("key");
+        tracing::debug!("使用同名 keyfile: {}", key.display());
+        key
+    });
+    Some(ResolvedKdbx {
+        db_path,
+        keyfile_path,
+    })
 }
 
 impl Config {
@@ -242,13 +326,27 @@ impl Config {
             }
         }
         let llm_default_upstream = get("LLM_UPSTREAM").filter(|v| !v.is_empty());
-        let redaction_enabled = match get("REDACTION_ENABLED") {
-            Some(v) if !v.is_empty() => !matches!(
-                v.trim().to_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            ),
-            _ => true,
+        // 脱敏总开关：`REDACTION_ENABLED` 优先，`PII_REDACTION_ENABLED` 为原仓别名；
+        // 两者皆空默认开启，显式假值（0/false/no/off）关闭。
+        let redaction_enabled = match get("REDACTION_ENABLED").filter(|v| !v.is_empty()) {
+            Some(v) => !is_falsy(&v),
+            None => match get("PII_REDACTION_ENABLED").filter(|v| !v.is_empty()) {
+                Some(v) => !is_falsy(&v),
+                None => true,
+            },
         };
+        let pii_response_side = parse_bool_on(&get, "PII_RESPONSE_SIDE");
+        let pii_fuzzy_restore = parse_bool_off(&get, "PII_FUZZY_RESTORE");
+        let pii_detection_hardening = parse_bool_off(&get, "PII_DETECTION_HARDENING");
+        let pii_custom_rules_file =
+            load_custom_file(&get, "PII_CUSTOM_RULES_FILE", "PII_CUSTOM_RULES")?;
+        let pii_custom_patterns_file =
+            load_custom_file(&get, "PII_CUSTOM_PATTERNS_FILE", "PII_CUSTOM_PATTERNS")?;
+        let pii_custom_dict_file =
+            load_custom_file(&get, "PII_CUSTOM_DICT_FILE", "PII_CUSTOM_DICT")?;
+        let pii_value_sample_enabled = parse_bool_off(&get, "PII_VALUE_SAMPLE_ENABLED");
+        let pii_value_sample_persist = parse_bool_on(&get, "PII_VALUE_SAMPLE_PERSIST");
+        let pii_value_sample_hmac_key = get("PII_VALUE_SAMPLE_HMAC_KEY").filter(|v| !v.is_empty());
         let audit_policy_file = get("AUDIT_POLICY_FILE")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -267,6 +365,19 @@ impl Config {
             "HTTP_POOL_IDLE_TIMEOUT_SECS",
             HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT,
         )?;
+        let db_dir = get("DB_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| data_dir.join("db"), PathBuf::from);
+        let tpm_dir = get("TPM_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| data_dir.join("tpm"), PathBuf::from);
+        let keepass_backend: KeepassBackendKind = match get("VEIL_KEEPASS_BACKEND") {
+            Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
+                var: "VEIL_KEEPASS_BACKEND".to_string(),
+                message,
+            })?,
+            _ => KeepassBackendKind::Real,
+        };
 
         Ok(Self {
             homeserver,
@@ -288,6 +399,15 @@ impl Config {
             llm_upstreams,
             llm_default_upstream,
             redaction_enabled,
+            pii_response_side,
+            pii_fuzzy_restore,
+            pii_detection_hardening,
+            pii_custom_rules_file,
+            pii_custom_patterns_file,
+            pii_custom_dict_file,
+            pii_value_sample_enabled,
+            pii_value_sample_persist,
+            pii_value_sample_hmac_key,
             normalize_json_whitespace,
             audit_policy_file,
             placeholder_prompt_enabled,
@@ -295,7 +415,150 @@ impl Config {
             http_timeout_secs,
             http_pool_max_idle_per_host,
             http_pool_idle_timeout_secs,
+            db_dir,
+            tpm_dir,
+            keepass_backend,
         })
+    }
+}
+
+fn is_falsy(v: &str) -> bool {
+    matches!(
+        v.trim().to_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// 默认开启的布尔开关：空缺为真，仅显式假值关闭。
+fn parse_bool_on(get: &dyn Fn(&str) -> Option<String>, var: &str) -> bool {
+    match get(var).filter(|v| !v.is_empty()) {
+        Some(v) => !is_falsy(&v),
+        None => true,
+    }
+}
+
+/// 默认关闭的布尔开关：空缺为假，仅显式真值开启。
+fn parse_bool_off(get: &dyn Fn(&str) -> Option<String>, var: &str) -> bool {
+    match get(var).filter(|v| !v.is_empty()) {
+        Some(v) => is_truthy(&v),
+        None => false,
+    }
+}
+
+/// 自定义 PII 文件 fail-closed 加载：`file_var` 优先、`short_var` 兼容，两者皆空为未配置。
+/// 已配置但缺文件/不可读/JSON 解析失败/形态非法一律拒绝启动，报错指明实际命中的变量名。
+fn load_custom_file(
+    get: &dyn Fn(&str) -> Option<String>,
+    file_var: &str,
+    short_var: &str,
+) -> Result<Option<PathBuf>> {
+    let (var, raw) = match get(file_var).filter(|v| !v.is_empty()) {
+        Some(v) => (file_var, v),
+        None => match get(short_var).filter(|v| !v.is_empty()) {
+            Some(v) => (short_var, v),
+            None => return Ok(None),
+        },
+    };
+    let path = PathBuf::from(&raw);
+    if !path.is_file() {
+        return Err(config_error(
+            var,
+            &format!("{var} 指向的文件不存在或不可读: {raw:?}，拒绝启动"),
+        ));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        config_error(
+            var,
+            &format!("{var} 文件读取失败 {}: {e:?}，拒绝启动", path.display()),
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        config_error(
+            var,
+            &format!("{var} 文件 JSON 解析失败 {}: {e}，拒绝启动", path.display()),
+        )
+    })?;
+    validate_custom_shape(var, &path, &value)?;
+    Ok(Some(path))
+}
+
+/// 自定义文件形态校验：规则/模式须为 `{name, pattern}` 数组（模式兼容 `{name: pattern}` 映射），
+/// 字典须为 `{name[, type]}` 数组、`[string]` 数组或 `{name: type}` 映射；缺字段即拒启动。
+fn validate_custom_shape(
+    var: &str,
+    path: &std::path::Path,
+    value: &serde_json::Value,
+) -> Result<()> {
+    use serde_json::Value as V;
+    let is_dict = var.contains("DICT");
+    match value {
+        V::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let ok = match item {
+                    V::Object(map) => {
+                        let has_name = map
+                            .get("name")
+                            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()));
+                        if is_dict {
+                            has_name
+                                && map
+                                    .get("type")
+                                    .is_none_or(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                        } else {
+                            has_name
+                                && map
+                                    .get("pattern")
+                                    .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                        }
+                    }
+                    V::String(s) => is_dict && !s.is_empty(),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(config_error(
+                        var,
+                        &format!(
+                            "{var} 文件 {} 第 {i} 项形态非法（规则/模式须含 name+pattern，字典须含 name），拒绝启动",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        V::Object(map) => {
+            if is_dict {
+                if map
+                    .values()
+                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                {
+                    return Ok(());
+                }
+            } else if map
+                .values()
+                .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            {
+                return Ok(());
+            }
+            Err(config_error(
+                var,
+                &format!(
+                    "{var} 文件 {} 映射值须为非空字符串，拒绝启动",
+                    path.display()
+                ),
+            ))
+        }
+        _ => Err(config_error(
+            var,
+            &format!("{var} 文件 {} 顶层须为数组或映射，拒绝启动", path.display()),
+        )),
     }
 }
 
@@ -732,5 +995,215 @@ mod tests {
                 "输入 {var}={raw} 报错须指明变量名"
             );
         }
+    }
+
+    #[test]
+    fn 脱敏别名与三语义开关() {
+        // 默认：脱敏开、响应侧开、宽松关、强化关。
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert!(cfg.redaction_enabled);
+        assert!(cfg.pii_response_side);
+        assert!(!cfg.pii_fuzzy_restore);
+        assert!(!cfg.pii_detection_hardening);
+        // 原仓别名单独置位等价开启。
+        let mut env = base_env();
+        env.insert("PII_REDACTION_ENABLED".to_string(), "1".to_string());
+        assert!(Config::load_from(&env).unwrap().redaction_enabled);
+        // 别名显式关闭同样生效。
+        let mut env = base_env();
+        env.insert("PII_REDACTION_ENABLED".to_string(), "0".to_string());
+        assert!(!Config::load_from(&env).unwrap().redaction_enabled);
+        // 主变量优先于别名。
+        let mut env = base_env();
+        env.insert("REDACTION_ENABLED".to_string(), "0".to_string());
+        env.insert("PII_REDACTION_ENABLED".to_string(), "1".to_string());
+        assert!(!Config::load_from(&env).unwrap().redaction_enabled);
+        // 三语义覆盖。
+        let mut env = base_env();
+        env.insert("PII_RESPONSE_SIDE".to_string(), "0".to_string());
+        env.insert("PII_FUZZY_RESTORE".to_string(), "yes".to_string());
+        env.insert("PII_DETECTION_HARDENING".to_string(), "on".to_string());
+        let cfg = Config::load_from(&env).unwrap();
+        assert!(!cfg.pii_response_side);
+        assert!(cfg.pii_fuzzy_restore);
+        assert!(cfg.pii_detection_hardening);
+    }
+
+    fn custom_tmp_file(name: &str, content: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("veil-config-test-{}-{name}", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn 自定义文件缺失拒启动并指明变量名() {
+        for var in [
+            "PII_CUSTOM_RULES_FILE",
+            "PII_CUSTOM_PATTERNS_FILE",
+            "PII_CUSTOM_DICT_FILE",
+            "PII_CUSTOM_RULES",
+            "PII_CUSTOM_DICT",
+        ] {
+            let mut env = base_env();
+            env.insert(
+                var.to_string(),
+                "/nonexistent/veil-custom-缺失.json".to_string(),
+            );
+            let err = Config::load_from(&env).unwrap_err();
+            assert!(err.to_string().contains(var), "变量 {var} 报错须指明变量名");
+        }
+    }
+
+    #[test]
+    fn 自定义文件解析失败与形态非法拒启动() {
+        // 非法 JSON。
+        let bad = custom_tmp_file("bad.json", "{不是 json");
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_PATTERNS_FILE".to_string(),
+            bad.to_string_lossy().into_owned(),
+        );
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("PII_CUSTOM_PATTERNS_FILE"));
+        // 缺 pattern 字段。
+        let malformed = custom_tmp_file("malformed.json", r#"[{"name":"x"}]"#);
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            malformed.to_string_lossy().into_owned(),
+        );
+        let err = Config::load_from(&env).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("PII_CUSTOM_RULES_FILE"), "实际: {msg}");
+        // 顶层非数组/映射。
+        let scalar = custom_tmp_file("scalar.json", "42");
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_DICT_FILE".to_string(),
+            scalar.to_string_lossy().into_owned(),
+        );
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("PII_CUSTOM_DICT_FILE"));
+        for p in [bad, malformed, scalar] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn 自定义文件合法形态放行() {
+        let rules = custom_tmp_file(
+            "rules.json",
+            r#"[{"name":"ext-id","pattern":"EXT-\\d{6}"}]"#,
+        );
+        let patterns = custom_tmp_file("patterns.json", r#"{"p1":"bar\\d+"}"#);
+        let dict = custom_tmp_file("dict.json", r#"[{"name":"张三丰","type":"name"}]"#);
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            rules.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_PATTERNS".to_string(),
+            patterns.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_DICT_FILE".to_string(),
+            dict.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.pii_custom_rules_file.as_deref(), Some(rules.as_path()));
+        assert_eq!(
+            cfg.pii_custom_patterns_file.as_deref(),
+            Some(patterns.as_path())
+        );
+        assert_eq!(cfg.pii_custom_dict_file.as_deref(), Some(dict.as_path()));
+        // 未配置时为 None。
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert!(cfg.pii_custom_rules_file.is_none());
+        for p in [rules, patterns, dict] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn 采样开关默认值与覆盖() {
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert!(!cfg.pii_value_sample_enabled);
+        assert!(cfg.pii_value_sample_persist);
+        assert!(cfg.pii_value_sample_hmac_key.is_none());
+        let mut env = base_env();
+        env.insert("PII_VALUE_SAMPLE_ENABLED".to_string(), "1".to_string());
+        env.insert("PII_VALUE_SAMPLE_PERSIST".to_string(), "0".to_string());
+        env.insert(
+            "PII_VALUE_SAMPLE_HMAC_KEY".to_string(),
+            "k-0123456789".to_string(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert!(cfg.pii_value_sample_enabled);
+        assert!(!cfg.pii_value_sample_persist);
+        assert_eq!(
+            cfg.pii_value_sample_hmac_key.as_deref(),
+            Some("k-0123456789")
+        );
+    }
+
+    #[test]
+    fn 库目录默认派生与显式覆盖() {
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert_eq!(cfg.db_dir, PathBuf::from("/data/db"));
+        assert_eq!(cfg.tpm_dir, PathBuf::from("/data/tpm"));
+        assert_eq!(cfg.keepass_backend, KeepassBackendKind::Real);
+        let mut env = base_env();
+        env.insert("DB_DIR".to_string(), "/srv/kdbx".to_string());
+        env.insert("TPM_DIR".to_string(), "/srv/tpm".to_string());
+        env.insert("VEIL_KEEPASS_BACKEND".to_string(), "mock".to_string());
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.db_dir, PathBuf::from("/srv/kdbx"));
+        assert_eq!(cfg.tpm_dir, PathBuf::from("/srv/tpm"));
+        assert_eq!(cfg.keepass_backend, KeepassBackendKind::Mock);
+        let mut env = base_env();
+        env.insert("VEIL_KEEPASS_BACKEND".to_string(), "bogus".to_string());
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("VEIL_KEEPASS_BACKEND"));
+    }
+
+    #[test]
+    fn 多库取排序末位同名key优先() {
+        let dir = std::env::temp_dir().join(format!(
+            "veil-resolve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.kdbx"), b"a").unwrap();
+        std::fs::write(dir.join("z.kdbx"), b"z").unwrap();
+        std::fs::write(dir.join("z.key"), b"key").unwrap();
+        let found = resolve_kdbx(&dir).expect("须选中末位库");
+        assert_eq!(found.db_path, dir.join("z.kdbx"));
+        assert_eq!(found.keyfile_path, Some(dir.join("z.key")));
+        std::fs::remove_file(dir.join("z.key")).unwrap();
+        let found = resolve_kdbx(&dir).expect("无 keyfile 仍选中库");
+        assert_eq!(found.db_path, dir.join("z.kdbx"));
+        assert_eq!(found.keyfile_path, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 无库返回空() {
+        let dir = std::env::temp_dir().join(format!(
+            "veil-resolve-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), b"x").unwrap();
+        assert!(resolve_kdbx(&dir).is_none());
+        assert!(resolve_kdbx(&dir.join("不存在的子目录")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -13,6 +13,7 @@ use {
         error::{Result, VeilError},
         keepass::{KeePassBackend, MockKeePass},
         registry::CallerRegistry,
+        service::metrics::PiiSamplerConfig,
     },
     std::{
         collections::HashMap,
@@ -58,6 +59,7 @@ impl AppState {
         let registry = CallerRegistry::load_from(&registry_path).unwrap_or_default();
         let admin = Arc::new(crate::service::admin::AdminState::new(
             outcome.db_path.clone(),
+            PiiSamplerConfig::from_config(&config),
         ));
         let approval = Arc::new(crate::service::matrix::MatrixApproval::new(
             config.approval_whitelist.clone(),

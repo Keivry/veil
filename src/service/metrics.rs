@@ -639,10 +639,11 @@ pub fn summarize(text: &str, max_chars: usize) -> String {
 
 // ── §7.4 PII 值级掩码采样 ──────────────────────────────────────────────────
 
-/// PII 采样开关（环境变量口径，默认关闭）：
-/// `PII_VALUE_SAMPLE_ENABLED=1` 开启，`PII_VALUE_SAMPLE_PERSIST=0` 只记内存不落盘，
-/// `PII_VALUE_SAMPLE_HMAC_KEY` 置位时用 HMAC-SHA256 计 hash，未设退化为普通
+/// PII 采样开关（`Config` 口径，默认关闭）：
+/// `pii_value_sample_enabled` 开启，`pii_value_sample_persist=false` 只记内存不落盘，
+/// `pii_value_sample_hmac_key` 置位时用 HMAC-SHA256 计 hash，未设退化为普通
 /// SHA256（低熵 PII 可被字典枚举，仅趋势参考——文档声明风险，见 [`PiiValueSampler::hash_value`]）。
+/// 启动期由 `Config` 解析，热重载不支持；请求路径 MUST NOT 直读进程环境。
 #[derive(Debug, Clone)]
 pub struct PiiSamplerConfig {
     pub enabled: bool,
@@ -651,31 +652,12 @@ pub struct PiiSamplerConfig {
 }
 
 impl PiiSamplerConfig {
-    /// 从进程环境读取（默认全关）。
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("PII_VALUE_SAMPLE_ENABLED")
-            .map(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        let persist = std::env::var("PII_VALUE_SAMPLE_PERSIST")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(true);
-        let hmac_key = std::env::var("PII_VALUE_SAMPLE_HMAC_KEY")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
+    /// 从 `Config` 构造（启动期唯一入口）。
+    pub fn from_config(config: &crate::config::Config) -> Self {
         Self {
-            enabled,
-            persist,
-            hmac_key,
+            enabled: config.pii_value_sample_enabled,
+            persist: config.pii_value_sample_persist,
+            hmac_key: config.pii_value_sample_hmac_key.clone(),
         }
     }
 
@@ -1081,5 +1063,34 @@ mod tests {
         let s = PiiValueSampler::new(cfg, tmp_db("pii-degrade"));
         let (_, hash) = s.sample("email", "a@b.com", true).unwrap();
         assert_eq!(hash, crate::auth::sha256_hex(b"a@b.com"));
+    }
+
+    #[test]
+    fn 采样配置取自配置结构体而非进程环境() {
+        use std::collections::HashMap;
+        let base: HashMap<String, String> = HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+        ]);
+        let cfg = PiiSamplerConfig::from_config(&crate::config::Config::load_from(&base).unwrap());
+        assert!(!cfg.enabled && cfg.persist && cfg.hmac_key.is_none());
+        let mut env = base;
+        env.insert("PII_VALUE_SAMPLE_ENABLED".to_string(), "1".to_string());
+        env.insert("PII_VALUE_SAMPLE_PERSIST".to_string(), "0".to_string());
+        env.insert(
+            "PII_VALUE_SAMPLE_HMAC_KEY".to_string(),
+            "k-0123456789".to_string(),
+        );
+        let cfg = PiiSamplerConfig::from_config(&crate::config::Config::load_from(&env).unwrap());
+        assert!(cfg.enabled && !cfg.persist);
+        assert_eq!(cfg.hmac_key.as_deref(), Some("k-0123456789"));
     }
 }
