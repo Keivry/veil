@@ -6,8 +6,10 @@
 //! - Bot 经 `reqwest` 长轮询 sync 实现，不引入 matrix-sdk 重依赖；五分支
 //!   解锁/注册/哈希变更/凭据/审计 + ✅❎🔓 映射 + 摘要脱敏无明文。
 //!
-//! TODO(§6): 凭据/审计挂起任务需在 `handler` 侧调用 [`MatrixApproval::ask`]；
-//! 本文件只提供审批与 Bot 能力，不改网关侧文件。
+//! 接线：`AppState.approval` 持有本网关（白名单/`AUDIT_TIMEOUT` 来自 `Config`）；
+//! 凭据 handler 经 `service::record_pending` 建单（submit + Bot best-effort 发送，
+//! 立即返回 202）；问询经 `service::await_credential_approval`（300s）/
+//! `await_audit_approval`（90s 口径）；`main` 启动 `spawn_sweeper` 常驻清扫。
 
 use {
     crate::approval::{ApprovalGateway, ApprovalOutcome, PendingRecord},

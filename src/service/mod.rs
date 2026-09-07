@@ -112,14 +112,52 @@ fn effective_secret(headers: &CredentialHeaders, body: &CredentialBody) -> Optio
         .or_else(|| body.secret.clone().filter(|v| !v.is_empty()))
 }
 
-fn record_pending(state: &AppState, key: &str, reason: &str) -> VeilError {
+fn approval_event_id(key: &str, reason: &str) -> String {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash as _, Hasher as _},
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    (key, reason, nanos).hash(&mut hasher);
+    format!("$veil-{nanos}-{:08x}", hasher.finish() & 0xffff_ffff)
+}
+
+async fn record_pending(state: &AppState, key: &str, reason: &str) -> VeilError {
     let record = PendingRecord::new(key, reason);
     let gateway = NoopApproval;
     let _ = gateway.request_approval(&record);
     state.pending.insert(record);
+    let event_id = approval_event_id(key, reason);
+    state.approval.submit(&event_id).await;
+    let bot = matrix::MatrixBot::new(
+        state.config.homeserver.clone(),
+        state.config.room_id.clone(),
+        state.config.matrix_access_token.clone(),
+    );
+    let summary = format!("{reason} :: {key}");
+    let branch = matrix::MatrixBranch::from_reason(reason);
+    let text = bot.format_approval(branch, None, &summary);
+    tokio::spawn(async move {
+        let _ = bot.send_text(&text).await;
+    });
     VeilError::PendingApproval {
         message: format!("已转 Matrix 人工审批: {reason}"),
     }
+}
+
+/// 凭据审批问询（300s 超时口径）：超时/发送失败返回 None，调用方按 rejected 处理。
+pub async fn await_credential_approval(state: &AppState, event_id: &str) -> Option<bool> {
+    let timeout = state.approval.credential_timeout();
+    state.approval.ask(event_id, timeout).await
+}
+
+/// 审计审批问询（`AUDIT_TIMEOUT` 口径，默认 90s）：超时返回 None，调用方按 rejected 处理。
+pub async fn await_audit_approval(state: &AppState, event_id: &str) -> Option<bool> {
+    state.approval.ask_audit(event_id).await
 }
 
 pub async fn handle_credential(
@@ -191,7 +229,7 @@ pub async fn handle_credential(
 
     let effective = match decision {
         None => {
-            return Err(record_pending(state, &pending_key, "hash_mismatch"));
+            return Err(record_pending(state, &pending_key, "hash_mismatch").await);
         }
         Some(AutoApprove::Deny) => {
             return Err(VeilError::Auth {
@@ -201,7 +239,7 @@ pub async fn handle_credential(
         Some(AutoApprove::Pending)
             if state.config.entry_mode != crate::config::EntryMode::CredentialOnly =>
         {
-            return Err(record_pending(state, &pending_key, "auto_approve_none"));
+            return Err(record_pending(state, &pending_key, "auto_approve_none").await);
         }
         Some(_) => AutoApprove::Allow,
     };
@@ -311,18 +349,18 @@ pub async fn emergency_revoke(
     state: &AppState,
     key: &str,
     admin_token: Option<&str>,
-    source: Option<&str>,
+    peer_ip: Option<&str>,
     file_present: bool,
 ) -> Result<RegistrationView> {
     let admin_ok = match (admin_token, state.config.observability_admin_token.as_str()) {
         (Some(got), expected) if !got.is_empty() => ct_eq(got, expected),
         _ => false,
     };
-    let net_ok = source.is_some_and(is_private_ip);
+    let net_ok = peer_ip.is_some_and(is_private_ip);
     if admin_ok || file_present || net_ok {
         return revoke_caller(state, key).await;
     }
-    Err(record_pending(state, key, "emergency_revoke转常规审批"))
+    Err(record_pending(state, key, "emergency_revoke转常规审批").await)
 }
 
 pub async fn approve_hash_change(
@@ -702,5 +740,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn 审批建单落矩阵网关且问询口径分表() {
+        use std::time::Duration;
+        let env = cred_env(&[("APPROVAL_WHITELIST", "@admin:example.com")]);
+        let state = cred_state(&env);
+        assert_eq!(state.approval.pending_len().await, 0);
+        register_caller(&state, "/s/w.sh", "goodhash", "wire-src")
+            .await
+            .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled("/s/w.sh", true)
+            .unwrap();
+        let err = handle_credential(
+            &state,
+            &headers("badhash", Some("s3cr3t")),
+            &body("badhash", "/s/w.sh", None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.approval.pending_len().await, 1);
+        assert_eq!(
+            state.approval.credential_timeout(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(state.approval.audit_timeout(), Duration::from_secs(90));
+        state.approval.submit("$wire-ev").await;
+        state
+            .approval
+            .resolve("$wire-ev", "@admin:example.com", true)
+            .await;
+        let _ = state.approval.submit("$wire-ev2").await;
+        assert_eq!(
+            await_credential_approval(&state, "$wire-ev").await,
+            Some(true)
+        );
+        assert_eq!(
+            state
+                .approval
+                .ask("$wire-ev2", Duration::from_millis(50))
+                .await,
+            None
+        );
+        assert_eq!(state.approval.pending_len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn 审计问询走_audit_timeout口径() {
+        let mut env = cred_env(&[]);
+        env.insert("AUDIT_TIMEOUT".to_string(), "1".to_string());
+        let state = cred_state(&env);
+        assert_eq!(
+            state.approval.audit_timeout(),
+            std::time::Duration::from_secs(1)
+        );
+        state.approval.submit("$audit-ev").await;
+        assert_eq!(
+            await_audit_approval(&state, "$audit-ev-missing").await,
+            None
+        );
+        assert_eq!(state.approval.pending_len().await, 1);
     }
 }

@@ -44,6 +44,7 @@ pub struct AppState {
     pub registry_path: PathBuf,
     pub keepass: Arc<dyn KeePassBackend>,
     pub pending: Arc<PendingApprovals>,
+    pub approval: Arc<crate::service::matrix::MatrixApproval>,
     pub credential_hits: Arc<Mutex<HashMap<String, Instant>>>,
     pub register_hits: Arc<Mutex<HashMap<String, Instant>>>,
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
@@ -57,6 +58,10 @@ impl AppState {
         let admin = Arc::new(crate::service::admin::AdminState::new(
             outcome.db_path.clone(),
         ));
+        let approval = Arc::new(crate::service::matrix::MatrixApproval::new(
+            config.approval_whitelist.clone(),
+            config.audit_timeout_secs.max(1) as u64,
+        ));
         Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),
@@ -66,6 +71,7 @@ impl AppState {
             registry_path,
             keepass: Arc::new(MockKeePass::locked()),
             pending: Arc::new(PendingApprovals::default()),
+            approval,
             credential_hits: Arc::new(Mutex::new(HashMap::new())),
             register_hits: Arc::new(Mutex::new(HashMap::new())),
             gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
