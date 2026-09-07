@@ -1,0 +1,54 @@
+services:
+  veil:
+    build: .
+    image: veil:local
+    container_name: veil
+    restart: unless-stopped
+    environment:
+      # ── Matrix 审批（必填）──
+      - HOMESERVER=https://matrix.example.com
+      - ROOM_ID=!yourroomid:matrix.example.com
+      - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}
+
+      # ── 可观测 admin（/_admin，必填）──
+      # OBSERVABILITY_ADMIN_TOKEN 须独立（不得复用 MATRIX_ACCESS_TOKEN），建议 ≥32 字符。
+      - OBSERVABILITY_ADMIN_TOKEN=${OBSERVABILITY_ADMIN_TOKEN:?OBSERVABILITY_ADMIN_TOKEN is required}
+
+      # ── 三因子认证（强烈建议开启）──
+      # GET_BINARY_HASH 与 GET_BINARY_SECRET 须同时设置才生效；均为空时为兼容模式。
+      # - GET_BINARY_HASH=sha256:abc123...
+      # - GET_BINARY_SECRET=${GET_BINARY_SECRET}
+
+      # ── LLM 脱敏反向代理（可选）──
+      # 端口 → 上游 URL 映射；LLM_UPSTREAM 为缺省上游。
+      - LLM_8878=https://api.opencode.ai
+      - LLM_8879=https://api.deepseek.com
+      # - LLM_UPSTREAM=https://api.opencode.ai
+
+      # ── 输出审计（默认关闭，启用需显式设置）──
+      # - AUDIT_MODE=block
+      # - AUDIT_TIMEOUT=90          # 禁止 110-130（上游断连竞态窗口）
+      # - AUDIT_HOLD_MAX_BYTES=1048576
+      # - AUDIT_POLICY_FILE=/data/audit-policy.yaml
+      # - APPROVAL_WHITELIST=@admin:matrix.example.com
+
+      # ── 可选参数 ──
+      - DATA_DIR=/data
+      # 无 TPM 硬件的开发机：注释掉下方 devices 两行，并设置 VEIL_ALLOW_MOCK_TPM=1（仅开发）。
+      # - VEIL_ALLOW_MOCK_TPM=1
+    ports:
+      # 回环三端口（默认仅回环；宿主机端口可经环境变量覆盖，回环绑定语义保持）。
+      # Rust 服务在容器内固定监听 8877，三条映射均指向该端口（Host 端口区分调用入口）。
+      - "127.0.0.1:${PORT_8877:-8877}:8877"   # 凭据 API
+      - "127.0.0.1:${PORT_8878:-8878}:8877"   # LLM 代理入口一
+      - "127.0.0.1:${PORT_8879:-8879}:8877"   # LLM 代理入口二
+    volumes:
+      # 数据目录父卷在前（metrics.sqlite、audit.log 等），tpm/db 子卷在后（不遮蔽）。
+      - ${DATA_DIR:-./data}:/data
+      # TPM 密封文件（seal.pub + seal.priv）。
+      - ${TPM_HOST_PATH:-./data/tpm}:/data/tpm:ro
+      # KeePass 数据库（.kdbx + .key）。
+      - ${DB_HOST_PATH:-./data/db}:/data/db:ro
+    devices:
+      - /dev/tpm0:/dev/tpm0
+      - /dev/tpmrm0:/dev/tpmrm0
