@@ -231,6 +231,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin通用限流11连击429带retry_after() {
+        let (base, handle) = serve_and_client(test_app(&[])).await;
+        let client = reqwest::Client::new();
+        let token = "observability-admin-token-0123456789";
+        for _ in 0..crate::service::admin::ADMIN_RATE_LIMIT {
+            let ok = client
+                .get(format!("{base}/_admin/health"))
+                .header("X-Admin-Token", token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status().as_u16(), 200);
+        }
+        let limited = client
+            .get(format!("{base}/_admin/health"))
+            .header("X-Admin-Token", token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(limited.status().as_u16(), 429);
+        assert!(limited.headers().contains_key("retry-after"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn 网关体超限413() {
+        let app = test_app(&[]);
+        let (base, handle) = serve_and_client(app).await;
+        let client = reqwest::Client::new();
+        let over = vec![b'x'; crate::handler::GATEWAY_BODY_LIMIT_BYTES + 1];
+        let resp = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(over)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 413);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "E_PAYLOAD_TOO_LARGE");
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn 限流返回429带_retry_after() {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();

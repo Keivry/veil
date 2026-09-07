@@ -10,6 +10,19 @@
 //! `Retry-After`；SSE 5 并发/IP + 60s ping + 5min 强制重连（axum SSE 语义
 //! 与 §4 注释 keepalive 对齐：注释帧不计事件）。
 //!
+//! 限流契约（spec `admin-ratelimit-contract` + design D4，有意设计声明）：
+//! - 速率维度：通用 admin 接口 `10/min/IP`，超限 `429` + `Retry-After`（秒）+ 错误码
+//!   `E_RATE_LIMITED`；计数键为 TCP 直连对端 IP（`ConnectInfo`）， MUST NOT 读
+//!   `X-Forwarded-For`/`X-Real-IP` 等代理头（防伪造逃逸，生产由 `main.rs` 经
+//!   `into_make_service_with_connect_info` 注入真实对端）。
+//! - 并发维度：`/_admin/events/stream` 按 IP 限制并发 `5`，超限拒绝新连接 （`429` + `Retry-After:
+//!   60`）且已建连接不受影响；`10/min` 为速率维度、 `5/IP`
+//!   为并发维度，两者正交、独立计数，均为有意设计。
+//! - 与原仓差异：原仓通用 admin 豁免约 `60/min`，本仓收紧为 `10/min`，系有意 收敛（design
+//!   D4），不视为回归。
+//! - 超限头与指标锁定：头名 `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）；错误码
+//!   `E_RATE_LIMITED`；SSE 并发水位经 `sse_current` 与网关 `sse_event_total` 观测。
+//!
 //! 单向依赖：本模块只读 `state`（`Config`/`gateway_metrics`/`MetricsStore`），
 //! 不触网关/脱敏/审计业务文件（§5§6 并行施工零交叉）。
 
@@ -44,11 +57,14 @@ use {
     },
 };
 
-/// 通用管理接口限流：10/min/IP。
+/// 通用管理接口限流：10/min/IP（速率维度；spec `admin-ratelimit-contract`）。
+/// 与 SSE `5/IP` 并发维度正交、独立计数，均为有意设计（design D4）；
+/// 原仓约 60/min 豁免收紧至此值系有意收敛，不视为回归。
 pub const ADMIN_RATE_LIMIT: usize = 10;
 /// 限流窗口（秒）。
 pub const ADMIN_RATE_WINDOW_SECS: u64 = 60;
-/// SSE 并发上限/IP。
+/// SSE 并发上限/IP（并发维度；仅约束 `/_admin/events/stream` 同时在线数，
+/// 与通用 10/min 速率限流正交，超限拒绝新连接且已建连接不受影响）。
 pub const SSE_MAX_PER_IP: usize = 5;
 /// SSE 保活 ping 间隔（60s）。
 pub const SSE_PING_INTERVAL: Duration = Duration::from_secs(60);
@@ -305,6 +321,8 @@ fn unauthorized(message: &str) -> Response {
         .into_response()
 }
 
+/// 超限响应：429 + `Retry-After`（秒）+ 错误码 `E_RATE_LIMITED`（spec 锁定）。
+/// 头名小写 `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）。
 fn rate_limited(retry_after: u64) -> Response {
     let mut resp = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -364,6 +382,8 @@ fn authorize(
     Some(unauthorized("管理鉴权失败"))
 }
 
+/// 通用限流门（速率维度）：通过则计数 +1；超限返回 `Retry-After` 秒数。
+/// 与 SSE 并发计数相互独立（正交），本函数不触 `sse_count`。
 fn check_admin_rate(state: &AppState, ip: IpAddr) -> Option<Response> {
     match state.admin.check_rate(ip) {
         Ok(()) => None,
@@ -577,6 +597,7 @@ pub async fn admin_events_stream(
     ) {
         return r;
     }
+    // 并发超限：拒绝新连接（429 + Retry-After: 60），不触已建连接计数。
     if state.admin.acquire_sse(ip).is_none() {
         return rate_limited(60);
     }
@@ -789,6 +810,90 @@ mod tests {
         assert_eq!(st.sse_current(test_ip()), SSE_MAX_PER_IP - 1);
         assert!(st.acquire_sse(test_ip()).is_some());
         let _ = guards;
+    }
+
+    #[tokio::test]
+    async fn 超限响应429带retry_after与错误码锁定() {
+        let resp = rate_limited(42);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "E_RATE_LIMITED");
+        // SSE 并发拒绝固定 Retry-After: 60。
+        let sse_resp = rate_limited(60);
+        assert_eq!(sse_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            sse_resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+    }
+
+    #[tokio::test]
+    async fn peerip只认直连不采信代理头() {
+        use axum::extract::ConnectInfo;
+        let addr: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let req = axum::http::Request::builder()
+            .header("x-forwarded-for", "198.51.100.9")
+            .header("x-real-ip", "198.51.100.9")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        parts.extensions.insert(ConnectInfo(addr));
+        let peer = PeerIp::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(peer.0, addr.ip());
+    }
+
+    #[test]
+    fn sse超并发拒绝不影响已建连接() {
+        let st = test_admin_state();
+        let mut guards = Vec::new();
+        for _ in 0..SSE_MAX_PER_IP {
+            guards.push(st.acquire_sse(test_ip()).unwrap());
+        }
+        // 第 6 条被拒。
+        assert!(st.acquire_sse(test_ip()).is_none());
+        // 前 5 条计数不受影响。
+        assert_eq!(st.sse_current(test_ip()), SSE_MAX_PER_IP);
+        // 拒绝路径不触计数：再拒一次计数仍为 5。
+        assert!(st.acquire_sse(test_ip()).is_none());
+        assert_eq!(st.sse_current(test_ip()), SSE_MAX_PER_IP);
+        let _ = guards;
+        // 逐路释放后归零。
+        for _ in 0..SSE_MAX_PER_IP {
+            st.release_sse_for(test_ip());
+        }
+        assert_eq!(st.sse_current(test_ip()), 0);
+    }
+
+    #[test]
+    fn 速率与并发计数正交() {
+        let st = test_admin_state();
+        // 速率打满不影响并发配额。
+        for _ in 0..ADMIN_RATE_LIMIT {
+            assert!(st.check_rate(test_ip()).is_ok());
+        }
+        assert!(st.check_rate(test_ip()).is_err());
+        for _ in 0..SSE_MAX_PER_IP {
+            assert!(st.acquire_sse(test_ip()).is_some());
+        }
+        assert!(st.acquire_sse(test_ip()).is_none());
+        // 并发打满不影响他 IP 速率。
+        assert!(st.check_rate(IpAddr::from([10, 0, 0, 9])).is_ok());
+        // 释放本 IP 全部并发后归零，速率仍保持超限（独立窗口）。
+        for _ in 0..SSE_MAX_PER_IP {
+            st.release_sse_for(test_ip());
+        }
+        assert_eq!(st.sse_current(test_ip()), 0);
+        assert!(st.check_rate(test_ip()).is_err());
     }
 
     #[test]
