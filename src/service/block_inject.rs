@@ -104,6 +104,26 @@ pub fn dedupe_terminal_frames(frames: Vec<String>, protocol: &str) -> Vec<String
 
 pub fn should_discard_after_terminal(terminated: bool) -> bool { terminated }
 
+pub fn empty_stream_frames(protocol: &str, conv_id: &str) -> Vec<String> {
+    match protocol {
+        "chat" => chat_block_frames("empty-stream"),
+        "anthropic" => anthropic_block_frames("empty-stream"),
+        "responses" => responses_truncated_frames(conv_id),
+        _ => vec![],
+    }
+}
+
+pub fn terminal_count(frames: &[String], protocol: &str) -> usize {
+    match protocol {
+        "chat" => count_done(frames),
+        "anthropic" => frames.iter().filter(|f| f.contains("message_stop")).count(),
+        _ => frames
+            .iter()
+            .filter(|f| f.contains("response.completed") || f.contains("response.failed"))
+            .count(),
+    }
+}
+
 pub fn count_done(frames: &[String]) -> usize {
     frames
         .iter()
@@ -228,15 +248,53 @@ mod tests {
     }
 
     #[test]
-    fn anthropic三件套去重保留首个stop() {
-        let frames = vec![
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\"}\n\n".to_string(),
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
-        ];
-        let out = dedupe_terminal_frames(frames, "anthropic");
-        assert_eq!(out.iter().filter(|f| f.contains("message_stop")).count(), 1);
-        assert!(out.join("").contains("content_block_stop"));
+    fn truncation_TSS01_openended不造假成功() {
+        let chat_frames = ensure_event_lines(chat_block_frames("truncated"));
+        let joined = chat_frames.join("");
+        assert!(!joined.contains("response.completed"));
+        assert!(joined.contains("[blocked: truncated]"));
+        let anth_frames = ensure_event_lines(anthropic_block_frames("truncated"));
+        let joined_a = anth_frames.join("");
+        assert!(!joined_a.contains("message_stop") || joined_a.contains("truncated"));
+        assert!(terminal_count(&chat_frames, "chat") == 1);
+    }
+
+    #[test]
+    fn truncation_TSS02_tooldrop无参数不伪造完成() {
+        let failed = ensure_event_lines(responses_truncated_frames("r-drop"));
+        let joined = failed.join("");
+        assert!(joined.contains("response.failed"));
+        assert!(!joined.contains("response.completed"));
+        assert!(!joined.contains("\"status\":\"completed\""));
+        assert!(terminal_count(&failed, "responses") == 1);
+    }
+
+    #[test]
+    fn truncation_TSS03_阻断与截断形态互斥() {
+        let done = ensure_event_lines(responses_block_frames("r1"));
+        let failed = ensure_event_lines(responses_truncated_frames("r1"));
+        assert!(done.join("").contains("response.completed"));
+        assert!(!failed.join("").contains("response.completed"));
+        assert!(failed.join("").contains("response.failed"));
+        assert!(!done.join("").contains("response.failed"));
+    }
+
+    #[test]
+    fn truncation_TSS04_空流兜底三协议恰一个终止() {
+        assert_eq!(
+            terminal_count(&empty_stream_frames("chat", "c1"), "chat"),
+            1
+        );
+        assert_eq!(
+            terminal_count(&empty_stream_frames("anthropic", "c1"), "anthropic"),
+            1
+        );
+        assert_eq!(
+            terminal_count(&empty_stream_frames("responses", "c1"), "responses"),
+            1
+        );
+        let chat_empty = dedupe_terminal_frames(vec![], "chat");
+        assert_eq!(count_done(&chat_empty), 1);
     }
 
     #[test]

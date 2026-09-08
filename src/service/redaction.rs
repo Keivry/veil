@@ -475,4 +475,32 @@ mod tests {
         assert!(!normalize_flag_enabled(Some("0")));
         assert!(normalize_flag_enabled(Some("1")));
     }
+
+    #[tokio::test]
+    async fn 多行保真往返字节一致() {
+        let vault = vault_with_secret("my-secret-001");
+        let detector = PiiDetector::new();
+        let scope = Scope::new();
+        let req = "第一行 电话 13812345678 📞\n第二行 密钥 my-secret-001 ✅\n第三行 纯文本无敏感";
+        let redacted = scope.redact_request_plain(&vault, &detector, req).await;
+        assert!(!redacted.contains("13812345678"), "{redacted}");
+        assert!(!redacted.contains("my-secret-001"), "{redacted}");
+        assert!(redacted.contains("第三行 纯文本无敏感"), "{redacted}");
+        let restored = scope.restore_response(&vault, &redacted);
+        assert_eq!(restored, req, "往返须字节一致");
+    }
+
+    #[test]
+    fn 还原幂等不双还原且未知透传() {
+        let vault = vault_with_secret("my-secret-001");
+        let scope = Scope::new();
+        let tok = scope.pii_scope().register("13812345678", false).unwrap();
+        let mixed = format!("回拨 {tok} 与 __PII_9_ab12cd34__ 及 my-secret-001");
+        let once = scope.restore_response(&vault, &mixed);
+        assert!(once.contains("13812345678"), "{once}");
+        assert!(once.contains("__PII_9_ab12cd34__"), "{once}");
+        assert!(once.contains("my-secret-001"), "明文直通不改写: {once}");
+        let twice = scope.restore_response(&vault, &once);
+        assert_eq!(twice, once, "二次还原须与一次一致");
+    }
 }

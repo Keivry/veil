@@ -268,6 +268,7 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
                 append_prompt_text(sys, prompt);
                 return true;
             }
+            tracing::warn!("Anthropic system 非法形态不注入，原体透传");
             return false;
         }
         map.insert("system".to_string(), Value::String(prompt.to_string()));
@@ -281,7 +282,14 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
     let Some(map) = body.as_object_mut() else {
         return false;
     };
-    let Some(msgs) = map.get_mut(key).and_then(|v| v.as_array_mut()) else {
+    let Some(field) = map.get_mut(key) else {
+        return false;
+    };
+    if protocol == Protocol::Responses && matches!(field, Value::String(_)) {
+        tracing::warn!("Responses 字符串 input 不注入，原体透传");
+        return false;
+    }
+    let Some(msgs) = field.as_array_mut() else {
         return false;
     };
     if msgs.is_empty() {
@@ -845,7 +853,16 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     blocks.push(msg);
                 }
             }
+            // 5.2：按事件 `index` 字段分桶（官方 `content_block_start/delta`
+            // 均带 `index`）；缺失才回退枚举下标，保证多 index 交错累积正确。
+            let bucket_index = |b: &Value, fallback: u32| -> u32 {
+                b.get("index")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(fallback)
+            };
             for (i, b) in blocks.iter().enumerate() {
+                let bucket = bucket_index(b, i as u32);
                 let is_tool = b.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
                     t.contains("tool_use") || t.contains("function") || t.contains("custom")
                 }) || b.get("name").is_some()
@@ -857,14 +874,14 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     continue;
                 }
                 if let Some(fc) = b.get("function_call").and_then(|v| v.as_object()) {
-                    let (id, id_synth) = synth_id(i as u32, None);
+                    let (id, id_synth) = synth_id(bucket, None);
                     let name = fc
                         .get("name")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let args = normalize_tool_args(fc.get("arguments"));
                     out.push(ToolCall {
-                        index: i as u32,
+                        index: bucket,
                         id,
                         name,
                         args,
@@ -875,7 +892,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                 if let Some(cc) = b.get("custom_tool_call") {
                     match cc {
                         Value::Object(obj) => {
-                            if let Some(c) = custom_obj_to_call(i as u32, obj) {
+                            if let Some(c) = custom_obj_to_call(bucket, obj) {
                                 out.push(c);
                             }
                             continue;
@@ -906,9 +923,9 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                 if name.is_none() && args.is_empty() && id_raw.is_none() {
                     continue;
                 }
-                let (id, id_synth) = synth_id(i as u32, id_raw);
+                let (id, id_synth) = synth_id(bucket, id_raw);
                 out.push(ToolCall {
-                    index: i as u32,
+                    index: bucket,
                     id,
                     name,
                     args,
@@ -917,8 +934,108 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
             }
         }
         Protocol::Responses => {
+            // 5.1：单事件形态优先（delta 只累积不解析、done 全量才审计）。
+            // 三级键：`output_index` 为桶号、`item_id/id` 为槽键、
+            // `sequence_number` 由 AuditHold 保序；此处只做提取不排序不解析。
+            let ev_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if ev_type.contains("function_call_arguments") {
+                let idx = payload
+                    .get("output_index")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(0);
+                let id_raw = payload
+                    .get("item_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload.get("id").and_then(|v| v.as_str()));
+                let name = payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if ev_type.ends_with(".delta") {
+                    let delta = payload
+                        .get("delta")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if !delta.is_empty() || name.is_some() {
+                        let (id, id_synth) = synth_id(idx, id_raw);
+                        out.push(ToolCall {
+                            index: idx,
+                            id,
+                            name,
+                            args: delta.to_string(),
+                            id_synth,
+                        });
+                    }
+                    return out;
+                }
+                if ev_type.ends_with(".done") {
+                    let args = match payload.get("arguments") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    if !args.is_empty() || name.is_some() {
+                        let (id, id_synth) = synth_id(idx, id_raw);
+                        out.push(ToolCall {
+                            index: idx,
+                            id,
+                            name,
+                            args,
+                            id_synth,
+                        });
+                    }
+                    return out;
+                }
+                return out;
+            }
+            if ev_type.contains("output_text") {
+                return out;
+            }
+            if ev_type == "response.output_item.done"
+                && let Some(item) = payload.get("item")
+                && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+            {
+                let idx = payload
+                    .get("output_index")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(0);
+                let args = match item.get("arguments") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                    None => String::new(),
+                };
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let id_raw = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
+                if !args.is_empty() || name.is_some() {
+                    let (id, id_synth) = synth_id(idx, id_raw);
+                    out.push(ToolCall {
+                        index: idx,
+                        id,
+                        name,
+                        args,
+                        id_synth,
+                    });
+                }
+                return out;
+            }
+            if payload.get("item").is_some() {
+                return out;
+            }
             if let Some(output) = payload.get("output").and_then(|o| o.as_array()) {
                 for (i, item) in output.iter().enumerate() {
+                    let bucket = item
+                        .get("output_index")
+                        .and_then(|x| x.as_u64())
+                        .map(|n| n as u32)
+                        .unwrap_or(i as u32);
                     let is_tool = item.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
                         t.contains("function_call")
                             || t.contains("custom_tool_call")
@@ -931,13 +1048,13 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     }
                     if let Some(obj) = item.as_object()
                         && let Some(Value::Object(inner)) = obj.get("custom_tool_call")
-                        && let Some(c) = custom_obj_to_call(i as u32, inner)
+                        && let Some(c) = custom_obj_to_call(bucket, inner)
                     {
                         out.push(c);
                         continue;
                     }
                     if let Some(obj) = item.as_object()
-                        && let Some(c) = custom_obj_to_call(i as u32, obj)
+                        && let Some(c) = custom_obj_to_call(bucket, obj)
                     {
                         let meaningful = c.name.is_some() || !c.args.is_empty() || !c.id_synth;
                         if meaningful {
@@ -1389,6 +1506,31 @@ mod tests {
         assert_eq!(retry_delay(2), Duration::from_millis(2000));
     }
 
+    #[tokio::test]
+    async fn 断开重试退避封顶且最终失败() {
+        use axum::http::HeaderMap;
+        assert_eq!(retry_delay(3), Duration::from_millis(2000));
+        assert_eq!(retry_delay(99), Duration::from_millis(2000));
+        assert_eq!(MAX_RETRY_ATTEMPTS, 3);
+        let client = reqwest::Client::new();
+        let start = std::time::Instant::now();
+        let err = fetch_upstream_with_retry(
+            &client,
+            reqwest::Method::POST,
+            "http://127.0.0.1:9/v1/chat/completions",
+            HeaderMap::new(),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            start.elapsed() >= Duration::from_millis(3000),
+            "三次退避(500+1000+2000)须走完，实测 {:?}",
+            start.elapsed()
+        );
+        assert!(!err.to_string().is_empty());
+    }
+
     #[test]
     fn fix1全集双向大小写不敏感加动态项() {
         use axum::http::{HeaderMap, HeaderValue};
@@ -1501,6 +1643,94 @@ mod tests {
         let (hit, _) = is_chat_tail("/v1/chat/completions/", Some(&m));
         assert!(hit);
         assert_eq!(m.lenient_count("chat/completions"), 1);
+    }
+
+    #[test]
+    fn responses增量delta按三级键提取且文本事件放行() {
+        let d1 = serde_json::json!({"type":"response.function_call_arguments.delta","output_index":1,"item_id":"item-7","sequence_number":0,"delta":"{\"x\":"});
+        let calls = extract_tool_calls(Protocol::Responses, &d1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].index, 1);
+        assert_eq!(calls[0].id, "item-7");
+        assert!(!calls[0].id_synth);
+        assert_eq!(calls[0].args, "{\"x\":");
+        let done = serde_json::json!({"type":"response.function_call_arguments.done","output_index":1,"item_id":"item-7","sequence_number":2,"name":"run","arguments":"{\"x\":1}"});
+        let calls2 = extract_tool_calls(Protocol::Responses, &done);
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].name.as_deref(), Some("run"));
+        assert_eq!(calls2[0].args, "{\"x\":1}");
+        let text =
+            serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":"hi"});
+        assert!(extract_tool_calls(Protocol::Responses, &text).is_empty());
+        let item_done = serde_json::json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"c9","name":"q","arguments":"{}"}});
+        let calls3 = extract_tool_calls(Protocol::Responses, &item_done);
+        assert_eq!(calls3.len(), 1);
+        assert_eq!((calls3[0].index, calls3[0].id.as_str()), (2, "c9"));
+    }
+
+    #[test]
+    fn anthropic多index交错按事件index分桶() {
+        let b0 = serde_json::json!({"content_block":{"type":"tool_use","index":3,"id":"a3","name":"t3","input":{}}});
+        let calls = extract_tool_calls(Protocol::Anthropic, &b0);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].index, 3);
+        let d1 = serde_json::json!({"delta":{"type":"input_json_delta","index":5,"partial_json":"{\"a\":"}});
+        let calls2 = extract_tool_calls(Protocol::Anthropic, &d1);
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].index, 5);
+        assert_eq!(calls2[0].args, "{\"a\":");
+        assert!(calls2[0].id_synth);
+    }
+
+    #[test]
+    fn 占位符四形态注入回退() {
+        let prompt = "PROMPT";
+        let resp_str = serde_json::json!({"model":"m","input":"hello"});
+        assert!(
+            inject_placeholder_prompt(
+                &serde_json::to_string(&resp_str).unwrap(),
+                prompt,
+                Protocol::Responses,
+            )
+            .is_none()
+        );
+        let mut v = resp_str.clone();
+        assert!(!placeholder_inject_obj(&mut v, prompt, Protocol::Responses));
+        assert!(!placeholder_schema_ok(&v, Protocol::Responses));
+        let anth_bad = serde_json::json!({"model":"m","system":42});
+        assert!(
+            inject_placeholder_prompt(
+                &serde_json::to_string(&anth_bad).unwrap(),
+                prompt,
+                Protocol::Anthropic,
+            )
+            .is_none()
+        );
+        let mut v2 = anth_bad.clone();
+        assert!(!placeholder_inject_obj(
+            &mut v2,
+            prompt,
+            Protocol::Anthropic
+        ));
+        assert!(!placeholder_schema_ok(&v2, Protocol::Anthropic));
+        let resp_arr = serde_json::json!({"input":[{"role":"user","content":"hi"}]});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&resp_arr).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["input"][0]["role"], "system");
+        let anth_ok = serde_json::json!({"model":"m","system":"base"});
+        let out2 = inject_placeholder_prompt(
+            &serde_json::to_string(&anth_ok).unwrap(),
+            prompt,
+            Protocol::Anthropic,
+        )
+        .unwrap();
+        let parsed2: Value = serde_json::from_str(&out2).unwrap();
+        assert!(parsed2["system"].as_str().unwrap().contains(prompt));
     }
 
     #[test]

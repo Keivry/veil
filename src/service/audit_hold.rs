@@ -27,10 +27,34 @@ pub fn decide_via_gateway(
 }
 
 #[derive(Debug, Default)]
+struct ResponsesSlot {
+    output_index: u32,
+    name: Option<String>,
+    frags: std::collections::BTreeMap<u64, String>,
+    next_seq: u64,
+    done_args: Option<String>,
+    done_seen: bool,
+}
+
+impl ResponsesSlot {
+    fn full_args(&self) -> String {
+        if let Some(done) = self.done_args.as_deref() {
+            return done.to_string();
+        }
+        let mut out = String::new();
+        for frag in self.frags.values() {
+            out.push_str(frag);
+        }
+        out
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct AuditHold {
     args_by_index: HashMap<u32, String>,
     name_by_index: HashMap<u32, String>,
     id_by_index: HashMap<u32, String>,
+    responses_slots: HashMap<String, ResponsesSlot>,
     total_bytes: usize,
     max_bytes: usize,
     rejected: bool,
@@ -77,12 +101,103 @@ impl AuditHold {
             self.args_by_index.clear();
             self.name_by_index.clear();
             self.id_by_index.clear();
+            self.responses_slots.clear();
             return HoldVerdict::Rejected;
         }
         HoldVerdict::Approved
     }
 
+    pub fn responses_key(item_id: Option<&str>, output_index: u32) -> String {
+        match item_id.filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            None => format!("output_index:{output_index}"),
+        }
+    }
+
+    pub fn push_responses_fragment(
+        &mut self,
+        item_key: &str,
+        output_index: u32,
+        seq: Option<u64>,
+        id: Option<&str>,
+        name: Option<&str>,
+        args_delta: &str,
+    ) -> HoldVerdict {
+        if self.rejected || self.completed {
+            return if self.rejected {
+                HoldVerdict::Rejected
+            } else {
+                HoldVerdict::Approved
+            };
+        }
+        let slot = self
+            .responses_slots
+            .entry(item_key.to_string())
+            .or_insert_with(|| ResponsesSlot {
+                output_index,
+                ..Default::default()
+            });
+        if let Some(v) = name {
+            slot.name.get_or_insert_with(|| v.to_string());
+        }
+        let seq_no = seq.unwrap_or_else(|| {
+            let n = slot.next_seq;
+            slot.next_seq += 1;
+            n
+        });
+        slot.next_seq = slot.next_seq.max(seq_no + 1);
+        slot.frags
+            .entry(seq_no)
+            .or_insert_with(|| args_delta.to_string());
+        self.total_bytes += args_delta.len();
+        if self.total_bytes > self.max_bytes {
+            self.rejected = true;
+            self.args_by_index.clear();
+            self.name_by_index.clear();
+            self.id_by_index.clear();
+            self.responses_slots.clear();
+            return HoldVerdict::Rejected;
+        }
+        HoldVerdict::Approved
+    }
+
+    pub fn mark_responses_done(&mut self, item_key: &str, full_args: Option<&str>) {
+        if let Some(slot) = self.responses_slots.get_mut(item_key) {
+            slot.done_seen = true;
+            if let Some(args) = full_args {
+                slot.done_args = Some(args.to_string());
+            }
+        }
+    }
+
+    pub fn is_responses_complete(&self, item_key: &str) -> bool {
+        self.responses_slots
+            .get(item_key)
+            .is_some_and(|s| s.done_seen)
+    }
+
+    pub fn responses_triples(&self) -> Vec<(u32, String, String)> {
+        self.responses_slots
+            .values()
+            .filter(|s| s.done_seen)
+            .map(|s| {
+                (
+                    s.output_index,
+                    s.name.clone().unwrap_or_default(),
+                    s.full_args(),
+                )
+            })
+            .collect()
+    }
+
     pub fn is_complete_event(payload: &Value) -> bool {
+        if payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t.ends_with(".delta"))
+        {
+            return false;
+        }
         if payload.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls") {
             return true;
         }
@@ -132,11 +247,14 @@ impl AuditHold {
         self.args_by_index.clear();
         self.name_by_index.clear();
         self.id_by_index.clear();
+        self.responses_slots.clear();
     }
 
     /// 完成点审计用三元组：`(index, tool 名, 累积参数全文)`。
+    /// 含 Responses `done` 门控槽（仅 `done` 到达的槽参与审计，delta 只累积）。
     pub fn tool_triples(&self) -> Vec<(u32, String, String)> {
-        self.args_by_index
+        let mut triples: Vec<(u32, String, String)> = self
+            .args_by_index
             .iter()
             .map(|(idx, args)| {
                 (
@@ -145,7 +263,9 @@ impl AuditHold {
                     args.clone(),
                 )
             })
-            .collect()
+            .collect();
+        triples.extend(self.responses_triples());
+        triples
     }
 
     pub fn held(&self) -> bool { !self.completed && !self.rejected }
@@ -212,6 +332,41 @@ impl Drop for RequestKeepalive {
 #[cfg(test)]
 mod tests {
     use {super::*, crate::approval::NoopApproval};
+
+    #[test]
+    fn responses三分片保序单flush且增量期不审计() {
+        let mut hold = AuditHold::new(1024);
+        let key = AuditHold::responses_key(Some("item-7"), 1);
+        assert_eq!(
+            hold.push_responses_fragment(&key, 1, Some(2), Some("item-7"), Some("run"), "1}"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(
+            hold.push_responses_fragment(&key, 1, Some(0), None, None, "{\"x\":"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(
+            hold.push_responses_fragment(&key, 1, Some(1), None, None, ""),
+            HoldVerdict::Approved
+        );
+        assert!(
+            hold.tool_triples().is_empty(),
+            "done 到达前不得有可审计三元组"
+        );
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{\"x\":"})
+        ));
+        hold.mark_responses_done(&key, None);
+        assert!(hold.is_responses_complete(&key));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"type":"response.function_call_arguments.done"})
+        ));
+        let triples = hold.tool_triples();
+        assert_eq!(triples.len(), 1, "三分片单 flush 为一条三元组");
+        assert_eq!(triples[0].0, 1);
+        assert_eq!(triples[0].1, "run");
+        assert_eq!(triples[0].2, "{\"x\":1}");
+    }
 
     #[test]
     fn tool增量按index累积至完成前不flush() {
@@ -311,5 +466,129 @@ mod tests {
         assert!(!std::ptr::eq(&h1, &h2));
         drop(h1);
         assert!(h2.is_live());
+    }
+
+    #[test]
+    fn audit_approve_stream_批准注入完成放行() {
+        let mut hold = AuditHold::new(1024);
+        assert_eq!(
+            hold.push_fragment(0, Some("c1"), Some("run"), "{\"x\":"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(
+            hold.push_fragment(0, None, None, "1}"),
+            HoldVerdict::Approved
+        );
+        assert!(hold.held());
+        let triples = hold.tool_triples();
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].2, "{\"x\":1}");
+        hold.mark_completed();
+        assert!(!hold.held());
+        assert!(!hold.is_rejected());
+    }
+
+    #[test]
+    fn audit_approve_stream_拒绝与过期注入清理() {
+        let mut deny = AuditHold::new(1024);
+        deny.push_fragment(0, Some("c1"), Some("rm"), "{\"p\":");
+        deny.mark_rejected();
+        assert!(deny.is_rejected());
+        assert!(deny.tool_triples().is_empty());
+        assert_eq!(deny.accumulated(0), None);
+        let mut expired = AuditHold::new(1024);
+        expired.push_fragment(0, Some("c9"), Some("run"), "{\"y\":2}");
+        expired.mark_rejected();
+        assert!(expired.is_rejected());
+        assert!(expired.tool_triples().is_empty());
+        assert_eq!(
+            expired.push_fragment(0, None, None, "x"),
+            HoldVerdict::Rejected
+        );
+    }
+
+    #[test]
+    fn audit_approve_stream_anthropic_precheck三事件() {
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"type":"content_block_stop"})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"type":"item_done"})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+        ));
+    }
+
+    #[test]
+    fn audit_approve_stream_溢出failclosed双路径() {
+        let mut chat_hold = AuditHold::new(4);
+        assert_eq!(
+            chat_hold.push_fragment(0, None, None, "ab"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(
+            chat_hold.push_fragment(0, None, None, "cde"),
+            HoldVerdict::Rejected
+        );
+        assert!(chat_hold.is_rejected());
+        assert!(chat_hold.tool_triples().is_empty());
+        let mut resp_hold = AuditHold::new(4);
+        let key = AuditHold::responses_key(Some("item-o"), 0);
+        assert_eq!(
+            resp_hold.push_responses_fragment(&key, 0, Some(0), None, None, "ab"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(
+            resp_hold.push_responses_fragment(&key, 0, Some(1), None, None, "cde"),
+            HoldVerdict::Rejected
+        );
+        assert!(resp_hold.is_rejected());
+        assert!(resp_hold.responses_triples().is_empty());
+    }
+
+    #[test]
+    fn audit_approve_stream_abort_mid_toolcall粘性拒绝() {
+        let mut hold = AuditHold::new(1024);
+        hold.push_fragment(0, Some("c1"), Some("run"), "{\"a\":");
+        hold.mark_rejected();
+        assert_eq!(
+            hold.push_fragment(0, None, None, "1}"),
+            HoldVerdict::Rejected
+        );
+        let key = AuditHold::responses_key(Some("item-a"), 1);
+        assert_eq!(
+            hold.push_responses_fragment(&key, 1, Some(0), None, None, "z"),
+            HoldVerdict::Rejected
+        );
+        hold.mark_completed();
+        assert!(hold.is_rejected());
+        assert!(hold.tool_triples().is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_approve_stream_超时断连竞态与早断清理() {
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<String>(8);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<String>(8);
+        let gate_closed = std::sync::Arc::new(AtomicBool::new(false));
+        let gated = RequestKeepalive::spawn_gated(tx1, gate_closed);
+        assert!(gated.is_live());
+        drop(gated);
+        let h1 = RequestKeepalive::spawn(tx2);
+        assert!(h1.is_live());
+        drop(h1);
+        let (tx3, _rx3) = tokio::sync::mpsc::channel::<String>(8);
+        let (tx4, _rx4) = tokio::sync::mpsc::channel::<String>(8);
+        let keep_a = RequestKeepalive::spawn(tx3);
+        let keep_b = RequestKeepalive::spawn(tx4);
+        assert!(keep_a.is_live() && keep_b.is_live());
+        drop(keep_a);
+        assert!(keep_b.is_live());
     }
 }

@@ -469,10 +469,77 @@ mod tests {
     }
 
     #[test]
+    fn truncation_真实数据_utf8分片重组与终止唯一() {
+        let mut buf = Utf8ByteBuffer::new();
+        let raw = "data: {\"content\":\"中文回复。\"}\n\n".as_bytes();
+        let mut text = String::new();
+        for chunk in raw.chunks(3) {
+            text.push_str(&buf.push(chunk));
+        }
+        text.push_str(&buf.flush_text());
+        assert!(text.contains("中文回复"));
+        let mut p = SseParser::new();
+        let mut evs = Vec::new();
+        for chunk in raw.chunks(5) {
+            evs.extend(p.push_bytes(chunk));
+        }
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].data.contains("中文回复"));
+        let mut meta = StreamMeta::default();
+        assert!(set_truncated(
+            &mut meta,
+            Protocol::Chat,
+            TruncatedMode::OpenEnded,
+            None
+        ));
+        assert_eq!(meta.truncated_mode, Some(TruncatedMode::OpenEnded));
+    }
+
+    #[test]
     fn data行级json_aware还原() {
         let out = json_aware_line("{\"a\": \"v1\"}", |s| s.replace("v1", "v2"));
         assert!(out.contains("v2"));
         let plain = json_aware_line("plain token", |s| s.to_uppercase());
         assert_eq!(plain, "PLAIN TOKEN");
+    }
+
+    #[test]
+    fn fast去抖累积至标点或阈值才吐() {
+        let mut agg = String::new();
+        agg.push_str("hello");
+        assert!(select_emit(&mut agg, Speed::Fast).is_none());
+        agg.push_str(" world");
+        assert!(select_emit(&mut agg, Speed::Fast).is_none());
+        assert_eq!(agg, "hello world");
+        agg.push('。');
+        assert_eq!(
+            select_emit(&mut agg, Speed::Fast).as_deref(),
+            Some("hello world。")
+        );
+        assert!(agg.is_empty());
+        // 空缓冲恒 None，两档一致。
+        assert!(select_emit(&mut agg, Speed::Fast).is_none());
+        assert!(select_emit(&mut agg, Speed::Slow).is_none());
+        // 4KB 阈值无标点也吐（长文本不饿死）。
+        agg.push_str(&"x".repeat(4096));
+        assert_eq!(select_emit(&mut agg, Speed::Fast).unwrap().len(), 4096);
+        // 阈值差一字节仍缓冲。
+        agg.push_str(&"y".repeat(4095));
+        assert!(select_emit(&mut agg, Speed::Fast).is_none());
+    }
+
+    #[test]
+    fn 多行data按序透传且事件名保留() {
+        let mut p = SseParser::new();
+        let evs = p.push_bytes("event: message\ndata: 第一行\ndata: 第二行\n\n".as_bytes());
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_type.as_deref(), Some("message"));
+        assert_eq!(evs[0].data, "第一行\n第二行");
+        // 多行中文分包到达仍完整组装。
+        let mut q = SseParser::new();
+        assert!(q.push_bytes("data: 甲".as_bytes()).is_empty());
+        assert!(q.push_bytes("乙\n".as_bytes()).is_empty());
+        let evs = q.push_bytes("data: 丙\n\n".as_bytes());
+        assert_eq!(evs[0].data, "甲乙\n丙");
     }
 }
