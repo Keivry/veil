@@ -51,6 +51,8 @@ pub struct AppState {
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
     pub admin: Arc<crate::service::admin::AdminState>,
     pub http_client: Arc<reqwest::Client>,
+    pub vault: Arc<crate::service::credential_vault::CredentialVault>,
+    pub detector: Arc<crate::service::pii::PiiDetector>,
 }
 
 impl AppState {
@@ -66,6 +68,9 @@ impl AppState {
             config.audit_timeout_secs.max(1) as u64,
         ));
         let http_client = Arc::new(build_http_client(&config));
+        let vault = Arc::new(crate::service::credential_vault::CredentialVault::new());
+        let detector = Arc::new(crate::service::pii::PiiDetector::new());
+        detector.set_hardening(config.pii_detection_hardening);
         Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),
@@ -81,6 +86,8 @@ impl AppState {
             gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
             admin,
             http_client,
+            vault,
+            detector,
         }
     }
 
@@ -357,5 +364,38 @@ mod tests {
         }
         handle.abort();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vault与detector全局单例跨克隆共享() {
+        let env = std::collections::HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+        ]);
+        let state = AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: PathBuf::from("/tmp/x.sqlite"),
+                memory_only: false,
+            },
+        );
+        let again = state.clone();
+        assert!(Arc::ptr_eq(&state.vault, &again.vault));
+        assert!(Arc::ptr_eq(&state.detector, &again.detector));
+        // 同一 vault 注册复用：跨请求同秘密同 token。
+        let first = state.vault.register("跨请求秘密-abc123").unwrap();
+        let second = again.vault.register("跨请求秘密-abc123").unwrap();
+        assert_eq!(first, second);
+        assert!(first.starts_with("__VG_CRED_"));
     }
 }
