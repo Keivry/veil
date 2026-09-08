@@ -1,0 +1,19 @@
+# veil 自定义脱敏规则示例（极简 YAML 子集，可直接启动加载）
+#
+# 加载：
+#   PII_CUSTOM_RULES_FILE=examples/pii-custom.yaml cargo run --release
+#
+# 约束（违反的规则拒绝加载并告警，不静默生效）：
+# - `name` 须与 `(?P<name>...)` 内同名（无命名组亦可）；
+# - 禁止 `\b`（中文紧贴下零命中，须用 lookaround 边界）；
+# - 禁止嵌套命名组；
+# - 不得与内置重名（email/phone/id_card/bank_card/ipv4/ipv6/api_key）；
+# - 跨文件重名去重（先加载者生效）。
+# 管线语义：命中区间与 `__PII_*__`/`__VG_CRED_*__` 重叠跳过，凭据值优先，
+# 超长输入按 1MB 分块，单规则连续 3 次超时停用。
+
+- name: ext_id
+  pattern: (?P<ext_id>(?<![0-9A-Za-z-])EXT-\d{6}(?![0-9A-Za-z-]))
+
+- name: emp_no
+  pattern: (?P<emp_no>(?<![\d])工号\d{6}(?![\d]))

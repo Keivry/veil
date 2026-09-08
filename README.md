@@ -19,7 +19,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | `HOMESERVER` | Matrix homeserver URL |
 | `ROOM_ID` | Matrix 审批房间 ID |
 | `MATRIX_ACCESS_TOKEN` | Matrix Bot access token |
-| `OBSERVABILITY_ADMIN_TOKEN` | `/_admin` 鉴权 Token，须独立（不得复用 `MATRIX_ACCESS_TOKEN`），建议 ≥32 字符 |
+| `OBSERVABILITY_ADMIN_TOKEN` | `/_admin` 鉴权 Token，须独立（不得复用 `MATRIX_ACCESS_TOKEN`），建议 ≥32 字符（不足仅 warn 告警，不拒启动） |
 
 ### 环境变量全表（PII/AUDIT/TPM/LLM）
 
@@ -29,7 +29,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 分组 | 变量 | 默认 | 说明 |
 |:-----|:-----|:-----|:-----|
 | 认证 | `GET_BINARY_SECRET` / `CREDENTIAL_SECRET` | 空（兼容模式） | 三因子之部署密钥；前者优先 |
-| 认证 | `GET_BINARY_HASH` | 空 | 须与 `GET_BINARY_SECRET` 同时设置才生效 |
+| 认证 | `GET_BINARY_HASH` | 空 | 独立生效：置位时拒绝调用方冒用 get 自身哈希的直调（`caller_hash == GET_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `GET_BINARY_SECRET` 无联动 |
 | 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同 |
 | 认证 | `AUTO_APPROVE` | `true` | `true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批 |
 | 入口 | `VEIL_ENTRY_MODE` | `full` | `full` / `credential-only` / `llm-only` |
@@ -42,13 +42,13 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 脱敏 | `PII_RESPONSE_SIDE` | 开启 | 响应侧新检出注册占位符；关闭后新 PII 原样透出 |
 | 脱敏 | `PII_FUZZY_RESTORE` | 关闭 | 残缺形态按序号回查还原 |
 | 脱敏 | `PII_DETECTION_HARDENING` | 关闭 | 严格边界复核，丢弃 ASCII 粘连与前导零 IPv4 |
-| 脱敏 | `PII_CUSTOM_RULES_FILE` / `PII_CUSTOM_RULES` | 空 | 自定义正则文件，前者优先；已配置但缺文件/不可读/JSON 非法/形态非法一律拒启动 |
-| 脱敏 | `PII_CUSTOM_PATTERNS_FILE` / `PII_CUSTOM_PATTERNS` | 空 | 同上（数组或 `{name: pattern}` 映射） |
-| 脱敏 | `PII_CUSTOM_DICT_FILE` / `PII_CUSTOM_DICT` | 空 | 同上（字典形态） |
+| 脱敏 | `PII_CUSTOM_RULES_FILE` / `PII_RULES_FILE` / `PII_CUSTOM_RULES` | 空 | 自定义正则文件（合并文件，可与分离文件叠加；优先级按列序）；格式 JSON / 极简 YAML（`.yaml`）/ TXT 名单；已配置但缺文件/不可读/解析失败/形态非法一律拒启动，空文件仅 warn（见 `examples/pii-custom.yaml`） |
+| 脱敏 | `PII_CUSTOM_PATTERNS_FILE` / `PII_CUSTOM_PATTERN_FILE` / `PII_CUSTOM_PATTERNS` | 空 | 同上（数组或 `{name: pattern}` 映射） |
+| 脱敏 | `PII_CUSTOM_DICT_FILE` / `PII_SENSITIVE_DICT_FILE` / `PII_SENSITIVE_NAMES_FILE` / `PII_CUSTOM_DICT` | 空 | 同上（字典形态；TXT 每行一名，`#` 注释忽略） |
 | 脱敏 | `PII_VALUE_SAMPLE_ENABLED` | 关闭 | 值级采样总开关 |
 | 脱敏 | `PII_VALUE_SAMPLE_PERSIST` | 开启 | 值级采样落盘 |
 | 脱敏 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 未设退化为 SHA256 |
-| 脱敏 | `PII_PLACEHOLDER_PROMPT` | 开启 | 占位符说明注入；`0/false/no` 关闭 |
+| 脱敏 | `PII_PLACEHOLDER_PROMPT` | 开启 | 占位符说明注入；`0/false/no/off` 关闭 |
 | 脱敏 | `PII_PLACEHOLDER_PROMPT_TEXT` | 内建默认 | 自定义文案（4KB 上限，超限截断；含合法占位符形态回退默认） |
 | 脱敏 | `PII_HOLD_MAX` | `64` | PII 保持上限（须 ≥1 正整数） |
 | 脱敏 | `NORMALIZE_JSON_WHITESPACE` | 关闭 | 仅 `"1"` 开启请求体空白归一 |
@@ -63,8 +63,8 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | LLM | `HTTP_TIMEOUT_SECS` | `30` | 上游转发整体超时（秒） |
 | LLM | `HTTP_POOL_MAX_IDLE_PER_HOST` | `16` | 每主机空闲连接上限 |
 | LLM | `HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | 空闲连接保活（秒） |
-| compose 专用 | `PORT_8877` / `PORT_8878` / `PORT_8879` | `8877/8878/8879` | 仅改宿主机映射端口，不改容器内监听 |
-| compose 专用 | `TPM_HOST_PATH` / `DB_HOST_PATH` | `./data/tpm` / `./data/db` | 宿主机只读挂载源 |
+| compose 专用 | `PORT_8877` / `PORT_8878` / `PORT_8879` | `8877/8878/8879` | 仅改宿主机映射端口，不改容器内监听；二进制直跑时忽略（只监听 `127.0.0.1:8877`） |
+| compose 专用 | `TPM_HOST_PATH` / `DB_HOST_PATH` | `./data/tpm` / `./data/db` | 宿主机只读挂载源；二进制直跑时忽略 |
 
 ### 端口语义：单端口运行时 vs compose 三端口映射
 
@@ -73,6 +73,8 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
   `LLM_8878`/`LLM_8879` 按入口宿主机端口选择上游，`LLM_UPSTREAM` 为缺省上游。宿主机端口可经
   `PORT_8877/8878/8879` 覆盖，回环绑定不变。
 - 不存在多端口运行时重构：多端口语义仅为文档声明，当前行为由 `resolve_upstream` 单测锁定。
+  选路上游缺省唯一生效：`resolve_upstream(None)` 恒返回 `LLM_UPSTREAM` 缺省上游（未设则取首个
+  `LLM_<port>`），不按端口猜测；`LLM_8878`/`LLM_8879` 仅在携带入口宿主机端口上下文时生效。
 
 ### 管理控制台说明（`admin.html` 范围）
 
@@ -124,7 +126,8 @@ docker compose up -d --build
 ```bash
 # 存活探针（无需鉴权）
 curl -fsS http://127.0.0.1:8877/health
-# 期望：{"ok":true,"sqlite_ok":true,"sqlite_error":null}
+# 期望（含超集字段 status/unlocked，向后兼容只增不减）：
+# {"ok":true,"sqlite_ok":true,"sqlite_error":null,"status":"ok","unlocked":true}
 
 # 管理面探针（需 X-Admin-Token）
 curl -fsS -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8877/_admin/health
@@ -159,7 +162,7 @@ curl -fsS http://127.0.0.1:8877/credential \
 
 ## 3. 限流规则
 
-- 通用 admin 接口按源 IP 限流 `10/min`，超限返回 `429` 并携带 `Retry-After` 头。
+- 通用 admin 接口按源 IP 限流 `10/min`，超限返回 `429` 并携带 `Retry-After` 头（头名大小写不敏感， wire 形态为小写 `retry-after`）。
 - `/_admin/events/stream` 按 IP 限制并发 `5`，超限拒绝新连接而不影响已建连接；
   保活 `60s` ping，`5min` 服务端强制重连。
 - `10/min` 为速率维度、`5`/IP 为并发维度，两者正交且均为有意设计。
@@ -175,6 +178,16 @@ for i in $(seq 1 11); do
 done
 ```
 
+### 旧查询兼容（已弃用，新口径优先）
+
+旧大盘可继续工作，响应附 `deprecated` + `compat` 标注；新调用方请直接用新口径：
+
+| 旧查询 | 兼容行为 | 新口径 |
+|:-------|:---------|:-------|
+| `series?range=1h/24h/7d/30d` | 映射 `1h→five_min`、`24h→hourly`、`7d/30d→daily`，与同窗新口径等价 | `series?granularity=daily\|hourly\|five_min&since=&protocol=` |
+| `metrics/events?model=&upstream=` | 忽略过滤（全局口径，避免空结果误导）+ 弃用标注 | `series?protocol=` 按协议查询 |
+| `events?verdict=<旧值>` | 接受 `allow/allowed/pass/approved/block/blocked/deny/rejected/need_approval/pending/approve` 并归一；命中环内 `kind` 才过滤，否则忽略过滤 + 弃用标注 | `events?kind=&since=&limit=` |
+
 ## 4. 阈值表
 
 下表与 `admin-ratelimit-contract` spec 同字；差异均为有意设计（不同检查点），超限行为统一为
@@ -184,8 +197,8 @@ done
 |:-----|:-----|:---------|:-----|
 | 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 速率维度；按 TCP 远端地址计数，不采信代理头 |
 | SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 并发维度；与 `10/min` 正交；`60s` ping + `5min` 强制重连 |
-| 通用请求体上限 | `10MB` | `413` | 通用 JSON 检查点 |
-| 审计类上限 | `8MB` | `413` | 审计 hold/扫描上限类检查点；与 `10MB` 属不同检查点，差异有意 |
+| 通用请求体上限 | `10MB` | `413` | 通用 JSON 检查点（入口唯一 enforcement） |
+| 审计类上限 | `8MB` | —（不接入口） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `AUDIT_HOLD_MAX_BYTES` 默认 1MB 均不得超过它）；入口 enforcement 仅 `10MB`，两表属不同检查点、差异有意 |
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
 | 审批超时 | `AUDIT_TIMEOUT` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
 | 凭据审批超时 | `300`s | — | 与审计 `AUDIT_TIMEOUT` 分表 |
@@ -217,3 +230,42 @@ get revoke --name "check-mail"
 - 三因子字段：`X-Get-Binary-Hash` + `X-Get-Binary-Secret`（或 `body.secret`）+ `body.auth.caller_hash` /
   `caller_path`；齐全时按既有语义放行或进入审批，缺失时返回明确的鉴权失败（403），不会空响应或挂起。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
+
+## 6. 行为变更（BREAKING）与迁移
+
+下述三处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
+按迁移步骤调整后可回到预期行为，无静默变严或明文落盘增量。
+
+### 6.1 脱敏总开关默认开启（原仓默认关闭）
+
+- 变更：`REDACTION_ENABLED` 两者皆空时默认开启；原仓默认关闭。
+- 影响：旧 compose 若未显式配置，会被静默变严（请求被脱敏）。
+- 迁移：沿用原仓行为请显式关闭：
+  ```bash
+  REDACTION_ENABLED=0
+  ```
+
+### 6.2 PII 值采样持久默认开启落盘（原仓内存-only）
+
+- 变更：`PII_VALUE_SAMPLE_PERSIST` 默认开启（掩码 + hash 落盘 `pii_value_samples` 表，7 天滚动）；
+  原仓内存-only 不落盘。注意采样总开关 `PII_VALUE_SAMPLE_ENABLED` 默认仍关闭，
+  仅在其开启后持久语义才生效。
+- 影响：开启采样后会产生落盘增量；未设 `PII_VALUE_SAMPLE_HMAC_KEY` 时 hash 为无盐 SHA256，
+  低熵 PII 可被离线字典枚举（仅趋势参考，生产必须配置 HMAC key）。
+- 迁移：回到内存-only 请显式关闭持久，或整体关闭采样（默认即关闭）：
+  ```bash
+  PII_VALUE_SAMPLE_PERSIST=0
+  # 或
+  PII_VALUE_SAMPLE_ENABLED=0
+  ```
+  生产启用采样时必须配置：
+  ```bash
+  PII_VALUE_SAMPLE_HMAC_KEY="$(openssl rand -hex 32)"
+  ```
+
+### 6.3 凭据淘汰 FIFO 改 LRU（含容量分表声明）
+
+- 变更：凭据映射淘汰策略由 FIFO 改为 LRU（最久未用优先淘汰）；容量分表：
+  凭据表 `MAX_TOKEN_ENTRIES=5000`，PII 请求/响应单表 `PII_MAX_ENTRIES=1000`。
+- 影响：热点凭据驻留更久，冷凭据更快被淘汰；容量语义以本表为准。
+- 迁移：无配置项需改；如依赖旧 FIFO 逐出顺序做容量估算，请按上表容量重估。
