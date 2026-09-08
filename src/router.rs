@@ -237,7 +237,8 @@ mod tests {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
         let token = "observability-admin-token-0123456789";
-        for _ in 0..crate::service::admin::ADMIN_RATE_LIMIT {
+        // health 豁免限流（§6.2）：连续命中恒 200，不被误伤。
+        for _ in 0..crate::service::admin::ADMIN_RATE_LIMIT + 1 {
             let ok = client
                 .get(format!("{base}/_admin/health"))
                 .header("X-Admin-Token", token)
@@ -246,8 +247,18 @@ mod tests {
                 .unwrap();
             assert_eq!(ok.status().as_u16(), 200);
         }
+        // 非豁免路由：10/min 后第 11 次 429 带 retry-after。
+        for _ in 0..crate::service::admin::ADMIN_RATE_LIMIT {
+            let ok = client
+                .get(format!("{base}/_admin/metrics"))
+                .header("X-Admin-Token", token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status().as_u16(), 200);
+        }
         let limited = client
-            .get(format!("{base}/_admin/health"))
+            .get(format!("{base}/_admin/metrics"))
             .header("X-Admin-Token", token)
             .send()
             .await

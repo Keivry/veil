@@ -29,8 +29,9 @@ use {
 
 /// 内存环容量（最近 10k 样本）。
 pub const RING_CAP: usize = 10_000;
-/// 延迟桶边界（毫秒），11 条边界 → 12 桶（含上溢桶）。
-pub const LATENCY_BOUNDS_MS: [u64; 11] = [5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000];
+/// 延迟桶边界（毫秒），对标原仓 12 桶 Python 边界；11 条边界 → 12 桶（含上溢桶）。
+pub const LATENCY_BOUNDS_MS: [u64; 11] =
+    [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
 /// 延迟桶数（硬性 12）。
 pub const LATENCY_BUCKETS: usize = 12;
 /// `truncated_mode` 唯一三态（他值不落指标）。
@@ -52,7 +53,8 @@ pub fn bucket_index(latency_ms: u64) -> usize {
         .unwrap_or(LATENCY_BUCKETS - 1)
 }
 
-/// 12 桶近似 p95：返回累积 ≥95% 所在桶的上界（上溢桶返回最后边界）。
+/// 12 桶近似 p95：首个累积 ≥95% 所在桶的桶中位 `(lower+upper)/2`（对标原仓口径）；
+/// 上溢桶返回最后边界（无上界，中位无定义）。
 pub fn p95_approx(buckets: &[u64; LATENCY_BUCKETS]) -> u64 {
     let total: u64 = buckets.iter().sum();
     if total == 0 {
@@ -63,10 +65,20 @@ pub fn p95_approx(buckets: &[u64; LATENCY_BUCKETS]) -> u64 {
     for (i, &c) in buckets.iter().enumerate() {
         acc += c;
         if acc >= threshold {
-            return LATENCY_BOUNDS_MS.get(i).copied().unwrap_or(u64::MAX);
+            let upper = LATENCY_BOUNDS_MS.get(i).copied().unwrap_or(u64::MAX);
+            if upper == u64::MAX {
+                return LATENCY_BOUNDS_MS[LATENCY_BOUNDS_MS.len() - 1];
+            }
+            let lower = if i == 0 { 0 } else { LATENCY_BOUNDS_MS[i - 1] };
+            return (lower + upper) / 2;
         }
     }
     LATENCY_BOUNDS_MS[LATENCY_BOUNDS_MS.len() - 1]
+}
+
+/// 精确性双条件（对标原仓）：`窗口覆盖 ≥3600s && 样本 ≥100` 才标精确，否则近似标 `≈`。
+pub fn is_precise_for_window(coverage_secs: u64, samples: u64) -> bool {
+    coverage_secs >= 3600 && samples >= 100
 }
 
 /// 单个请求样本（仅对话端点）。
@@ -78,8 +90,23 @@ pub struct MetricSample {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cached_read: u64,
+    pub cached_write: u64,
+    pub unknown: u64,
     pub truncated_mode: Option<String>,
     pub is_precise: bool,
+}
+
+/// 扩展 usage（对标原仓 `cached_read/cached_write/unknown` 三列）。
+/// `Usage` 结构体归属网关模块（禁触），本结构为指标侧加法口径。
+#[derive(Debug, Clone, Default)]
+pub struct ExtendedUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_read: u64,
+    pub cached_write: u64,
+    pub unknown: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,6 +129,12 @@ struct WindowAgg {
     prompt: u64,
     completion: u64,
     total: u64,
+    cached_read: u64,
+    cached_write: u64,
+    unknown: u64,
+    pii_hits: u64,
+    cred_hits: u64,
+    audit_blocks: u64,
     buckets: [u64; LATENCY_BUCKETS],
     t_silent: u64,
     t_open: u64,
@@ -152,15 +185,31 @@ impl MetricsStore {
         }
     }
 
-    /// 记录一次对话端点观测。非对话（`Protocol::NonDialog`）直接跳过返回 `false`。
-    ///
-    /// `truncated_mode` 仅三态落标签，他值忽略并记告警，不失败。
-    /// `is_precise` 由调用方按 `sqlite_ok` 传入（降级内存-only 时为假）。
+    /// 记录一次对话端点观测（基础口径，扩展列置零；签名兼容版）。
     pub fn record_chat(
         &self,
         protocol: Protocol,
         latency_ms: u64,
         usage: Option<&Usage>,
+        truncated_mode: Option<&str>,
+        is_precise: bool,
+        ts_secs: i64,
+    ) -> bool {
+        let ext = usage.map(|u| ExtendedUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            ..ExtendedUsage::default()
+        });
+        self.record_chat_extended(protocol, latency_ms, ext.as_ref(), truncated_mode, is_precise, ts_secs)
+    }
+
+    /// 记录一次对话端点观测（扩展口径：含 `cached_read/write/unknown`）。
+    pub fn record_chat_extended(
+        &self,
+        protocol: Protocol,
+        latency_ms: u64,
+        usage: Option<&ExtendedUsage>,
         truncated_mode: Option<&str>,
         is_precise: bool,
         ts_secs: i64,
@@ -177,17 +226,17 @@ impl MetricsStore {
             None => None,
         };
         let proto = protocol.as_tail().to_string();
-        let (prompt, completion, total) = match usage {
-            Some(u) => (u.prompt_tokens, u.completion_tokens, u.total_tokens),
-            None => (0, 0, 0),
-        };
+        let ext = usage.cloned().unwrap_or_default();
         let sample = MetricSample {
             ts_secs,
             protocol: proto.clone(),
             latency_ms,
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
+            prompt_tokens: ext.prompt_tokens,
+            completion_tokens: ext.completion_tokens,
+            total_tokens: ext.total_tokens,
+            cached_read: ext.cached_read,
+            cached_write: ext.cached_write,
+            unknown: ext.unknown,
             truncated_mode: truncated.clone(),
             is_precise,
         };
@@ -212,9 +261,12 @@ impl MetricsStore {
                     })
                     .or_default();
                 entry.count += 1;
-                entry.prompt += prompt;
-                entry.completion += completion;
-                entry.total += total;
+                entry.prompt += ext.prompt_tokens;
+                entry.completion += ext.completion_tokens;
+                entry.total += ext.total_tokens;
+                entry.cached_read += ext.cached_read;
+                entry.cached_write += ext.cached_write;
+                entry.unknown += ext.unknown;
                 entry.buckets[bucket_index(latency_ms)] += 1;
                 match truncated.as_deref() {
                     Some("silent_discard") => entry.t_silent += 1,
@@ -236,6 +288,7 @@ impl MetricsStore {
     /// 快照（`/_admin/metrics` 口径）：聚合内存环 + 窗口累计。
     pub fn snapshot(&self) -> MetricsSnapshot {
         let (mut count, mut prompt, mut completion, mut total) = (0u64, 0u64, 0u64, 0u64);
+        let (mut cached_read, mut cached_write, mut unknown) = (0u64, 0u64, 0u64);
         let mut buckets = [0u64; LATENCY_BUCKETS];
         let mut t_silent = 0u64;
         let mut t_open = 0u64;
@@ -243,12 +296,22 @@ impl MetricsStore {
         let mut per_protocol: HashMap<String, u64> = HashMap::new();
         let mut precise_true = 0u64;
         let mut precise_total = 0u64;
+        let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
         if let Ok(ring) = self.ring.lock() {
             for s in ring.iter() {
                 count += 1;
+                if s.ts_secs < min_ts {
+                    min_ts = s.ts_secs;
+                }
+                if s.ts_secs > max_ts {
+                    max_ts = s.ts_secs;
+                }
                 prompt += s.prompt_tokens;
                 completion += s.completion_tokens;
                 total += s.total_tokens;
+                cached_read += s.cached_read;
+                cached_write += s.cached_write;
+                unknown += s.unknown;
                 buckets[bucket_index(s.latency_ms)] += 1;
                 *per_protocol.entry(s.protocol.clone()).or_insert(0) += 1;
                 precise_total += 1;
@@ -268,14 +331,26 @@ impl MetricsStore {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: total,
+            cached_read,
+            cached_write,
+            unknown,
             latency_buckets: buckets,
             p95_ms: p95_approx(&buckets),
             per_protocol,
             truncated_silent_discard: t_silent,
             truncated_open_ended: t_open,
             truncated_synthesized_failed: t_synth,
-            // 全精确才标精确（降级期混入近似即为假，仅趋势参考）。
-            is_precise: precise_total > 0 && precise_true == precise_total,
+            // 精确性双条件（窗口覆盖 ≥3600s 且样本 ≥100）叠加降级样本一票否决。
+            is_precise: {
+                let coverage = if count == 0 {
+                    0
+                } else {
+                    (max_ts - min_ts).max(0) as u64
+                };
+                is_precise_for_window(coverage, count)
+                    && precise_total > 0
+                    && precise_true == precise_total
+            },
             ring_len: count as usize,
             dropped: self.dropped_total(),
         }
@@ -309,6 +384,55 @@ impl MetricsStore {
         .map_err(|e| anyhow::anyhow!("metrics 刷盘任务异常: {e}"))?
     }
 
+    /// 附属计数（pii/cred/audit 三列，日/小时口径）：网关侧审计与脱敏事件回填。
+    /// 与 `record_chat` 独立累积，flush 时同窗合并（覆盖式 UPSERT）。
+    pub fn record_aux_counts(
+        &self,
+        protocol: Protocol,
+        ts_secs: i64,
+        pii_hits: u64,
+        cred_hits: u64,
+        audit_blocks: u64,
+    ) {
+        if protocol == Protocol::NonDialog {
+            return;
+        }
+        let proto = protocol.as_tail().to_string();
+        if let Ok(mut aggs) = self.aggs.lock() {
+            for (g, key) in [
+                (Granularity::Daily, day_key(ts_secs)),
+                (Granularity::Hourly, hour_key(ts_secs)),
+                (Granularity::FiveMin, five_min_key(ts_secs)),
+            ] {
+                let entry = aggs
+                    .entry(AggKey {
+                        granularity: g,
+                        window: key,
+                        protocol: proto.clone(),
+                    })
+                    .or_default();
+                entry.pii_hits += pii_hits;
+                entry.cred_hits += cred_hits;
+                entry.audit_blocks += audit_blocks;
+            }
+        }
+    }
+
+    /// 重启回填：从 sqlite 读回各粒度聚合，恢复内存窗口累计（覆盖式，不翻倍）。
+    pub async fn backfill_from_sqlite(&self) -> anyhow::Result<usize> {
+        let db_path = self.db_path.clone();
+        let rows = tokio::task::spawn_blocking(move || backfill_rows_blocking(&db_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("metrics 回填任务异常: {e}"))??;
+        let n = rows.len();
+        if let Ok(mut aggs) = self.aggs.lock() {
+            for (key, agg) in rows {
+                aggs.insert(key, agg);
+            }
+        }
+        Ok(n)
+    }
+
     /// 时序查询（`/_admin/series` 口径）：读 sqlite 聚合表。
     pub async fn query_series(
         &self,
@@ -335,6 +459,9 @@ pub struct MetricsSnapshot {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cached_read: u64,
+    pub cached_write: u64,
+    pub unknown: u64,
     pub latency_buckets: [u64; LATENCY_BUCKETS],
     pub p95_ms: u64,
     pub per_protocol: HashMap<String, u64>,
@@ -355,6 +482,12 @@ pub struct SeriesPoint {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cached_read: u64,
+    pub cached_write: u64,
+    pub unknown: u64,
+    pub pii_hits: u64,
+    pub cred_hits: u64,
+    pub audit_blocks: u64,
     pub truncated_silent_discard: u64,
     pub truncated_open_ended: u64,
     pub truncated_synthesized_failed: u64,
@@ -381,6 +514,12 @@ fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             prompt_tokens INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_read INTEGER NOT NULL DEFAULT 0,
+            cached_write INTEGER NOT NULL DEFAULT 0,
+            unknown INTEGER NOT NULL DEFAULT 0,
+            pii_hits INTEGER NOT NULL DEFAULT 0,
+            cred_hits INTEGER NOT NULL DEFAULT 0,
+            audit_blocks INTEGER NOT NULL DEFAULT 0,
             t_silent INTEGER NOT NULL DEFAULT 0,
             t_open INTEGER NOT NULL DEFAULT 0,
             t_synth INTEGER NOT NULL DEFAULT 0,
@@ -392,6 +531,12 @@ fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             prompt_tokens INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_read INTEGER NOT NULL DEFAULT 0,
+            cached_write INTEGER NOT NULL DEFAULT 0,
+            unknown INTEGER NOT NULL DEFAULT 0,
+            pii_hits INTEGER NOT NULL DEFAULT 0,
+            cred_hits INTEGER NOT NULL DEFAULT 0,
+            audit_blocks INTEGER NOT NULL DEFAULT 0,
             t_silent INTEGER NOT NULL DEFAULT 0,
             t_open INTEGER NOT NULL DEFAULT 0,
             t_synth INTEGER NOT NULL DEFAULT 0,
@@ -403,12 +548,36 @@ fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             prompt_tokens INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_read INTEGER NOT NULL DEFAULT 0,
+            cached_write INTEGER NOT NULL DEFAULT 0,
+            unknown INTEGER NOT NULL DEFAULT 0,
+            pii_hits INTEGER NOT NULL DEFAULT 0,
+            cred_hits INTEGER NOT NULL DEFAULT 0,
+            audit_blocks INTEGER NOT NULL DEFAULT 0,
             t_silent INTEGER NOT NULL DEFAULT 0,
             t_open INTEGER NOT NULL DEFAULT 0,
             t_synth INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY(window, protocol));
-         CREATE TABLE IF NOT EXISTS pii_value_samples(
+            PRIMARY KEY(window, protocol));",
+    )?;
+    // 存量库兼容：旧表缺新列时补列（双写兼容视图对等，旧大盘不断链）。
+    for table in ["metrics_daily", "metrics_hourly", "metrics_five_min"] {
+        for col in [
+            "cached_read",
+            "cached_write",
+            "unknown",
+            "pii_hits",
+            "cred_hits",
+            "audit_blocks",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
+        }
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pii_value_samples(
             hash TEXT PRIMARY KEY, kind TEXT NOT NULL,
             mask TEXT NOT NULL, hits INTEGER NOT NULL DEFAULT 1,
             first_seen INTEGER NOT NULL DEFAULT 0,
@@ -442,11 +611,15 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
         };
         let sql = format!(
             "INSERT INTO {table}(window, protocol, requests, prompt_tokens, completion_tokens, \
-             total_tokens, t_silent, t_open, t_synth, buckets) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             total_tokens, cached_read, cached_write, unknown, pii_hits, cred_hits, audit_blocks, \
+             t_silent, t_open, t_synth, buckets) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
              ON CONFLICT(window, protocol) DO UPDATE SET \
              requests=excluded.requests, prompt_tokens=excluded.prompt_tokens, \
              completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens, \
+             cached_read=excluded.cached_read, cached_write=excluded.cached_write, \
+             unknown=excluded.unknown, pii_hits=excluded.pii_hits, cred_hits=excluded.cred_hits, \
+             audit_blocks=excluded.audit_blocks, \
              t_silent=excluded.t_silent, t_open=excluded.t_open, t_synth=excluded.t_synth, \
              buckets=excluded.buckets"
         );
@@ -459,6 +632,12 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
                 agg.prompt as i64,
                 agg.completion as i64,
                 agg.total as i64,
+                agg.cached_read as i64,
+                agg.cached_write as i64,
+                agg.unknown as i64,
+                agg.pii_hits as i64,
+                agg.cred_hits as i64,
+                agg.audit_blocks as i64,
                 agg.t_silent as i64,
                 agg.t_open as i64,
                 agg.t_synth as i64,
@@ -514,7 +693,8 @@ fn query_series_blocking(
     };
     let mut sql = format!(
         "SELECT window, protocol, requests, prompt_tokens, completion_tokens,\
-         total_tokens, t_silent, t_open, t_synth FROM {table} WHERE 1=1"
+         total_tokens, cached_read, cached_write, unknown, pii_hits, cred_hits, audit_blocks, \
+         t_silent, t_open, t_synth FROM {table} WHERE 1=1"
     );
     if since.is_some() {
         sql.push_str(" AND window >= ?");
@@ -540,9 +720,15 @@ fn query_series_blocking(
             prompt_tokens: row.get::<_, i64>(3)? as u64,
             completion_tokens: row.get::<_, i64>(4)? as u64,
             total_tokens: row.get::<_, i64>(5)? as u64,
-            truncated_silent_discard: row.get::<_, i64>(6)? as u64,
-            truncated_open_ended: row.get::<_, i64>(7)? as u64,
-            truncated_synthesized_failed: row.get::<_, i64>(8)? as u64,
+            cached_read: row.get::<_, i64>(6)? as u64,
+            cached_write: row.get::<_, i64>(7)? as u64,
+            unknown: row.get::<_, i64>(8)? as u64,
+            pii_hits: row.get::<_, i64>(9)? as u64,
+            cred_hits: row.get::<_, i64>(10)? as u64,
+            audit_blocks: row.get::<_, i64>(11)? as u64,
+            truncated_silent_discard: row.get::<_, i64>(12)? as u64,
+            truncated_open_ended: row.get::<_, i64>(13)? as u64,
+            truncated_synthesized_failed: row.get::<_, i64>(14)? as u64,
         })
     })?;
     let mut out = Vec::new();
@@ -552,8 +738,59 @@ fn query_series_blocking(
     Ok(out)
 }
 
-fn chmod_0600(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
+/// 重启回填行读取：三粒度表全量读回内存聚合（flush 覆盖式语义，重启不丢窗）。
+fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowAgg)>> {
+    let conn = connect_wal(db_path)?;
+    ensure_tables(&conn)?;
+    let mut out = Vec::new();
+    for (gran, table) in [
+        (Granularity::Daily, "metrics_daily"),
+        (Granularity::Hourly, "metrics_hourly"),
+        (Granularity::FiveMin, "metrics_five_min"),
+    ] {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT window, protocol, requests, prompt_tokens, completion_tokens, total_tokens, \
+             cached_read, cached_write, unknown, pii_hits, cred_hits, audit_blocks, \
+             t_silent, t_open, t_synth, buckets FROM {table}"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            let buckets_s: String = row.get(15)?;
+            let mut buckets = [0u64; LATENCY_BUCKETS];
+            for (i, part) in buckets_s.split(',').enumerate().take(LATENCY_BUCKETS) {
+                buckets[i] = part.trim().parse().unwrap_or(0);
+            }
+            Ok((
+                AggKey {
+                    granularity: gran,
+                    window: row.get(0)?,
+                    protocol: row.get(1)?,
+                },
+                WindowAgg {
+                    count: row.get::<_, i64>(2)? as u64,
+                    prompt: row.get::<_, i64>(3)? as u64,
+                    completion: row.get::<_, i64>(4)? as u64,
+                    total: row.get::<_, i64>(5)? as u64,
+                    cached_read: row.get::<_, i64>(6)? as u64,
+                    cached_write: row.get::<_, i64>(7)? as u64,
+                    unknown: row.get::<_, i64>(8)? as u64,
+                    pii_hits: row.get::<_, i64>(9)? as u64,
+                    cred_hits: row.get::<_, i64>(10)? as u64,
+                    audit_blocks: row.get::<_, i64>(11)? as u64,
+                    t_silent: row.get::<_, i64>(12)? as u64,
+                    t_open: row.get::<_, i64>(13)? as u64,
+                    t_synth: row.get::<_, i64>(14)? as u64,
+                    buckets,
+                },
+            ))
+        })?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
+fn chmod_0600(path: &Path) {    use std::os::unix::fs::PermissionsExt as _;
     if !path.exists() {
         return;
     }
@@ -880,10 +1117,19 @@ mod tests {
     }
 
     #[test]
-    fn 延迟12桶p95近似() {
+    fn 延迟12桶与原仓边界可比() {
+        assert_eq!(
+            LATENCY_BOUNDS_MS,
+            [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000]
+        );
+        assert_eq!(LATENCY_BUCKETS, 12);
         assert_eq!(bucket_index(3), 0);
         assert_eq!(bucket_index(10_000), 10);
         assert_eq!(bucket_index(99_999), 11);
+    }
+
+    #[test]
+    fn p95桶中位近似() {
         let mut buckets = [0u64; LATENCY_BUCKETS];
         for _ in 0..95 {
             buckets[bucket_index(8)] += 1;
@@ -891,17 +1137,32 @@ mod tests {
         for _ in 0..5 {
             buckets[bucket_index(9000)] += 1;
         }
-        // 95% 落在 10ms 桶。
-        assert_eq!(p95_approx(&buckets), 10);
+        // 95% 落 [0,10] 桶，中位 5。
+        assert_eq!(p95_approx(&buckets), 5);
         assert_eq!(p95_approx(&[0u64; LATENCY_BUCKETS]), 0);
+        // [800,1500) 桶中位 (800+1500)/2=1150。
+        let mut b2 = [0u64; LATENCY_BUCKETS];
+        b2[bucket_index(1000)] = 100;
+        assert_eq!(p95_approx(&b2), 1150);
     }
 
     #[test]
-    fn is_precise标记精确与近似() {
+    fn is_precise双条件() {
+        assert!(!is_precise_for_window(3600, 99));
+        assert!(!is_precise_for_window(3599, 100));
+        assert!(is_precise_for_window(3600, 100));
         let store = MetricsStore::new(tmp_db("precise"));
+        // 少样本低覆盖一律近似（标≈）。
         store.record_chat(Protocol::Chat, 5, None, None, true, now());
+        assert!(!store.snapshot().is_precise);
+        // 100 样本跨 3600s 全精确 → 精确。
+        let base = now() - 4000;
+        for i in 0..100 {
+            store.record_chat(Protocol::Chat, 5, None, None, true, base + i * 40);
+        }
         assert!(store.snapshot().is_precise);
-        store.record_chat(Protocol::Chat, 5, None, None, false, now());
+        // 混入降级样本 → 近似。
+        store.record_chat(Protocol::Chat, 5, None, None, false, base + 4100);
         assert!(!store.snapshot().is_precise);
     }
 
@@ -945,6 +1206,58 @@ mod tests {
         assert_eq!(snap.truncated_open_ended, 1);
         assert_eq!(snap.truncated_synthesized_failed, 1);
         assert_eq!(snap.requests, 4);
+    }
+
+    #[test]
+    fn 扩展usage三列与aux回填() {
+        let db = tmp_db("ext-usage");
+        let _ = std::fs::remove_file(&db);
+        let ts = now();
+        let store = MetricsStore::new(db.clone());
+        store.record_chat_extended(
+            Protocol::Chat,
+            20,
+            Some(&ExtendedUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+                cached_read: 40,
+                cached_write: 5,
+                unknown: 1,
+            }),
+            None,
+            true,
+            ts,
+        );
+        store.record_aux_counts(Protocol::Chat, ts, 7, 3, 2);
+        let snap = store.snapshot();
+        assert_eq!(snap.cached_read, 40);
+        assert_eq!(snap.cached_write, 5);
+        assert_eq!(snap.unknown, 1);
+    }
+
+    #[tokio::test]
+    async fn aux列落盘查询与重启回填() {
+        let db = tmp_db("aux-flush");
+        let _ = std::fs::remove_file(&db);
+        let ts = now();
+        let store = MetricsStore::new(db.clone());
+        store.record_chat(Protocol::Chat, 12, Some(&usage(1, 2, 3)), None, true, ts);
+        store.record_aux_counts(Protocol::Chat, ts, 7, 3, 2);
+        store.flush().await.unwrap();
+        let pts = store
+            .query_series("daily", None, Some("chat/completions".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].pii_hits, 7);
+        assert_eq!(pts[0].cred_hits, 3);
+        assert_eq!(pts[0].audit_blocks, 2);
+        // 重启回填：新 store 读旧库恢复窗口累计。
+        let store2 = MetricsStore::new(db.clone());
+        let n = store2.backfill_from_sqlite().await.unwrap();
+        assert!(n >= 3, "三粒度至少各一窗: {n}");
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

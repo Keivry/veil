@@ -75,6 +75,15 @@ pub const EVENT_RING_CAP: usize = 512;
 /// 事件查询默认上限。
 pub const EVENT_DEFAULT_LIMIT: usize = 100;
 
+/// 限流豁免路径：`/_admin/health` 为存活探针（前端刷新高频），豁免通用 10/min 限流。
+/// 阈值数值不动（10/min 等接线维持），仅 health 不计数。
+pub fn admin_rate_exempt_paths() -> [&'static str; 1] { ["/_admin/health"] }
+
+/// 是否豁免限流（health 恒 true）。
+pub fn is_rate_exempt(path: &str) -> bool {
+    admin_rate_exempt_paths().contains(&path)
+}
+
 /// 旧查询 `range` 兼容：`1h/24h/7d/30d` 映射新口径 `granularity`；未知值返回 `None`。
 /// 映射等价性：`1h→five_min`、`24h→hourly`、`7d/30d→daily`，与新口径同窗查询等价。
 pub fn compat_granularity_for_range(range: &str) -> Option<&'static str> {
@@ -122,9 +131,11 @@ pub fn admin_token_eq(provided: &str, expected: &str) -> bool {
     tags_eq && len_eq && provided.len() == expected.len()
 }
 
-/// 从 `Cookie` 头提取 `__Host-admin_token`。
+/// 从 `Cookie` 头提取 admin token（`__Host-admin_token` 优先，回退 `admin_token`
+/// 兼容 http；对标原仓 `_cookie_token` 双名）。
 pub fn cookie_admin_token(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    let mut fallback: Option<String> = None;
     for part in raw.split(';') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix("__Host-admin_token=") {
@@ -133,8 +144,45 @@ pub fn cookie_admin_token(headers: &HeaderMap) -> Option<String> {
                 return Some(v);
             }
         }
+        if fallback.is_none()
+            && let Some(v) = part.strip_prefix("admin_token=")
+        {
+            let v = v.trim().trim_matches('"').to_string();
+            if !v.is_empty() {
+                fallback = Some(v);
+            }
+        }
     }
-    None
+    fallback
+}
+
+/// `DATA_DIR/admin_token` 文件值读取（Token 独立性第二锚点：文件值须与
+/// `MATRIX_ACCESS_TOKEN` 不同，由网关启动期校验；缺失/空返回 None）。
+pub fn load_admin_token_file(data_dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(data_dir.join("admin_token")).ok()?;
+    let v = text.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// 回环免 token 放行判定（对标原仓）：仅 `ENV=dev` 且回环远端时豁免鉴权，
+/// 生产回环同样鉴权（Docker/反代下回环不可靠，fail-closed）。
+/// 完整 bypass 接线（`ALLOW_LOOPBACK_NO_TOKEN` 门 + 鉴权前判定）归网关入口，
+/// 本函数只提供纯判定供接线与单测。
+pub fn loopback_grace(env_is_dev: bool, remote: &str) -> bool {
+    if !env_is_dev {
+        return false;
+    }
+    let r = remote.trim().trim_start_matches('[').trim_end_matches(']');
+    r == "127.0.0.1" || r == "::1" || r == "::ffff:127.0.0.1"
+}
+
+/// 可观测性总开关：`OBSERVABILITY_DISABLE=1` 时管理面显式禁用（过渡逃生开关，
+/// 对标原仓；网关入口据此拒绝注册 admin 路由并告警）。
+pub fn observability_disabled(env: &HashMap<String, String>) -> bool {
+    matches!(
+        env.get("OBSERVABILITY_DISABLE").map(|v| v.trim()),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 /// 管理事件（摘要落盘前已 `redact → truncate`，零明文）。
@@ -350,8 +398,7 @@ fn unauthorized(message: &str) -> Response {
         .into_response()
 }
 
-/// 超限响应：429 + `Retry-After`（秒）+ 错误码 `E_RATE_LIMITED`（spec 锁定）。
-/// 头名小写 `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）。
+/// 超限响应：429 + `Retry-After`（秒）+ 错误码 `E_RATE_LIMITED`（spec 锁定）。/// 头名小写 `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）。
 fn rate_limited(retry_after: u64) -> Response {
     let mut resp = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -420,6 +467,43 @@ fn check_admin_rate(state: &AppState, ip: IpAddr) -> Option<Response> {
     }
 }
 
+/// 头凭证有效时签发登录 Cookie（对标原仓：仅非 SSE 路由签发）。
+/// https 经 `X-Forwarded-Proto` 识别签发 `__Host-admin_token`（Secure），
+/// 否则回退 `admin_token` 兼容 http；token 含非法 cookie-octet 字符时拒绝签发。
+fn with_admin_cookie(mut resp: Response, headers: &HeaderMap, expected: &str) -> Response {
+    let Some(got) = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    else {
+        return resp;
+    };
+    if !admin_token_eq(got, expected) {
+        return resp;
+    }
+    if got
+        .chars()
+        .any(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '~' | '+' | '/' | '-' | '='))
+    {
+        tracing::warn!("拒绝签发 Cookie：X-Admin-Token 含非法 cookie-octet 字符");
+        return resp;
+    }
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+    let value = if https {
+        format!("__Host-admin_token={got}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600")
+    } else {
+        format!("admin_token={got}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600")
+    };
+    if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+        resp.headers_mut()
+            .insert(axum::http::header::SET_COOKIE, v);
+    }
+    resp
+}
+
 /// `GET /_admin/`：JSON 索引占位（终态：返回六路由表与就绪说明，不交付 admin.html 静态页）。
 pub async fn admin_index(
     State(state): State<AppState>,
@@ -441,26 +525,25 @@ pub async fn admin_index(
     ) {
         return r;
     }
-    Json(json!({
+    let body = Json(json!({
         "ok": true,
         "admin": "veil observability",
         "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream"],
         "note": "JSON 索引占位终态：六路由 API + SSE 流已就绪（admin.html 为 Non-Goal）",
     }))
-    .into_response()
+    .into_response();
+    with_admin_cookie(body, &headers, &state.config.observability_admin_token)
 }
 
-/// `GET /_admin/health`：存活探针（透出 sqlite 健康）。
+/// `GET /_admin/health`：存活探针（透出 sqlite 健康；豁免通用限流，见 [`is_rate_exempt`]）。
 pub async fn admin_health(
     State(state): State<AppState>,
     addr: PeerIp,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let ip = addr.0;
-    if let Some(r) = check_admin_rate(&state, ip) {
-        return r;
-    }
+    debug_assert!(is_rate_exempt("/_admin/health"));
+    let _ = addr;
     let has_q = query.contains_key("access_token");
     if let Some(r) = authorize(
         &state.config.observability_admin_token,
@@ -472,8 +555,9 @@ pub async fn admin_health(
         return r;
     }
     let health = crate::service::health_status(&state);
-    Json(json!({"ok": true, "sqlite_ok": health.sqlite_ok, "sqlite_error": health.sqlite_error}))
-        .into_response()
+    let body = Json(json!({"ok": true, "sqlite_ok": health.sqlite_ok, "sqlite_error": health.sqlite_error}))
+        .into_response();
+    with_admin_cookie(body, &headers, &state.config.observability_admin_token)
 }
 
 /// `GET /_admin/metrics`：指标快照（聚合环 + 网关只读计数合并）。
@@ -505,7 +589,7 @@ pub async fn admin_metrics(
         "ok": true,
         "is_precise": snap.is_precise,
         "requests": snap.requests,
-        "tokens": {"prompt": snap.prompt_tokens, "completion": snap.completion_tokens, "total": snap.total_tokens},
+        "tokens": {"prompt": snap.prompt_tokens, "completion": snap.completion_tokens, "total": snap.total_tokens, "cached_read": snap.cached_read, "cached_write": snap.cached_write, "unknown": snap.unknown},
         "per_protocol": snap.per_protocol,
         "latency_buckets": snap.latency_buckets,
         "p95_ms": snap.p95_ms,
@@ -533,7 +617,8 @@ pub async fn admin_metrics(
                 .into();
         body["compat"] = json!(compat);
     }
-    Json(body).into_response()
+    let resp = Json(body).into_response();
+    with_admin_cookie(resp, &headers, &state.config.observability_admin_token)
 }
 
 /// `GET /_admin/series`：时序查询（`?granularity=daily|hourly|five_min&since=&protocol=`）。
@@ -606,7 +691,8 @@ pub async fn admin_series(
                     "range/model/upstream 已弃用：请改用 granularity/since/protocol 新口径".into();
                 body["compat"] = json!(compat);
             }
-            Json(body).into_response()
+            let resp = Json(body).into_response();
+            with_admin_cookie(resp, &headers, &state.config.observability_admin_token)
         }
         Err(e) => VeilError::internal(e).into_response(),
     }
@@ -672,10 +758,65 @@ pub async fn admin_events(
         body["deprecated"] = "verdict/model/upstream 已弃用：请改用 kind/since/limit 新口径".into();
         body["compat"] = json!(compat);
     }
-    Json(body).into_response()
+    let resp = Json(body).into_response();
+    with_admin_cookie(resp, &headers, &state.config.observability_admin_token)
 }
 
-/// `GET /_admin/events/stream`：SSE 实时推送（query 鉴权仅此路由有效）。
+/// SSE 推送节奏（对标原仓）：15s 快照全量 + 2s 增量推送。
+/// 网关接线人注意：当前 `admin_events_stream` 为事件驱动直推（广播即到）；
+/// 若需严格 15s/2s 节奏，网关侧在订阅循环加节流窗（BREAKING 声明备选：保持直推并文档化差异）。
+pub const SSE_SNAPSHOT_SECS: u64 = 15;
+/// SSE 增量推送间隔（秒）。
+pub const SSE_DELTA_SECS: u64 = 2;
+
+/// SSE 建连过滤维度（`?model=&upstream=`；对标原仓建连参数绑定）。
+/// 返回 `(model, upstream)`；空表示不过滤。`model` 按事件 `protocol` 子串匹配，
+/// `upstream` 按事件摘要子串匹配（尽力过滤，形态不符的事件直通）。
+#[derive(Debug, Clone, Default)]
+pub struct SseFilter {
+    pub model: Option<String>,
+    pub upstream: Option<String>,
+}
+
+impl SseFilter {
+    /// 从建连 query 解析过滤维度。
+    pub fn from_query(query: &HashMap<String, String>) -> Self {
+        Self {
+            model: query.get("model").cloned().filter(|v| !v.is_empty()),
+            upstream: query.get("upstream").cloned().filter(|v| !v.is_empty()),
+        }
+    }
+
+    /// 事件 JSON 是否通过过滤（解析失败直通，不丢事件）。
+    pub fn passes(&self, event_json: &str) -> bool {
+        if self.model.is_none() && self.upstream.is_none() {
+            return true;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(event_json) else {
+            return true;
+        };
+        if let Some(m) = self.model.as_deref()
+            && !v
+                .get("protocol")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.contains(m))
+        {
+            return false;
+        }
+        if let Some(u) = self.upstream.as_deref()
+            && !v
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s.contains(u))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// `GET /_admin/events/stream`：SSE 实时推送（query 鉴权仅此路由有效；
+/// 建连 `?model=&upstream=` 过滤维度生效，见 [`SseFilter`]）。
 pub async fn admin_events_stream(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -703,12 +844,15 @@ pub async fn admin_events_stream(
     }
     let rx = state.admin.subscribe();
     let admin = state.admin.clone();
+    // 建连过滤维度（model/upstream）；近环回放与实时流同过滤。
+    let filter = SseFilter::from_query(&query);
     // 近环回放（最近 20 条，已脱敏）。
     let backlog: Vec<String> = admin
         .query_events(None, None, 20)
         .into_iter()
         .rev()
         .filter_map(|e| serde_json::to_string(&e).ok())
+        .filter(|s| filter.passes(s))
         .collect();
     let stream = async_stream::stream! {
         for item in backlog {
@@ -720,7 +864,9 @@ pub async fn admin_events_stream(
             let timeout = tokio::time::timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), rx.recv()).await;
             match timeout {
                 Ok(Ok(msg)) => {
-                    yield Ok::<_, anyhow::Error>(Event::default().data(msg).event("message"));
+                    if filter.passes(&msg) {
+                        yield Ok::<_, anyhow::Error>(Event::default().data(msg).event("message"));
+                    }
                 }
                 Ok(Err(_)) => break,
                 Err(_) => break,
@@ -1120,8 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn 后订阅者不收历史只收实时() {
-        let st = test_admin_state();
+    fn 后订阅者不收历史只收实时() {        let st = test_admin_state();
         st.push_event("audit", "历史摘要", None);
         let mut late = st.subscribe();
         assert!(late.try_recv().is_err(), "后订阅不得收到历史广播");
@@ -1133,5 +1278,94 @@ mod tests {
         assert!(got_early.contains("实时摘要"), "{got_early}");
         assert_eq!(ev.summary, summarize("实时摘要", SUMMARY_MAX_CHARS));
         assert!(late.try_recv().is_err(), "单事件不得重复投递");
+    }
+
+    #[test]
+    fn health豁免限流阈值不动() {
+        assert!(is_rate_exempt("/_admin/health"));
+        assert!(!is_rate_exempt("/_admin/metrics"));
+        assert!(!is_rate_exempt("/_admin/events/stream"));
+        assert_eq!(ADMIN_RATE_LIMIT, 10);
+        assert_eq!(ADMIN_RATE_WINDOW_SECS, 60);
+    }
+
+    #[test]
+    fn cookie兼容http回退() {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", "__Host-admin_token=tok-https".parse().unwrap());
+        assert_eq!(cookie_admin_token(&h).as_deref(), Some("tok-https"));
+        let mut h2 = HeaderMap::new();
+        h2.insert("cookie", "admin_token=tok-http".parse().unwrap());
+        assert_eq!(cookie_admin_token(&h2).as_deref(), Some("tok-http"));
+        // 双名并存时 __Host- 优先。
+        let mut h3 = HeaderMap::new();
+        h3.insert(
+            "cookie",
+            "admin_token=tok-http; __Host-admin_token=tok-https".parse().unwrap(),
+        );
+        assert_eq!(cookie_admin_token(&h3).as_deref(), Some("tok-https"));
+        assert_eq!(cookie_admin_token(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn setcookie签发区分https与http() {
+        let expected = "observability-admin-token-0123456789";
+        let mut h = HeaderMap::new();
+        h.insert("x-admin-token", expected.parse().unwrap());
+        let resp = with_admin_cookie(Json(json!({"ok": true})).into_response(), &h, expected);
+        let sc = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(sc.starts_with("admin_token="), "{sc}");
+        assert!(sc.contains("HttpOnly") && sc.contains("SameSite=Strict"), "{sc}");
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-admin-token", expected.parse().unwrap());
+        h2.insert("x-forwarded-proto", "https".parse().unwrap());
+        let resp2 = with_admin_cookie(Json(json!({"ok": true})).into_response(), &h2, expected);
+        let sc2 = resp2.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(sc2.starts_with("__Host-admin_token="), "{sc2}");
+        assert!(sc2.contains("Secure"), "{sc2}");
+        // 头凭证无效不签发。
+        let mut h3 = HeaderMap::new();
+        h3.insert("x-admin-token", "wrong".parse().unwrap());
+        let resp3 = with_admin_cookie(Json(json!({"ok": true})).into_response(), &h3, expected);
+        assert!(resp3.headers().get("set-cookie").is_none());
+    }
+
+    #[test]
+    fn admintoken文件独立性与回环开关() {
+        let dir = std::env::temp_dir().join(format!("veil-admin-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(load_admin_token_file(&dir), None);
+        std::fs::write(dir.join("admin_token"), "file-token-abc\n").unwrap();
+        assert_eq!(load_admin_token_file(&dir).as_deref(), Some("file-token-abc"));
+        std::fs::remove_dir_all(&dir).ok();
+        // 回环免 token 仅 dev + 回环。
+        assert!(loopback_grace(true, "127.0.0.1"));
+        assert!(loopback_grace(true, "::1"));
+        assert!(!loopback_grace(false, "127.0.0.1"));
+        assert!(!loopback_grace(true, "192.168.1.10"));
+        assert!(!loopback_grace(true, "unknown"));
+        // 总开关。
+        let env: HashMap<String, String> =
+            HashMap::from([("OBSERVABILITY_DISABLE".to_string(), "1".to_string())]);
+        assert!(observability_disabled(&env));
+        assert!(!observability_disabled(&HashMap::new()));
+    }
+
+    #[test]
+    fn sse节奏常量与过滤维度() {
+        assert_eq!(SSE_SNAPSHOT_SECS, 15);
+        assert_eq!(SSE_DELTA_SECS, 2);
+        let q: HashMap<String, String> = HashMap::from([
+            ("model".to_string(), "chat".to_string()),
+            ("upstream".to_string(), "u1".to_string()),
+        ]);
+        let f = SseFilter::from_query(&q);
+        assert!(f.passes(r#"{"protocol":"chat/completions","summary":"u1 ok"}"#));
+        assert!(!f.passes(r#"{"protocol":"v1/responses","summary":"u1 ok"}"#));
+        assert!(!f.passes(r#"{"protocol":"chat/completions","summary":"other"}"#));
+        // 形态不符直通不丢事件。
+        assert!(f.passes("not-json"));
+        let empty = SseFilter::from_query(&HashMap::new());
+        assert!(empty.passes(r#"{"protocol":"x"}"#));
     }
 }
