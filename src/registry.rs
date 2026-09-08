@@ -58,7 +58,40 @@ pub struct RegisterParams {
     pub allow_mode: Option<AutoApprove>,
 }
 
+/// 授权判定：对标 Python `_registry.py` 的 entry/field 语义。
+/// - `Allow`：命中授权表，放行；
+/// - `TurnToApproval`：未知 entry/field，迁移期先 warn 后转 Matrix 审批（fail-closed，
+///   不得默认放行；网关侧收到本判定后建单走审批链）；
+/// - `Deny`：已吊销/禁用，拒绝。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationDecision {
+    Allow,
+    TurnToApproval { reason: String },
+    Deny { reason: String },
+}
+
 impl CallerEntry {
+    /// entry/field 授权判定（空表/未知一律转审，迁移期 warn 指引补注册）。
+    pub fn authorize_entry(&self, entry: &str, field: Option<&str>) -> AuthorizationDecision {
+        if self.revoked || !self.enabled {
+            return AuthorizationDecision::Deny {
+                reason: "调用方已吊销或未启用".to_string(),
+            };
+        }
+        if !self.check_entry_allowed(entry, field) {
+            let want = match field {
+                Some(f) => format!("{entry}/{f}"),
+                None => entry.to_string(),
+            };
+            tracing::warn!(
+                "未知授权 {want:?}：转 Matrix 审批（迁移期），请补注册 entry/field 后重新申请"
+            );
+            return AuthorizationDecision::TurnToApproval {
+                reason: format!("未授权 entry/field: {want}，已转审批"),
+            };
+        }
+        AuthorizationDecision::Allow
+    }
     pub fn status_emoji(&self) -> &'static str {
         if self.revoked {
             "❎"
@@ -240,14 +273,11 @@ impl CallerRegistry {
                 message: "caller_path 与 caller_hash 均必填".to_string(),
             });
         }
+        // 冲突判定只看 path：同值多路径允许分别注册（对标 Python 口径）。
+        // 全局 hash 唯一拒绝已删除：内容相同的双脚本可各自注册。
         if self.entries.contains_key(caller_path) {
             return Err(VeilError::Conflict {
                 message: format!("调用方已注册: {caller_path}"),
-            });
-        }
-        if self.lookup_by_hash(caller_hash).is_some() {
-            return Err(VeilError::Conflict {
-                message: "调用方哈希已存在".to_string(),
             });
         }
         let entry = CallerEntry {
@@ -339,6 +369,110 @@ impl CallerRegistry {
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 
     pub fn snapshot(&self) -> Vec<CallerEntry> { self.entries.values().cloned().collect() }
+
+    /// Python `caller_registry.json` 迁移（`version/callers/allowed_entries` 形态）。
+    /// 成功后旧文件保留 `.bak` 备份；新格式文件直接走 [`CallerRegistry::load_from`]。
+    pub fn migrate_python_registry(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read(path).map_err(|e| VeilError::Storage {
+            message: format!("注册表读取失败: {}: {e}", path.display()),
+        })?;
+        // 先试新格式；失败再试 Python 旧形态。
+        if let Ok(file) = serde_json::from_slice::<RegistryFile>(&raw)
+            && file.sha256 == integrity_of(&file.entries)
+        {
+            return Ok(Self {
+                entries: file.entries,
+            });
+        }
+        let old: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| VeilError::Storage {
+                message: format!("注册表解析失败（新旧格式均不匹配）: {e}"),
+            })?;
+        // Python 形态判定：含 `callers` 数组即视为旧格式。
+        let Some(callers) = old.get("callers").and_then(|v| v.as_array()) else {
+            return Err(VeilError::Storage {
+                message: "注册表解析失败（新旧格式均不匹配）".to_string(),
+            });
+        };
+        tracing::warn!(
+            "检测到 Python 旧格式注册表（含 {} 条），迁移为当前格式并保留 .bak",
+            callers.len()
+        );
+        let mut entries = BTreeMap::new();
+        for c in callers {
+            let caller_path = c
+                .get("script_path")
+                .or_else(|| c.get("caller_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let expected_hash = c
+                .get("script_hash")
+                .or_else(|| c.get("caller_hash"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if caller_path.is_empty() || expected_hash.is_empty() {
+                continue;
+            }
+            // 旧条目 allowed_entries：`{"entry": ["field", ...]}` 或字符串数组。
+            let mut entry_map = BTreeMap::new();
+            if let Some(allowed) = c.get("allowed_entries").and_then(|v| v.as_object()) {
+                for (k, v) in allowed {
+                    let fields: Vec<String> = match v {
+                        serde_json::Value::Array(arr) => arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect(),
+                        serde_json::Value::String(s) => vec![s.clone()],
+                        _ => Vec::new(),
+                    };
+                    entry_map.insert(k.clone(), fields);
+                }
+            }
+            entries.insert(
+                caller_path.clone(),
+                CallerEntry {
+                    caller_path: caller_path.clone(),
+                    expected_hash: expected_hash.clone(),
+                    script_sha256: bind_script_sha256(&caller_path, &expected_hash),
+                    enabled: c
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    revoked: false,
+                    auto_approve: None,
+                    name: c
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    description: String::new(),
+                    entries: entry_map,
+                    allow_mode: None,
+                    old_hash: c
+                        .get("script_hash_old")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    old_hash_expires_at: None,
+                },
+            );
+        }
+        let migrated = Self { entries };
+        // 旧文件备份 .bak（fail-closed：备份失败则拒绝覆盖写新格式）。
+        let bak = path.with_extension("json.bak");
+        std::fs::copy(path, &bak).map_err(|e| VeilError::Storage {
+            message: format!("旧注册表备份失败（拒绝迁移覆盖）: {e}"),
+        })?;
+        chmod_0600(&bak);
+        migrated.save_to(path)?;
+        Ok(migrated)
+    }
 }
 
 fn chmod_0600(path: &Path) {
@@ -381,13 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn 重复注册判重409() {
+    fn 同路径重复注册判重409同值多路径允许() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/a.sh", "h1").unwrap();
         let err = reg.register("/s/a.sh", "h2").unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::CONFLICT);
-        let err2 = reg.register("/s/b.sh", "h1").unwrap_err();
-        assert_eq!(err2.status_code(), axum::http::StatusCode::CONFLICT);
+        // 同 hash 不同 path：允许分别注册（冲突只看 path）。
+        let e2 = reg.register("/s/b.sh", "h1").unwrap();
+        assert_eq!(e2.caller_path, "/s/b.sh");
+        assert_eq!(reg.len(), 2);
     }
 
     #[test]
@@ -445,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn 未知条目字段默认拒绝() {
+    fn 未知条目字段转审批而非放行() {
         let mut reg = CallerRegistry::empty();
         reg.register_extended(&RegisterParams {
             caller_path: "/s/acl.sh".to_string(),
@@ -456,12 +592,64 @@ mod tests {
             allow_mode: None,
         })
         .unwrap();
+        reg.set_enabled("/s/acl.sh", true).unwrap();
         let e = reg.lookup_by_path("/s/acl.sh").unwrap();
+        assert_eq!(e.authorize_entry("网易", Some("授权码")), AuthorizationDecision::Allow);
+        assert!(matches!(
+            e.authorize_entry("未知条目", Some("授权码")),
+            AuthorizationDecision::TurnToApproval { .. }
+        ));
+        assert!(matches!(
+            e.authorize_entry("网易", Some("未授权字段")),
+            AuthorizationDecision::TurnToApproval { .. }
+        ));
+        // 空授权表同样转审（迁移期 warn），不直接放行。
+        let mut reg2 = CallerRegistry::empty();
+        reg2.register("/s/empty.sh", "h9").unwrap();
+        reg2.set_enabled("/s/empty.sh", true).unwrap();
+        let e2 = reg2.lookup_by_path("/s/empty.sh").unwrap();
+        assert!(matches!(
+            e2.authorize_entry("网易", None),
+            AuthorizationDecision::TurnToApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn python旧格式迁移保留bak() {
+        let dir = std::env::temp_dir().join(format!(
+            "veil-reg-mig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller_registry.json");
+        let old = serde_json::json!({
+            "version": 1,
+            "callers": [
+                {
+                    "script_path": "/s/old.sh",
+                    "script_hash": "hold1",
+                    "name": "old-job",
+                    "enabled": true,
+                    "allowed_entries": {"网易": ["授权码"]}
+                }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        let migrated = CallerRegistry::migrate_python_registry(&path).unwrap();
+        assert_eq!(migrated.len(), 1);
+        let e = migrated.lookup_by_path("/s/old.sh").unwrap();
+        assert_eq!(e.expected_hash, "hold1");
+        assert!(e.enabled);
         assert!(e.check_entry_allowed("网易", Some("授权码")));
-        assert!(e.check_entry_allowed("网易", None));
-        assert!(!e.check_entry_allowed("未知条目", Some("授权码")));
-        assert!(!e.check_entry_allowed("网易", Some("未授权字段")));
-        assert!(!e.check_entry_allowed("", Some("授权码")));
+        assert!(path.with_extension("json.bak").exists(), "旧文件须留 .bak");
+        // 迁移后新格式可直接加载。
+        let reloaded = CallerRegistry::load_from(&path).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -373,6 +373,26 @@ impl MatrixApproval {
         count
     }
 
+    /// `lock` 全清：全部未决按拒绝落定后清空 pending 表（对标 Python `pending_requests.clear()`）。
+    /// 网关接线人注意：`lock` 还须清理口令缓存 + KeePass 会话（`_kp=None` 对等）+
+    /// PII scope 缓存，见 [`MatrixBot::handle_text_command_full`] 的 BREAKING 说明。
+    pub async fn lock_clear_all(&self) -> usize {
+        let mut guard = self.pending.lock().await;
+        let mut count = 0;
+        for entry in guard.values_mut() {
+            if entry.decided.is_none() {
+                entry.decided = Some(false);
+                count += 1;
+            }
+        }
+        let total = guard.len();
+        guard.clear();
+        if total > 0 {
+            tracing::info!("审批锁定全清: {total} 单清空（含已决），其中 {count} 未决按拒绝落定");
+        }
+        total
+    }
+
     /// `forget` 指令：清理已决单并返回清理条数。
     pub async fn forget_decided(&self) -> usize {
         let mut guard = self.pending.lock().await;
@@ -434,6 +454,11 @@ impl MatrixApproval {
     }
 
     pub async fn pending_len(&self) -> usize { self.pending.lock().await.len() }
+
+    /// 待审批 event 列表（只读快照，凭据阻塞双模的测试/运维可观测用）。
+    pub async fn pending_event_ids(&self) -> Vec<String> {
+        self.pending.lock().await.keys().cloned().collect()
+    }
 
     /// 启动 60s 间隔清扫 tokio 任务；返回句柄（调用方持有，drop 即停）。
     pub fn spawn_sweeper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -587,27 +612,49 @@ impl MatrixBot {
             .unwrap_or_default()
     }
 
-    /// 文本指令执行：`lock` 未决转拒绝、`status` 回显计数、`forget` 清已决；
-    /// 返回应答正文（Unknown 返回 None，调用方不回消息）。
-    pub async fn handle_text_command(
+    /// 文本指令执行（Python 口径全量版）：`lock`→`🔒 Proxy 已锁定`、
+    /// `status`→`Proxy: {✅ 已解锁/🔒 未解锁} | 待审批: {n} | LLM secrets: {n}`、
+    /// `forget`→`🧹 已清除 {n} 个 LLM 密码映射`。
+    ///
+    /// BREAKING 说明（注册/吊销/哈希变更审批链）：本库只做审批单流转；
+    /// 注册-批准链的实际生效（`set_enabled(true)` / 吊销落盘）由网关侧在收到
+    /// `ReactionOutcome::Applied` 后执行——若网关直接生效而不经审批，即为相对原仓的
+    /// BREAKING（直接生效语义），须在发布说明中声明并给出风险说明。
+    /// 网关接线人注意：
+    /// - `lock` 除本函数落定外，还须清口令缓存 + KeePass 会话 + PII scope；
+    /// - `status` 的 `unlocked/secrets` 由网关侧传入；
+    /// - `forget` 的 `n` 为网关侧实际清除的 token 映射数（本函数只清审批单）。
+    pub async fn handle_text_command_full(
         approval: &MatrixApproval,
         command: TextCommand,
+        unlocked: bool,
+        secrets: usize,
     ) -> Option<String> {
         match command {
             TextCommand::Lock => {
                 let count = approval.lock_reject_all().await;
-                Some(format!("🔒 已锁定，未决 {count} 单已按拒绝落定"))
+                approval.lock_clear_all().await;
+                Some(format!("🔒 Proxy 已锁定（未决 {count} 单已按拒绝落定）"))
             }
             TextCommand::Status => {
                 let pending = approval.pending_len().await;
-                Some(format!("Proxy 状态 | 待审批: {pending}"))
+                let s = if unlocked { "✅ 已解锁" } else { "🔒 未解锁" };
+                Some(format!("Proxy: {s} | 待审批: {pending} | LLM secrets: {secrets}"))
             }
             TextCommand::Forget => {
                 let cleared = approval.forget_decided().await;
-                Some(format!("🧹 已清理 {cleared} 个已决审批单"))
+                Some(format!("🧹 已清除 {cleared} 个已决审批单（网关侧另清 {secrets} 个口令映射）"))
             }
             TextCommand::Unknown => None,
         }
+    }
+
+    /// 文本指令执行（兼容版）：签名不变，内部走全量版（`unlocked=true/secrets=0`）。
+    pub async fn handle_text_command(
+        approval: &MatrixApproval,
+        command: TextCommand,
+    ) -> Option<String> {
+        Self::handle_text_command_full(approval, command, true, 0).await
     }
 
     /// 常驻 sync 循环：since 持久化 + 指数退避 + 启动时间戳过滤。
@@ -1092,10 +1139,32 @@ mod tests {
             Some(false)
         );
         let status = MatrixBot::handle_text_command(&gw, TextCommand::Status).await;
-        assert!(status.is_some_and(|s| s.contains("待审批")));
+        assert!(status.is_some_and(|s| s.contains("待审批") && s.contains("LLM secrets")));
         let forget = MatrixBot::handle_text_command(&gw, TextCommand::Forget).await;
-        assert!(forget.is_some_and(|s| s.contains("已清理")));
+        assert!(forget.is_some_and(|s| s.contains("已清除")));
         assert_eq!(gw.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn lock全清无残留且文案对齐原仓() {
+        let gw = approval();
+        gw.submit_branch("$a", MatrixBranch::Credential).await;
+        gw.submit_branch("$b", MatrixBranch::Audit).await;
+        assert_eq!(
+            gw.resolve("$a", "@admin:example.com", true).await,
+            ResolveOutcome::Applied(true)
+        );
+        // 全清：已决 + 未决一并清空。
+        assert_eq!(gw.lock_clear_all().await, 2);
+        assert_eq!(gw.pending_len().await, 0);
+        let lock = MatrixBot::handle_text_command_full(&gw, TextCommand::Lock, true, 0).await;
+        assert!(lock.is_some_and(|s| s.contains("🔒 Proxy 已锁定")));
+        let status =
+            MatrixBot::handle_text_command_full(&gw, TextCommand::Status, false, 3).await;
+        assert_eq!(
+            status.as_deref(),
+            Some("Proxy: 🔒 未解锁 | 待审批: 0 | LLM secrets: 3")
+        );
     }
 
     #[test]

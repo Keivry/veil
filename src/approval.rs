@@ -46,6 +46,18 @@ impl PendingApprovals {
 
     pub fn remove(&self, key: &str) { self.inner.lock().map(|mut g| g.remove(key)).ok(); }
 
+    /// 全清：`lock` 语义配套，清空未决审批 + pending 表（口令缓存/KeePass 会话由网关侧接线清理）。
+    pub fn clear_all(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|mut g| {
+                let n = g.len();
+                g.clear();
+                n
+            })
+            .unwrap_or(0)
+    }
+
     pub fn len(&self) -> usize { self.inner.lock().map(|g| g.len()).unwrap_or(0) }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
@@ -86,6 +98,7 @@ pub trait ApprovalGateway: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     Pending,
+    Approved,
     Blocked,
 }
 
@@ -132,6 +145,16 @@ mod tests {
         assert!(table.get("stale").is_none());
         table.remove("fresh");
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn lock全清无残留() {
+        let table = PendingApprovals::default();
+        table.insert(PendingRecord::new("k1", "hash_mismatch"));
+        table.insert(PendingRecord::new("k2", "auto_approve_none"));
+        assert_eq!(table.clear_all(), 2);
+        assert!(table.is_empty());
+        assert_eq!(table.clear_all(), 0);
     }
 
     #[test]
