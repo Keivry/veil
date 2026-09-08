@@ -8,7 +8,10 @@ use {
         state::AppState,
     },
     serde::{Deserialize, Serialize},
-    std::{collections::HashMap, time::Instant},
+    std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    },
 };
 
 pub mod admin;
@@ -209,7 +212,7 @@ fn approval_event_id(key: &str, reason: &str) -> String {
     format!("$veil-{nanos}-{:08x}", hasher.finish() & 0xffff_ffff)
 }
 
-async fn record_pending(state: &AppState, key: &str, reason: &str) -> VeilError {
+async fn submit_pending(state: &AppState, key: &str, reason: &str) -> String {
     let record = PendingRecord::new(key, reason);
     let gateway = NoopApproval;
     let _ = gateway.request_approval(&record);
@@ -231,8 +234,39 @@ async fn record_pending(state: &AppState, key: &str, reason: &str) -> VeilError 
             tracing::warn!("审批消息发送失败: {err:#}");
         }
     });
+    event_id
+}
+
+async fn record_pending(state: &AppState, key: &str, reason: &str) -> VeilError {
+    submit_pending(state, key, reason).await;
     VeilError::PendingApproval {
         message: format!("已转 Matrix 人工审批: {reason}"),
+    }
+}
+
+async fn approval_dual_mode(
+    state: &AppState,
+    key: &str,
+    reason: &str,
+    entry: &str,
+    field: Option<&str>,
+    use_token: bool,
+) -> Result<serde_json::Value> {
+    if !state.config.credential_block_wait {
+        return Err(record_pending(state, key, reason).await);
+    }
+    let event_id = submit_pending(state, key, reason).await;
+    let timeout = Duration::from_secs(
+        state.config.credential_approval_timeout_secs.max(1) as u64,
+    );
+    match state.approval.ask(&event_id, timeout).await {
+        Some(true) => query_keepass(state, entry, field, use_token).await,
+        Some(false) => Err(VeilError::Auth {
+            message: "凭据审批被拒绝".to_string(),
+        }),
+        None => Err(VeilError::Auth {
+            message: "凭据审批超时，按拒绝处理".to_string(),
+        }),
     }
 }
 
@@ -280,13 +314,24 @@ pub async fn handle_credential(
             message: "三因子缺失：body.auth.caller_hash/caller_path 必填".to_string(),
         });
     }
-    if let Some(expected_get) = state.config.get_binary_hash.as_deref()
-        && !expected_get.is_empty()
-        && ct_eq(&caller_hash, expected_get)
-    {
-        return Err(VeilError::Auth {
-            message: "调用方冒用 get 自身哈希直调，拒绝".to_string(),
-        });
+    let use_token = body.token.unwrap_or(true);
+    let header_hash = effective_binary_hash(headers, body);
+    let server_get_hash = state
+        .config
+        .get_binary_hash
+        .as_deref()
+        .filter(|v| !v.is_empty());
+    if let Some(expected_get) = server_get_hash {
+        if !ct_eq(&header_hash, expected_get) {
+            return Err(VeilError::Auth {
+                message: "三因子缺失或不一致：get_binary_hash 不匹配".to_string(),
+            });
+        }
+        if !use_token && ct_eq(&caller_hash, expected_get) {
+            return Err(VeilError::Auth {
+                message: "原始凭据请求被拒绝（token=false/--raw）：不允许终端直接调用".to_string(),
+            });
+        }
     }
     if let Some(expected_secret) = state.config.credential_secret.as_deref()
         && !expected_secret.is_empty()
@@ -300,28 +345,21 @@ pub async fn handle_credential(
             }
         }
     }
-    let header_hash = effective_binary_hash(headers, body);
-    if header_hash.is_empty() {
-        return Err(VeilError::Auth {
-            message: "三因子缺失：X-Get-Binary-Hash 必填（或 body.auth.get_binary_hash）"
-                .to_string(),
-        });
-    }
     let (entry, field) = entry_selector(body);
     let entry = entry.ok_or_else(|| VeilError::BadRequest {
         message: "取用选择器缺失：entry 必填（POST /credential 须携带 entry，如 {\"entry\":\"网易\",\"field\":\"授权码\"}；缺 field 取整条目）"
             .to_string(),
     })?;
-    let use_token = body.token.unwrap_or(true);
 
     let pending_key = format!("{caller_path}:{caller_hash}");
     let mut hash_grace = false;
     let decision = {
         let registry = state.registry.read().await;
-        if !ct_eq(&header_hash, &caller_hash) {
-            None
-        } else if let Some(caller) = registry.lookup_by_path(&caller_path) {
-            if ct_eq(&header_hash, &caller.expected_hash) {
+        if let Some(caller) = registry.lookup_by_path(&caller_path) {
+            // 双模顺序（credential-approval-dual-mode）：先比 hash，
+            // 失配后再查吊销可达性——已吊销→403，其余转审批（默认 202 抛单）。
+            // 新注册（enabled=false 未启用）失配时同样转审批，不在此直接 403。
+            if ct_eq(&caller_hash, &caller.expected_hash) {
                 if caller.revoked || !caller.enabled {
                     return Err(VeilError::Auth {
                         message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
@@ -333,7 +371,7 @@ pub async fn handle_credential(
                     });
                 }
                 Some(caller.effective_allow_mode(state.config.auto_approve))
-            } else if caller.matches_old_hash(&header_hash) {
+            } else if caller.matches_old_hash(&caller_hash) {
                 if caller.revoked || !caller.enabled {
                     return Err(VeilError::Auth {
                         message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
@@ -346,17 +384,26 @@ pub async fn handle_credential(
                 }
                 hash_grace = true;
                 Some(caller.effective_allow_mode(state.config.auto_approve))
-            } else if !ct_eq(&header_hash, &caller.expected_hash) {
+            } else {
+                if caller.revoked {
+                    return Err(VeilError::Auth {
+                        message: format!("调用方已吊销（{}），拒绝", caller.status_emoji()),
+                    });
+                }
                 None
-            } else if caller.revoked || !caller.enabled {
+            }
+        } else if let Some(caller) = registry.lookup_by_hash(&caller_hash) {
+            if caller.revoked || !caller.enabled {
                 return Err(VeilError::Auth {
                     message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
                 });
-            } else {
-                Some(caller.effective_allow_mode(state.config.auto_approve))
             }
-        } else if registry.lookup_by_hash(&header_hash).is_some() {
-            None
+            if !caller.check_entry_allowed(&entry, field.as_deref()) {
+                return Err(VeilError::Auth {
+                    message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
+                });
+            }
+            Some(caller.effective_allow_mode(state.config.auto_approve))
         } else {
             Some(state.config.auto_approve)
         }
@@ -365,9 +412,23 @@ pub async fn handle_credential(
         notify_hash_change(state, &pending_key, "old_hash宽限内放行");
     }
 
+    check_rate(
+        &state.credential_hits,
+        &pending_key,
+        CREDENTIAL_RATE_WINDOW_SECS,
+    )?;
+
     let effective = match decision {
         None => {
-            return Err(record_pending(state, &pending_key, "hash_mismatch").await);
+            return approval_dual_mode(
+                state,
+                &pending_key,
+                "hash_mismatch",
+                &entry,
+                field.as_deref(),
+                use_token,
+            )
+            .await;
         }
         Some(AutoApprove::Deny) => {
             return Err(VeilError::Auth {
@@ -377,17 +438,19 @@ pub async fn handle_credential(
         Some(AutoApprove::Pending)
             if state.config.entry_mode != crate::config::EntryMode::CredentialOnly =>
         {
-            return Err(record_pending(state, &pending_key, "auto_approve_none").await);
+            return approval_dual_mode(
+                state,
+                &pending_key,
+                "auto_approve_none",
+                &entry,
+                field.as_deref(),
+                use_token,
+            )
+            .await;
         }
         Some(_) => AutoApprove::Allow,
     };
     let _ = effective;
-
-    check_rate(
-        &state.credential_hits,
-        &pending_key,
-        CREDENTIAL_RATE_WINDOW_SECS,
-    )?;
 
     query_keepass(state, &entry, field.as_deref(), use_token).await
 }
@@ -421,13 +484,13 @@ pub async fn query_keepass(
             return Err(e);
         }
     };
-    let vault = credential_vault::CredentialVault::new();
+    let vault = state.vault.as_ref();
     match field {
         None => {
             let mut custom_properties = serde_json::Map::new();
             for prop in &snapshot.custom {
                 let value = if prop.protected {
-                    tokenize_field(&vault, &prop.value, use_token)
+                    tokenize_field(vault, &prop.value, use_token)
                 } else {
                     prop.value.clone()
                 };
@@ -436,7 +499,7 @@ pub async fn query_keepass(
             Ok(serde_json::json!({
                 "title": snapshot.title,
                 "username": snapshot.username,
-                "password": tokenize_field(&vault, &snapshot.password, use_token),
+                "password": tokenize_field(vault, &snapshot.password, use_token),
                 "url": snapshot.url,
                 "custom_properties": custom_properties,
             }))
@@ -458,7 +521,7 @@ pub async fn query_keepass(
                 },
             };
             let value = if protect {
-                tokenize_field(&vault, &value, use_token)
+                tokenize_field(vault, &value, use_token)
             } else {
                 value
             };
@@ -731,7 +794,7 @@ mod tests {
         let state = cred_state(&env);
         let out = handle_credential(
             &state,
-            &headers("callerhash1", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("callerhash1", "/s/a.sh", None),
         )
         .await
@@ -745,7 +808,7 @@ mod tests {
         let state = cred_state(&env);
         let err = handle_credential(
             &state,
-            &headers("callerhash1", None),
+            &headers("gethash", None),
             &body("callerhash1", "/s/a.sh", None),
         )
         .await
@@ -767,7 +830,7 @@ mod tests {
         let state = cred_state(&env);
         let err = handle_credential(
             &state,
-            &headers("callerhash1", Some("wrong")),
+            &headers("gethash", Some("wrong")),
             &body("callerhash1", "/s/a.sh", None),
         )
         .await
@@ -781,7 +844,7 @@ mod tests {
         let state = cred_state(&env);
         let out = handle_credential(
             &state,
-            &headers("callerhash2", None),
+            &headers("gethash", None),
             &body("callerhash2", "/s/b.sh", Some("s3cr3t")),
         )
         .await
@@ -793,13 +856,11 @@ mod tests {
     async fn 冒用get自身哈希拒403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
-        let err = handle_credential(
-            &state,
-            &headers("gethash", Some("s3cr3t")),
-            &body("gethash", "/s/a.sh", None),
-        )
-        .await
-        .unwrap_err();
+        let mut raw = body("gethash", "/s/a.sh", None);
+        raw.token = Some(false);
+        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &raw)
+            .await
+            .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
     }
 
@@ -812,7 +873,7 @@ mod tests {
             auth: Some(AuthBlock {
                 caller_hash: Some("gohash1".to_string()),
                 caller_path: Some("/s/go.sh".to_string()),
-                get_binary_hash: Some("gohash1".to_string()),
+                get_binary_hash: Some("gethash".to_string()),
                 get_binary_secret: Some("s3cr3t".to_string()),
             }),
             entry: Some("网易".to_string()),
@@ -835,7 +896,7 @@ mod tests {
             auth: Some(AuthBlock {
                 caller_hash: Some("gohash2".to_string()),
                 caller_path: Some("/s/go2.sh".to_string()),
-                get_binary_hash: Some("gohash2".to_string()),
+                get_binary_hash: Some("gethash".to_string()),
                 get_binary_secret: Some("wrong".to_string()),
             }),
             entry: Some("网易".to_string()),
@@ -857,7 +918,7 @@ mod tests {
         missing.entry = None;
         missing.field = None;
         missing.fields = None;
-        let err = handle_credential(&state, &headers("entryless", Some("s3cr3t")), &missing)
+        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &missing)
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
@@ -871,7 +932,7 @@ mod tests {
         let mut full = body("nofield", "/s/nof.sh", None);
         full.field = None;
         full.fields = None;
-        let out = handle_credential(&state, &headers("nofield", Some("s3cr3t")), &full)
+        let out = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &full)
             .await
             .unwrap();
         assert_eq!(out.get("title").and_then(|v| v.as_str()), Some("网易"));
@@ -890,7 +951,7 @@ mod tests {
         let mut plural = body("plural1", "/s/p.sh", None);
         plural.field = None;
         plural.fields = Some(serde_json::json!(["授权码"]));
-        let out = handle_credential(&state, &headers("plural1", Some("s3cr3t")), &plural)
+        let out = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &plural)
             .await
             .unwrap();
         assert!(credential_value(&out).starts_with("__VG_CRED_"));
@@ -902,7 +963,7 @@ mod tests {
         let state = cred_state(&env);
         let mut raw = body("raw1", "/s/raw.sh", None);
         raw.token = Some(false);
-        let out = handle_credential(&state, &headers("raw1", Some("s3cr3t")), &raw)
+        let out = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &raw)
             .await
             .unwrap();
         assert_eq!(credential_value(&out), "__MOCK_CRED_网易-授权码__");
@@ -910,7 +971,7 @@ mod tests {
         full_body.token = Some(false);
         full_body.field = None;
         full_body.fields = None;
-        let full = handle_credential(&state, &headers("raw2", Some("s3cr3t")), &full_body)
+        let full = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &full_body)
             .await
             .unwrap();
         assert_eq!(
@@ -925,7 +986,7 @@ mod tests {
         let state = cred_state(&env);
         let mut missing = body("noattr", "/s/na.sh", None);
         missing.field = Some("不存在的字段".to_string());
-        let err = handle_credential(&state, &headers("noattr", Some("s3cr3t")), &missing)
+        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &missing)
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
@@ -962,7 +1023,7 @@ mod tests {
         )));
         let mut missing = body("svc1", "/s/svc.sh", None);
         missing.entry = Some("不存在".to_string());
-        let err = handle_credential(&state, &headers("svc1", Some("s3cr3t")), &missing)
+        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &missing)
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
@@ -970,7 +1031,7 @@ mod tests {
         let mut ok_body = body("svc2", "/s/svc2.sh", None);
         ok_body.field = None;
         ok_body.fields = None;
-        let ok = handle_credential(&state, &headers("svc2", Some("s3cr3t")), &ok_body)
+        let ok = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &ok_body)
             .await
             .unwrap();
         assert_eq!(ok.get("title").and_then(|v| v.as_str()), Some("网易"));
@@ -992,7 +1053,7 @@ mod tests {
             .unwrap();
         let err = handle_credential(
             &state,
-            &headers("badhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("badhash", "/s/a.sh", None),
         )
         .await
@@ -1016,7 +1077,7 @@ mod tests {
             .unwrap();
         let err = handle_credential(
             &state,
-            &headers("goodhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("goodhash", "/s/a.sh", None),
         )
         .await
@@ -1030,7 +1091,7 @@ mod tests {
         let state = cred_state(&env);
         let err = handle_credential(
             &state,
-            &headers("fresh", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("fresh", "/s/fresh.sh", None),
         )
         .await
@@ -1044,14 +1105,14 @@ mod tests {
         let state = cred_state(&env);
         handle_credential(
             &state,
-            &headers("rlhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("rlhash", "/s/rl.sh", None),
         )
         .await
         .unwrap();
         let err = handle_credential(
             &state,
-            &headers("rlhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("rlhash", "/s/rl.sh", None),
         )
         .await
@@ -1095,7 +1156,7 @@ mod tests {
         );
         let err = handle_credential(
             &locked,
-            &headers("k1", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("k1", "/s/k.sh", None),
         )
         .await
@@ -1168,7 +1229,7 @@ mod tests {
             .unwrap();
         let err = handle_credential(
             &state,
-            &headers("badhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("badhash", "/s/w.sh", None),
         )
         .await
@@ -1236,7 +1297,7 @@ mod tests {
             .unwrap();
         let err = handle_credential(
             &state,
-            &headers("badhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("badhash", "/s/down.sh", None),
         )
         .await
@@ -1296,7 +1357,7 @@ mod tests {
         .await;
         let mut over = body("aclhash", "/s/acl.sh", None);
         over.entry = Some("未知条目".to_string());
-        let err = handle_credential(&state, &headers("aclhash", Some("s3cr3t")), &over)
+        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &over)
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
@@ -1316,7 +1377,7 @@ mod tests {
         .await;
         let mut over = body("aclfhash", "/s/aclf.sh", None);
         over.field = Some("未授权字段".to_string());
-        let err = handle_credential(&state, &headers("aclfhash", Some("s3cr3t")), &over)
+        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &over)
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
@@ -1335,7 +1396,7 @@ mod tests {
         .await;
         let out = handle_credential(
             &state,
-            &headers("okhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("okhash", "/s/ok.sh", None),
         )
         .await
@@ -1356,7 +1417,7 @@ mod tests {
         .await;
         let err = handle_credential(
             &state,
-            &headers("badhash", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("badhash", "/s/tamper.sh", None),
         )
         .await
@@ -1384,11 +1445,178 @@ mod tests {
             .unwrap();
         let out = handle_credential(
             &state,
-            &headers("h1", Some("s3cr3t")),
+            &headers("gethash", Some("s3cr3t")),
             &body("h1", "/s/grace.sh", None),
         )
         .await
         .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn go正常脚本已注册匹配放行200() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        enrolled_with_entries(
+            &state,
+            "/s/job.sh",
+            "scripthash",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let out = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("scripthash", "/s/job.sh", None),
+        )
+        .await
+        .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn 纯body形态无头放行() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let pure = CredentialBody {
+            secret: None,
+            auth: Some(AuthBlock {
+                caller_hash: Some("purehash".to_string()),
+                caller_path: Some("/s/pure.sh".to_string()),
+                get_binary_hash: Some("gethash".to_string()),
+                get_binary_secret: Some("s3cr3t".to_string()),
+            }),
+            entry: Some("网易".to_string()),
+            field: Some("授权码".to_string()),
+            fields: None,
+            token: None,
+        };
+        let out = handle_credential(&state, &CredentialHeaders::new(None, None), &pure)
+            .await
+            .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn 头哈希与服务端失配拒403() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let err = handle_credential(
+            &state,
+            &headers("forged-hash", Some("s3cr3t")),
+            &body("forged-hash", "/s/f.sh", None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn 终端token取用放行() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let out = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("gethash", "/s/term.sh", None),
+        )
+        .await
+        .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn 已吊销调用方哈希失配仍拒403() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        register_caller(&state, "/s/r.sh", "goodhash", "rev-src")
+            .await
+            .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled("/s/r.sh", true)
+            .unwrap();
+        revoke_caller(&state, "/s/r.sh").await.unwrap();
+        let err = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("badhash", "/s/r.sh", None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+        assert!(state.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn 同秘密跨请求同token() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let first = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("cross1", "/s/cross1.sh", None),
+        )
+        .await
+        .unwrap();
+        let second = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("cross2", "/s/cross2.sh", None),
+        )
+        .await
+        .unwrap();
+        assert!(credential_value(&first).starts_with("__VG_CRED_"));
+        assert_eq!(credential_value(&first), credential_value(&second));
+    }
+
+    #[tokio::test]
+    async fn 阻塞模批准同请求返回凭据() {
+        let env = cred_env(&[
+            ("CREDENTIAL_BLOCK_WAIT", "1"),
+            ("APPROVAL_WHITELIST", "@admin:example.com"),
+        ]);
+        let state = cred_state(&env);
+        register_caller(&state, "/s/b.sh", "goodhash", "blk-src")
+            .await
+            .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled("/s/b.sh", true)
+            .unwrap();
+        let worker = state.clone();
+        let handle = tokio::spawn(async move {
+            handle_credential(
+                &worker,
+                &headers("gethash", Some("s3cr3t")),
+                &body("badhash", "/s/b.sh", None),
+            )
+            .await
+        });
+        let event_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ids = state.approval.pending_event_ids().await;
+                if let Some(id) = ids.into_iter().next() {
+                    return id;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("阻塞模须先建单");
+        state
+            .approval
+            .resolve(&event_id, "@admin:example.com", true)
+            .await;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("阻塞问询须在批准后返回")
+            .expect("任务不崩")
+            .expect("批准后同请求须返回凭据");
         assert!(credential_value(&out).starts_with("__VG_CRED_"));
     }
 }
