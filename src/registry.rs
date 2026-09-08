@@ -1,3 +1,6 @@
+//! 调用方注册表：读多写少，调用方持 `RwLock` 共享；`check_entry_allowed` 等
+//! 鉴权判定已移出锁外，写路径（注册/吊销/哈希变更）串行化并原子落盘。
+
 use {
     crate::{
         auth::sha256_hex,

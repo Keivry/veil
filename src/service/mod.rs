@@ -123,8 +123,35 @@ fn registration_view(entry: &CallerEntry) -> RegistrationView {
     }
 }
 
+/// 限流表（有界 + 双触发清扫，对齐原仓语义）：请求路径内联清扫，不新增后台任务。
+/// - 计数触发：条目超 `SWEEP_LEN` 时清过期键；
+/// - 时间触发：距上次清扫超 `SWEEP_SECS` 时清过期键；
+/// - 硬上限：超 `MAX_ENTRIES` 时挤出任意非当前键（永不影响本次判定）。
+#[derive(Debug)]
+pub struct RateTable {
+    hits: HashMap<String, Instant>,
+    last_sweep: Instant,
+}
+
+impl RateTable {
+    pub const MAX_ENTRIES: usize = 4096;
+    pub const SWEEP_LEN: usize = 1000;
+    pub const SWEEP_SECS: u64 = 60;
+
+    pub fn new() -> Self {
+        Self { hits: HashMap::new(), last_sweep: Instant::now() }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize { self.hits.len() }
+}
+
+impl Default for RateTable {
+    fn default() -> Self { Self::new() }
+}
+
 fn check_rate(
-    hits: &std::sync::Mutex<HashMap<String, Instant>>,
+    hits: &std::sync::Mutex<RateTable>,
     key: &str,
     window_secs: u64,
 ) -> Result<()> {
@@ -132,7 +159,15 @@ fn check_rate(
         message: "限流表锁定失败".to_string(),
     })?;
     let now = Instant::now();
-    if let Some(last) = guard.get(key)
+    if guard.hits.len() > RateTable::SWEEP_LEN
+        || now.duration_since(guard.last_sweep).as_secs() >= RateTable::SWEEP_SECS
+    {
+        guard
+            .hits
+            .retain(|_, t| now.duration_since(*t).as_secs() < window_secs);
+        guard.last_sweep = now;
+    }
+    if let Some(last) = guard.hits.get(key)
         && now.duration_since(*last).as_secs() < window_secs
     {
         let remain = window_secs.saturating_sub(now.duration_since(*last).as_secs());
@@ -140,7 +175,12 @@ fn check_rate(
             retry_after_secs: remain.max(1),
         });
     }
-    guard.insert(key.to_string(), now);
+    guard.hits.insert(key.to_string(), now);
+    if guard.hits.len() > RateTable::MAX_ENTRIES
+        && let Some(victim) = guard.hits.keys().find(|k| k.as_str() != key).cloned()
+    {
+        guard.hits.remove(&victim);
+    }
     Ok(())
 }
 
@@ -1140,6 +1180,41 @@ mod tests {
             limited.status_code(),
             axum::http::StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    #[test]
+    fn 限流表双触发清扫只删过期键() {
+        use std::sync::Mutex;
+        let table = Mutex::new(RateTable::new());
+        // 计数触发：超 1000 条后下一次检查清扫；窗口 0 使旧键全部过期。
+        for i in 0..(RateTable::SWEEP_LEN + 5) {
+            check_rate(&table, &format!("cold-{i}"), 0).unwrap();
+        }
+        let guard = table.lock().unwrap();
+        assert!(
+            guard.len() <= RateTable::SWEEP_LEN + 6,
+            "过期键须被清扫，长跑不膨胀: {}",
+            guard.len()
+        );
+        drop(guard);
+        // 活跃键判定不受清扫影响：同键在窗口内仍限流。
+        check_rate(&table, "hot-key", 3600).unwrap();
+        let err = check_rate(&table, "hot-key", 3600).unwrap_err();
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn 限流表硬上限挤出不影响本次判定() {
+        use std::sync::Mutex;
+        let table = Mutex::new(RateTable::new());
+        for i in 0..(RateTable::MAX_ENTRIES + 10) {
+            check_rate(&table, &format!("k-{i}"), u64::MAX).unwrap();
+        }
+        let guard = table.lock().unwrap();
+        assert_eq!(guard.len(), RateTable::MAX_ENTRIES, "硬上限须钳制");
     }
 
     #[tokio::test]

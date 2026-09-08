@@ -69,13 +69,14 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 
 ### 端口语义：单端口运行时 vs compose 三端口映射
 
-- 本地直跑（二进制）：只监听 `127.0.0.1:8877` 一个端口（见 `src/main.rs`），凭据 API 与 LLM 代理共用该端口（LLM 按路径透传）。
-- compose 部署：容器内仍只监听 `8877`，三条映射（宿主机 `PORT_887x` → 容器 `8877`）只是宿主机入口区分；
+- 单进程单监听：二进制与容器内均只监听 `127.0.0.1:8877` 一个端口（见 `src/main.rs`），
+  凭据 API 与 LLM 代理共用该端口（LLM 按路径透传）；不存在多端口运行时。
+- compose 三映射宿主机入口区分：三条映射（宿主机 `PORT_887x` → 容器 `8877`）只是宿主机入口区分；
   `LLM_8878`/`LLM_8879` 按入口宿主机端口选择上游，`LLM_UPSTREAM` 为缺省上游。宿主机端口可经
   `PORT_8877/8878/8879` 覆盖，回环绑定不变。
-- 不存在多端口运行时重构：多端口语义仅为文档声明，当前行为由 `resolve_upstream` 单测锁定。
-  选路上游缺省唯一生效：`resolve_upstream(None)` 恒返回 `LLM_UPSTREAM` 缺省上游（未设则取首个
+- 选路上游缺省唯一生效：`resolve_upstream(None)` 恒返回 `LLM_UPSTREAM` 缺省上游（未设则取首个
   `LLM_<port>`），不按端口猜测；`LLM_8878`/`LLM_8879` 仅在携带入口宿主机端口上下文时生效。
+  当前行为由 `resolve_upstream` 单测锁定。
 
 ### 管理控制台说明（`admin.html` 范围）
 
@@ -194,12 +195,12 @@ done
 下表与 `admin-ratelimit-contract` spec 同字；差异均为有意设计（不同检查点），超限行为统一为
 `429 + Retry-After`（限流）与 `413`（body 超限）。
 
-| 维度 | 取值 | 超限行为 | 说明 |
-|:-----|:-----|:---------|:-----|
-| 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 速率维度；按 TCP 远端地址计数，不采信代理头 |
-| SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 并发维度；与 `10/min` 正交；`60s` ping + `5min` 强制重连 |
-| 通用请求体上限 | `10MB` | `413` | 通用 JSON 检查点（入口唯一 enforcement） |
-| 审计类上限 | `8MB` | —（不接入口） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `AUDIT_HOLD_MAX_BYTES` 默认 1MB 均不得超过它）；入口 enforcement 仅 `10MB`，两表属不同检查点、差异有意 |
+| 维度 | 取值 | 超限行为 | 是否接入口 | 说明 |
+|:-----|:-----|:---------|:-----------|:-----|
+| 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 是 | 速率维度；按 TCP 远端地址计数，不采信代理头 |
+| SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 是 | 并发维度；与 `10/min` 正交；`60s` ping + `5min` 强制重连 |
+| 通用请求体上限 | `10MB` | `413` | 是（入口唯一 enforcement） | 通用 JSON 检查点 |
+| 审计类上限 | `8MB` | — | 否（纯 ceiling 锚点） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `AUDIT_HOLD_MAX_BYTES` 默认 1MB 均不得超过它）；与入口 `10MB` 属不同检查点、差异有意 |
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
 | 审批超时 | `AUDIT_TIMEOUT` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
 | 凭据审批超时 | `300`s | — | 与审计 `AUDIT_TIMEOUT` 分表 |
@@ -208,15 +209,15 @@ done
 
 存量 Go `get` 客户端无需修改即可对接：网关保持其所用路径与方法不变。
 
-| 用途 | 方法与路径 |
-|:-----|:-----------|
-| 取用凭据 | `POST /credential` |
-| 查看注册 | `GET /registrations` |
-| 注册调用方 | `POST /register-caller` |
-| 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` |
-| 批准哈希变更 | `POST /approve-hash-change` |
-| LLM 代理透传 | 任意 `/{tail}`（含 `GET`；未知 admin 子路径除外） |
-| 存活探针 | `GET /health` |
+| 用途 | 方法与路径 | 鉴权 |
+|:-----|:-----------|:-----|
+| 取用凭据 | `POST /credential` | 三因子（`X-Get-Binary-Hash` + `X-Get-Binary-Secret`/`body.secret` + `body.auth.caller_hash`/`caller_path`） |
+| 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` / Cookie / 仅 SSE 回退 query；无 token 恒 401，原仓无鉴权直读，旧脚本须补 token） |
+| 注册调用方 | `POST /register-caller` | 三因子（同取用；重名 409） |
+| 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销管理 token/文件在位/内网三者任一（见 7.5） |
+| 批准哈希变更 | `POST /approve-hash-change` | 三因子 |
+| LLM 代理透传 | 任意 `/{tail}`（含 `GET`；未知 admin 子路径除外） | 无（上游透传） |
+| 存活探针 | `GET /health` | 无 |
 
 ```bash
 # 取用（脱敏值，默认）
@@ -234,7 +235,7 @@ get revoke --name "check-mail"
 
 ## 6. 行为变更（BREAKING）与迁移
 
-下述三处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
+下述四处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
 按迁移步骤调整后可回到预期行为，无静默变严或明文落盘增量。
 
 ### 6.1 脱敏总开关默认开启（原仓默认关闭）
@@ -271,6 +272,16 @@ get revoke --name "check-mail"
 - 影响：热点凭据驻留更久，冷凭据更快被淘汰；容量语义以本表为准。
 - 迁移：无配置项需改；如依赖旧 FIFO 逐出顺序做容量估算，请按上表容量重估。
 
+### 6.4 流式审批挂起声明（原仓同步阻塞）
+
+- 变更：`AUDIT_MODE=approve` 下流式网关危险调用转 pending 记录，不阻塞流、不合成阻断帧，
+  不挂起等待真人 `✅/❎`；拒绝/过期语义由凭据审批链承载。原仓在流中挂起等待 Matrix 审批
+ （`keepalive` + 超时默认拒绝并注入阻断帧）。
+- 影响：长连接不挂起，对 Hermes 更友好；但“危险调用被拦”在流式面表现为 pending 建单
+  而非阻断帧，监控须查 pending 事件环而非流内阻断帧。
+- 迁移：沿用原仓语义（流中同步等待）需新 change 交付；当前行为以本条为准，e2e 以
+  “pending 建单 + 不断链 + 危险原文按 pending 语义处理”断言。
+
 ## 7. 传输与兼容声明
 
 ### 7.1 逐跳（HOP）头集
@@ -289,7 +300,14 @@ get revoke --name "check-mail"
 `prompt_tokens`/`completion_tokens`/`total_tokens` 三列各自取 max。
 旧大盘按 `sum` 估算会虚高，迁移到新口径请以本声明为准。
 
-### 7.3 遗留变量兼容表
+### 7.3 请求隔离声明
+
+PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁，跨请求不互见）；
+凭据 `vault` 与 PII `detector` 为进程单例只读复用（还原不断链）。与原仓差异：
+原仓 PII 全局复用（跨请求同明文同 token，prompt-cache 友好但可关联），本仓隐私更严，
+代价是跨请求 prompt-cache 命中率下降，属有意权衡。
+
+### 7.4 遗留变量兼容表
 
 | 遗留变量 | 状态 | 改用 |
 |:---------|:-----|:-----|
@@ -299,7 +317,7 @@ get revoke --name "check-mail"
 
 沿用旧名部署会静默不生效（环境变量全表之外的一律忽略），迁移时必须改名。
 
-### 7.4 吊销与注册鉴权声明
+### 7.5 吊销与注册鉴权声明
 
 - 紧急吊销 `POST /revoke/emergency`：入参含 `file_present` 文件在位标记，
   管理 token 可走请求体或 `X-Admin-Token` 头；内网判定只认 TCP 远端地址

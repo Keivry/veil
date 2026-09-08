@@ -1,388 +1,14 @@
 use {
-    crate::{
-        error::{Result, VeilError},
-        service::{self, AuthBlock, CredentialBody, CredentialHeaders},
-        state::AppState,
-    },
+    crate::state::AppState,
     axum::{
         Json,
         body::Body,
-        extract::{ConnectInfo, Request, State},
+        extract::{Request, State},
         http::{HeaderMap, StatusCode, header},
         response::{IntoResponse, Response},
     },
-    serde::{Deserialize, Serialize},
     serde_json::{Value, json},
-    std::net::SocketAddr,
 };
-
-pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
-    let health = service::health_status(&state);
-    Json(json!({
-        "ok": true,
-        "sqlite_ok": health.sqlite_ok,
-        "sqlite_error": health.sqlite_error,
-        "status": if health.sqlite_ok { "ok" } else { "degraded" },
-        "unlocked": state.keepass.is_unlocked(),
-    }))
-}
-
-fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn credential_headers(headers: &HeaderMap) -> CredentialHeaders {
-    CredentialHeaders::new(
-        header_str(headers, "x-get-binary-hash"),
-        header_str(headers, "x-get-binary-secret"),
-    )
-}
-
-pub async fn credential_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<CredentialBody>,
-) -> Result<Json<Value>> {
-    let payload = service::handle_credential(&state, &credential_headers(&headers), &body).await?;
-    Ok(Json(json!({ "ok": true, "credential": payload })))
-}
-
-pub async fn registrations_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>> {
-    let views = service::list_registrations(
-        &state,
-        header_str(&headers, "x-admin-token").as_deref(),
-        header_str(&headers, "x-get-binary-secret").as_deref(),
-    )
-    .await?;
-    Ok(Json(json!({ "ok": true, "registrations": views })))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegisterBody {
-    #[serde(default, alias = "script_path", alias = "path")]
-    pub caller_path: String,
-    #[serde(default, alias = "script_hash", alias = "hash")]
-    pub caller_hash: String,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default, alias = "desc")]
-    pub description: String,
-    #[serde(default)]
-    pub entries: Option<serde_json::Value>,
-    #[serde(default)]
-    pub entry: Option<String>,
-    #[serde(default)]
-    pub fields: Option<serde_json::Value>,
-    #[serde(default)]
-    pub field: Option<String>,
-    #[serde(default, alias = "auto_approve", alias = "allowMode")]
-    pub allow_mode: Option<String>,
-    #[serde(default)]
-    pub auto: Option<bool>,
-}
-
-fn parse_register_entries(body: &RegisterBody) -> std::collections::BTreeMap<String, Vec<String>> {
-    use std::collections::BTreeMap;
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    if let Some(v) = body.entries.as_ref() {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, fv) in map {
-                    let key = k.trim();
-                    if key.is_empty() {
-                        continue;
-                    }
-                    let fields = match fv {
-                        serde_json::Value::String(s) => {
-                            let s = s.trim();
-                            if s.is_empty() {
-                                vec![]
-                            } else {
-                                vec![s.to_string()]
-                            }
-                        }
-                        serde_json::Value::Array(items) => items
-                            .iter()
-                            .filter_map(|i| i.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .collect(),
-                        _ => vec![],
-                    };
-                    out.insert(key.to_string(), fields);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    match item {
-                        serde_json::Value::String(s) => {
-                            let s = s.trim();
-                            if !s.is_empty() {
-                                out.entry(s.to_string()).or_default();
-                            }
-                        }
-                        serde_json::Value::Object(map) => {
-                            for (k, fv) in map {
-                                let key = k.trim();
-                                if key.is_empty() {
-                                    continue;
-                                }
-                                let fields = match fv {
-                                    serde_json::Value::String(s) => {
-                                        let s = s.trim();
-                                        if s.is_empty() {
-                                            vec![]
-                                        } else {
-                                            vec![s.to_string()]
-                                        }
-                                    }
-                                    serde_json::Value::Array(a) => a
-                                        .iter()
-                                        .filter_map(|i| i.as_str())
-                                        .map(str::trim)
-                                        .filter(|s| !s.is_empty())
-                                        .map(str::to_string)
-                                        .collect(),
-                                    _ => vec![],
-                                };
-                                out.insert(key.to_string(), fields);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            serde_json::Value::String(s) => {
-                let s = s.trim();
-                if !s.is_empty() {
-                    out.entry(s.to_string()).or_default();
-                }
-            }
-            _ => {}
-        }
-    }
-    if out.is_empty() {
-        let single_entry = body
-            .entry
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(e) = single_entry {
-            let mut fields: Vec<String> = vec![];
-            if let Some(f) = body
-                .field
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                fields.push(f.to_string());
-            }
-            if let Some(fv) = body.fields.as_ref() {
-                match fv {
-                    serde_json::Value::String(s) => {
-                        let s = s.trim();
-                        if !s.is_empty() && !fields.contains(&s.to_string()) {
-                            fields.push(s.to_string());
-                        }
-                    }
-                    serde_json::Value::Array(items) => {
-                        for i in items {
-                            if let Some(s) = i.as_str().map(str::trim).filter(|s| !s.is_empty())
-                                && !fields.contains(&s.to_string())
-                            {
-                                fields.push(s.to_string());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            out.insert(e.to_string(), fields);
-        }
-    }
-    out
-}
-
-fn parse_register_allow_mode(body: &RegisterBody) -> Option<crate::config::AutoApprove> {
-    use std::str::FromStr as _;
-    if let Some(raw) = body
-        .allow_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && let Ok(mode) = crate::config::AutoApprove::from_str(raw)
-    {
-        return Some(mode);
-    }
-    body.auto.map(|a| {
-        if a {
-            crate::config::AutoApprove::Allow
-        } else {
-            crate::config::AutoApprove::Deny
-        }
-    })
-}
-
-pub async fn register_caller_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<RegisterBody>,
-) -> Result<Json<Value>> {
-    let source = body
-        .source
-        .clone()
-        .or_else(|| header_str(&headers, "x-source").or_else(|| Some("unknown".to_string())));
-    let params = crate::registry::RegisterParams {
-        caller_path: if body.caller_path.trim().is_empty() {
-            String::new()
-        } else {
-            body.caller_path.trim().to_string()
-        },
-        caller_hash: body.caller_hash.trim().to_string(),
-        name: body.name.trim().to_string(),
-        description: body.description.trim().to_string(),
-        entries: parse_register_entries(&body),
-        allow_mode: parse_register_allow_mode(&body),
-    };
-    let view =
-        service::register_caller_extended(&state, &params, source.as_deref().unwrap_or("unknown"))
-            .await?;
-    Ok(Json(json!({ "ok": true, "registration": view })))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RevokeBody {
-    #[serde(default)]
-    pub key: Option<String>,
-    #[serde(default)]
-    pub caller_path: Option<String>,
-    #[serde(default)]
-    pub caller_hash: Option<String>,
-}
-
-fn revoke_key(body: &RevokeBody) -> Result<String> {
-    body.key
-        .clone()
-        .or_else(|| body.caller_path.clone())
-        .or_else(|| body.caller_hash.clone())
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| VeilError::BadRequest {
-            message: "key/caller_path/caller_hash 三选一必填".to_string(),
-        })
-}
-
-pub async fn revoke_handler(
-    State(state): State<AppState>,
-    Json(body): Json<RevokeBody>,
-) -> Result<Json<Value>> {
-    let view = service::revoke_caller(&state, &revoke_key(&body)?).await?;
-    Ok(Json(json!({ "ok": true, "registration": view })))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct EmergencyRevokeBody {
-    #[serde(default)]
-    pub key: Option<String>,
-    #[serde(default)]
-    pub caller_path: Option<String>,
-    #[serde(default)]
-    pub caller_hash: Option<String>,
-    #[serde(default)]
-    pub admin_token: Option<String>,
-    #[serde(default)]
-    pub file_present: bool,
-}
-
-pub struct PeerIp(pub Option<String>);
-
-impl<S> axum::extract::FromRequestParts<S> for PeerIp
-where
-    S: Send + Sync,
-{
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let ip = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip().to_string());
-        Ok(Self(ip))
-    }
-}
-
-pub async fn emergency_revoke_handler(
-    State(state): State<AppState>,
-    peer: PeerIp,
-    headers: HeaderMap,
-    Json(body): Json<EmergencyRevokeBody>,
-) -> Result<Json<Value>> {
-    let key = revoke_key(&RevokeBody {
-        key: body.key.clone(),
-        caller_path: body.caller_path.clone(),
-        caller_hash: body.caller_hash.clone(),
-    })?;
-    let admin_token = body
-        .admin_token
-        .clone()
-        .or_else(|| header_str(&headers, "x-admin-token"));
-    // 安全契约（security-compat-fix）：紧急吊销只认 TCP 远端 `ConnectInfo`，
-    // MUST NOT 回退 `X-Forwarded-For` 等代理头（伪造头可绕过内网豁免）。
-    let peer_ip = peer.0;
-    let view = service::emergency_revoke(
-        &state,
-        &key,
-        admin_token.as_deref(),
-        peer_ip.as_deref(),
-        body.file_present,
-    )
-    .await?;
-    Ok(Json(json!({ "ok": true, "registration": view })))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApproveHashChangeBody {
-    #[serde(default)]
-    pub caller_path: String,
-    #[serde(default)]
-    pub new_hash: String,
-}
-
-pub async fn approve_hash_change_handler(
-    State(state): State<AppState>,
-    Json(body): Json<ApproveHashChangeBody>,
-) -> Result<Json<Value>> {
-    let view = service::approve_hash_change(&state, &body.caller_path, &body.new_hash).await?;
-    Ok(Json(json!({ "ok": true, "registration": view })))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CredentialRequestBody {
-    #[serde(default)]
-    pub secret: Option<String>,
-    #[serde(default)]
-    pub auth: Option<AuthBlock>,
-    #[serde(default)]
-    pub entry: Option<String>,
-    #[serde(default)]
-    pub field: Option<String>,
-    #[serde(default)]
-    pub fields: Option<Value>,
-    #[serde(default)]
-    pub token: Option<bool>,
-}
 
 /// 通用网关 ingress JSON 上限 10MB（检查点：`llm_proxy_handler` 的 `to_bytes`）。
 /// spec `admin-ratelimit-contract` + design D4：与 8MB 审计/扫描类上限分属
@@ -457,7 +83,7 @@ use {
             },
             metrics::MetricsStore,
             pii::PiiDetector,
-            redaction::Scope,
+            redaction::{BoundaryHold, Scope, marker_cross_spans},
             sse::{
                 Speed, SseParser, classify_residue, is_done_payload, set_truncated, strip_sse_bom,
             },
@@ -606,6 +232,13 @@ pub enum NonstreamOutcome {
     Stream(reqwest::Response),
 }
 
+/// 流泵路由判定（D5 定稿：客户端 `stream` 意图优先）：上游 `Content-Type`
+/// 为 `event-stream` 或请求 `stream==true` 即转流泵；`stream:true` 配
+/// `application/json` 组合亦走流泵，由泵内残余分类保证不丢帧。
+pub fn should_pump_stream(resp_content_type: &str, stream_flag: bool) -> bool {
+    resp_content_type.contains("text/event-stream") || stream_flag
+}
+
 /// 2.2 `nonstream` 一发一收：接收改写后请求，返回完整上游响应；
 /// 上游超时/不可达映射为网关级错误状态码而非挂起。
 /// `client` 为只读引用（单例由 1.x 负责），本单元内不新建 Client。
@@ -663,7 +296,7 @@ pub async fn serve_nonstream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let looks_sse = resp_ct.contains("text/event-stream") || ctx.stream_flag;
+    let looks_sse = should_pump_stream(&resp_ct, ctx.stream_flag);
     if looks_sse {
         return NonstreamOutcome::Stream(up);
     }
@@ -775,6 +408,8 @@ pub struct StreamPumpCtx {
     pub pending: Arc<PendingApprovals>,
     pub init_conv: Option<String>,
     pub normalized_out: bool,
+    /// PII 边界 hold 窗（字符数，`PII_HOLD_MAX` 口径；0 = 响应侧关闭，直通）。
+    pub pii_boundary_chars: usize,
 }
 
 /// 流泵结束时的可观测结果（单测断言用）。
@@ -811,7 +446,19 @@ pub fn spawn_stream_pump(
             pending: audit_pending,
             init_conv,
             normalized_out: _,
+            pii_boundary_chars,
         } = ctx;
+        let mut boundary = BoundaryHold::new(pii_boundary_chars);
+        let boundary_spans = |window: &str, seam: usize| {
+            let cred_map = resp_vault.snapshot_p2t();
+            let mut spans: Vec<(usize, usize)> = resp_detector
+                .scan_spans_sync(window, &cred_map)
+                .into_iter()
+                .map(|(_, _, s, e)| (s, e))
+                .collect();
+            spans.extend(marker_cross_spans(window, seam));
+            spans
+        };
         let mut conv_id = init_conv;
         let hold_gate = Arc::new(std::sync::atomic::AtomicBool::new(!matches!(
             audit_mode,
@@ -1077,6 +724,7 @@ pub fn spawn_stream_pump(
                             audit_blocked = true;
                             terminal_sent = true;
                             agg.clear();
+                            boundary.clear();
                             if !block_injected {
                                 block_injected = true;
                                 for f in block_inject::ensure_event_lines(match protocol {
@@ -1130,9 +778,13 @@ pub fn spawn_stream_pump(
                         if event_terminal {
                             terminal_sent = true;
                         }
-                        agg.push_str(&prefix);
-                        agg.push_str(&format!("data: {restored_data}\n\n"));
-                        if !minor && hold.held() && !restored_data.is_empty() {
+                        let (out_prefix, out_data) =
+                            boundary.push(prefix, restored_data, &boundary_spans);
+                        if !out_data.is_empty() || !boundary.has_held() {
+                            agg.push_str(&out_prefix);
+                            agg.push_str(&format!("data: {out_data}\n\n"));
+                        }
+                        if !minor && hold.held() && !out_data.is_empty() {
                             continue;
                         }
                     } else {
@@ -1155,8 +807,12 @@ pub fn spawn_stream_pump(
                             .as_ref()
                             .map(|t| format!("event: {t}\n"))
                             .unwrap_or_default();
-                        agg.push_str(&prefix);
-                        agg.push_str(&format!("data: {scanned}\n\n"));
+                        let (out_prefix, out_data) =
+                            boundary.push(prefix, scanned, &boundary_spans);
+                        if !out_data.is_empty() || !boundary.has_held() {
+                            agg.push_str(&out_prefix);
+                            agg.push_str(&format!("data: {out_data}\n\n"));
+                        }
                     }
                 } else if ev.data.is_empty() {
                     // 空心跳帧：原样透出，不参与终端计数。
@@ -1168,10 +824,15 @@ pub fn spawn_stream_pump(
                     agg.push_str(&format!("{prefix}data: {}\n\n", ev.data));
                 } else {
                     // `[DONE]`（含 BOM 前缀）：恰一终止帧，多余去重。
+                    // 滞留帧先于终止帧放行（保序：滞留内容属于终止前的数据）。
                     if terminal_sent {
                         continue;
                     }
                     terminal_sent = true;
+                    if let Some((fp, fd)) = boundary.flush() {
+                        agg.push_str(&fp);
+                        agg.push_str(&format!("data: {fd}\n\n"));
+                    }
                     let prefix = ev
                         .event_type
                         .as_ref()
@@ -1191,6 +852,10 @@ pub fn spawn_stream_pump(
                 break;
             }
         }
+        if let Some((fp, fd)) = boundary.flush() {
+            agg.push_str(&fp);
+            agg.push_str(&format!("data: {fd}\n\n"));
+        }
         if !agg.is_empty() {
             metrics.add_sse_event();
             let _ = pump_tx.send(std::mem::take(&mut agg)).await;
@@ -1206,7 +871,14 @@ pub fn spawn_stream_pump(
                 .redact_response_new_pii_with_skip(&resp_vault, &resp_detector, &restored, &spans)
                 .await;
             if !scanned.is_empty() {
-                let _ = pump_tx.send(format!("data: {scanned}\n\n")).await;
+                let (op, od) = boundary.push(String::new(), scanned, &boundary_spans);
+                let _ = op;
+                if !od.is_empty() {
+                    let _ = pump_tx.send(format!("data: {od}\n\n")).await;
+                }
+                if let Some((fp, fd)) = boundary.flush() {
+                    let _ = pump_tx.send(format!("{fp}data: {fd}\n\n")).await;
+                }
             }
         }
         if forwarded == 0 && !block_injected {
@@ -1345,6 +1017,11 @@ async fn gateway_serve(
     let audit_mode = state.config.audit_mode;
     let audit_policy_file = state.config.audit_policy_file.clone();
     let approval_whitelist = state.config.approval_whitelist.clone();
+    let pii_boundary_chars = if state.config.pii_response_side {
+        state.config.pii_hold_max.max(1) as usize
+    } else {
+        0
+    };
 
     if !is_chat {
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
@@ -1386,6 +1063,11 @@ async fn gateway_serve(
                     audit_policy_file: state.config.audit_policy_file.clone(),
                     approval_whitelist: state.config.approval_whitelist.clone(),
                     hold_max,
+                    pii_boundary_chars: if state.config.pii_response_side {
+                        state.config.pii_hold_max.max(1) as usize
+                    } else {
+                        0
+                    },
                     gateway_metrics: state.gateway_metrics.clone(),
                     admin_metrics: state.admin.metrics.clone(),
                     sqlite_precise,
@@ -1420,6 +1102,7 @@ async fn gateway_serve(
         audit_policy_file: audit_policy_file.clone(),
         approval_whitelist: approval_whitelist.clone(),
         hold_max,
+        pii_boundary_chars,
         gateway_metrics: state.gateway_metrics.clone(),
         admin_metrics: state.admin.metrics.clone(),
         sqlite_precise,
@@ -1556,6 +1239,7 @@ mod gateway_units_tests {
             audit_policy_file: None,
             approval_whitelist: Vec::new(),
             hold_max: 1_048_576,
+            pii_boundary_chars: 64,
             gateway_metrics: Arc::new(GatewayMetrics::default()),
             admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
                 "/tmp/veil-gateway-units-test.sqlite",
@@ -1641,6 +1325,24 @@ mod gateway_units_tests {
         assert!(!out.normalized_out);
         assert!(!out.stream_flag);
         assert!(out.init_conv.is_none());
+    }
+
+    #[tokio::test]
+    async fn 脱敏关闭显式零值请求原文透传() {
+        let config = test_config(&[("REDACTION_ENABLED", "0")]);
+        assert!(!config.redaction_enabled);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw = br#"{"model":"m","messages":[{"role":"user","content":"call 13812345678"}]}"#;
+        let out = request_rewrite(
+            raw.to_vec(),
+            Protocol::Chat,
+            &config,
+            scope,
+            vault,
+            detector,
+        )
+        .await;
+        assert_eq!(out.body, raw, "显式关闭脱敏时含 PII 请求须原文透传，防旧 compose 静默变严");
     }
 
     #[tokio::test]
@@ -1772,6 +1474,78 @@ mod gateway_units_tests {
             frames.last().is_some_and(|f| f.contains("data: [DONE]")),
             "下游须以终止帧收尾"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn 跨帧切分手机号边界hold掩码() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"call 138\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"12345678 ok\"}}]}\n\ndata: [DONE]\n\n"
+            .to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (cscope, cvault, cdetector) = (scope.clone(), vault.clone(), detector.clone());
+        let (outcome, frames) =
+            collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+        assert!(!outcome.block_injected);
+        let mut decoded = String::new();
+        for f in &frames {
+            for line in f.lines() {
+                let Some(payload) = line.strip_prefix("data: ") else { continue };
+                if payload.trim() == "[DONE]" {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+                    && let Some(c) = v
+                        .pointer("/choices/0/delta/content")
+                        .and_then(|x| x.as_str())
+                {
+                    decoded.push_str(c);
+                }
+            }
+        }
+        assert!(
+            !decoded.contains("13812345678"),
+            "解码拼接后不得复原完整手机号: {decoded}"
+        );
+        assert!(decoded.contains("call "), "非敏感前缀须保留: {decoded}");
+        assert!(decoded.contains("ok"), "非敏感后缀须保留: {decoded}");
+        // 对照：逐帧脱敏（无边界 hold）对切分残片漏检，拼接可复原原文。
+        let f1 = cscope
+            .redact_response_new_pii(&cvault, &cdetector, "call 138")
+            .await;
+        let f2 = cscope
+            .redact_response_new_pii(&cvault, &cdetector, "12345678 ok")
+            .await;
+        assert!(
+            format!("{f1}{f2}").contains("13812345678"),
+            "对照组须复现漏检，否则本用例无回归价值"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn 保真字段原样透传不改写() {
+        let sse = b"data: {\"id\":\"chatcmpl-xyz\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"m-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-xyz\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"m-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (outcome, frames) =
+            collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+        assert!(!outcome.block_injected);
+        let joined = frames.join("");
+        for key in [
+            "\"chatcmpl-xyz\"",
+            "\"chat.completion.chunk\"",
+            "1700000000",
+            "\"m-test\"",
+            "\"stop\"",
+        ] {
+            assert!(joined.contains(key), "保真字段须原样透传，缺 {key}: {joined}");
+        }
         server.abort();
     }
 
@@ -2282,39 +2056,7 @@ fn extract_tool_fragments(
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        crate::{config::Config, state::SqliteOutcome},
-        std::{collections::HashMap, path::PathBuf},
-    };
-
-    #[tokio::test]
-    async fn 健康处理器透出服务层状态() {
-        let env = HashMap::from([
-            (
-                "HOMESERVER".to_string(),
-                "https://matrix.example.com".to_string(),
-            ),
-            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-            (
-                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-                "observability-admin-token-0123456789".to_string(),
-            ),
-        ]);
-        let state = AppState::new(
-            Config::load_from(&env).unwrap(),
-            SqliteOutcome {
-                sqlite_ok: true,
-                sqlite_error: None,
-                db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
-            },
-        );
-        let Json(body) = health_handler(State(state)).await;
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["sqlite_ok"], true);
-    }
+    use super::*;
 
     #[test]
     fn 流式legacy_function_call与非流式口径统一() {
@@ -2334,6 +2076,32 @@ mod tests {
         let legacy_arr = serde_json::json!({"choices":[{"delta":{"function_call":[{"name":"a","arguments":"{}"}]}}]});
         let frags3 = extract_tool_fragments(P::Chat, &legacy_arr);
         assert!(frags3.is_empty() || frags3.len() == 1);
+    }
+
+    #[test]
+    fn 双路工具调用按index独立累积不串扰() {
+        use crate::service::llm_gateway::Protocol as P;
+        let two = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","type":"function","function":{"name":"exec_a","arguments":"{\"x\":1}"}},
+            {"index":1,"id":"call_b","type":"function","function":{"name":"exec_b","arguments":"{\"y\":2}"}}
+        ]}}]});
+        let frags = extract_tool_fragments(P::Chat, &two);
+        assert_eq!(frags.len(), 2, "双路须各一条: {frags:?}");
+        assert_eq!(frags[0].0, 0);
+        assert_eq!(frags[1].0, 1);
+        assert_eq!(frags[0].2.as_deref(), Some("exec_a"));
+        assert_eq!(frags[1].2.as_deref(), Some("exec_b"));
+        assert!(frags[0].3.contains("\"x\":1") && !frags[0].3.contains("\"y\""));
+        assert!(frags[1].3.contains("\"y\":2") && !frags[1].3.contains("\"x\""));
+    }
+
+    #[test]
+    fn stream真加json组合走流泵() {
+        assert!(should_pump_stream("text/event-stream", false));
+        assert!(should_pump_stream("text/event-stream", true));
+        assert!(should_pump_stream("application/json", true));
+        assert!(!should_pump_stream("application/json", false));
+        assert!(!should_pump_stream("", false));
     }
 
     #[test]
@@ -2466,67 +2234,4 @@ mod tests {
         assert!(ok.is_ok());
     }
 
-    fn revoke_test_state() -> AppState {
-        let env = HashMap::from([
-            (
-                "HOMESERVER".to_string(),
-                "https://matrix.example.com".to_string(),
-            ),
-            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-            (
-                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-                "observability-admin-token-0123456789".to_string(),
-            ),
-        ]);
-        AppState::new(
-            Config::load_from(&env).unwrap(),
-            SqliteOutcome {
-                sqlite_ok: true,
-                sqlite_error: None,
-                db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
-            },
-        )
-    }
-
-    fn revoke_body(key: &str) -> Json<EmergencyRevokeBody> {
-        Json(EmergencyRevokeBody {
-            key: Some(key.to_string()),
-            caller_path: None,
-            caller_hash: None,
-            admin_token: None,
-            file_present: false,
-        })
-    }
-
-    #[tokio::test]
-    async fn 伪造代理头不绕过吊销判定() {
-        // 内网豁免只认 TCP 远端：公网对端携带伪造内网 XFF 仍转审批，不直接吊销。
-        let state = revoke_test_state();
-        service::register_caller(&state, "/s/xff.sh", "h-xff", "src-xff")
-            .await
-            .unwrap();
-        let mut forged = HeaderMap::new();
-        forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
-        let err = emergency_revoke_handler(
-            State(state.clone()),
-            PeerIp(Some("203.0.113.9".to_string())),
-            forged,
-            revoke_body("/s/xff.sh"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::ACCEPTED);
-        // 回环 TCP 对端无头时豁免路径仍可用。
-        let ok = emergency_revoke_handler(
-            State(state),
-            PeerIp(Some("127.0.0.1".to_string())),
-            HeaderMap::new(),
-            revoke_body("/s/xff.sh"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(ok.0["ok"], true);
-    }
 }

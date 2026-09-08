@@ -239,14 +239,232 @@ pub fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
     strip_partials(&vault.strip_hallucinated(text))
 }
 
+/// 跨帧边界 hold（A 案，`PII_HOLD_MAX` 字符窗）：整帧延迟一级，缝合相邻两帧的
+/// 尾/首窗口做跨缝 PII 检测，跨缝命中掩码两侧后再放行上一帧。
+/// 与 [`strip_partials`] 分工：strip 清理本帧内残缺占位符（出口卫生，不跨帧）；
+/// hold 防止 PII 被切在两帧而逐帧漏检（边界检测，需跨帧状态）。两者正交。
+/// 解码文本窗口：JSON 信封字符（`"` `{` `}` `[` `]` `,` 与 `"key":` 键）会隔断缝合（如
+/// `138"}}]}…{"content":"12345678`），窗口先过滤信封并保留对齐映射，使检测发生
+/// 在近似解码文本空间；掩码映射回原帧坐标，结构字符守卫兜底保信封。
+/// `window_chars == 0` 时直通（响应侧关闭）。
+pub struct BoundaryHold {
+    held_prefix: Option<String>,
+    held_data: Option<String>,
+    window_chars: usize,
+}
+
+impl BoundaryHold {
+    pub fn new(window_chars: usize) -> Self {
+        Self { held_prefix: None, held_data: None, window_chars }
+    }
+
+    pub fn has_held(&self) -> bool { self.held_data.is_some() }
+
+    /// 推入下一帧已处理数据，返回本轮可放行帧。首帧返回空（延迟一级）；
+    /// `spans_fn(window, seam)` 返回窗口内待掩码字节区间（窗口坐标，过滤后空间）。
+    /// 仅跨缝区间被处理，非跨缝命中留给逐帧逻辑（已处理过）。
+    pub fn push(
+        &mut self,
+        prefix: String,
+        data: String,
+        spans_fn: impl Fn(&str, usize) -> Vec<(usize, usize)>,
+    ) -> (String, String) {
+        if self.window_chars == 0 {
+            return (prefix, data);
+        }
+        let (held_prefix, mut held_data) = match (self.held_prefix.take(), self.held_data.take()) {
+            (Some(p), Some(d)) => (p, d),
+            _ => {
+                self.held_prefix = Some(prefix);
+                self.held_data = Some(data);
+                return (String::new(), String::new());
+            }
+        };
+        let (tail_f, tail_map, tail_base) = {
+            let (_, tail) = tail_window(&held_data, self.window_chars);
+            let base = held_data.len().saturating_sub(tail.len());
+            let (f, m) = filter_window(tail);
+            (f, m, base)
+        };
+        let (head_f, head_map) = filter_window(head_window(&data, self.window_chars));
+        let mut window = String::with_capacity(tail_f.len() + head_f.len());
+        window.push_str(&tail_f);
+        let seam = window.len();
+        window.push_str(&head_f);
+        let mut data = data;
+        for (s, e) in spans_fn(&window, seam) {
+            if s < seam && e > seam && e <= window.len() {
+                if let Some((ps, pe)) = map_filtered_span(&tail_map, s, seam.min(e)) {
+                    mask_span_bytes(&mut held_data, tail_base + ps, tail_base + pe);
+                }
+                if let Some((cs, ce)) = map_filtered_span(&head_map, 0, e - seam) {
+                    let data_len = data.len();
+                    mask_span_bytes(&mut data, cs.min(data_len), ce.min(data_len));
+                }
+            }
+        }
+        self.held_prefix = Some(prefix);
+        self.held_data = Some(data);
+        (held_prefix, held_data)
+    }
+
+    pub fn flush(&mut self) -> Option<(String, String)> {
+        match (self.held_prefix.take(), self.held_data.take()) {
+            (Some(p), Some(d)) => Some((p, d)),
+            _ => None,
+        }
+    }
+
+    /// 阻断时丢弃滞留帧（与 `agg.clear()` 同语义：阻断后不再透出常规内容）。
+    pub fn clear(&mut self) {
+        self.held_prefix = None;
+        self.held_data = None;
+    }
+}
+
+/// 窗口过滤：在原文上去除 JSON 信封（`"` `{` `}` `[` `]` `,` 与 `"key":` 键），
+/// 返回过滤文本及逐字符原字节映射。`"key":` 要求引号后首字符为字母/下划线，
+/// 故纯数字值（IPv6 组、电话片段）不受影响；`:` 本身保留（IPv6 跨缝需要）。
+/// 全字母组 IPv6 紧邻缝合缝仍可能受 `"key":` 误删影响，为可接受残留
+/// （逐帧检测仍覆盖完整形态）。
+fn filter_window(s: &str) -> (String, Vec<(usize, usize)>) {
+    let mut out = String::with_capacity(s.len());
+    let mut map: Vec<(usize, usize)> = Vec::new();
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (off, c) = chars[i];
+        let next_off = |k: usize| chars.get(k).map(|(o, _)| *o).unwrap_or(s.len());
+        if c == '"' {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].1.is_ascii_alphanumeric() || chars[j].1 == '_') {
+                j += 1;
+            }
+            if j > i + 1
+                && j + 1 < chars.len()
+                && chars[i + 1].1.is_ascii_alphabetic()
+                && chars[i + 1].1 != '_'
+                && chars[j].1 == '"'
+                && chars[j + 1].1 == ':'
+            {
+                i = j + 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(c, '{' | '}' | '[' | ']' | ',') {
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        map.push((off, next_off(i + 1)));
+        i += 1;
+    }
+    (out, map)
+}
+
+/// 过滤坐标映射回原坐标：`[fs, fe)`（过滤字节区间）→ 原字节 `(start, end)`。
+/// 非字符边界返回 `None`（调用方跳过）。
+fn map_filtered_span(
+    map: &[(usize, usize)],
+    fs: usize,
+    fe: usize,
+) -> Option<(usize, usize)> {
+    if fs >= fe {
+        return None;
+    }
+    let mut start: Option<usize> = None;
+    let mut end: Option<usize> = None;
+    let mut byte = 0;
+    // 过滤仅整字符删除，保留字符字节原样，过滤字节偏移按原字符长度递增。
+    for (os, oe) in map {
+        let clen = oe - os;
+        if byte == fs && start.is_none() {
+            start = Some(*os);
+        }
+        if byte + clen == fe {
+            end = Some(*oe);
+            break;
+        }
+        byte += clen;
+    }
+    match (start, end) {
+        (Some(s), Some(e)) if s < e => Some((s, e)),
+        _ => None,
+    }
+}
+
+/// 占位符残片跨缝区间：`__PII_`/`__VG_CRED_` 前缀残片横跨缝合缝时返回可见部分
+/// 区间（窗口坐标），供 [`BoundaryHold`] 掩码。完整 token 不在此处理（逐帧逻辑归属）。
+pub fn marker_cross_spans(window: &str, seam: usize) -> Vec<(usize, usize)> {
+    const MARKERS: [&str; 2] = ["__PII_", "__VG_CRED_"];
+    let mut out = Vec::new();
+    for m in MARKERS {
+        let mlen = m.len();
+        let from = seam.saturating_sub(mlen);
+        for start in from..seam.min(window.len()) {
+            if !window.is_char_boundary(start) {
+                continue;
+            }
+            let end_cap = (start + mlen).min(window.len());
+            if !window.is_char_boundary(end_cap) || end_cap <= seam {
+                continue;
+            }
+            if m.starts_with(&window[start..end_cap]) && start + mlen > seam {
+                out.push((start, end_cap));
+            }
+        }
+    }
+    out
+}
+
+fn tail_window(s: &str, n_chars: usize) -> (usize, &str) {
+    let total: usize = s.chars().count();
+    if total <= n_chars {
+        return (0, s);
+    }
+    let skip = total - n_chars;
+    let off = s
+        .char_indices()
+        .nth(skip)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    (off, &s[off..])
+}
+
+fn head_window(s: &str, n_chars: usize) -> &str {
+    match s.char_indices().nth(n_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// 字节区间掩码（等字符数 `*` 替换）：越界/非字符边界/含 JSON 结构字符时拒绝，
+/// 保证信封结构不被破坏。
+fn mask_span_bytes(text: &mut String, start: usize, end: usize) {
+    if start >= end || end > text.len() {
+        return;
+    }
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return;
+    }
+    let span = &text[start..end];
+    if span.contains(['{', '}', '"', '[', ']']) {
+        return;
+    }
+    let masked: String = span.chars().map(|_| '*').collect();
+    text.replace_range(start..end, &masked);
+}
+
 pub const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
 pub const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
 
-/// 占位符说明注入开关（对标原仓口径）：仅 `0/false/no` 关闭，其余（含空/`off`）启用。
-/// 接线注记：`Config::is_falsy` 另把 `off` 视为关（更严收敛）；此处保留原仓口径供网关侧
-/// 对账，`off` 语义差异由配置归属方在发布说明中声明。
+/// 占位符说明注入开关（与 `Config::is_falsy` 同口径）：`0/false/no/off` 关闭，
+/// 其余（含空）启用。网关实际以 `Config::parse_placeholder_prompt` 为准，
+/// 本函数仅供单测对账，两者语义一致。
 pub fn placeholder_prompt_enabled(raw: &str) -> bool {
-    !matches!(raw.trim().to_lowercase().as_str(), "0" | "false" | "no")
+    !matches!(raw.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off")
 }
 
 /// span 加法 API：去重后位置化替换（原 `apply_spans` 语义不变，本函数仅叠加去重层）。
@@ -506,7 +724,6 @@ mod tests {
         assert!(restored.contains("my-secret-001"), "{restored}");
         assert!(restored.contains("13812345678"), "{restored}");
     }
-
     #[tokio::test]
     async fn 响应新检出不还原() {
         let vault = CredentialVault::new();
@@ -521,6 +738,23 @@ mod tests {
         // 请求还原表不含该 token：restore 原样保留。
         let again = scope.restore_response(&vault, &resp);
         assert!(again.contains("__PII_"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn 同秘密复用不重复注册且重建一致() {
+        let vault = vault_with_secret("cache-secret-xyz");
+        let detector = PiiDetector::new();
+        let scope = Scope::new();
+        let req = r#"{"a":"cache-secret-xyz","b":"cache-secret-xyz"}"#;
+        let once = scope.redact_request(&vault, &detector, req).await;
+        let twice = scope.redact_request(&vault, &detector, req).await;
+        assert_eq!(once, twice, "同秘密重复脱敏须复用一致");
+        assert_eq!(vault.len(), 1, "同一秘密只注册一次");
+        // 重建一致：还原后结构与原文一致。
+        let rebuilt = scope.restore_response(&vault, &once);
+        let v_orig: serde_json::Value = serde_json::from_str(req).unwrap();
+        let v_back: serde_json::Value = serde_json::from_str(&rebuilt).unwrap();
+        assert_eq!(v_orig, v_back);
     }
 
     #[tokio::test]
@@ -706,8 +940,9 @@ mod tests {
         assert!(!placeholder_prompt_enabled("false"));
         assert!(!placeholder_prompt_enabled("no"));
         assert!(!placeholder_prompt_enabled(" NO "));
-        // 原仓口径：`off`/空均视为启用（`off` 差异见函数注记）。
-        assert!(placeholder_prompt_enabled("off"));
+        // 与 Config::is_falsy 同口径：`off` 视为关闭。
+        assert!(!placeholder_prompt_enabled("off"));
+        assert!(!placeholder_prompt_enabled(" OFF "));
         assert!(placeholder_prompt_enabled(""));
         assert!(placeholder_prompt_enabled("1"));
     }
@@ -730,5 +965,105 @@ mod tests {
         assert!(once.contains("my-secret-001"), "明文直通不改写: {once}");
         let twice = scope.restore_response(&vault, &once);
         assert_eq!(twice, once, "二次还原须与一次一致");
+    }
+
+    #[test]
+    fn 边界hold跨缝手机号双侧掩码() {
+        let mut h = BoundaryHold::new(64);
+        let (p0, d0) = h.push("event: message\n".to_string(), "call 138".to_string(), |_, _| vec![]);
+        assert!(p0.is_empty() && d0.is_empty(), "首帧延迟无放行");
+        let span_fn = |_: &str, sm: usize| {
+            vec![(5, 16)]
+                .into_iter()
+                .filter(|(s, e)| *s < sm && *e > sm)
+                .collect()
+        };
+        let (p1, d1) = h.push("event: message\n".to_string(), "12345678 ok".to_string(), span_fn);
+        assert_eq!(p1, "event: message\n");
+        assert_eq!(d1, "call ***", "上一帧尾部残片须掩码: {d1}");
+        let (pf, df) = h.flush().expect("次帧须滞留");
+        assert_eq!(pf, "event: message\n");
+        assert_eq!(df, "******** ok", "次帧头部延续须掩码: {df}");
+    }
+
+    #[test]
+    fn 边界hold无跨缝原样透传() {
+        let mut h = BoundaryHold::new(64);
+        let (p0, d0) = h.push("e\n".to_string(), "hello".to_string(), |_, _| vec![]);
+        assert!(p0.is_empty() && d0.is_empty(), "首帧延迟无放行");
+        let (p1, d1) = h.push("e\n".to_string(), "world".to_string(), |_, _| vec![]);
+        assert_eq!((p1.as_str(), d1.as_str()), ("e\n", "hello"));
+        let (pf, df) = h.flush().expect("须有滞留");
+        assert_eq!((pf.as_str(), df.as_str()), ("e\n", "world"));
+        assert!(!h.has_held());
+    }
+
+    #[test]
+    fn 边界hold零窗直通且json结构守卫() {
+        let mut h = BoundaryHold::new(0);
+        let (p, d) = h.push("e\n".to_string(), "{\"a\":1}".to_string(), |_, _| vec![(0, 7)]);
+        assert_eq!((p.as_str(), d.as_str()), ("e\n", "{\"a\":1}"));
+        let mut t = "{\"a\":1}".to_string();
+        mask_span_bytes(&mut t, 0, 7);
+        assert_eq!(t, "{\"a\":1}", "含结构字符不得掩码");
+        let mut t2 = "13812345678".to_string();
+        mask_span_bytes(&mut t2, 0, 11);
+        assert_eq!(t2, "***********");
+    }
+
+    #[test]
+    fn 占位符残片跨缝可检出() {
+        // marker 前缀本身横跨缝合缝："ab __VG_CRE" + "D_12..."。
+        let window = "ab __VG_CRED".to_string();
+        let seam = "ab __VG_CRE".len();
+        let spans = marker_cross_spans(&window, seam);
+        assert!(!spans.is_empty(), "残片横跨缝合缝须检出: {spans:?}");
+        let window2 = "abc def".to_string();
+        assert!(marker_cross_spans(&window2, 4).is_empty());
+        let window3 = "__PII_1_ab12cd34__ tail".to_string();
+        assert!(marker_cross_spans(&window3, 19).is_empty(), "完整 token 左侧不算跨缝");
+    }
+
+    #[test]
+    fn 信封过滤缝合跨帧数字() {
+        let prev = "{\"delta\":{\"content\":\"call 138\"}}";
+        let cur = "{\"delta\":{\"content\":\"12345678 ok\"}}";
+        let (tail_f, _) = filter_window(prev);
+        let (head_f, _) = filter_window(cur);
+        assert!(tail_f.ends_with("call 138"), "尾部解码文本保留: {tail_f}");
+        assert!(head_f.starts_with(":delta:content:") == false, "{head_f}");
+        let mut window = String::new();
+        window.push_str(&tail_f);
+        let seam = window.len();
+        window.push_str(&head_f);
+        let digits = format!("{}{}", "138", "12345678");
+        assert!(
+            window.contains(&digits),
+            "信封过滤后跨帧数字须相邻: {window}"
+        );
+        let _ = seam;
+    }
+
+    #[test]
+    fn 边界hold信封分隔同样掩码() {
+        let mut h = BoundaryHold::new(128);
+        let prev = "{\"delta\":{\"content\":\"call 138\"}}".to_string();
+        let cur = "{\"delta\":{\"content\":\"12345678 ok\"}}".to_string();
+        let (p0, d0) = h.push("event: message\n".to_string(), prev, |_, _| vec![]);
+        assert!(p0.is_empty() && d0.is_empty(), "首帧延迟无放行");
+        let span_fn = |w: &str, sm: usize| {
+            let rel = w.find("13812345678").expect("过滤窗口须缝合数字");
+            vec![(rel, rel + 11)]
+                .into_iter()
+                .filter(|(s, e)| *s < sm && *e > sm)
+                .collect()
+        };
+        let (p1, d1) = h.push("event: message\n".to_string(), cur, span_fn);
+        assert_eq!(p1, "event: message\n");
+        assert!(!d1.contains("138"), "上一帧尾部残片须掩码: {d1}");
+        assert!(d1.contains("call "), "{d1}");
+        assert!(d1.contains("\"content\""), "信封键须完整保留: {d1}");
+        let (_, df) = h.flush().expect("次帧须滞留");
+        assert!(!df.contains("12345678"), "次帧头部延续须掩码: {df}");
     }
 }

@@ -407,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn 双空格data_json可解析() {
+        let mut p = SseParser::new();
+        let evs = p.push_bytes(b"data:  {\"a\":1}\n\n");
+        assert_eq!(evs.len(), 1);
+        let v: serde_json::Value =
+            serde_json::from_str(&evs[0].data).expect("双空格残留须被 serde_json 容忍");
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
     fn utf8按字节缓冲不逐chunk解码() {
         let mut buf = Utf8ByteBuffer::new();
         let ch = "中".as_bytes();

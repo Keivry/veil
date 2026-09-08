@@ -1,3 +1,7 @@
+//! KeePass 后端（真实 kdbx + Mock）：并发查询经 `Semaphore(1)` 串行化
+//! （等价原仓 `_kp_semaphore(1)`），缓存锁（std Mutex）绝不跨 await，
+//! 只在同步小临界区内加锁，拿完快照立即释放。
+
 use {
     crate::error::{Result, VeilError},
     std::{

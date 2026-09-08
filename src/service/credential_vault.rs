@@ -403,11 +403,33 @@ mod tests {
     #[test]
     fn 全局映射有界lru淘汰最久() {
         let vault = CredentialVault::new();
+        assert_eq!(MAX_TOKEN_ENTRIES, 5000, "凭据表容量分表锁定");
         for i in 0..MAX_TOKEN_ENTRIES + 5 {
             vault.register(&format!("secret-value-{i:06}")).unwrap();
         }
         assert_eq!(vault.len(), MAX_TOKEN_ENTRIES);
         // 最早注册的已被淘汰。
         assert!(!vault.snapshot_p2t().contains_key("secret-value-000000"));
+    }
+
+    #[test]
+    fn lru热点访问驻留冷条目先逐出() {
+        let vault = CredentialVault::new();
+        for i in 0..MAX_TOKEN_ENTRIES {
+            vault.register(&format!("secret-value-{i:06}")).unwrap();
+        }
+        // 触达最早条目提升为热点（复用提升 LRU），再溢出一条。
+        vault.register("secret-value-000000").unwrap();
+        vault.register("secret-overflow-000001").unwrap();
+        let snap = vault.snapshot_p2t();
+        assert_eq!(vault.len(), MAX_TOKEN_ENTRIES);
+        assert!(
+            snap.contains_key("secret-value-000000"),
+            "热点须驻留而非按 FIFO 逐出"
+        );
+        assert!(
+            !snap.contains_key("secret-value-000001"),
+            "从未触达的次冷条目须先逐出"
+        );
     }
 }

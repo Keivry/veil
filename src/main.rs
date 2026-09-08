@@ -48,6 +48,13 @@ async fn main() -> ExitCode {
     };
 
     let allow_mock_tpm = allow_mock_from_env();
+    if config.pii_value_sample_enabled
+        && config.pii_value_sample_hmac_key.as_deref().unwrap_or("").is_empty()
+    {
+        tracing::warn!(
+            "PII_VALUE_SAMPLE_ENABLED=1 且未设 PII_VALUE_SAMPLE_HMAC_KEY：hash 退化为无盐 SHA256，低熵 PII 可被离线字典枚举，生产必须配置"
+        );
+    }
     match startup_tpm_in(&config.tpm_dir, allow_mock_tpm) {
         Ok(sealed) => {
             tracing::info!("TPM 门禁通过（密封 {} 字节，明文已弃置）", sealed.len());

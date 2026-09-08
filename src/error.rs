@@ -1,5 +1,13 @@
 //! 统一错误类型：`thiserror` 分类 + `anyhow` 上下文链。
 //!
+//! 状态码集中表（`status_code()` 唯一实现，调用方不得另行映射）：
+//! `PendingApproval→202` / `Auth→403` / `Unauthorized→401` / `Conflict→409` /
+//! `RateLimited→429(+Retry-After)` / `BadRequest→400` /
+//! `NotFound→404` / `EmptyBody→502` / `Unavailable→503` /
+//! `Upstream→透传上游码` / 其余→500（响应体不泄漏内部细节，仅记日志）。
+//! 例外：入口 body 超限 `413` 由网关入口直接构造（`payload_too_large`），
+//! 不经本枚举（超限发生在 JSON 解析之前，无错误变体可承载）。
+//!
 //! 映射口径（§1.2 验收）：
 //! - 认证失败 → 403
 //! - 上游错误 → 透传上游状态码

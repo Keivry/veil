@@ -159,6 +159,8 @@ async fn 批准分支不断链且不合成阻断() {
     let client = reqwest::Client::new();
     // 批准模式：危险调用转 pending 记录、不阻塞流、不合成阻断帧；
     // 拒绝/过期语义由凭据审批链承载（见下个用例），流式网关只保证不断链。
+    // B 案挂起语义（README 6.4）：pending 建单后原文透传（有别于 block 模式的阻断替换），
+    // e2e 以“载荷原样 + 无阻断帧 + 单 DONE”断言。
     let (status, body) = post_stream(&base, &client, "danger-case").await;
     assert_eq!(status, 200);
     assert!(
@@ -167,6 +169,14 @@ async fn 批准分支不断链且不合成阻断() {
     );
     assert!(body.contains("data:"), "批准分支下游须为良构 SSE: {body}");
     assert_eq!(done_count(&body), 1, "批准分支终止帧须恰为一帧: {body}");
+    assert!(
+        body.contains("exec"),
+        "批准分支危险工具名须原样透传（pending 放行）: {body}"
+    );
+    assert!(
+        body.contains("evil.example"),
+        "批准分支危险参数须原样释放（有别于阻断模式无泄漏）: {body}"
+    );
     handle.abort();
     uhandle.abort();
 }

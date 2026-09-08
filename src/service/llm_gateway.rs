@@ -193,8 +193,14 @@ pub fn should_inject_stream_options(protocol: Protocol, body: &Value) -> bool {
             if !is_stream_body(body) {
                 return false;
             }
-            body.as_object()
-                .is_some_and(|m| m.get("stream_options").is_none())
+            match body.as_object().and_then(|m| m.get("stream_options")) {
+                // 键内合并语义（对齐 Python setdefault）：整键缺失或
+                // `include_usage` 缺失即需注入，保留用户自带其他键。
+                None => true,
+                Some(Value::Object(opts)) => opts.get("include_usage").is_none(),
+                // 非对象形态视为缺失，由 inject 整体替换 + warn。
+                Some(_) => true,
+            }
         }
         Protocol::Anthropic | Protocol::NonDialog => false,
     }
@@ -202,10 +208,22 @@ pub fn should_inject_stream_options(protocol: Protocol, body: &Value) -> bool {
 
 pub fn inject_stream_options(body: &mut Value) {
     if let Some(map) = body.as_object_mut() {
-        map.insert(
-            "stream_options".to_string(),
-            serde_json::json!({"include_usage": true}),
-        );
+        match map.get_mut("stream_options") {
+            Some(Value::Object(opts)) => {
+                opts.entry("include_usage".to_string())
+                    .or_insert(serde_json::json!(true));
+            }
+            Some(slot) => {
+                tracing::warn!("stream_options 非对象形态，已整体替换为 include_usage");
+                *slot = serde_json::json!({"include_usage": true});
+            }
+            None => {
+                map.insert(
+                    "stream_options".to_string(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            }
+        }
     }
 }
 
@@ -1277,6 +1295,25 @@ mod tests {
         ));
         let with_opt = serde_json::json!({"stream":true,"stream_options":{"include_usage":true}});
         assert!(!should_inject_stream_options(Protocol::Chat, &with_opt));
+        let partial_opt = serde_json::json!({"stream":true,"stream_options":{"other":1}});
+        assert!(
+            should_inject_stream_options(Protocol::Chat, &partial_opt),
+            "用户自带其他键但缺 include_usage 时须合并注入"
+        );
+        let mut merged = partial_opt.clone();
+        inject_stream_options(&mut merged);
+        assert_eq!(merged["stream_options"]["include_usage"], true);
+        assert_eq!(merged["stream_options"]["other"], 1);
+        let bad_opt = serde_json::json!({"stream":true,"stream_options":"yes"});
+        assert!(should_inject_stream_options(Protocol::Chat, &bad_opt));
+        let mut fixed = bad_opt.clone();
+        inject_stream_options(&mut fixed);
+        assert_eq!(fixed["stream_options"]["include_usage"], true);
+        let anth_partial = serde_json::json!({"stream":true,"stream_options":{"other":1}});
+        assert!(
+            !should_inject_stream_options(Protocol::Anthropic, &anth_partial),
+            "Anthropic 永不注入"
+        );
         let non_dict = serde_json::json!([1, 2]);
         assert!(!should_inject_stream_options(Protocol::Chat, &non_dict));
         let mut body = chat_stream.clone();
@@ -1591,6 +1628,55 @@ mod tests {
             start.elapsed()
         );
         assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn 首连拒收重试后成功() {
+        use axum::http::HeaderMap;
+        // 预留端口后释放：首连 ECONNREFUSED（可重试类），600ms 后起真服务；
+        // 两次退避（500+1000）后第三次命中，验证首连失败仍能恢复。
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("预留端口须成功")
+            .local_addr()
+            .expect("回环地址须可读")
+            .port();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+                .await
+                .expect("延迟服务须监听成功");
+            let (mut sock, _) = listener.accept().await.expect("须收到重试连接");
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 65536];
+            let _ = sock.read(&mut buf).await;
+            let body = br#"{"ok":true}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+        });
+        let client = reqwest::Client::new();
+        let start = std::time::Instant::now();
+        let resp = fetch_upstream_with_retry(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            HeaderMap::new(),
+            b"{}".to_vec(),
+        )
+        .await
+        .expect("退避后服务就绪须成功");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(
+            start.elapsed() >= Duration::from_millis(1200),
+            "须走完两次退避才成功，实测 {:?}",
+            start.elapsed()
+        );
+        server.abort();
     }
 
     #[test]

@@ -506,6 +506,18 @@ fn connect_wal(db_path: &Path) -> anyhow::Result<rusqlite::Connection> {
     Ok(conn)
 }
 
+/// WAL 截断检查点（TRUNCATE）：刷盘后 best-effort 调用，把 `-wal` 合并回主库并截断，
+/// 防 `-wal` 常驻膨胀。返回 `(busy, checkpointed)`；调用方失败只 warn 不中断刷盘。
+pub fn wal_checkpoint_truncate(db_path: &Path) -> anyhow::Result<(u32, u32)> {
+    let conn = connect_wal(db_path)?;
+    let (busy, checkpointed): (u32, u32) = conn.query_row(
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((busy, checkpointed))
+}
+
 fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metrics_daily(
@@ -651,6 +663,10 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
          (SELECT protocol, MAX(window) FROM metrics_five_min GROUP BY protocol);",
     )?;
     chmod_0600(db_path);
+    drop(conn);
+    if let Err(err) = wal_checkpoint_truncate(db_path) {
+        tracing::warn!("wal_checkpoint(TRUNCATE) 失败（刷盘不受影响）: {err:#}");
+    }
     Ok(())
 }
 
@@ -906,6 +922,12 @@ impl PiiSamplerConfig {
             hmac_key,
         }
     }
+
+    /// 无盐告警谓词：采样开启且未配 HMAC 时 hash 退化为无盐 SHA256，
+    /// 低熵 PII 可被离线字典枚举，启动期须 warn（生产必须配置）。
+    pub fn needs_hmac_warn(&self) -> bool {
+        self.enabled && self.hmac_key.as_deref().unwrap_or("").is_empty()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1101,6 +1123,21 @@ mod tests {
         }
         assert_eq!(store.ring_len(), RING_CAP);
         assert_eq!(store.dropped_total(), 5);
+    }
+
+    #[test]
+    fn wal检查点截断可执行() {
+        let db = tmp_db("checkpoint");
+        let _ = std::fs::remove_file(&db);
+        let conn = connect_wal(&db).expect("WAL 库须可建");
+        conn.execute_batch("CREATE TABLE t(x TEXT); INSERT INTO t VALUES('a');")
+            .expect("写入须成功");
+        drop(conn);
+        let (busy, _done) = wal_checkpoint_truncate(&db).expect("检查点须可执行");
+        assert_eq!(busy, 0, "单连接无竞争时不得 busy");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(db.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(db.with_extension("sqlite-shm"));
     }
 
     #[test]
@@ -1500,5 +1537,14 @@ mod tests {
         let cfg = PiiSamplerConfig::from_config(&crate::config::Config::load_from(&env).unwrap());
         assert!(cfg.enabled && !cfg.persist);
         assert_eq!(cfg.hmac_key.as_deref(), Some("k-0123456789"));
+    }
+
+    #[test]
+    fn 无盐采样告警谓词() {
+        assert!(PiiSamplerConfig::for_test(true, true, None).needs_hmac_warn());
+        assert!(PiiSamplerConfig::for_test(true, true, Some(String::new())).needs_hmac_warn());
+        assert!(!PiiSamplerConfig::for_test(true, true, Some("k".to_string())).needs_hmac_warn());
+        assert!(!PiiSamplerConfig::for_test(false, true, None).needs_hmac_warn());
+        assert!(!PiiSamplerConfig::for_test(false, false, None).needs_hmac_warn());
     }
 }

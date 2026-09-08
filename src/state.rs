@@ -16,14 +16,12 @@ use {
         service::metrics::PiiSamplerConfig,
     },
     std::{
-        collections::HashMap,
         path::{Path, PathBuf},
         sync::{
             Arc,
             Mutex,
             atomic::{AtomicBool, Ordering},
         },
-        time::Instant,
     },
 };
 
@@ -46,8 +44,8 @@ pub struct AppState {
     pub keepass: Arc<dyn KeePassBackend>,
     pub pending: Arc<PendingApprovals>,
     pub approval: Arc<crate::service::matrix::MatrixApproval>,
-    pub credential_hits: Arc<Mutex<HashMap<String, Instant>>>,
-    pub register_hits: Arc<Mutex<HashMap<String, Instant>>>,
+    pub credential_hits: Arc<Mutex<crate::service::RateTable>>,
+    pub register_hits: Arc<Mutex<crate::service::RateTable>>,
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
     pub admin: Arc<crate::service::admin::AdminState>,
     pub http_client: Arc<reqwest::Client>,
@@ -81,8 +79,8 @@ impl AppState {
             keepass: Arc::new(MockKeePass::locked()),
             pending: Arc::new(PendingApprovals::default()),
             approval,
-            credential_hits: Arc::new(Mutex::new(HashMap::new())),
-            register_hits: Arc::new(Mutex::new(HashMap::new())),
+            credential_hits: Arc::new(Mutex::new(crate::service::RateTable::new())),
+            register_hits: Arc::new(Mutex::new(crate::service::RateTable::new())),
             gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
             admin,
             http_client,

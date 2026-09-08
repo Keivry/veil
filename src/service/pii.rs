@@ -1800,6 +1800,14 @@ mod tests {
             hits.iter().any(|h| h.0 == "ipv6"),
             "大写全写须命中: {hits:?}"
         );
+        // 17: 尾部双冒号（`2001:db8::`）合法但文档段保留豁免，与 `2001:db8::1` 同口径。
+        assert!(is_valid_ipv6("2001:db8::"));
+        assert!(is_reserved_ip("2001:db8::", "ipv6"));
+        let hits = scan_builtin_sync("地址 2001:db8:: 结束", &empty_cred());
+        assert!(
+            hits.iter().all(|h| h.0 != "ipv6"),
+            "文档段豁免：尾部双冒号文档地址不得检出: {hits:?}"
+        );
     }
 
     #[test]

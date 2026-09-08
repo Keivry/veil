@@ -1,15 +1,14 @@
 //! §6.1 策略引擎 + §6.2 阻断/审批判定 + §6.3 审计日志。
 //!
 //! - 三模式：`off`（默认放行）/`block`（命中直接拒绝）/`approve`（命中转人工审批）。
+//! - 审计读上游原文：verdict 判定一律基于上游原始 tool 名/参数（未还原、未掩码），
+//!   防占位符混淆审计；非流 `evaluate_nonstream` 与流泵 `tool_triples` 均以原文为准。
 //! - 危险规则：危险 shell、敏感路径写入、网络外传（子串判定，禁全文正则回溯）。
 //! - 参数规范化：空白合并 / `\uXXXX`+`\xXX` 转义 / 拆链 / 单层变量展开 / 别名折叠 / `..` O(n)
 //!   词法规范化。
 //! - `AUDIT_POLICY_FILE` 加载；热重载为 Non-Goal（改配置重启生效）。
 //! - 审计日志：`DATA_DIR/audit.log` JSONL，先脱敏后截断，零明文，剥 `\x00-\x1f`， 0600，10MB x 5
 //!   轮转，写失败双层 fail-closed + 熔断计数。
-//!
-//! TODO(§6): 网关侧 verdict 调用点（`llm_gateway.rs` / `audit_hold.rs` §5 并行施工中）
-//! 需在 tool 三元组就绪后调用 [`evaluate`]；本文件只提供判定与日志能力，不改其文件。
 
 use {
     crate::{

@@ -27,15 +27,29 @@ pub fn anthropic_block_frames(reason: &str) -> Vec<String> {
 }
 
 pub fn responses_block_frames(response_id: &str) -> Vec<String> {
-    vec![format!(
-        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\",\"status\":\"completed\"}}}}\n\n"
-    )]
+    // 可读性修复：空 completed 下游见空完成不可用，补 output_text.delta 明文；
+    // delta 帧不计入终止计数（dedupe 仅认 completed/failed），恰一约束不受影响。
+    let text = "[blocked: audit]";
+    vec![
+        format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"{response_id}\",\"delta\":\"{text}\"}}\n\n"
+        ),
+        format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\",\"status\":\"completed\"}}}}\n\n"
+        ),
+    ]
 }
 
 pub fn responses_truncated_frames(response_id: &str) -> Vec<String> {
-    vec![format!(
-        "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"{response_id}\",\"status\":\"failed\"}}}}\n\n"
-    )]
+    let text = "[truncated]";
+    vec![
+        format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"{response_id}\",\"delta\":\"{text}\"}}\n\n"
+        ),
+        format!(
+            "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"{response_id}\",\"status\":\"failed\"}}}}\n\n"
+        ),
+    ]
 }
 
 pub fn ensure_event_lines(frames: Vec<String>) -> Vec<String> {
@@ -128,10 +142,18 @@ pub fn nonstream_block_body(
             "choices": [{"finish_reason": "stop",
                 "message": {"role": "assistant", "content": text}}]
         }),
-        GatewayProtocol::Anthropic => serde_json::json!({
-            "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn"
-        }),
+        GatewayProtocol::Anthropic => {
+            let id = if conv_id.is_empty() { "blocked".to_string() } else { conv_id.to_string() };
+            serde_json::json!({
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "model": "blocked",
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 1}
+            })
+        }
         GatewayProtocol::Responses => serde_json::json!({
             "id": conv_id, "status": "failed",
             "error": {"message": text}
@@ -192,10 +214,7 @@ pub fn terminal_count(frames: &[String], protocol: &str) -> usize {
 }
 
 pub fn count_done(frames: &[String]) -> usize {
-    frames
-        .iter()
-        .filter(|f| f.contains("data: [DONE]") || f.contains("data:[DONE]"))
-        .count()
+    frames.iter().filter(|f| is_done_frame(f)).count()
 }
 
 #[cfg(test)]
@@ -409,5 +428,68 @@ mod tests {
         assert!(!blocked_r.to_string().contains("response.completed"));
         let need = evaluate_nonstream(Protocol::Chat, &chat, AuditMode::Approve, &policy, "r1");
         assert!(need.is_some(), "approve 命中按阻断处理，不静默放行");
+    }
+
+    #[test]
+    fn anthropic非流阻断六字段完整() {
+        use super::super::llm_gateway::Protocol;
+        let body = nonstream_block_body(Protocol::Anthropic, "policy", "msg-1");
+        assert_eq!(body["id"], "msg-1");
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert!(body.get("model").is_some(), "严格 SDK 要求 model 字段");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"]["input_tokens"], 0);
+        assert_eq!(body["usage"]["output_tokens"], 1);
+        assert_eq!(body["content"][0]["type"], "text");
+        let fallback = nonstream_block_body(Protocol::Anthropic, "policy", "");
+        assert_eq!(fallback["id"], "blocked");
+    }
+
+    #[test]
+    fn responses阻断先文本后完成且终止恰一() {
+        let frames = ensure_event_lines(responses_block_frames("r9"));
+        assert_eq!(frames.len(), 2, "delta 明文 + 唯一 completed");
+        assert!(frames[0].contains("response.output_text.delta"));
+        assert!(frames[0].contains("[blocked:"));
+        assert!(frames[1].contains("response.completed"));
+        assert_eq!(terminal_count(&frames, "responses"), 1);
+        let trunc = ensure_event_lines(responses_truncated_frames("r9"));
+        assert_eq!(terminal_count(&trunc, "responses"), 1);
+        assert!(trunc.join("").contains("response.failed"));
+        assert!(!trunc.join("").contains("response.completed"));
+    }
+
+    #[test]
+    fn count_done行级精确不误计参数同串() {
+        let tricky = vec![
+            "event: message\ndata: {\"arguments\":\"data: [DONE]\"}\n\n".to_string(),
+        ];
+        assert_eq!(count_done(&tricky), 0, "参数内同串不得计入终止");
+        assert_eq!(terminal_count(&tricky, "chat"), 0);
+        let real = vec!["data: [DONE]\n\n".to_string()];
+        assert_eq!(count_done(&real), 1);
+    }
+
+    #[test]
+    fn blocked占位不触发二次调用() {
+        use super::super::audit::{AuditPolicy, AuditVerdict, evaluate};
+        use crate::config::AuditMode;
+        let policy = AuditPolicy::default_policy();
+        let verdict = evaluate(AuditMode::Block, "blocked", "{}", &policy);
+        assert!(
+            matches!(verdict, AuditVerdict::Allow),
+            "占位名 blocked + 空 input 须放行，否则下游二次调用被拦死循环"
+        );
+    }
+
+    #[test]
+    fn chat阻断文案统一自闭合() {
+        let frames = ensure_event_lines(chat_block_frames("policy"));
+        let first = &frames[0];
+        assert!(first.contains("[blocked: policy]"), "文案统一为 [blocked: reason]");
+        assert!(first.contains("\"message\""), "自闭合 message 形态");
+        assert!(!first.contains("\"delta\""), "不得用 delta 增量形态");
+        assert_eq!(count_done(&frames), 1);
     }
 }

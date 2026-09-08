@@ -13,6 +13,8 @@
 # 阻断触发说明：网关流式阻断由审计 hold 超限 fail-closed 触发（AUDIT_HOLD_MAX_BYTES=16
 # 极小值 + 危险 tool args），阻断相以 AUDIT_MODE=block 运行；responses 协议无 tool
 # 输出数组可供 hold 捕获，阻断相取空流截断合成 response.failed 路径。
+# NON_GOAL 豁免：独立 admin.html 静态控制台不在本仓交付（见 README 管理控制台说明），
+# 本脚本不覆盖其前端行为（静态页/CSP/Chart），仅覆盖后端管理面 API。
 
 import json
 import os
