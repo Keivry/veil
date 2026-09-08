@@ -11,8 +11,34 @@ use {
     },
 };
 
+/// Linux 内存锁定：`mlockall(MCL_CURRENT | MCL_FUTURE)` 把已映射与未来映射的
+/// 内存全部锁入 RAM，防止密钥/口令被换出到 swap。失败仅 warn 不拒启动
+/// （容器缺 `CAP_IPC_LOCK` 时常见，网关仍可运行；生产建议补该 capability）。
+/// 非 Linux 平台直接跳过（无对应语义）。实现上直连 libc 符号，不引入新依赖。
+#[cfg(target_os = "linux")]
+fn lock_memory_linux() {
+    unsafe extern "C" {
+        fn mlockall(flags: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    const MCL_CURRENT: std::os::raw::c_int = 1;
+    const MCL_FUTURE: std::os::raw::c_int = 2;
+    // SAFETY：`mlockall` 为纯 C 库调用，参数仅为标志位，无内存安全前置条件；
+    // 返回值检查后转 `last_os_error`，不解引用任何指针。
+    let rc = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
+    if rc != 0 {
+        eprintln!(
+            "警告: mlockall 失败（{}），内存可能被换出，生产建议授予 CAP_IPC_LOCK",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_memory_linux() {}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    lock_memory_linux();
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -71,6 +97,11 @@ async fn main() -> ExitCode {
     }
     let _orphan_sweeper = state.approval.spawn_sweeper();
     let _pending_sweeper = state.pending.spawn_sweeper();
+    // 指标重启回填：sqlite 聚合覆盖式恢复内存窗口；失败仅 warn（内存-only 照常服务）。
+    match state.admin.metrics.backfill_from_sqlite().await {
+        Ok(n) => tracing::info!("指标回填完成: {n} 个聚合窗口"),
+        Err(err) => tracing::warn!("指标回填失败，内存窗口从空累计: {err:#}"),
+    }
     if let Err(err) =
         veil::service::matrix::validate_whitelist_mxids(&state.config.approval_whitelist)
     {
