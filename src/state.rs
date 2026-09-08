@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 初始化口径与0600权限() {
+    async fn sqlite_init_applies_wal_and_0600_perms() {
         let dir = unique_temp_dir();
         let worker_dir = dir.clone();
         let conn = tokio::task::spawn_blocking(move || open_sqlite_blocking(&worker_dir))
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn 磁盘满分类器识别sqlite_full() {
+    fn no_space_classifier_detects_sqlite_full() {
         let full = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(13),
             Some("database or disk is full".to_string()),
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn 磁盘满降级内存only且进程不崩() {
+    fn disk_full_degrades_to_memory_only_without_crash() {
         let full = anyhow::Error::from(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(13),
             Some("database or disk is full".to_string()),
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn 非磁盘满错误向上传播() {
+    fn non_disk_full_error_propagates() {
         let outcome = outcome_from_open_result(
             PathBuf::from("/data/metrics.sqlite"),
             Err(anyhow::anyhow!("boom")),
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_singleton_两次转发共享同一句柄() {
+    async fn http_client_singleton_shared_across_forwards() {
         let dir = unique_temp_dir();
         let env = std::collections::HashMap::from([
             (
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn vault与detector全局单例跨克隆共享() {
+    fn vault_and_detector_singletons_shared_across_clones() {
         let env = std::collections::HashMap::from([
             (
                 "HOMESERVER".to_string(),

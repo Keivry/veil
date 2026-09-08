@@ -218,7 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 空体502四分支() {
+    fn empty_body_502_four_branches() {
         assert_eq!(
             classify_empty(true, true, 0, false, 200),
             EmptyAction::StreamInjectThen502
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn 上游端口映射解析() {
+    fn upstream_port_mapping_resolves() {
         use std::collections::HashMap;
         let env = HashMap::from([
             (
@@ -281,14 +281,14 @@ mod tests {
     }
 
     #[test]
-    fn 重试退避曲线() {
+    fn retry_backoff_curve() {
         assert_eq!(retry_delay(0), Duration::from_millis(500));
         assert_eq!(retry_delay(1), Duration::from_millis(1000));
         assert_eq!(retry_delay(2), Duration::from_millis(2000));
     }
 
     #[tokio::test]
-    async fn 断开重试退避封顶且最终失败() {
+    async fn disconnect_retries_capped_then_fails() {
         use axum::http::HeaderMap;
         assert_eq!(retry_delay(3), Duration::from_millis(2000));
         assert_eq!(retry_delay(99), Duration::from_millis(2000));
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 首连拒收重试后成功() {
+    async fn first_refused_then_retry_succeeds() {
         use axum::http::HeaderMap;
         // 预留端口后释放：首连 ECONNREFUSED（可重试类），600ms 后起真服务；
         // 两次退避（500+1000）后第三次命中，验证首连失败仍能恢复。
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn fix4宽容计数加models零统计() {
+    fn fix4_lenient_count_and_models_zero_stats() {
         let m = GatewayMetrics::default();
         for p in [
             "/v1/models",
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 业务500体不重试直接返回() {
+    async fn business_500_returns_without_retry() {
         use axum::http::HeaderMap;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn sse与hop计数器可查且剥离即计数() {
+    fn sse_and_hop_counters_queryable_and_count_on_strip() {
         let m = GatewayMetrics::default();
         assert_eq!(m.sse_event_total(), 0);
         m.add_sse_event();

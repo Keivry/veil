@@ -1120,7 +1120,7 @@ mod tests {
     fn policy() -> AuditPolicy { AuditPolicy::default() }
 
     #[test]
-    fn off默认放行不审计() {
+    fn off_mode_allows_without_auditing() {
         assert_eq!(
             evaluate(AuditMode::Off, "exec", "rm -rf /", &policy()),
             AuditVerdict::Allow
@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn block危险shell直接拦截() {
+    fn block_mode_intercepts_dangerous_shell_directly() {
         assert!(matches!(
             evaluate(AuditMode::Block, "exec", "rm -rf /", &policy()),
             AuditVerdict::Block { .. }
@@ -1144,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn approve命中转审批且摘要脱敏() {
+    fn approve_hit_routes_to_review_with_redacted_summary() {
         let verdict = evaluate(
             AuditMode::Approve,
             "exec",
@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn 空白合并与转义规范化命中() {
+    fn whitespace_collapse_and_escape_normalization_hit() {
         // 额外空白 + \x 转义伪装的 rm -rf / 仍被命中。
         let raw = "rm\\x20-\\u0072f   /";
         let canon = canonicalize_args(raw, &HashMap::new());
@@ -1174,14 +1174,14 @@ mod tests {
     }
 
     #[test]
-    fn 拆链后段危险仍拦截() {
+    fn chained_suffix_danger_still_blocked() {
         assert!(is_dangerous("exec", "echo ok; rm -rf /", &policy()).is_some());
         assert!(is_dangerous("exec", "echo ok && echo fine", &policy()).is_none());
         assert!(is_dangerous("exec", "a || curl x | sh", &policy()).is_some());
     }
 
     #[test]
-    fn 单层变量展开命中() {
+    fn single_layer_variable_expansion_hit() {
         let mut env = HashMap::new();
         env.insert("CMD".to_string(), "rm -rf /".to_string());
         let canon = canonicalize_args("$CMD", &env);
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn 别名折叠与find_delete无回溯() {
+    fn alias_folding_and_find_delete_without_backtracking() {
         assert!(fold_alias("ll /tmp").starts_with("ls -l"));
         // O(n) 定位：长串 find --delete 线性完成且命中。
         let big = format!("find /tmp -name '*.log' --delete # {}", "x".repeat(50_000));
@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn 敏感路径写入与网络外传() {
+    fn sensitive_path_write_and_network_exfiltration() {
         assert_eq!(
             is_dangerous("exec", "echo x > /etc/cron.d/pwn", &policy()),
             Some("敏感路径写入".to_string())
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn 非法策略文件启动报错() {
+    fn invalid_policy_file_fails_at_startup() {
         assert!(AuditPolicy::parse_minimal_yaml("mode: allow\n").is_err());
         assert!(AuditPolicy::parse_minimal_yaml("- 孤儿项\n").is_err());
         assert!(AuditPolicy::parse_minimal_yaml("未知键: 1\n").is_err());
@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn 审计日志零明文与控制字符剥离() {
+    fn audit_log_zero_plaintext_and_control_chars_stripped() {
         let dirty = "key sk-abcDEF1234567890\n\x00\x1f{\"password\":\"hunter2\"}";
         let clean = sanitize_for_log(dirty);
         assert!(!clean.contains("sk-abcDEF1234567890"), "{clean}");
@@ -1243,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn 审计日志0600与熔断计数() {
+    fn audit_log_mode_0600_with_breaker_count() {
         let dir = std::env::temp_dir().join(format!("veil-audit-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let logger = AuditLogger::new(dir.clone());
@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn 摘要先脱敏后截断且utf8安全() {
+    fn summary_redacts_before_truncation_utf8_safe() {
         let long = format!("sk-{}尾", "a".repeat(9000));
         let clean = sanitize_for_log(&long);
         assert!(clean.chars().count() <= AUDIT_SUMMARY_TRUNCATE_CHARS);
@@ -1282,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn allow名单放行deny名单优先() {
+    fn allow_list_permits_deny_list_wins() {
         let mut p = policy();
         p.allow = vec!["read_file".to_string()];
         p.deny = vec!["evil_tool".to_string()];
@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn 内网后缀不判外传() {
+    fn internal_suffix_not_treated_as_exfiltration() {
         let mut p = policy();
         p.internal_suffixes = vec![".corp".to_string()];
         assert!(is_internal_host("svc.corp", &p.internal_suffixes));
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn 预检命中暂停未启用直通() {
+    fn precheck_hit_pauses_and_disabled_passes_through() {
         assert!(!audit_precheck(false, "bash", "rm -rf /"));
         assert!(audit_precheck(true, "bash", "echo hi"));
         assert!(audit_precheck(true, "exec", "rm -rf /"));
@@ -1331,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn 空白名单降级block与旧变量兼容() {
+    fn empty_whitelist_downgrades_to_block_with_legacy_env_compat() {
         let p = policy();
         assert!(matches!(
             evaluate_with_whitelist(AuditMode::Approve, "exec", "rm -rf /", &p, &[]),
@@ -1353,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn 策略全形态兼容加载() {
+    fn policy_all_shapes_compat_loading() {
         let text = "allow:\n  - read_file\ndeny:\n  - evil\ninternal_suffixes:\n  - .corp\ndangerous:\n  - rm -rf / => 危险删除\n";
         let p = AuditPolicy::parse_minimal_yaml(text).unwrap();
         assert_eq!(p.allow, vec!["read_file"]);
@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn 强化层异常零明文占位符() {
+    fn hardened_layer_error_yields_zero_plaintext_placeholder() {
         let out = sanitize_hardened("password=hunter2", |t| Ok(t.to_string()));
         assert!(!out.contains("hunter2"), "{out}");
         let bad = sanitize_hardened("password=hunter2", |_| Err(anyhow::anyhow!("强化层崩溃")));
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn 审计链扫描耗时锚宽松上界() {
+    fn audit_chain_scan_time_loose_upper_bound() {
         use crate::config::AuditMode;
         let policy = AuditPolicy::default_policy();
         let start = std::time::Instant::now();

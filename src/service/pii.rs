@@ -1413,7 +1413,7 @@ mod tests {
     fn kinds(hits: &[PiiHit]) -> Vec<&str> { hits.iter().map(|h| h.0.as_str()).collect() }
 
     #[tokio::test]
-    async fn 六类recognizer命中对照() {
+    async fn six_recognizer_kinds_match() {
         let d = detector();
         // 手机号（含 +86 冠码与中文紧贴）。
         let hits = d.scan_spans("联系13812345678处理", &empty_cred()).await;
@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 保留豁免清单放行() {
+    async fn reserved_allowlist_exempted() {
         let d = detector();
         for ip in [
             "10.0.0.1",
@@ -1510,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn 含b自定义正则拒绝加载() {
+    fn custom_regex_with_word_boundary_rejected() {
         let d = detector();
         let n = d.load_custom_patterns(&[("bad".to_string(), r"\bfoo\d+\b".to_string())]);
         assert_eq!(n, 0);
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 恶意模式百毫秒内拦截且三次停用() {
+    async fn malicious_pattern_fast_reject_and_disable_after_three_timeouts() {
         // 引擎层：`^(a+)+$` 对抗性输入微秒级返回，远快于 100ms 预算（不挂起主链）。
         let d = detector();
         d.load_custom_patterns(&[("evil".to_string(), r"^(a+)+$".to_string())]);
@@ -1562,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn 字典独立扫描与cjk边界() {
+    fn dict_standalone_scan_with_cjk_boundary() {
         let d = detector();
         d.load_dict(&[
             ("张三".to_string(), "name".to_string()),
@@ -1591,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn 强化模式丢弃粘连与前导零命中() {
+    fn hardening_drops_attached_and_leading_zero_ipv4() {
         // 默认关闭：粘连手机号仍命中（历史口径不变）。
         let plain = detector();
         assert!(!plain.hardening());
@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn 同值复用与空洞跳过稳态下标() {
+    fn same_value_reuse_and_gap_skip_stable_index() {
         let scope = PiiScope::new();
         let t1 = scope.register("13812345678", false).unwrap();
         let t2 = scope.register("13812345678", false).unwrap();
@@ -1637,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn 并发注册无下标冲突() {
+    fn concurrent_register_no_index_conflict() {
         use std::sync::Arc;
         let scope = Arc::new(PiiScope::new());
         let handles: Vec<_> = (0..32)
@@ -1656,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn rand8形态与不可预测长度() {
+    fn rand8_shape_and_unpredictable_length() {
         for _ in 0..10 {
             let r = gen_rand8().unwrap();
             assert_eq!(r.len(), 8);
@@ -1666,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn 残缺清理保留完整形态() {
+    fn partial_strip_keeps_complete_token() {
         assert_eq!(
             strip_pii_partials("__PII_1_ab12cd34__ tail"),
             "__PII_1_ab12cd34__ tail"
@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn 凭据优先跳过() {
+    fn credential_values_skipped() {
         let mut cred = HashMap::new();
         cred.insert("13812345678".to_string(), "__VG_CRED_000001__".to_string());
         let hits = scan_builtin_sync("电话 13812345678", &cred);
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn 命名组与外层同名约束() {
+    fn named_group_inner_mismatch_uses_outer_name() {
         let d = detector();
         // 原仓口径：内命名组与外层失配允许加载（分类以外层 name 为准）。
         let n = d.load_custom_patterns(&[(
@@ -1698,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn 嵌套命名组与跨文件去重拒绝() {
+    fn nested_group_and_duplicate_name_rejected() {
         let d = detector();
         let n = d.load_custom_patterns(&[(
             "nested".to_string(),
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 自定义重叠占位符跳过与停用跳过() {
+    async fn custom_overlap_placeholder_skipped_and_disabled_skipped() {
         let d = detector();
         d.load_custom_patterns(&[("tag".to_string(), "TAG-\\d+".to_string())]);
         let hits = d
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 超长输入分块不丢命中() {
+    async fn oversized_input_chunked_without_losing_hits() {
         let d = detector();
         d.load_custom_patterns(&[("tail".to_string(), "TAIL-\\d{6}".to_string())]);
         let mut big = "中".repeat(600_000);
@@ -1764,7 +1764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 自定义cjk紧贴命中() {
+    async fn custom_pattern_cjk_adjacent_match() {
         let d = detector();
         d.load_custom_patterns(&[(
             "工号".to_string(),
@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_time_16项回归时间戳非ipv6且无缩写须8组() {
+    fn ipv6_timestamp_not_ipv6_and_uncompressed_requires_8_groups() {
         // 01-03: 典型 HH:MM:SS 时间戳恒非法（RFC4291 无 `::` 须 8 组）。
         assert!(!is_valid_ipv6("12:34:56"), "时分秒不得判 IPv6");
         assert!(!is_valid_ipv6("23:59:59"), "时分秒不得判 IPv6");
@@ -1843,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_5000字典扫描耗时锚点() {
+    fn perf_5000_dict_scan_time_anchor() {
         let d = detector();
         let entries: Vec<(String, String)> = (0..5000)
             .map(|i| (format!("敏感词{i:05}号"), "name".to_string()))
@@ -1868,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_增量扫描耗时锚点() {
+    fn perf_incremental_scan_time_anchor() {
         let d = detector();
         let base = "联系 13812345678 地址 2001:4860:4860::8888 结束 ".repeat(20);
         let start = std::time::Instant::now();
@@ -1915,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn base64与超长连续数字零误报() {
+    fn base64_and_long_digit_run_zero_false_positive() {
         // base64 data URL 内嵌数字串：保护区间整体跳过。
         let blob = format!("data:image/png;base64,MTM4{}AAAA", "13812345678");
         let hits = scan_builtin_sync(&format!("图片 {blob} 结束"), &empty_cred());
@@ -1938,7 +1938,7 @@ mod tests {
     }
 
     #[test]
-    fn 句末标点剥离后仍命中() {
+    fn trailing_punct_stripped_still_matches() {
         // IPv4：ASCII 句末标点剥离后公网判定不变。
         for text in [
             "访问 8.8.8.8, 继续",
@@ -1975,7 +1975,7 @@ mod tests {
     }
 
     #[test]
-    fn 冠码86与新密钥及62卡形态() {
+    fn country_code_86_new_api_keys_and_62_card_shapes() {
         // +86 冠码三形态均命中 phone。
         for text in [
             "联系 +86 13812345678 处理",
@@ -2015,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn 宽松形态审计分类且未知透传() {
+    fn loose_shape_audit_class_and_unknown_passthrough() {
         let scope = PiiScope::new();
         // 完整形态但未注册：归类 unregistered。
         assert_eq!(scope.count_malformed("__PII_9_ab12cd34__"), "unregistered");
@@ -2070,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy忽略大小写变体还原() {
+    fn fuzzy_case_insensitive_restore() {
         let scope = PiiScope::new();
         let token = scope.register("13812345678", false).unwrap();
         let seq: usize = token
@@ -2086,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn keep前缀兜底覆盖特殊段() {
+    fn keep_prefix_covers_special_ranges() {
         assert!(is_keep_prefix_ip("10.1.2.3", "ipv4"));
         assert!(is_keep_prefix_ip("100.64.0.1", "ipv4"));
         assert!(is_keep_prefix_ip("192.0.2.1", "ipv4"));
@@ -2097,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn 命名组失配放宽到原仓口径() {
+    fn named_group_mismatch_relaxed_to_legacy() {
         let d = detector();
         // 内命名组与外层 name 不同名：原仓口径允许加载（分类以外层为准）。
         let n = d.load_custom_patterns(&[(
@@ -2109,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn 三槽叠加同时生效() {
+    fn three_slot_custom_dict_combined() {
         let d = detector();
         let (n, m) = d.load_custom_all(
             &[(
@@ -2124,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn 字典独立扫描不并入联合正则() {
+    fn dict_scan_excluded_from_combined_regex() {
         let d = detector();
         d.load_dict(&[("张三".to_string(), "name".to_string())]);
         // 联合正则扫描不含字典命中（独立扫描语义）。
@@ -2135,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn 掩码六分支形态正确() {
+    fn mask_six_branch_shapes_correct() {
         assert_eq!(mask_pii_value("phone", "13812345678"), "138****5678");
         assert_eq!(mask_pii_value("email", "a@b.com"), "***@***.com");
         assert_eq!(

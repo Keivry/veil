@@ -98,7 +98,7 @@ const CHAT_STREAM_BODY: &str =
 // —— 1.1 TSS01：完整残余静默丢弃（有效分片 + 截断垃圾尾），无成功终端伪造 ——
 
 #[tokio::test]
-async fn tss01_完整残余静默丢弃无成功终端() {
+async fn tss01_truncated_tail_silently_dropped_without_success_terminal() {
     let frames = vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"有效分片\"}}]}\n\n".to_string(),
         // 截断垃圾尾：非 JSON 残余，不得被合成为成功终端。
@@ -132,7 +132,7 @@ async fn tss01_完整残余静默丢弃无成功终端() {
 // —— 1.1 TSS02：文本中截断开环（保留已收分片，无伪造 DONE 载荷） ——
 
 #[tokio::test]
-async fn tss02_文本中截断开环保留分片() {
+async fn tss02_midtext_truncation_keeps_open_loop_fragments() {
     let frames = vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"甲\"}}]}\n\n".to_string(),
         "data: {\"choices\":[{\"delta\":{\"content\":\"乙\"}}]}\n\n".to_string(),
@@ -162,7 +162,7 @@ async fn tss02_文本中截断开环保留分片() {
 // —— 1.2 TSS03：tool_calls 参数截断不全则整把丢弃，不伪造 success ——
 
 #[tokio::test]
-async fn tss03_tool中截断丢弃不伪造成功() {
+async fn tss03_truncated_tool_call_dropped_without_fake_success() {
     let frames = vec![
         // 首帧声明 tool_call（参数仅一半），随后断流。
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{\\\"tz\\\":\\\"\"}}]}}]}\n\n".to_string(),
@@ -191,7 +191,7 @@ async fn tss03_tool中截断丢弃不伪造成功() {
 // —— 1.2 真实 toolcalls 开环：多 index 聚合形态 fixture，无伪造 ——
 
 #[tokio::test]
-async fn 真实toolcalls开环多index聚合无伪造() {
+async fn real_tool_calls_open_loop_multi_index_without_fabrication() {
     // 合成 fixture：两把完整 tool_call（多 index 聚合）+ 正常 [DONE]。
     let frames = vec![
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"k\\\":\\\"v\\\"}\"}}]}}]}\n\n".to_string(),
@@ -221,7 +221,7 @@ async fn 真实toolcalls开环多index聚合无伪造() {
 // —— 1.3 TSS04：Responses 空流截断合成 failed（与 completed 互斥） ——
 
 #[tokio::test]
-async fn tss04_responses截断合成failed互斥completed() {
+async fn tss04_responses_truncation_synthesizes_failed_excluding_completed() {
     // 空流：上游立即断流（零帧），网关合成截断序列。
     let (upstream, uhandle) = mock_upstream(vec![]).await;
     let (base, handle) = serve(test_app(
@@ -251,7 +251,7 @@ async fn tss04_responses截断合成failed互斥completed() {
 // —— 1.3 真实 reasoning 开环：分片保留，无伪造完成 ——
 
 #[tokio::test]
-async fn 真实reasoning开环保留分片无伪造() {
+async fn real_reasoning_open_loop_keeps_fragments_without_fabrication() {
     let frames = vec![
         "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"item_id\":\"r1\",\"output_index\":0,\"content_index\":0,\"delta\":\"合成推理甲\"}\n\n".to_string(),
         "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"item_id\":\"r1\",\"output_index\":0,\"content_index\":0,\"delta\":\"合成推理乙\"}\n\n".to_string(),
@@ -284,7 +284,7 @@ async fn 真实reasoning开环保留分片无伪造() {
 // —— 1.3 Anthropic 截断：message_stop 正常闭合，不断言 failed 合成 ——
 
 #[tokio::test]
-async fn anthropic截断正常闭合无failed合成() {
+async fn anthropic_truncation_closes_cleanly_without_failed() {
     let frames = vec![
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"分片甲\"}}\n\n".to_string(),
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"分片乙\"}}\n\n".to_string(),

@@ -128,7 +128,7 @@ fn assert_loop_body(body: &str) {
 }
 
 #[tokio::test]
-async fn 回环快档混合载荷对齐() {
+async fn loopback_fast_pump_aligns_mixed_payload() {
     let (upstream, uhandle) = mock_upstream_tricky().await;
     let (base, handle) = serve(test_app(&[("LLM_UPSTREAM", upstream.as_str())])).await;
     let client = reqwest::Client::new();
@@ -140,7 +140,7 @@ async fn 回环快档混合载荷对齐() {
 }
 
 #[tokio::test]
-async fn 回环慢档混合载荷对齐() {
+async fn loopback_slow_pump_aligns_mixed_payload() {
     let (upstream, uhandle) = mock_upstream_tricky().await;
     let (base, handle) = serve(test_app(&[
         ("LLM_UPSTREAM", upstream.as_str()),

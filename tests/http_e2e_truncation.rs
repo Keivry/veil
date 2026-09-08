@@ -98,7 +98,7 @@ async fn post_stream(
 }
 
 #[tokio::test]
-async fn 截断开环已透传保留无伪造终止() {
+async fn truncated_open_loop_keeps_forwarded_fragments_without_fake_terminal() {
     let (upstream, uhandle) = mock_upstream_truncated().await;
     let (base, handle) = serve(test_app(&[("LLM_UPSTREAM", upstream.as_str())])).await;
     let client = reqwest::Client::new();
@@ -132,7 +132,7 @@ async fn 截断开环已透传保留无伪造终止() {
 }
 
 #[tokio::test]
-async fn 截断慢审计同样开环() {
+async fn truncated_slow_audit_keeps_open_loop() {
     let (upstream, uhandle) = mock_upstream_truncated().await;
     let (base, handle) = serve(test_app(&[
         ("LLM_UPSTREAM", upstream.as_str()),

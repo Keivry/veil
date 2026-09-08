@@ -116,14 +116,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 占位审批保持挂起() {
+    fn placeholder_approval_stays_pending() {
         let gateway = NoopApproval;
         let record = PendingRecord::new("k", "hash_mismatch");
         assert_eq!(gateway.request_approval(&record), ApprovalOutcome::Pending);
     }
 
     #[test]
-    fn 挂起表可回查() {
+    fn pending_table_supports_lookup() {
         let table = PendingApprovals::default();
         table.insert(PendingRecord::new("k", "r"));
         assert_eq!(table.len(), 1);
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn 超期孤儿被清扫器回收() {
+    fn expired_orphans_reclaimed_by_sweeper() {
         let table = PendingApprovals::default();
         table.insert(PendingRecord::new("fresh", "r"));
         let mut stale = PendingRecord::new("stale", "r");
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn lock全清无残留() {
+    fn clear_all_leaves_no_remainder() {
         let table = PendingApprovals::default();
         table.insert(PendingRecord::new("k1", "hash_mismatch"));
         table.insert(PendingRecord::new("k2", "auto_approve_none"));
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn 同key重复建单幂等覆盖() {
+    fn duplicate_key_insert_overwrites_idempotently() {
         let table = PendingApprovals::default();
         table.insert(PendingRecord::new("k", "hash_mismatch"));
         table.insert(PendingRecord::new("k", "auto_approve_none"));
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn 并发双解锁同key仅单记录无死锁() {
+    fn concurrent_unlock_same_key_single_record_without_deadlock() {
         use std::sync::Arc;
         let table = Arc::new(PendingApprovals::default());
         let mut handles = Vec::new();

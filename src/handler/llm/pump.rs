@@ -1047,7 +1047,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 流式legacy_function_call与非流式口径统一() {
+    fn streaming_legacy_function_call_matches_nonstream() {
         use crate::service::llm_gateway::Protocol as P;
         let stream_delta = serde_json::json!({"choices":[{"delta":{"function_call":{"name":"old","arguments":"{\"x\":1}"}}}]});
         let frags = extract_tool_fragments(P::Chat, &stream_delta);
@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn 双路工具调用按index独立累积不串扰() {
+    fn dual_tool_calls_accumulate_independently_by_index() {
         use crate::service::llm_gateway::Protocol as P;
         let two = serde_json::json!({"choices":[{"delta":{"tool_calls":[
             {"index":0,"id":"call_a","type":"function","function":{"name":"exec_a","arguments":"{\"x\":1}"}},
@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic数组形态content与message_content对齐网关() {
+    fn anthropic_array_content_aligns_with_gateway() {
         use crate::service::llm_gateway::Protocol as P;
         let content_arr = serde_json::json!({"content":[{"type":"tool_use","id":"a1","name":"bash","input":{"cmd":"ls"}}]});
         let frags = extract_tool_fragments(P::Anthropic, &content_arr);
@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic按事件index分桶而非枚举下标() {
+    fn anthropic_buckets_by_event_index_not_position() {
         use crate::service::llm_gateway::Protocol as P;
         let first = serde_json::json!({"content_block":{"type":"tool_use","index":4,"id":"a4","name":"t","input":{}}});
         let frags = extract_tool_fragments(P::Anthropic, &first);
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn responses增量带序号且done全量() {
+    fn responses_delta_carries_sequence_and_done_is_full() {
         use crate::service::llm_gateway::Protocol as P;
         let delta = serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"it1","sequence_number":3,"delta":"{\"a\":"});
         let frags = extract_tool_fragments(P::Responses, &delta);
@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn 次要事件透传不审计() {
+    fn minor_events_passthrough_without_audit() {
         use crate::service::llm_gateway::Protocol as P;
         assert!(is_minor_event(
             P::Anthropic,
@@ -1169,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn refusal消息形态同样次要透传() {
+    fn refusal_message_shape_passthrough_as_minor() {
         use crate::service::llm_gateway::Protocol as P;
         assert!(is_minor_event(
             P::Chat,

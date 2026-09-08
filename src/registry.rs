@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn 三态标识映射() {
+    fn status_emoji_maps_three_states() {
         let mut e = entry("/s/a.sh", "h1");
         assert_eq!(e.status_emoji(), "🔓");
         e.enabled = true;
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn 同路径重复注册判重409同值多路径允许() {
+    fn duplicate_path_conflicts_409_same_hash_multi_path_allowed() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/a.sh", "h1").unwrap();
         let err = reg.register("/s/a.sh", "h2").unwrap_err();
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn 新注册默认未启用() {
+    fn new_registration_disabled_by_default() {
         let mut reg = CallerRegistry::empty();
         let e = reg.register("/s/a.sh", "h1").unwrap();
         assert!(!e.enabled && !e.revoked);
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn 原子落盘与完整性校验() {
+    fn atomic_save_and_integrity_check() {
         let dir = std::env::temp_dir().join(format!(
             "veil-reg-{}-{}",
             std::process::id(),
@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn 吊销后置禁用() {
+    fn revoke_disables_entry() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/a.sh", "h1").unwrap();
         reg.set_enabled("/s/a.sh", true).unwrap();
@@ -565,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn 哈希变更审批后生效并启用() {
+    fn approve_hash_change_applies_and_enables() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/a.sh", "h1").unwrap();
         reg.approve_hash_change("/s/a.sh", "h2").unwrap();
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn 未知条目字段转审批而非放行() {
+    fn unknown_entry_or_field_turns_to_approval() {
         let mut reg = CallerRegistry::empty();
         reg.register_extended(&RegisterParams {
             caller_path: "/s/acl.sh".to_string(),
@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn python旧格式迁移保留bak() {
+    fn legacy_python_format_migration_keeps_bak() {
         let dir = std::env::temp_dir().join(format!(
             "veil-reg-mig-{}-{}",
             std::process::id(),
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn 空授权表默认拒绝() {
+    fn empty_allowlist_denies_by_default() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/empty.sh", "h9").unwrap();
         let e = reg.lookup_by_path("/s/empty.sh").unwrap();
@@ -660,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn 旧哈希宽限有效且过期失效() {
+    fn old_hash_grace_accepts_old_rejects_other() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/g.sh", "h1").unwrap();
         reg.approve_hash_change("/s/g.sh", "h2").unwrap();
@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn 落盘权限0600() {
+    fn saved_file_permissions_0600() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!(
             "veil-reg-0600-{}-{}",
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn 扩展注册保留名称描述与授权映射() {
+    fn extended_register_keeps_name_desc_and_allowlist() {
         let mut reg = CallerRegistry::empty();
         reg.register_extended(&RegisterParams {
             caller_path: "/s/go.sh".to_string(),
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn 缺条目无库无效分支与双吊销幂等() {
+    fn missing_entry_no_db_invalid_json_and_double_revoke_idempotent() {
         let mut reg = CallerRegistry::empty();
         assert!(reg.lookup_by_path("/s/nope.sh").is_none(), "未注册缺条目");
         let err = reg.revoke("/s/nope.sh").unwrap_err();

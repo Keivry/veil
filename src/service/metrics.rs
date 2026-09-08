@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn 内存环10k封顶且丢弃计数() {
+    fn memory_ring_capped_with_drop_count() {
         let store = MetricsStore::new(tmp_db("ring"));
         for i in 0..(RING_CAP + 5) {
             store.record_chat(Protocol::Chat, 10, None, None, true, now() + i as i64);
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn wal检查点截断可执行() {
+    fn wal_checkpoint_truncate_runs() {
         let db = tmp_db("checkpoint");
         let _ = std::fs::remove_file(&db);
         let conn = open_wal(&db).expect("WAL 库须可建");
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn 仅对话端点计数非对话跳过() {
+    fn only_dialog_endpoints_counted_non_dialog_skipped() {
         let store = MetricsStore::new(tmp_db("nondialog"));
         assert!(!store.record_chat(Protocol::NonDialog, 10, None, None, true, now()));
         assert!(store.record_chat(Protocol::Chat, 10, None, None, true, now()));
@@ -1228,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn 延迟12桶与原仓边界可比() {
+    fn latency_12_buckets_match_legacy_bounds() {
         assert_eq!(
             LATENCY_BOUNDS_MS,
             [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000]
@@ -1240,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn p95桶中位近似() {
+    fn p95_bucket_midpoint_approximation() {
         let mut buckets = [0u64; LATENCY_BUCKETS];
         for _ in 0..95 {
             buckets[bucket_index(8)] += 1;
@@ -1258,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn is_precise双条件() {
+    fn is_precise_requires_window_and_samples() {
         assert!(!is_precise_for_window(3600, 99));
         assert!(!is_precise_for_window(3599, 100));
         assert!(is_precise_for_window(3600, 100));
@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated三态分标签非法值不落() {
+    fn truncated_three_modes_split_by_label_invalid_ignored() {
         let store = MetricsStore::new(tmp_db("trunc"));
         store.record_chat(
             Protocol::Responses,
@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn 扩展usage三列与aux回填() {
+    fn extended_usage_columns_with_aux_backfill() {
         let db = tmp_db("ext-usage");
         let _ = std::fs::remove_file(&db);
         let ts = now();
@@ -1348,7 +1348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aux列落盘查询与重启回填() {
+    async fn aux_columns_persist_query_and_restart_backfill() {
         let db = tmp_db("aux-flush");
         let _ = std::fs::remove_file(&db);
         let ts = now();
@@ -1372,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn 非流式usage同流式口径计入() {
+    fn nonstream_usage_recorded_with_stream_caliber() {
         use super::super::llm_gateway::extract_usage_nonstream;
         let store = MetricsStore::new(tmp_db("usage"));
         // responses 单层 response.usage。
@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 覆盖upsert不翻倍与重启口径一致() {
+    async fn overwrite_upsert_no_double_count_restart_consistent() {
         let db = tmp_db("upsert");
         let _ = std::fs::remove_file(&db);
         let ts = now();
@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn 摘要脱敏单一路径() {
+    fn summarize_redacts_through_single_path() {
         // JSON 键形态落盘为脱敏后。
         let out = summarize(r#"{"password":"hunter2"}"#, 1000);
         assert!(!out.contains("hunter2"), "{out}");
@@ -1445,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn pii采样关闭仅计数() {
+    fn pii_sampling_disabled_counts_only() {
         let cfg = PiiSamplerConfig::for_test(false, true, None);
         let s = PiiValueSampler::new(cfg, tmp_db("pii-off"));
         assert!(s.sample("phone", "13812345678", true).is_none());
@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn pii采样开启掩码top_n与hmac口径() {
+    fn pii_sampling_enabled_masks_top_n_with_hmac() {
         let cfg =
             PiiSamplerConfig::for_test(true, false, Some("test-hmac-key-0123456789".to_string()));
         let s = PiiValueSampler::new(cfg, tmp_db("pii-on"));
@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn pii采样未设hmac退化sha256() {
+    fn pii_sampling_without_hmac_falls_back_to_sha256() {
         let cfg = PiiSamplerConfig::for_test(true, false, None);
         let s = PiiValueSampler::new(cfg, tmp_db("pii-degrade"));
         let (_, hash) = s.sample("email", "a@b.com", true).unwrap();
@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn series_四窗口跨日近似求和查询语义() {
+    async fn series_four_windows_cross_day_approx_sum_query() {
         let db = tmp_db("series-sem");
         let _ = std::fs::remove_file(&db);
         let day10 = 86_400 * 10 + 100;
@@ -1535,7 +1535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn series_since与protocol过滤语义() {
+    async fn series_since_and_protocol_filter_semantics() {
         let db = tmp_db("series-filter");
         let _ = std::fs::remove_file(&db);
         let ts = now();
@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn pii_value_掩码合并与计数查询语义() {
+    fn pii_value_mask_merge_and_count_query() {
         let cfg = PiiSamplerConfig::for_test(true, false, None);
         let s = PiiValueSampler::new(cfg, tmp_db("pii-query"));
         let (m1, h1) = s.sample("phone", "13812345678", true).unwrap();
@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn 采样后台落盘生效() {
+    async fn sampling_background_flush_persists() {
         let db = tmp_db("pii-flush");
         let _ = std::fs::remove_file(&db);
         let cfg = PiiSamplerConfig::for_test(true, true, None);
@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn 采样满队列丢最老可查() {
+    async fn sampling_full_queue_drops_oldest_queryable() {
         let db = tmp_db("pii-full");
         let _ = std::fs::remove_file(&db);
         let cfg = PiiSamplerConfig::for_test(true, true, None);
@@ -1644,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn 采样配置取自配置结构体而非进程环境() {
+    fn sampling_config_from_struct_not_env() {
         use std::collections::HashMap;
         let base: HashMap<String, String> = HashMap::from([
             (
@@ -1673,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn 无盐采样告警谓词() {
+    fn unsalted_sampling_warns_predicate() {
         assert!(PiiSamplerConfig::for_test(true, true, None).needs_hmac_warn());
         assert!(PiiSamplerConfig::for_test(true, true, Some(String::new())).needs_hmac_warn());
         assert!(!PiiSamplerConfig::for_test(true, true, Some("k".to_string())).needs_hmac_warn());
@@ -1682,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn 模型近似口径与窗口判定() {
+    fn model_approximation_caliber_and_window_check() {
         assert!(is_precise_for_window(3600, 100));
         assert!(is_precise_for_window(86400, 1000));
         assert!(!is_precise_for_window(3599, 100), "覆盖不足须标近似");
@@ -1691,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn 采样总开关关则零落盘零采样() {
+    fn sampling_master_switch_off_means_zero_persist() {
         let cfg = PiiSamplerConfig::for_test(false, true, None);
         let s = PiiValueSampler::new(cfg, tmp_db("sample-off"));
         assert!(s.sample("phone", "13812345678", true).is_none());

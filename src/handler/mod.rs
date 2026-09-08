@@ -31,7 +31,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn 健康处理器透出服务层状态() {
+    async fn health_handler_exposes_service_status() {
         let env = HashMap::from([
             (
                 "HOMESERVER".to_string(),

@@ -474,7 +474,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fix3缺id合成call_stable标id_synth() {
+    fn fix3_missing_id_synthesizes_call_stable_id() {
         let v = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"run","arguments":"{}"}}]}}]});
         let calls = extract_tool_calls(Protocol::Chat, &v);
         assert_eq!(calls.len(), 1);
@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn fix3保留id且非string_args规范化() {
+    fn fix3_preserved_id_normalizes_non_string_args() {
         let v = serde_json::json!({"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"q","arguments":{"a":1}}}]}}]});
         let calls = extract_tool_calls(Protocol::Chat, &v);
         assert_eq!(calls.len(), 1);
@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn fix3兼容legacy与custom方言() {
+    fn fix3_supports_legacy_and_custom_dialects() {
         let legacy = serde_json::json!({"choices":[{"delta":{"function_call":{"name":"old","arguments":"{\"x\":1}"}}}]});
         let calls = extract_tool_calls(Protocol::Chat, &legacy);
         assert_eq!(calls.len(), 1);
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn responses增量delta按三级键提取且文本事件放行() {
+    fn responses_delta_extracted_by_three_level_key_ignoring_text() {
         let d1 = serde_json::json!({"type":"response.function_call_arguments.delta","output_index":1,"item_id":"item-7","sequence_number":0,"delta":"{\"x\":"});
         let calls = extract_tool_calls(Protocol::Responses, &d1);
         assert_eq!(calls.len(), 1);
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic多index交错按事件index分桶() {
+    fn anthropic_interleaved_indices_bucketed_by_event_index() {
         let b0 = serde_json::json!({"content_block":{"type":"tool_use","index":3,"id":"a3","name":"t3","input":{}}});
         let calls = extract_tool_calls(Protocol::Anthropic, &b0);
         assert_eq!(calls.len(), 1);
@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic外层index交错分桶不串() {
+    fn anthropic_outer_index_interleaving_keeps_buckets_separate() {
         let start0 = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a0","name":"run"}});
         let start1 = serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"a1","name":"run"}});
         let d0 = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":"}});
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn fix6单双层与data_response回退加缺失归档() {
+    fn fix6_single_double_layer_fallback_with_missing_archive() {
         let m = GatewayMetrics::default();
         let single = serde_json::json!({"type":"response.failed","id":"r1"});
         assert_eq!(extract_conv_id(&single).as_deref(), Some("r1"));

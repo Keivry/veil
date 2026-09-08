@@ -56,7 +56,7 @@ mod tests {
     }
 
     #[test]
-    fn 打开口径wal加0600同权() {
+    fn open_applies_wal_with_0600_perms() {
         let dir = std::env::temp_dir().join(format!("veil-fsperm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("u.sqlite");

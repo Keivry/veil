@@ -180,7 +180,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 每类错误有唯一错误码() {
+    fn each_error_variant_has_unique_code() {
         let cases = [
             VeilError::Auth {
                 message: "缺密钥".to_string(),
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn 认证失败映射403() {
+    fn auth_error_maps_to_forbidden() {
         let err = VeilError::Auth {
             message: "三因子缺一".to_string(),
         };
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn 上游状态码透传() {
+    fn upstream_status_code_passthrough() {
         for status in [401u16, 429, 502, 503] {
             let err = VeilError::Upstream {
                 status,
@@ -226,12 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn 空体映射502() {
+    fn empty_body_maps_to_bad_gateway() {
         assert_eq!(VeilError::EmptyBody.status_code(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
-    fn 未知错误默认500且不泄漏细节() {
+    fn internal_error_defaults_to_500_without_secret_leak() {
         let secret = "sk-绝密-12345";
         let err = VeilError::internal(anyhow::anyhow!(secret).context("网关中段断连"));
         assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -241,14 +241,14 @@ mod tests {
     }
 
     #[test]
-    fn anyhow上下文链保留() {
+    fn anyhow_context_chain_preserved() {
         let err = VeilError::internal(anyhow::anyhow!("根因").context("中间层").context("外层"));
         let debug = format!("{err:?}");
         assert!(debug.contains("根因") && debug.contains("中间层") && debug.contains("外层"));
     }
 
     #[tokio::test]
-    async fn 错误响应体携带错误码() {
+    async fn error_response_body_carries_code() {
         let response = VeilError::Auth {
             message: "拒绝".to_string(),
         }
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 错误体带error_detail字符串镜像() {
+    async fn error_body_carries_error_detail_mirror() {
         let response = VeilError::Auth {
             message: "拒绝".to_string(),
         }

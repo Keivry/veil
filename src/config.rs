@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn 缺必填项逐个拒启动并指明变量名() {
+    fn missing_required_each_rejects_startup_naming_var() {
         for var in [
             "HOMESERVER",
             "ROOM_ID",
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn 空值必填同样拒启动() {
+    fn blank_required_also_rejects_startup() {
         let mut env = base_env();
         env.insert("ROOM_ID".to_string(), "   ".to_string());
         let err = Config::load_from(&env).unwrap_err();
@@ -1108,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn 管理token不得复用业务token() {
+    fn admin_token_must_not_reuse_service_token() {
         let mut env = base_env();
         env.insert(
             "OBSERVABILITY_ADMIN_TOKEN".to_string(),
@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_timeout零负与禁区拒启动() {
+    fn audit_timeout_zero_negative_and_forbidden_zone_rejects_startup() {
         for raw in ["0", "-5", "110", "120", "130"] {
             let mut env = base_env();
             env.insert("AUDIT_TIMEOUT".to_string(), raw.to_string());
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_timeout合法值放行并指明区间() {
+    fn audit_timeout_valid_values_allow_with_range_hint() {
         for (raw, want) in [("90", 90), ("1", 1), ("109", 109), ("131", 131)] {
             let mut env = base_env();
             env.insert("AUDIT_TIMEOUT".to_string(), raw.to_string());
@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn pii_hold_max非正整数拒启动() {
+    fn pii_hold_max_non_positive_rejects_startup() {
         for raw in ["0", "-1", "abc", "1.5"] {
             let mut env = base_env();
             env.insert("PII_HOLD_MAX".to_string(), raw.to_string());
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn approve无白名单拒启动() {
+    fn approve_without_whitelist_rejects_startup() {
         let mut env = base_env();
         env.insert("AUDIT_MODE".to_string(), "approve".to_string());
         let err = Config::load_from(&env).unwrap_err();
@@ -1169,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn approve有白名单放行() {
+    fn approve_with_whitelist_allows() {
         let mut env = base_env();
         env.insert("AUDIT_MODE".to_string(), "approve".to_string());
         env.insert(
@@ -1181,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn 非法白名单成员拒启动() {
+    fn invalid_whitelist_member_rejects_startup() {
         let mut env = base_env();
         env.insert("AUDIT_MODE".to_string(), "approve".to_string());
         env.insert(
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn 非法审计模式拒启动并给出合法取值() {
+    fn invalid_audit_mode_rejects_startup_with_valid_values() {
         let mut env = base_env();
         env.insert("AUDIT_MODE".to_string(), "allow".to_string());
         let msg = Config::load_from(&env).unwrap_err().to_string();
@@ -1201,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符开关默认开启关闭短路() {
+    fn placeholder_toggle_defaults_on_and_off_short_circuits() {
         let cfg = Config::load_from(&base_env()).unwrap();
         assert!(cfg.placeholder_prompt_enabled);
         assert!(cfg.placeholder_prompt_text.is_empty());
@@ -1229,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符文案上限与形态回退() {
+    fn placeholder_text_cap_and_shape_fallback() {
         let mut env = base_env();
         env.insert(
             "PII_PLACEHOLDER_PROMPT_TEXT".to_string(),
@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn http_client配置缺省与覆盖均正常() {
+    fn http_client_defaults_and_overrides_ok() {
         let cfg = Config::load_from(&base_env()).unwrap();
         assert_eq!(cfg.http_timeout_secs, HTTP_TIMEOUT_SECS_DEFAULT);
         assert_eq!(
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn http_client配置非法拒启动() {
+    fn http_client_invalid_rejects_startup() {
         for (var, raw) in [
             ("HTTP_TIMEOUT_SECS", "0"),
             ("HTTP_TIMEOUT_SECS", "abc"),
@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn 脱敏别名与三语义开关() {
+    fn redaction_alias_and_three_semantic_toggles() {
         // 默认：脱敏开、响应侧开、宽松关、强化关。
         let cfg = Config::load_from(&base_env()).unwrap();
         assert!(cfg.redaction_enabled);
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn 自定义文件缺失拒启动并指明变量名() {
+    fn custom_file_missing_rejects_startup_naming_var() {
         for var in [
             "PII_CUSTOM_RULES_FILE",
             "PII_CUSTOM_PATTERNS_FILE",
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn 自定义文件解析失败与形态非法拒启动() {
+    fn custom_file_parse_failure_and_bad_shape_rejects_startup() {
         // 非法 JSON。
         let bad = custom_tmp_file("bad.json", "{不是 json");
         let mut env = base_env();
@@ -1401,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn 自定义文件合法形态放行() {
+    fn custom_file_valid_shape_allows() {
         let rules = custom_tmp_file(
             "rules.json",
             r#"[{"name":"ext-id","pattern":"EXT-\\d{6}"}]"#,
@@ -1437,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn 采样开关默认值与覆盖() {
+    fn sampling_toggles_defaults_and_overrides() {
         let cfg = Config::load_from(&base_env()).unwrap();
         assert!(!cfg.pii_value_sample_enabled);
         assert!(cfg.pii_value_sample_persist);
@@ -1459,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn 库目录默认派生与显式覆盖() {
+    fn lib_dirs_default_derived_and_explicit_override() {
         let cfg = Config::load_from(&base_env()).unwrap();
         assert_eq!(cfg.db_dir, PathBuf::from("/data/db"));
         assert_eq!(cfg.tpm_dir, PathBuf::from("/data/tpm"));
@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn 多库取排序末位同名key优先() {
+    fn multi_db_sorted_last_with_matching_key_preferred() {
         let dir = std::env::temp_dir().join(format!(
             "veil-resolve-{}",
             std::time::SystemTime::now()
@@ -1502,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml合并文件加载成功() {
+    fn yaml_merged_files_load_ok() {
         let rules = custom_tmp_file(
             "compat-rules.yaml",
             "# 自定义规则\n- name: ext-id\n  pattern: EXT-\\d{6}\n- name: emp_no\n  pattern: (?P<emp_no>(?<![\\d])工号\\d{6}(?![\\d]))\n",
@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn txt名单加载成功注释忽略() {
+    fn txt_allowlist_loads_ok_ignoring_comments() {
         let dict = custom_tmp_file(
             "compat-dict.txt",
             "# 敏感名单\n张三丰\n\n李四 # 行尾注释\n# 全行注释\n王五\n",
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn 四别名各自生效() {
+    fn four_aliases_each_take_effect() {
         let rules = custom_tmp_file("alias-a.json", r#"[{"name":"x1","pattern":"X1\\d+"}]"#);
         let patterns = custom_tmp_file("alias-b.json", r#"{"p1":"P1\\d+"}"#);
         let dict = custom_tmp_file("alias-c.json", r#"["张三"]"#);
@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn 三变量叠加主文件优先可共存() {
+    fn three_vars_overlay_primary_file_wins_coexist() {
         let merged = custom_tmp_file(
             "overlay-merged.json",
             r#"[{"name":"m1","pattern":"M1\\d+"}]"#,
@@ -1652,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn 空文件零命中仅告警放行() {
+    fn empty_file_zero_hits_warns_and_allows() {
         let empty = custom_tmp_file("compat-empty.json", "   \n");
         let mut env = base_env();
         env.insert(
@@ -1677,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml非法形态拒启动() {
+    fn yaml_bad_shape_rejects_startup() {
         let bad = custom_tmp_file("compat-bad.yaml", ":\n: :\n- \n???\n");
         let mut env = base_env();
         env.insert(
@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn 示例yaml启动可加载() {
+    fn example_yaml_loads_on_startup() {
         let mut env = base_env();
         env.insert(
             "PII_CUSTOM_RULES_FILE".to_string(),
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符off关闭复用falsy() {
+    fn placeholder_off_disables_reusing_falsy() {
         for raw in ["off", "OFF", "  off  "] {
             let mut env = base_env();
             env.insert("PII_PLACEHOLDER_PROMPT".to_string(), raw.to_string());
@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn 审批双模与pii持久默认关闭() {
+    fn approval_block_wait_and_pii_persist_default_off() {
         let cfg = Config::load_from(&base_env()).unwrap();
         assert!(!cfg.credential_block_wait);
         assert!(!cfg.pii_global_persist);
@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn 无库返回空() {
+    fn no_db_returns_none() {
         let dir = std::env::temp_dir().join(format!(
             "veil-resolve-empty-{}",
             std::time::SystemTime::now()
@@ -1777,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn 入口端口命中对应上游() {
+    fn ingress_port_hits_matching_upstream() {
         let cfg = Config::load_from(&upstream_env()).unwrap();
         assert_eq!(
             resolve_upstream_with_ingress(&cfg, Some(8878)).as_deref(),
@@ -1790,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn 未命中端口与空上下文回落缺省() {
+    fn unmatched_port_and_empty_context_fall_back_to_default() {
         let cfg = Config::load_from(&upstream_env()).unwrap();
         for port in [None, Some(8877), Some(9999)] {
             assert_eq!(
@@ -1802,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn 无缺省时回落任一端口上游() {
+    fn without_default_falls_back_to_any_port_upstream() {
         let mut env = upstream_env();
         env.remove("LLM_UPSTREAM");
         let cfg = Config::load_from(&env).unwrap();
@@ -1815,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn 遗留变量名不被读取() {
+    fn legacy_var_names_not_read() {
         let mut env = base_env();
         env.insert(
             "CREDENTIAL_MASTER_PASSWORD".to_string(),

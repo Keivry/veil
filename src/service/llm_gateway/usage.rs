@@ -170,7 +170,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 非流式usage同流式口径() {
+    fn nonstream_usage_matches_stream_convention() {
         let chat =
             serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}});
         assert_eq!(
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn responses双层回退与归一别名() {
+    fn responses_double_layer_fallback_with_alias_normalization() {
         let double = serde_json::json!({"response":{"response":{"usage":{"prompt_tokens":7,"completion_tokens":8,"total_tokens":15}}}});
         let u = extract_usage_nonstream(Protocol::Responses, &double).unwrap();
         assert_eq!(
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn 流式usage双段单调max不双计且快路径兼查裸键() {
+    fn streaming_usage_two_segments_take_max_without_double_count() {
         let start =
             serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5}}});
         let delta = serde_json::json!({"type":"message_delta","usage":{"output_tokens":20}});
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn responses流式单层usage优先于双层() {
+    fn responses_streaming_single_layer_preferred_over_double() {
         let both = serde_json::json!({"response":{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"response":{"usage":{"prompt_tokens":9,"completion_tokens":9,"total_tokens":18}}}});
         let u = extract_usage_stream(Protocol::Responses, &both).unwrap();
         assert_eq!(
@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn usage累计值分片取max不双计() {
+    fn usage_accumulation_takes_max_without_double_count() {
         let mut acc: Option<Usage> = None;
         accumulate_usage(
             &mut acc,
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn usage递减乱序取历史最大且message_delta累计覆盖() {
+    fn usage_regression_keeps_historical_max_with_delta_coverage() {
         let mut acc: Option<Usage> = None;
         accumulate_usage(
             &mut acc,

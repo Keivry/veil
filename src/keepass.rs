@@ -398,7 +398,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 未解锁返回503() {
+    fn locked_backend_returns_503() {
         let backend = MockKeePass::locked();
         let err = backend.fetch_credential("c1").unwrap_err();
         assert_eq!(
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn 解锁后下发占位载荷() {
+    fn unlocked_backend_serves_placeholder_payload() {
         let backend = MockKeePass::unlocked();
         assert!(backend.fetch_credential("c1").is_ok());
     }
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 真实固件整条目回放() {
+    async fn real_fixture_full_entry_replay() {
         let dir = unique_temp_dir("full");
         let backend = fixture_backend(&dir);
         assert!(backend.is_unlocked());
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 缺条目返回404具名() {
+    async fn missing_entry_returns_named_404() {
         let dir = unique_temp_dir("missing");
         let backend = fixture_backend(&dir);
         let err = backend.fetch_entry("不存在".to_string()).await.unwrap_err();
@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 无库返回503且不尝试解锁() {
+    async fn missing_db_returns_503_without_unlock_attempt() {
         let dir = unique_temp_dir("nodb");
         let opened = std::sync::Arc::new(AtomicBool::new(false));
         let flag = opened.clone();
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 错误主密码返回500() {
+    async fn wrong_master_password_returns_500() {
         let dir = unique_temp_dir("badpw");
         let db_path = dir.join("vault.kdbx");
         build_test_kdbx(&db_path, b"correct-pw", &[("网易", "u", "s", "", vec![])]);
@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 并发冷缓存仅单次open() {
+    async fn concurrent_cold_cache_opens_once() {
         let dir = unique_temp_dir("race");
         let backend = std::sync::Arc::new(fixture_backend(&dir));
         let mut handles = Vec::new();
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 清缓存后重新open() {
+    async fn cache_clear_reopens() {
         let dir = unique_temp_dir("invalidate");
         let backend = fixture_backend(&dir);
         backend.fetch_entry("备用".to_string()).await.unwrap();
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn tpm口令提供器缓存复用() {
+    fn tpm_password_provider_reuses_cache() {
         let dir = unique_temp_dir("tpm-cache");
         let provider = tpm_password_provider(dir.clone(), true);
         let first = provider().expect("mock 放行须解封成功");
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 同名多条目取首条不排序() {
+    async fn duplicate_titles_return_first_without_sorting() {
         let dir = unique_temp_dir("first");
         let db_path = dir.join("vault.kdbx");
         build_test_kdbx(
@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn 解锁探针判口令非空() {
+    fn unlock_probe_detects_nonempty_password() {
         let dir = unique_temp_dir("probe");
         let db_path = dir.join("vault.kdbx");
         build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 二次查询不重解主密码() {
+    async fn second_lookup_does_not_reunlock_password() {
         let dir = unique_temp_dir("tpm-reuse");
         let db_path = dir.join("vault.kdbx");
         build_test_kdbx(

@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 对话尾严格命中三协议() {
+    fn dialog_tail_strictly_matches_three_protocols() {
         let m = GatewayMetrics::default();
         for (path, want) in [
             ("/v1/chat/completions", Protocol::Chat),
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn 非对话不命中且不计数() {
+    fn non_dialog_miss_without_counting() {
         let m = GatewayMetrics::default();
         let (hit, proto) = is_chat_tail("/v1/models", Some(&m));
         assert!(!hit && proto == Protocol::NonDialog);
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn 一层后缀宽容计数() {
+    fn single_suffix_lenient_match_with_count() {
         let m = GatewayMetrics::default();
         let (hit, proto) = is_chat_tail("/v1/chat/completions/", Some(&m));
         assert!(hit && proto == Protocol::Chat);
@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn tail优先于content_type() {
+    fn tail_takes_precedence_over_content_type() {
         let m = GatewayMetrics::default();
         assert_eq!(
             resolve_protocol("/v1/models", Some("text/event-stream"), Some(&m)),
@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_options仅chat_responses注入() {
+    fn stream_options_injected_only_for_chat_and_responses() {
         let chat_stream = serde_json::json!({"model":"m","stream":true});
         let resp_stream = serde_json::json!({"model":"m","stream":true});
         let anth_stream = serde_json::json!({"model":"m","stream":true});
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_options键冲突按键合并而非替换() {
+    fn stream_options_conflict_merged_by_key_not_replaced() {
         // D5 回归：已存在 object 内键冲突时按 key 合并，既有值（含 false）不得被覆盖。
         let mut conflict =
             serde_json::json!({"stream":true,"stream_options":{"include_usage":false,"other":1}});

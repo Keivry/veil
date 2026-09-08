@@ -247,7 +247,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ci用mock全绿() {
+    fn ci_mock_unlocks_and_passes_gate() {
         let mock = MockTpm::unlocked(b"supersecret");
         assert!(mock.is_available());
         assert_eq!(mock.unseal().unwrap(), b"supersecret");
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn tpm不可用启动失败且无软件回退() {
+    fn unavailable_tpm_fails_startup_without_software_fallback() {
         let mock = MockTpm::unavailable();
         assert!(!mock.is_available());
         assert!(mock.unseal().is_err());
@@ -270,27 +270,27 @@ mod tests {
     }
 
     #[test]
-    fn 真实实现无持久化primary_ctx() {
+    fn real_impl_persists_no_primary_ctx() {
         // primary.ctx 只允许出现在临时目录拼装路径中，仓库内不得存在持久化文件。
         assert!(!std::path::Path::new("primary.ctx").exists());
         assert!(!std::path::Path::new("/data/primary.ctx").exists());
     }
 
     #[test]
-    fn 启动门禁显式mock放行() {
+    fn startup_gate_explicit_mock_allowed() {
         let sealed = startup_tpm(true).unwrap();
         assert!(!sealed.is_empty());
     }
 
     #[test]
-    fn 启动门禁默认真实无硬件失败() {
+    fn startup_gate_defaults_to_hardware_and_fails_without_it() {
         if !RealTpm::new().is_available() {
             assert!(startup_tpm(false).is_err());
         }
     }
 
     #[test]
-    fn 模板回放含owner_rsa2048_sha256() {
+    fn template_replay_contains_owner_rsa2048_sha256() {
         let tpm = RealTpm::with_dir(PathBuf::from("/data/tpm"));
         let args = tpm.createprimary_args("primary.ctx");
         let joined = args.join(" ");
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn 密封路径取自tpm_dir() {
+    fn seal_paths_come_from_tpm_dir() {
         let tpm = RealTpm::with_dir(PathBuf::from("/srv/tpm"));
         assert_eq!(tpm.seal_pub(), PathBuf::from("/srv/tpm/seal.pub"));
         assert_eq!(tpm.seal_priv(), PathBuf::from("/srv/tpm/seal.priv"));
@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn 缺密封文件拒绝空密钥() {
+    fn missing_seal_files_reject_empty_key() {
         let dir = std::env::temp_dir().join(format!(
             "veil-tpm-missing-{}-{}",
             std::process::id(),
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn mock门禁仅精确1放行() {
+    fn mock_gate_allows_only_exact_one() {
         assert!(mock_allowed_value("1"));
         for raw in ["true", "True", "0", "", "  ", "01", "1 "] {
             if raw == "1 " {
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn 超时默认30秒() {
+    fn timeout_defaults_to_30_seconds() {
         assert_eq!(RealTpm::new().timeout, Duration::from_secs(30));
         assert_eq!(
             RealTpm::with_dir(PathBuf::from("/x")).timeout,

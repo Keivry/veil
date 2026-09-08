@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 请求侧替换响应侧还原() {
+    async fn request_redact_response_restore() {
         let vault = vault_with_secret("my-secret-001");
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -751,7 +751,7 @@ mod tests {
         assert!(restored.contains("13812345678"), "{restored}");
     }
     #[tokio::test]
-    async fn 响应新检出不还原() {
+    async fn response_new_pii_not_restored() {
         let vault = CredentialVault::new();
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 同秘密复用不重复注册且重建一致() {
+    async fn same_secret_reuse_single_register_rebuild_consistent() {
         let vault = vault_with_secret("cache-secret-xyz");
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 跨请求不可还原他方pii() {
+    async fn cross_request_pii_not_restorable() {
         let vault = CredentialVault::new();
         let detector = PiiDetector::new();
         let a = Scope::new();
@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 嵌套tool_calls回归() {
+    async fn nested_tool_calls_roundtrip() {
         let vault = CredentialVault::new();
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 非流式与流末残余出口一致清理() {
+    async fn nonstream_and_stream_tail_partials_cleaned() {
         let vault = CredentialVault::new();
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -829,7 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 响应侧关闭透出原文() {
+    async fn response_side_disabled_passes_through() {
         let vault = CredentialVault::new();
         let detector = PiiDetector::new();
         let scope = Scope::with_opts(false, false);
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn 宽松还原按序号回查() {
+    fn fuzzy_restore_by_sequence_lookup() {
         let vault = CredentialVault::new();
         let plain = "13812345678";
         let exact = Scope::with_opts(true, false);
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn strip出口函数语义() {
+    fn strip_partial_and_token_fn_semantics() {
         let vault = CredentialVault::new();
         assert_eq!(strip_partials("a __VG_CRED_00 b"), "a  b");
         assert_eq!(strip_partials("a __PII_3_ab b"), "a  b");
@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn fix5默认子串不重排仅开启才声明头() {
+    fn fix5_default_no_reorder_header_only_when_enabled() {
         let original = br#"{"b": 1,  "a": 2}"#;
         let normalized = br#"{"a":2,"b":1}"#;
         let (bytes, header) = select_request_bytes(original, normalized, false);
@@ -902,7 +902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 多行保真往返字节一致() {
+    async fn multiline_faithful_roundtrip_bytes_identical() {
         let vault = vault_with_secret("my-secret-001");
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -916,7 +916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 还原span跳过防二次掩码() {
+    async fn restore_spans_skip_prevents_remask() {
         let vault = CredentialVault::new();
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn 凭据还原span覆盖明文() {
+    fn credential_restore_spans_cover_plaintext() {
         let vault = CredentialVault::new();
         vault.register("my-secret-001").expect("注册恒成功");
         let scope = Scope::new();
@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符关闭条件与原仓对齐() {
+    fn placeholder_disable_conditions_match_legacy() {
         assert!(!placeholder_prompt_enabled("0"));
         assert!(!placeholder_prompt_enabled("false"));
         assert!(!placeholder_prompt_enabled("no"));
@@ -977,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn span加法去重语义() {
+    fn span_apply_dedup_semantics() {
         let out = apply_spans_dedup(
             "hello world",
             &[(6, 11, "W".to_string()), (6, 11, "W".to_string())],
@@ -986,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn 还原幂等不双还原且未知透传() {
+    fn restore_idempotent_unknown_passthrough() {
         let vault = vault_with_secret("my-secret-001");
         let scope = Scope::new();
         let tok = scope.pii_scope().register("13812345678", false).unwrap();
@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn 边界hold跨缝手机号双侧掩码() {
+    fn boundary_hold_cross_seam_phone_masked_both_sides() {
         let mut h = BoundaryHold::new(64);
         let (p0, d0) = h.push(
             "event: message\n".to_string(),
@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn 边界hold无跨缝原样透传() {
+    fn boundary_hold_no_seam_passthrough() {
         let mut h = BoundaryHold::new(64);
         let (p0, d0) = h.push("e\n".to_string(), "hello".to_string(), |_, _| vec![]);
         assert!(p0.is_empty() && d0.is_empty(), "首帧延迟无放行");
@@ -1039,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn 边界hold零窗直通且json结构守卫() {
+    fn boundary_hold_zero_window_passthrough_json_guard() {
         let mut h = BoundaryHold::new(0);
         let (p, d) = h.push("e\n".to_string(), "{\"a\":1}".to_string(), |_, _| {
             vec![(0, 7)]
@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn 掩码逐字豁免且roundtrip合法() {
+    fn mask_per_char_envelope_exempt_roundtrip_valid() {
         // 贴信封 PII：数字紧邻引号/冒号，非信封位仍被掩码。
         let mut t = "{\"content\":\"13812345678\"}".to_string();
         let start = "{\"content\":\"".len();
@@ -1070,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_window_ipv6全字母组缝邻保护() {
+    fn filter_window_ipv6_alpha_group_seam_guard() {
         // 尾窗末端短词 `"abcd":`：缝邻保护开启时保留 `abcd` 组。
         let (guarded, _) = filter_window("xx\"abcd\":", true, false);
         assert!(guarded.contains("abcd"), "缝邻短词不得误删: {guarded}");
@@ -1096,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符残片跨缝可检出() {
+    fn placeholder_fragment_cross_seam_detected() {
         // marker 前缀本身横跨缝合缝："ab __VG_CRE" + "D_12..."。
         let window = "ab __VG_CRED".to_string();
         let seam = "ab __VG_CRE".len();
@@ -1112,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn 信封过滤缝合跨帧数字() {
+    fn envelope_filter_stitches_cross_frame_digits() {
         let prev = "{\"delta\":{\"content\":\"call 138\"}}";
         let cur = "{\"delta\":{\"content\":\"12345678 ok\"}}";
         let (tail_f, _) = filter_window(prev, true, false);
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn 边界hold信封分隔同样掩码() {
+    fn boundary_hold_envelope_split_masked_same() {
         let mut h = BoundaryHold::new(128);
         let prev = "{\"delta\":{\"content\":\"call 138\"}}".to_string();
         let cur = "{\"delta\":{\"content\":\"12345678 ok\"}}".to_string();
@@ -1155,7 +1155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 字典5000防联合正则爆炸耗时锚() {
+    async fn dict_5000_no_combined_regex_blowup_time_anchor() {
         let detector = PiiDetector::new();
         let dict: Vec<(String, String)> = (0..5000)
             .map(|i| (format!("合成姓名{i:05}号"), "name".to_string()))
@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 增量扫描耗时锚宽松上界() {
+    async fn incremental_scan_time_anchor_loose_bound() {
         let vault = vault_with_secret("anchor-secret-007");
         let detector = PiiDetector::new();
         let scope = Scope::new();
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scope请求隔离并发互不可见() {
+    async fn scope_request_isolation_concurrent_invisible() {
         let detector = std::sync::Arc::new(PiiDetector::new());
         let mut handles = Vec::new();
         for i in 0..4 {
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn boundaryhold组合fuzz往返不破坏信封() {
+    fn boundary_hold_combined_fuzz_roundtrip_keeps_envelope() {
         let frags = ["__PII_", "7__", "\"content\":\"", "abc", "\"}"];
         let seps = ["", "\"k\":", "{", "},{\"next\":"];
         let mut n = 0u64;

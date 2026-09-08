@@ -65,7 +65,7 @@ fn count_done(data: &[&veil::service::sse::SseEvent]) -> usize {
 }
 
 #[test]
-fn sentinel_check语义对齐_四份全行可loads且keepalive可见() {
+fn sentinel_check_semantics_aligned_all_fixtures_parseable_with_keepalive() {
     let mut seen_keepalive: HashMap<&str, bool> = HashMap::new();
     for name in [
         "sentinel_chat.jsonl",
@@ -94,7 +94,7 @@ fn sentinel_check语义对齐_四份全行可loads且keepalive可见() {
 }
 
 #[test]
-fn chat回放_终止恰1个done() {
+fn chat_replay_terminates_with_exactly_one_done() {
     let (_req, sse_lines, _audit) = load_fixture("sentinel_chat.jsonl");
     let events = replay(&sse_lines);
     let data = data_events(&events);
@@ -112,7 +112,7 @@ fn chat回放_终止恰1个done() {
 }
 
 #[test]
-fn anthropic回放_含stop三件套() {
+fn anthropic_replay_contains_stop_triad() {
     let (_req, sse_lines, _audit) = load_fixture("sentinel_anthropic.jsonl");
     let events = replay(&sse_lines);
     let data = data_events(&events);
@@ -136,7 +136,7 @@ fn anthropic回放_含stop三件套() {
 }
 
 #[test]
-fn responses回放_含completed终止() {
+fn responses_replay_contains_completed_terminator() {
     let (_req, sse_lines, _audit) = load_fixture("sentinel_responses.jsonl");
     let events = replay(&sse_lines);
     let data = data_events(&events);
@@ -157,7 +157,7 @@ fn responses回放_含completed终止() {
 }
 
 #[test]
-fn v1models回放_非对话透传单包() {
+fn v1_models_replay_passthrough_single_packet() {
     let (_req, sse_lines, _audit) = load_fixture("sentinel_v1_models.jsonl");
     let events = replay(&sse_lines);
     let data = data_events(&events);
@@ -167,7 +167,7 @@ fn v1models回放_非对话透传单包() {
 }
 
 #[test]
-fn 空流_零事件不断链() {
+fn empty_stream_yields_zero_events_without_breaking_chain() {
     let mut parser = SseParser::new();
     let events = parser.push_bytes(b"");
     assert!(events.is_empty(), "空输入应零事件");
@@ -178,7 +178,7 @@ fn 空流_零事件不断链() {
 }
 
 #[test]
-fn 坏json_解析器不崩且原样透出() {
+fn malformed_json_parser_survives_and_passes_through() {
     let mut parser = SseParser::new();
     let events = parser.push_bytes(b"data: {not-json\n\n");
     assert_eq!(events.len(), 1, "坏 JSON 行仍应产出事件");
@@ -189,7 +189,7 @@ fn 坏json_解析器不崩且原样透出() {
 }
 
 #[test]
-fn 断连_半帧缓冲不断链残余可见() {
+fn truncated_half_frame_buffered_residual_visible() {
     let mut parser = SseParser::new();
     let events = parser.push_bytes(b"data: {\"a\": 1");
     assert!(events.is_empty(), "半帧不应提前产出事件");
@@ -203,7 +203,7 @@ fn 断连_半帧缓冲不断链残余可见() {
 }
 
 #[test]
-fn 跨分片utf8半字符按字节缓冲组装() {
+fn split_utf8_half_char_reassembled_bytewise() {
     let mut parser = SseParser::new();
     let raw = "data: 中文\n\n".as_bytes();
     let mut events = Vec::new();

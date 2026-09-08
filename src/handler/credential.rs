@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 伪造代理头不绕过吊销判定() {
+    async fn forged_proxy_headers_do_not_bypass_revoke_check() {
         // 内网豁免只认 TCP 远端：公网对端携带伪造内网 XFF 仍转审批，不直接吊销。
         let state = revoke_test_state();
         service::register_caller(&state, "/s/xff.sh", "h-xff", "src-xff")

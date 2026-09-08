@@ -77,7 +77,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fix1全集双向大小写不敏感加动态项() {
+    fn hop_filter_full_set_case_insensitive_with_dynamic_entries() {
         use axum::http::{HeaderMap, HeaderValue};
         let m = GatewayMetrics::default();
         let mut h = HeaderMap::new();
@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn fix1关闭解码透传编码且双向计数() {
+    fn hop_filter_decode_off_preserves_encoding_with_both_dir_counts() {
         use axum::http::{HeaderMap, HeaderValue};
         let m = GatewayMetrics::default();
         let mut up = HeaderMap::new();
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn 八头逐项过滤透传矩阵() {
+    fn eight_hop_headers_filtered_individually_matrix() {
         use axum::http::{HeaderMap, HeaderValue};
         for hop in HOP_HEADERS {
             let m = GatewayMetrics::default();

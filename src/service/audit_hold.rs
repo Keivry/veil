@@ -360,7 +360,7 @@ mod tests {
     use {super::*, crate::approval::NoopApproval};
 
     #[test]
-    fn responses三分片保序单flush且增量期不审计() {
+    fn responses_three_fragments_ordered_single_flush_no_audit_during_delta() {
         let mut hold = AuditHold::new(1024);
         let key = AuditHold::responses_key(Some("item-7"), 1);
         assert_eq!(
@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn tool增量按index累积至完成前不flush() {
+    fn tool_deltas_accumulate_by_index_without_flush_until_complete() {
         let mut hold = AuditHold::new(1024);
         assert_eq!(
             hold.push_fragment(0, Some("a"), Some("run"), "{\"x\":"),
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn 超限fail_closed且清理pending() {
+    fn overflow_fail_closed_and_clears_pending() {
         let mut hold = AuditHold::new(4);
         assert_eq!(
             hold.push_fragment(0, None, None, "ab"),
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn 中途abort与早断清理均为fail_closed无挂起() {
+    fn mid_abort_and_early_close_cleanup_fail_closed_without_hang() {
         let mut hold = AuditHold::new(1024);
         assert_eq!(
             hold.push_fragment(0, Some("a"), Some("run"), "{\"x\":"),
@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn 双index独立累积不串扰() {
+    fn dual_index_independent_accumulation_without_crosstalk() {
         let mut hold = AuditHold::new(1024);
         assert_eq!(
             hold.push_fragment(0, Some("a"), Some("run_a"), "{\"x\":"),
@@ -507,21 +507,21 @@ mod tests {
     }
 
     #[test]
-    fn 超时断连竞态区间常量锁定() {
+    fn timeout_disconnect_race_window_constants_locked() {
         assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MIN, 110);
         assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MAX, 130);
         assert_eq!(crate::config::AUDIT_TIMEOUT_DEFAULT, 90);
     }
 
     #[test]
-    fn 挂起期新危险调用一律拒绝() {
+    fn new_dangerous_calls_rejected_during_hold() {
         let hold = AuditHold::new(1024);
         assert!(hold.reject_new_dangerous_during_hold(true));
         assert!(!hold.reject_new_dangerous_during_hold(false));
     }
 
     #[test]
-    fn verdict沿用审批trait占位() {
+    fn verdict_reuses_approval_trait_stub() {
         let gw = NoopApproval;
         let rec = PendingRecord::new("k", "audit_hold");
         assert_eq!(decide_via_gateway(&gw, &rec), None);
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn decide落实block与approve无noop占位() {
+    fn decide_enforces_block_and_approve_without_noop_stub() {
         let rec = PendingRecord::new("k", "audit_hold");
         struct AllowAll;
         impl std::fmt::Debug for AllowAll {
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn 完成判定无重复分支() {
+    fn completion_check_without_duplicate_branches() {
         // `response.output_item.done` 仅走 matches! 主分支，不再有尾部重复条件。
         assert!(AuditHold::is_complete_event(
             &serde_json::json!({"type": "response.output_item.done", "item": {"id": "x"}})
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keepalive句柄per_request独立且首包挂起保活() {
+    async fn keepalive_handle_per_request_independent_with_first_packet_hold() {
         let (tx1, _rx1) = tokio::sync::mpsc::channel::<String>(8);
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<String>(8);
         let h1 = RequestKeepalive::spawn(tx1);
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_approve_stream_批准注入完成放行() {
+    fn audit_approve_stream_approve_injects_completion_and_allows() {
         let mut hold = AuditHold::new(1024);
         assert_eq!(
             hold.push_fragment(0, Some("c1"), Some("run"), "{\"x\":"),
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_approve_stream_拒绝与过期注入清理() {
+    fn audit_approve_stream_reject_and_expiry_inject_cleanup() {
         let mut deny = AuditHold::new(1024);
         deny.push_fragment(0, Some("c1"), Some("rm"), "{\"p\":");
         deny.mark_rejected();
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_approve_stream_anthropic_precheck三事件() {
+    fn audit_approve_stream_anthropic_precheck_three_events() {
         // §2.5：stop/item_done 只清对应 index 槽；全局完成仅 message_stop。
         assert!(AuditHold::is_index_complete_event(
             &serde_json::json!({"type":"content_block_stop"})
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn 第二tool块不清全局且照常审计() {
+    fn second_tool_block_preserves_global_state_and_audits_normally() {
         let mut hold = AuditHold::new(1024);
         assert_eq!(
             hold.push_fragment(0, Some("a0"), Some("run"), "{\"x\":1}"),
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_approve_stream_溢出failclosed双路径() {
+    fn audit_approve_stream_overflow_fail_closed_both_paths() {
         let mut chat_hold = AuditHold::new(4);
         assert_eq!(
             chat_hold.push_fragment(0, None, None, "ab"),
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_approve_stream_abort_mid_toolcall粘性拒绝() {
+    fn audit_approve_stream_abort_mid_toolcall_sticky_reject() {
         let mut hold = AuditHold::new(1024);
         hold.push_fragment(0, Some("c1"), Some("run"), "{\"a\":");
         hold.mark_rejected();
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_approve_stream_超时断连竞态与早断清理() {
+    async fn audit_approve_stream_timeout_disconnect_race_with_early_close_cleanup() {
         let (tx1, _rx1) = tokio::sync::mpsc::channel::<String>(8);
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<String>(8);
         let gate_closed = std::sync::Arc::new(AtomicBool::new(false));

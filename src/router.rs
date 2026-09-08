@@ -79,7 +79,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 七路由路径拼写与状态码() {
+    async fn seven_routes_paths_and_status_codes() {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
 
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin精确路由先于通配未知子路径404() {
+    async fn admin_exact_routes_before_wildcard_unknown_404() {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
         let token = "observability-admin-token-0123456789";
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin通用限流11连击429带retry_after() {
+    async fn admin_rate_limit_eleventh_returns_429_with_retry_after() {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
         let token = "observability-admin-token-0123456789";
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 网关体超限413() {
+    async fn gateway_body_too_large_413() {
         let app = test_app(&[]);
         let (base, handle) = serve_and_client(app).await;
         let client = reqwest::Client::new();
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 限流返回429带_retry_after() {
+    async fn credential_rate_limit_returns_429_with_retry_after() {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn go互操作镜像与entry指引() {
+    async fn go_interop_mirror_and_entry_hint() {
         let (base, handle) = serve_and_client(test_app(&[])).await;
         let client = reqwest::Client::new();
 
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 默认关闭请求体除替换外字节一致() {
+    async fn body_passthrough_byte_identical_by_default() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (upstream, uhandle) = mock_upstream_echo(seen.clone()).await;
         let app = test_app(&[("LLM_UPSTREAM", upstream.as_str())]);
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 开启改写带声明头() {
+    async fn normalize_enabled_sets_declared_header() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (upstream, uhandle) = mock_upstream_echo(seen.clone()).await;
         let app = test_app(&[
@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 非流式观测落盘可查() {
+    async fn non_stream_observation_persisted_and_queryable() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (upstream, uhandle) = mock_upstream_echo(seen.clone()).await;
         let app = test_app(&[("LLM_UPSTREAM", upstream.as_str())]);

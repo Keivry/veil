@@ -379,7 +379,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whatwg切行与注释透传() {
+    fn whatwg_line_splitting_with_comment_passthrough() {
         let mut p = SseParser::new();
         let evs = p.push_bytes(b"event: message\ndata: {\"a\":1}\n\n");
         assert_eq!(evs.len(), 1);
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn retry全数字与data单空格剥离() {
+    fn retry_all_digits_and_data_single_space_stripped() {
         let mut p = SseParser::new();
         let evs = p.push_bytes(b"retry: 3000\ndata:  hello\n\n");
         assert_eq!(evs[0].retry, Some(3000));
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn 双空格data_json可解析() {
+    fn double_space_data_json_parses() {
         let mut p = SseParser::new();
         let evs = p.push_bytes(b"data:  {\"a\":1}\n\n");
         assert_eq!(evs.len(), 1);
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn utf8按字节缓冲不逐chunk解码() {
+    fn utf8_byte_buffered_without_per_chunk_decoding() {
         let mut buf = Utf8ByteBuffer::new();
         let ch = "中".as_bytes();
         let first = buf.push(&ch[..1]);
@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn 行缓冲16kb兜底不崩() {
+    fn line_buffer_16kb_fallback_without_crash() {
         let mut p = SseParser::new();
         let big = vec![b'x'; LINE_LIMIT_BYTES + 10];
         let mut frame = b"data: ".to_vec();
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn keepalive对齐且不计事件() {
+    fn keepalive_aligned_without_counting_events() {
         let p = SseParser::new();
         assert_eq!(p.sse_event_count, 0);
         let f = keepalive_frame();
@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn 截断三态与responses限定() {
+    fn truncation_three_states_with_responses_restriction() {
         let mut meta = StreamMeta::default();
         assert!(set_truncated(
             &mut meta,
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_fast分发语义() {
+    fn slow_fast_dispatch_semantics() {
         let mut buf = "hello。".to_string();
         assert!(select_emit(&mut buf, Speed::Slow).is_some());
         let mut buf2 = "hello".to_string();
@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_真实数据_utf8分片重组与终止唯一() {
+    fn truncation_real_data_utf8_fragments_reassembled_single_terminal() {
         let mut buf = Utf8ByteBuffer::new();
         let raw = "data: {\"content\":\"中文回复。\"}\n\n".as_bytes();
         let mut text = String::new();
@@ -545,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn data行级json_aware还原() {
+    fn data_line_level_json_aware_restore() {
         let out = json_aware_line("{\"a\": \"v1\"}", |s| s.replace("v1", "v2"));
         assert!(out.contains("v2"));
         let plain = json_aware_line("plain token", |s| s.to_uppercase());
@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn fast去抖累积至标点或阈值才吐() {
+    fn fast_debounce_accumulates_until_punctuation_or_threshold() {
         let mut agg = String::new();
         agg.push_str("hello");
         assert!(select_emit(&mut agg, Speed::Fast).is_none());
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn bom_done残余丢弃且终端恰一() {
+    fn bom_done_residue_discarded_single_terminal() {
         assert!(is_done_payload("\u{feff}[DONE]"));
         assert!(is_done_payload("  [DONE]  "));
         assert!(is_done_payload("data: [DONE]"));
@@ -622,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn 多行data按序透传且事件名保留() {
+    fn multiline_data_ordered_passthrough_preserving_event_name() {
         let mut p = SseParser::new();
         let evs = p.push_bytes("event: message\ndata: 第一行\ndata: 第二行\n\n".as_bytes());
         assert_eq!(evs.len(), 1);
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn 空retry与纯注释行被忽略不计事件() {
+    fn empty_retry_and_comment_lines_ignored_without_event_count() {
         let mut p = SseParser::new();
         let before = p.sse_event_count;
         let evs = p.push_bytes(b"retry:\ndata: v\n\n");
@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn refusal三片段单事件重组() {
+    fn refusal_three_fragments_reassembled_single_event() {
         let mut p = SseParser::new();
         let full = "data: {\"choices\":[{\"delta\":{\"refusal\":\"合成拒绝文\"}}]}\n\n";
         let a = full.floor_char_boundary(full.len() / 3);
@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn flush文本幂等无双还原() {
+    fn flush_text_idempotent_without_double_restore() {
         let mut buf = Utf8ByteBuffer::new();
         assert_eq!(buf.push("甲".as_bytes()), "甲");
         let first = buf.flush_text();
@@ -684,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn bom单次剥离且注释帧透传() {
+    fn bom_stripped_once_with_comment_frame_passthrough() {
         assert_eq!(strip_sse_bom("\u{feff}data: x"), "data: x");
         assert_eq!(strip_sse_bom("\u{feff}\u{feff}data: x"), "data: x");
         // 当前指定行为：行内 BOM 前缀的 data 行不被识别为数据行（BOM 剥离仅

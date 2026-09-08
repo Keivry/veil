@@ -928,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn hmac等长比较语义() {
+    fn hmac_constant_time_comparison_semantics() {
         assert!(admin_token_eq("tok-abc-123", "tok-abc-123"));
         assert!(!admin_token_eq("tok-abc-124", "tok-abc-123"));
         assert!(!admin_token_eq("short", "much-longer-expected-value"));
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn 鉴权优先级与401语义() {
+    fn auth_priority_header_cookie_query_and_401() {
         let expected = "observability-admin-token-0123456789";
         // 头优先：头有效不再校验低优先级。
         assert!(
@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn cookie解析形态() {
+    fn cookie_admin_token_parsing() {
         let mut h = HeaderMap::new();
         h.insert(
             "cookie",
@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn 限流按直连对端ip计数() {
+    fn rate_limit_counts_by_direct_peer_ip() {
         let st = test_admin_state();
         // 同一 IP 10 次放行，第 11 次 429。
         for _ in 0..ADMIN_RATE_LIMIT {
@@ -1045,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn sse每ip五并发第六路拒绝() {
+    fn sse_max_five_per_ip_sixth_rejected() {
         let st = test_admin_state();
         let mut guards = Vec::new();
         for _ in 0..SSE_MAX_PER_IP {
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 超限响应429带retry_after与错误码锁定() {
+    async fn rate_limited_returns_429_with_retry_after_and_code() {
         let resp = rate_limited(42);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peerip只认直连不采信代理头() {
+    async fn peer_ip_uses_direct_connection_ignores_proxy_headers() {
         use axum::extract::ConnectInfo;
         let addr: SocketAddr = "203.0.113.7:54321".parse().unwrap();
         let req = axum::http::Request::builder()
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn sse超并发拒绝不影响已建连接() {
+    fn sse_over_limit_rejection_preserves_existing_connections() {
         let st = test_admin_state();
         let mut guards = Vec::new();
         for _ in 0..SSE_MAX_PER_IP {
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn 速率与并发计数正交() {
+    fn rate_and_concurrency_counters_are_orthogonal() {
         let st = test_admin_state();
         // 速率打满不影响并发配额。
         for _ in 0..ADMIN_RATE_LIMIT {
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn 未知子路径404() {
+    fn unknown_subpath_returns_404() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn 事件摘要落盘已脱敏() {
+    fn event_summary_stored_redacted() {
         let st = test_admin_state();
         let ev = st.push_event(
             "audit",
@@ -1169,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn 旧range映射新口径等价() {
+    fn legacy_range_maps_to_new_granularity() {
         assert_eq!(compat_granularity_for_range("1h"), Some("five_min"));
         assert_eq!(compat_granularity_for_range("24h"), Some("hourly"));
         assert_eq!(compat_granularity_for_range("7d"), Some("daily"));
@@ -1181,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn 旧verdict归一新口径() {
+    fn legacy_verdict_normalizes_to_new_values() {
         for v in ["allow", "allowed", "pass", "approved", "ALLOW"] {
             assert_eq!(normalize_verdict_compat(v), Some("allow"), "{v}");
         }
@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict兼容命中kind才过滤() {
+    fn verdict_compat_filters_only_on_matching_kind() {
         let st = test_admin_state();
         st.push_event("audit", "危险操作摘要", None);
         assert!(st.has_kind("audit"));
@@ -1211,7 +1211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn series_model_upstream兼容仅标注不过滤() {
+    async fn series_model_upstream_compat_annotates_without_filtering() {
         use crate::{config::Config, state::SqliteOutcome};
         let dir = std::env::temp_dir().join(format!("veil-admin-series-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
@@ -1257,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_index占位文案含六路由() {
+    fn admin_index_lists_six_routes() {
         let body = json!({
             "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream"],
         });
@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn 后订阅者不收历史只收实时() {
+    fn late_subscriber_receives_only_live_events() {
         let st = test_admin_state();
         st.push_event("audit", "历史摘要", None);
         let mut late = st.subscribe();
@@ -1281,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn health豁免限流阈值不动() {
+    fn health_exempt_from_rate_limit_thresholds_unchanged() {
         assert!(is_rate_exempt("/_admin/health"));
         assert!(!is_rate_exempt("/_admin/metrics"));
         assert!(!is_rate_exempt("/_admin/events/stream"));
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict归一全别名通过() {
+    fn verdict_normalization_covers_all_aliases() {
         for v in ["allow", "allowed", "pass", "approved", "ALLOW", " Pass "] {
             assert_eq!(normalize_verdict_compat(v), Some("allow"), "{v}");
         }
@@ -1319,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn sse五并发上限与释放() {
+    fn sse_five_connection_cap_and_release() {
         let st = test_admin_state();
         let ip = test_ip();
         let mut guards = Vec::new();
@@ -1333,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn pending建单后监控可查环() {
+    fn pending_events_queryable_after_creation() {
         let st = test_admin_state();
         st.push_event("pending", "危险调用待审批", None);
         st.push_event("audit", "普通审计", None);
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn cookie兼容http回退() {
+    fn cookie_falls_back_to_http_name() {
         let mut h = HeaderMap::new();
         h.insert("cookie", "__Host-admin_token=tok-https".parse().unwrap());
         assert_eq!(cookie_admin_token(&h).as_deref(), Some("tok-https"));
@@ -1367,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn setcookie签发区分https与http() {
+    fn set_cookie_distinguishes_https_from_http() {
         let expected = "observability-admin-token-0123456789";
         let mut h = HeaderMap::new();
         h.insert("x-admin-token", expected.parse().unwrap());
@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn admintoken文件独立性与回环开关() {
+    fn admin_token_file_isolation_and_loopback_grace() {
         let dir = std::env::temp_dir().join(format!("veil-admin-token-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(load_admin_token_file(&dir), None);
@@ -1417,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn sse节奏常量与过滤维度() {
+    fn sse_cadence_constants_and_filter_dimensions() {
         assert_eq!(SSE_SNAPSHOT_SECS, 15);
         assert_eq!(SSE_DELTA_SECS, 2);
         let q: HashMap<String, String> = HashMap::from([

@@ -474,7 +474,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 改写默认字节等价且无网络() {
+    async fn rewrite_default_byte_equivalent_without_network() {
         let config = test_config(&[]);
         assert!(!config.normalize_json_whitespace);
         let (scope, vault, detector) = fresh_arcs();
@@ -495,7 +495,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 脱敏关闭显式零值请求原文透传() {
+    async fn redaction_disabled_passthrough_original_request() {
         let config = test_config(&[("REDACTION_ENABLED", "0")]);
         assert!(!config.redaction_enabled);
         let (scope, vault, detector) = fresh_arcs();
@@ -516,7 +516,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 改写注入stream选项并声明归一化() {
+    async fn rewrite_injects_stream_options_and_declares_normalization() {
         let config = test_config(&[("NORMALIZE_JSON_WHITESPACE", "1")]);
         let (scope, vault, detector) = fresh_arcs();
         let raw = br#"{"model":"m","stream":true,"messages":[]}"#;
@@ -541,7 +541,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 非流转发成功原样返回() {
+    async fn nonstream_forward_success_returns_verbatim() {
         let up_body = br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
         let (url, server) = loopback_server(200, "application/json", up_body).await;
         let client = reqwest::Client::new();
@@ -583,7 +583,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 非流上游不可达映射502而非挂起() {
+    async fn nonstream_upstream_unreachable_maps_to_502_without_hanging() {
         let url = refused_url().await;
         let client = reqwest::Client::new();
         let (scope, vault, detector) = fresh_arcs();
@@ -626,7 +626,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 流泵正常收尾恰一个终止帧() {
+    async fn stream_pump_clean_finish_emits_exactly_one_terminal_frame() {
         let sse =
             b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n".to_vec();
         let (url, server) = loopback_server(200, "text/event-stream", sse).await;
@@ -648,7 +648,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 跨帧切分手机号边界hold掩码() {
+    async fn cross_frame_split_phone_number_boundary_hold_masks() {
         let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"call 138\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"12345678 ok\"}}]}\n\ndata: [DONE]\n\n"
             .to_vec();
         let (url, server) = loopback_server(200, "text/event-stream", sse).await;
@@ -698,7 +698,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 保真字段原样透传不改写() {
+    async fn fidelity_fields_passthrough_unmodified() {
         let sse = b"data: {\"id\":\"chatcmpl-xyz\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"m-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-xyz\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"m-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
             .to_vec();
         let (url, server) = loopback_server(200, "text/event-stream", sse).await;
@@ -725,7 +725,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 流泵残余已发不再合成二次空流帧() {
+    async fn stream_pump_residue_sent_skips_secondary_empty_stream_frame() {
         // 无尾空行半帧：事件循环无分发（`forwarded==0`），残余路径直发下游。
         // 旧守门（`forwarded==0`）误触发二次空流合成；新守门以状态位为准跳过。
         let half = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}".to_vec();
@@ -743,7 +743,7 @@ mod gateway_units_tests {
     }
 
     #[test]
-    fn 空流合成守门真值表() {
+    fn empty_stream_synthesis_gate_truth_table() {
         assert!(should_synthesize_empty_stream(false, false, false));
         assert!(!should_synthesize_empty_stream(false, true, false));
         assert!(!should_synthesize_empty_stream(true, false, false));
@@ -752,7 +752,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 非流上游400原样透出不吞错() {
+    async fn nonstream_upstream_400_passthrough_without_swallowing_error() {
         // D5 回归：`truncation:disabled` 类上游 400 错误体须原样透出（状态码与正文），
         // 不得吞错转 502/空体。
         let up_body = br#"{"error":{"message":"truncation with disabled is not supported","type":"invalid_request_error"}}"#.to_vec();
@@ -787,7 +787,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn thinking与signature不透明透传值一致() {
+    async fn thinking_and_signature_opaque_passthrough_values_match() {
         // D5 回归：thinking/signature/redacted_thinking 为次要事件，不进 hold 不审计；
         // 网关 JSON 归一化仅调序，敏感字节值须原样透出。
         let sse = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm...\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-bytes-123\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"redacted_thinking\",\"redacted_data\":\"eHh4\"}\n\n".to_vec();
@@ -839,7 +839,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn 流泵空流注入阻断并标记终止() {
+    async fn stream_pump_empty_stream_injects_block_and_marks_terminal() {
         let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
         let client = reqwest::Client::new();
         let upstream = client.get(&url).send().await.expect("回环上游须可达");
@@ -861,7 +861,7 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
-    async fn responses_incomplete与error合成单个failed() {
+    async fn responses_incomplete_and_error_merge_into_single_failed() {
         let sse = b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r9\",\"status\":\"incomplete\"}}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
         let (url, server) = loopback_server(200, "text/event-stream", sse).await;
         let client = reqwest::Client::new();
@@ -894,7 +894,7 @@ mod gateway_units_tests {
     }
 
     #[test]
-    fn sse响应构建头合规() {
+    fn sse_response_builder_headers_compliant() {
         let (_tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         let resp = build_sse_response(rx, true);
         assert_eq!(resp.status(), StatusCode::OK);
@@ -918,7 +918,7 @@ mod entry_tests {
     use super::*;
 
     #[test]
-    fn stream真加json组合走流泵() {
+    fn stream_flag_with_json_combo_routes_to_pump() {
         assert!(should_pump_stream("text/event-stream", false));
         assert!(should_pump_stream("text/event-stream", true));
         assert!(should_pump_stream("application/json", true));
@@ -928,7 +928,7 @@ mod entry_tests {
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn 体上限分级取值与spec一致() {
+    fn body_limits_tiered_values_match_spec() {
         assert_eq!(GATEWAY_BODY_LIMIT_BYTES, 10 * 1024 * 1024);
         assert_eq!(AUDIT_SUBLIMIT_CEILING_BYTES, 8 * 1024 * 1024);
         assert!(GATEWAY_BODY_LIMIT_BYTES > AUDIT_SUBLIMIT_CEILING_BYTES);
@@ -937,7 +937,7 @@ mod entry_tests {
     }
 
     #[tokio::test]
-    async fn 体超限响应413携带错误码() {
+    async fn oversized_body_returns_413_with_error_code() {
         let resp = payload_too_large(GATEWAY_BODY_LIMIT_BYTES);
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -946,7 +946,7 @@ mod entry_tests {
     }
 
     #[tokio::test]
-    async fn 超限体被to_bytes拒绝而非静默空体() {
+    async fn oversized_body_rejected_by_to_bytes_not_silent_empty() {
         let over = vec![b'x'; 64];
         let err = axum::body::to_bytes(axum::body::Body::from(over), 16).await;
         assert!(err.is_err());

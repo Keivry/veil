@@ -312,13 +312,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token形态零填充六位() {
+    fn token_shape_zero_padded_six_digits() {
         assert_eq!(make_cred_token(1), "__VG_CRED_000001__");
         assert_eq!(make_cred_token(42), "__VG_CRED_000042__");
     }
 
     #[test]
-    fn 残缺前缀不泄漏() {
+    fn partial_prefix_stripped_without_leak() {
         for partial in [
             "__VG_C",
             "__VG_CRED",
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn 幻觉完整token被剥离而真实还原() {
+    fn hallucinated_token_stripped_while_real_restored() {
         let vault = CredentialVault::new();
         let tok = vault.register("s3cr3t-value").unwrap();
         let text = format!("real={tok} fake=__VG_CRED_999999__");
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn 长度降序防子串碰撞() {
+    fn longest_first_ordering_prevents_substring_collision() {
         let vault = CredentialVault::new();
         vault.register("abcd-1234-long").unwrap();
         vault.register("abcd").unwrap();
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn 短值与token形态拒绝注册() {
+    fn short_values_and_token_shapes_rejected() {
         let vault = CredentialVault::new();
         assert_eq!(vault.register("abc").unwrap(), "abc");
         assert!(vault.register("__VG_CRED_000001__").is_err());
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn 同秘密跨请求同token() {
+    fn same_secret_maps_to_same_token_across_requests() {
         let vault = CredentialVault::new();
         let first = vault.register("跨请求秘密-xyz789").unwrap();
         let second = vault.register("跨请求秘密-xyz789").unwrap();
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn 快照只读透传已注册映射且版本稳定() {
+    fn snapshot_readonly_passthrough_with_stable_version() {
         let vault = CredentialVault::new();
         let token = vault.register("快照秘密-abc456").unwrap();
         let snap = vault.snapshot();
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn 全局映射有界lru淘汰最久() {
+    fn bounded_global_map_evicts_oldest_via_lru() {
         let vault = CredentialVault::new();
         assert_eq!(MAX_TOKEN_ENTRIES, 5000, "凭据表容量分表锁定");
         for i in 0..MAX_TOKEN_ENTRIES + 5 {
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn lru热点访问驻留冷条目先逐出() {
+    fn lru_hot_entry_retained_cold_evicted_first() {
         let vault = CredentialVault::new();
         for i in 0..MAX_TOKEN_ENTRIES {
             vault.register(&format!("secret-value-{i:06}")).unwrap();

@@ -117,7 +117,7 @@ const ANTH_BODY: &str =
 // —— 01：thinking signature_delta 单帧块字节一致 ——
 
 #[tokio::test]
-async fn thinking签名单帧字节一致() {
+async fn thinking_signature_single_frame_byte_identical() {
     let sig = "sig合成签名块deadbeef";
     let frames = vec![
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n".to_string(),
@@ -141,7 +141,7 @@ async fn thinking签名单帧字节一致() {
 // —— 02：display:omitted 空思考块 ——
 
 #[tokio::test]
-async fn display_omitted空思考块透传() {
+async fn display_omitted_empty_thinking_passthrough() {
     let frames = vec![
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"display\":\"omitted\"}}\n\n".to_string(),
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
@@ -163,7 +163,7 @@ async fn display_omitted空思考块透传() {
 // —— 03：redacted_thinking 不透明透传 ——
 
 #[tokio::test]
-async fn redacted_thinking不透明透传() {
+async fn redacted_thinking_opaque_passthrough() {
     let blob = "合成密文块zz9x8c7";
     let frames = vec![
         format!(
@@ -192,7 +192,7 @@ async fn redacted_thinking不透明透传() {
 // —— 04：tool_use.input 跨帧累积，stop 后可 parse ——
 
 #[tokio::test]
-async fn tooluse跨帧累积stop后可parse() {
+async fn tool_use_fragments_passthrough_ordered_until_stop() {
     let frames = vec![
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"calc\",\"input\":{}}}\n\n".to_string(),
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\"}}\n\n".to_string(),
@@ -228,7 +228,7 @@ async fn tooluse跨帧累积stop后可parse() {
 // —— 05：fallback 块 start+stop 无 delta ——
 
 #[tokio::test]
-async fn fallback无delta不误判() {
+async fn fallback_block_without_delta_not_misjudged() {
     let frames = vec![
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_fb\",\"name\":\"fallback_tool\",\"input\":{}}}\n\n".to_string(),
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n".to_string(),
@@ -250,7 +250,7 @@ async fn fallback无delta不误判() {
 // —— 06：CR-only 与 LF 双路径一致 ——
 
 #[tokio::test]
-async fn cr_only与lf双路径一致() {
+async fn cr_only_and_lf_paths_match() {
     let lf_frames = vec![
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"双路径甲\"}}\n\n".to_string(),
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
@@ -274,7 +274,7 @@ async fn cr_only与lf双路径一致() {
 // —— 07：error(overloaded) 插帧中断 ——
 
 #[tokio::test]
-async fn error_overloaded插帧中断() {
+async fn error_overloaded_interrupts_stream() {
     let frames = vec![
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"中断前分片\"}}\n\n".to_string(),
         "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"synthetic overload\"}}\n\n".to_string(),
@@ -298,7 +298,7 @@ async fn error_overloaded插帧中断() {
 // —— 08：message_delta usage 累计覆盖 ——
 
 #[test]
-fn message_delta_usage覆盖非累加() {
+fn message_delta_usage_overwrites_not_sums() {
     let start = serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}});
     let delta = serde_json::json!({"type":"message_delta","usage":{"output_tokens":20}});
     let mut acc = None;
@@ -312,7 +312,7 @@ fn message_delta_usage覆盖非累加() {
 // —— 09：stop_sequence 回显 ——
 
 #[tokio::test]
-async fn stop_sequence回显() {
+async fn stop_sequence_echoed() {
     let frames = vec![
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"回显甲\"}}\n\n".to_string(),
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"合成停止串\"}}\n\n".to_string(),
@@ -334,7 +334,7 @@ async fn stop_sequence回显() {
 // —— 10：未知 event 跳过 ——
 
 #[tokio::test]
-async fn 未知event跳过() {
+async fn unknown_event_skipped() {
     let frames = vec![
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"有效分片\"}}\n\n".to_string(),
         "event: future_unknown_kind\ndata: {\"type\":\"future_unknown_kind\",\"payload\":{\"x\":1}}\n\n".to_string(),
@@ -356,7 +356,7 @@ async fn 未知event跳过() {
 // —— 11：ping 忽略 ——
 
 #[tokio::test]
-async fn ping忽略() {
+async fn ping_ignored() {
     let frames = vec![
         "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string(),
         ": ping-heartbeat\n\n".to_string(),
@@ -379,7 +379,7 @@ async fn ping忽略() {
 // —— 12：usage 递减乱序取 max ——
 
 #[test]
-fn usage递减乱序取max() {
+fn usage_regressing_out_of_order_takes_max() {
     let hi = serde_json::json!({"type":"message_delta","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}});
     let lo = serde_json::json!({"type":"message_delta","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}});
     let mut acc = None;

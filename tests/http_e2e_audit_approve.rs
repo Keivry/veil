@@ -98,7 +98,7 @@ async fn post_stream(base: &str, client: &reqwest::Client, marker: &str) -> (u16
 fn done_count(body: &str) -> usize { body.matches("data: [DONE]").count() }
 
 #[tokio::test]
-async fn 阻断分支注入阻断帧且无工具调用泄漏() {
+async fn blocked_branch_injects_block_frame_without_tool_leak() {
     let (upstream, uhandle) = mock_upstream_branches().await;
     let (base, handle) = serve(test_app(&[
         ("LLM_UPSTREAM", upstream.as_str()),
@@ -130,7 +130,7 @@ async fn 阻断分支注入阻断帧且无工具调用泄漏() {
 }
 
 #[tokio::test]
-async fn 阻断模式良性调用原样透传() {
+async fn benign_call_passthrough_in_block_mode() {
     let (upstream, uhandle) = mock_upstream_branches().await;
     let (base, handle) = serve(test_app(&[
         ("LLM_UPSTREAM", upstream.as_str()),
@@ -148,7 +148,7 @@ async fn 阻断模式良性调用原样透传() {
 }
 
 #[tokio::test]
-async fn 批准分支不断链且不合成阻断() {
+async fn approve_branch_keeps_stream_without_block_frame() {
     let (upstream, uhandle) = mock_upstream_branches().await;
     let (base, handle) = serve(test_app(&[
         ("LLM_UPSTREAM", upstream.as_str()),
@@ -182,7 +182,7 @@ async fn 批准分支不断链且不合成阻断() {
 }
 
 #[tokio::test]
-async fn 凭据篡改转审批挂起202() {
+async fn tampered_credential_turns_to_pending_202() {
     let (base, handle) = serve(test_app(&[("AUTO_APPROVE", "none")])).await;
     let client = reqwest::Client::new();
     let reg = client

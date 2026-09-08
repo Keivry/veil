@@ -167,7 +167,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 嵌套stringified_json递归且特殊字符安全() {
+    fn nested_stringified_json_recurses_with_special_chars_safe() {
         // tool_calls.arguments 场景：内层含 p@ss"quote 与 \u 转义。
         let text = r#"{"tool":"x","arguments":"{\"key\":\"p@ss\\\"quote\",\"u\":\"\\u0031\"}"}"#;
         let out = process_text(text, &mut |s| s.replace("p@ss\"quote", "MASKED"), 5);
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn 顶层叶loads_walk_dumps且非字符串值不碰() {
+    fn top_level_walk_leaves_strings_only() {
         let text = r#"{"a":"hello","n":42,"b":true,"z":null}"#;
         let out = process_text(
             text,
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn bom剥离后正常解析() {
+    fn bom_stripped_parses_normally() {
         let text = "\u{feff}{\"a\":\"hi\"}";
         let out = process_text(
             text,
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn 超限输入回退plain不崩() {
+    fn oversize_input_falls_back_to_plain() {
         let big = format!("{{\"a\":\"{}\"}}", "x".repeat(SCAN_INPUT_LIMIT));
         let out = process_text(&big, &mut |s| s.replace('x', "y"), 5);
         // plain 路径：整体替换生效且不抛错。
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn 超深嵌套回退plain() {
+    fn overdeep_nesting_falls_back_to_plain() {
         // 7 层 stringified 嵌套：depth=5 处的叶走 plain。
         let mut s = "deep_value".to_string();
         for _ in 0..7 {
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn 深容器嵌套守卫不崩且回退原样() {
+    fn deep_container_guard_no_crash_falls_back_verbatim() {
         // 500 层裸数组：serde 解析限层失败走 plain 回退，不崩。
         let mut v = serde_json::json!("leaf");
         for _ in 0..500 {
@@ -250,13 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn 非json走plain() {
+    fn non_json_goes_plain() {
         let out = process_text("plain p@ss text", &mut |s| s.replace("p@ss", "X"), 5);
         assert_eq!(out, "plain X text");
     }
 
     #[test]
-    fn roundtrip破坏回退原串() {
+    fn roundtrip_broken_falls_back_to_original() {
         // 字符串叶替换恒产生合法 JSON；roundtrip 校验针对非法输出直测。
         let original = r#"{"a":1}"#;
         assert_eq!(

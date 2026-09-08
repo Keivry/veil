@@ -320,7 +320,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat阻断恒以裸done恰1个收尾() {
+    fn chat_block_ends_with_exactly_one_bare_done() {
         let frames = ensure_event_lines(chat_block_frames("policy"));
         assert_eq!(frames.len(), 3, "delta 首帧 + 终端帧 + 裸 DONE");
         assert_eq!(count_done(&frames), 1);
@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn done裸帧豁免event补全() {
+    fn bare_done_frame_exempt_from_event_completion() {
         assert_eq!(chat_done_frame(), "data: [DONE]\n\n");
         let raw = vec![
             "data: [DONE]\n\n".to_string(),
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic四件套终止且顺序锁定() {
+    fn anthropic_four_part_termination_order_locked() {
         let frames = ensure_event_lines(anthropic_block_frames("policy"));
         let joined = frames.join("");
         for key in [
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn responses阻断与截断区分() {
+    fn responses_block_vs_truncate_distinguished() {
         let done = ensure_event_lines(responses_block_frames("r1"));
         let failed = ensure_event_lines(responses_truncated_frames("r1"));
         assert!(done.join("").contains("response.completed"));
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn 缺event行阻断载荷按协议补全() {
+    fn missing_event_line_completed_per_protocol() {
         // Chat（`choices` 载荷）：豁免补全，恒为纯 `data:` 形态。
         let chat_raw = vec!["data: {\"choices\":[{\"index\":0}]}\n\n".to_string()];
         let chat_fixed = ensure_event_lines(chat_raw);
@@ -426,14 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn 终止标记落meta() {
+    fn terminal_marker_recorded_in_meta() {
         let mut meta = StreamMeta::default();
         mark_terminal(&mut meta);
         assert!(meta.terminal_injected);
     }
 
     #[test]
-    fn chat空流与重复done恒恰1个且去重不重复计费() {
+    fn chat_empty_stream_and_dup_done_deduped_to_one() {
         let dup = vec![
             "event: message\ndata: {\"a\":1}\n\n".to_string(),
             "data: [DONE]\n\n".to_string(),
@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn responses完成失败形态区分且去重() {
+    fn responses_completed_vs_failed_shapes_deduped() {
         let frames = vec![
             "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_string(),
             "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_string(),
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn 非流危险调用被拦且形态协议正确() {
+    fn nonstream_dangerous_call_blocked_with_protocol_shape() {
         use {
             super::super::{audit::AuditPolicy, llm_gateway::Protocol},
             crate::config::AuditMode,
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic非流阻断六字段完整() {
+    fn anthropic_nonstream_block_has_six_fields() {
         use super::super::llm_gateway::Protocol;
         let body = nonstream_block_body(Protocol::Anthropic, "policy", "msg-1", None);
         assert_eq!(body["id"], "msg-1");
@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn chat非流阻断回显字段完整() {
+    fn chat_nonstream_block_echoes_upstream_fields() {
         use super::super::llm_gateway::Protocol;
         let upstream = serde_json::json!({
             "id": "chatcmpl-123", "object": "chat.completion", "created": 1700000000,
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn responses阻断先文本后完成且终止恰一() {
+    fn responses_block_text_then_completed_single_terminal() {
         let frames = ensure_event_lines(responses_block_frames("r9"));
         assert_eq!(
             frames.len(),
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn count_done行级精确不误计参数同串() {
+    fn count_done_line_precise_ignores_payload_substring() {
         let tricky = vec!["event: message\ndata: {\"arguments\":\"data: [DONE]\"}\n\n".to_string()];
         assert_eq!(count_done(&tricky), 0, "参数内同串不得计入终止");
         assert_eq!(terminal_count(&tricky, "chat"), 0);
@@ -646,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked占位不触发二次调用() {
+    fn blocked_placeholder_does_not_retrigger_audit() {
         use {
             super::super::audit::{AuditPolicy, AuditVerdict, evaluate},
             crate::config::AuditMode,
@@ -660,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn chat阻断文案统一自闭合() {
+    fn chat_block_copy_unified_self_closed() {
         let frames = ensure_event_lines(chat_block_frames("policy"));
         let first = &frames[0];
         assert!(
@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn 关闭审计deny后按策略转发无阻断体() {
+    fn audit_off_denies_forward_per_policy_without_block_body() {
         use {
             super::super::{audit::AuditPolicy, llm_gateway::Protocol},
             crate::config::AuditMode,
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn done回退审计三协议恰一终端() {
+    fn done_fallback_audits_single_terminal_all_protocols() {
         let chat = empty_stream_frames("chat", "c1");
         assert_eq!(terminal_count(&chat, "chat"), 1);
         assert!(has_chat_terminal(&chat));

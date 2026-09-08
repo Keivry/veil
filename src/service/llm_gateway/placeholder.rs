@@ -217,7 +217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 占位符三条件() {
+    fn placeholder_injection_requires_three_conditions() {
         assert!(should_inject_placeholders(true, true, true));
         assert!(!should_inject_placeholders(false, true, true));
         assert!(!should_inject_placeholders(true, false, true));
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符注入三协议形态() {
+    fn placeholder_injection_covers_three_protocol_shapes() {
         let prompt = "PROMPT";
         let openai = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
         let out = inject_placeholder_prompt(
@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn 占位符四形态注入回退() {
+    fn placeholder_four_shape_injection_with_fallback() {
         let prompt = "PROMPT";
         // §2.1：Responses 字符串 input 按串追加注入（与 input 数组同等）。
         let resp_str = serde_json::json!({"model":"m","input":"hello"});
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_instructions与input同等注入() {
+    fn responses_instructions_injected_like_input() {
         let prompt = "PROMPT";
         // instructions 字符串与 input 字符串同时注入。
         let both = serde_json::json!({"input":"hi","instructions":"be nice"});

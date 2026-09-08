@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn 健康状态透出降级标志() {
+    fn health_status_exposes_degraded_flag() {
         assert!(health_status(&test_state(true)).sqlite_ok);
         let degraded = health_status(&test_state(false));
         assert!(!degraded.sqlite_ok);
@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn 磁盘满分类与降级对偶标志() {
+    fn disk_full_classified_and_degraded_flags_paired() {
         use crate::state::{SqliteOutcome, is_no_space_error};
         let full = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::StorageFull));
         assert!(is_no_space_error(&full));
@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 三因子一致未enrolled放行() {
+    async fn three_factors_consistent_unenrolled_passes() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let out = handle_credential(
@@ -865,7 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 三因子缺一即403() {
+    async fn missing_any_factor_returns_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let err = handle_credential(
@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 伪造secret被拒403() {
+    async fn forged_secret_rejected_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let err = handle_credential(
@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_secret兼容放行() {
+    async fn body_secret_compat_allows() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let out = handle_credential(
@@ -915,7 +915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 冒用get自身哈希拒403() {
+    async fn spoofed_get_own_hash_rejected_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let mut raw = body("gethash", "/s/a.sh", None);
@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 审批三文案各有断言() {
+    async fn approval_three_messages_each_asserted() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         // 已注册：重复注册冲突文案。
@@ -963,7 +963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn go体别名无头放行() {
+    async fn go_body_alias_without_headers_allows() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let body = CredentialBody {
@@ -986,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn go体别名密钥错仍403() {
+    async fn go_body_alias_wrong_secret_still_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let body = CredentialBody {
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 缺entry报400带指引() {
+    async fn missing_entry_returns_400_with_hint() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let mut missing = body("entryless", "/s/none.sh", None);
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 缺field取整条目() {
+    async fn missing_field_returns_whole_entry() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let mut full = body("nofield", "/s/nof.sh", None);
@@ -1043,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fields复数形态放行() {
+    async fn plural_fields_form_allows() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let mut plural = body("plural1", "/s/p.sh", None);
@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token假值返回原文() {
+    async fn false_token_returns_raw_value() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let mut raw = body("raw1", "/s/raw.sh", None);
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 缺属性报404具名() {
+    async fn missing_attribute_returns_404_named() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let mut missing = body("noattr", "/s/na.sh", None);
@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 真实后端缺条目经服务报404() {
+    async fn real_backend_missing_entry_returns_404() {
         use zeroize::Zeroizing;
         let dir = std::env::temp_dir().join(format!(
             "veil-service-keepass-{}",
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 已enrolled哈希篡改转审批202() {
+    async fn enrolled_hash_tamper_turns_to_approval_202() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         register_caller(&state, "/s/a.sh", "goodhash", "test-src")
@@ -1161,7 +1161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 自动放行_false拒403() {
+    async fn auto_approve_false_rejects_403() {
         let env = cred_env(&[("AUTO_APPROVE", "false")]);
         let state = cred_state(&env);
         register_caller(&state, "/s/a.sh", "goodhash", "test-src")
@@ -1184,7 +1184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 自动放行_none转202() {
+    async fn auto_approve_none_turns_to_202() {
         let env = cred_env(&[("AUTO_APPROVE", "none")]);
         let state = cred_state(&env);
         let err = handle_credential(
@@ -1198,7 +1198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 凭据限流2秒429带_retry_after() {
+    async fn credential_rate_limit_2s_returns_429_with_retry_after() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         handle_credential(
@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 注册限流1秒() {
+    async fn register_rate_limit_1s() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         register_caller(&state, "/s/r1.sh", "h1", "src1")
@@ -1241,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 限流表双触发清扫只删过期键() {
+    async fn rate_table_sweep_removes_only_expired_keys() {
         use tokio::sync::Mutex;
         let table = Mutex::new(RateTable::new());
         // 计数触发：超 1000 条后下一次检查清扫；窗口 0 使旧键全部过期。
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 限流表硬上限挤出不影响本次判定() {
+    async fn rate_table_hard_cap_evicts_without_affecting_current_decision() {
         use tokio::sync::Mutex;
         let table = Mutex::new(RateTable::new());
         for i in 0..(RateTable::MAX_ENTRIES + 10) {
@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 未解锁返回503() {
+    async fn locked_returns_503() {
         let env = cred_env(&[]);
         let locked = AppState::new(
             Config::load_from(&env).unwrap(),
@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 轻量入口approve降级阻断() {
+    async fn credential_only_entry_approve_blocked_forbidden() {
         let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
         let state = cred_state(&env);
         register_caller(&state, "/s/a.sh", "h1", "test-src")
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 紧急吊销三免审与转审批() {
+    async fn emergency_revoke_exemptions_and_approval_flow() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         register_caller(&state, "/s/a.sh", "h1", "src-a")
@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 审批建单落矩阵网关且问询口径分表() {
+    async fn approval_ticket_uses_matrix_gateway_with_split_timeouts() {
         use std::time::Duration;
         let env = cred_env(&[("APPROVAL_WHITELIST", "@admin:example.com")]);
         let state = cred_state(&env);
@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 审计问询走_audit_timeout口径() {
+    async fn audit_ask_uses_audit_timeout() {
         let mut env = cred_env(&[]);
         env.insert("AUDIT_TIMEOUT".to_string(), "1".to_string());
         let state = cred_state(&env);
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 发送失败仍回202建单() {
+    async fn send_failure_still_returns_202_with_ticket() {
         let env = cred_env(&[
             ("APPROVAL_WHITELIST", "@admin:example.com"),
             ("HOMESERVER", "http://127.0.0.1:9"),
@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 越权条目拒绝403() {
+    async fn out_of_scope_entry_rejected_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         enrolled_with_entries(
@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 越权字段拒绝403() {
+    async fn out_of_scope_field_rejected_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         enrolled_with_entries(
@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 授权范围内放行200() {
+    async fn in_scope_allows_200() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         enrolled_with_entries(
@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 哈希篡改转审批202并通知() {
+    async fn hash_tamper_turns_to_approval_202_with_notify() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         enrolled_with_entries(
@@ -1559,7 +1559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 旧哈希宽限内放行() {
+    async fn old_hash_within_grace_allows() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         enrolled_with_entries(
@@ -1586,7 +1586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn go正常脚本已注册匹配放行200() {
+    async fn go_registered_script_match_allows_200() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         enrolled_with_entries(
@@ -1607,7 +1607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 纯body形态无头放行() {
+    async fn pure_body_without_headers_allows() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let pure = CredentialBody {
@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 头哈希与服务端失配拒403() {
+    async fn header_hash_mismatch_rejected_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let err = handle_credential(
@@ -1644,7 +1644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 终端token取用放行() {
+    async fn get_hash_caller_fetch_allows() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let out = handle_credential(
@@ -1658,7 +1658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 已吊销调用方哈希失配仍拒403() {
+    async fn revoked_caller_hash_mismatch_still_403() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         register_caller(&state, "/s/r.sh", "goodhash", "rev-src")
@@ -1683,7 +1683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 同秘密跨请求同token() {
+    async fn same_secret_cross_requests_same_token() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
         let first = handle_credential(
@@ -1705,7 +1705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 阻塞模批准同请求返回凭据() {
+    async fn blocking_mode_approval_returns_credential_for_same_request() {
         let env = cred_env(&[
             ("CREDENTIAL_BLOCK_WAIT", "1"),
             ("APPROVAL_WHITELIST", "@admin:example.com"),

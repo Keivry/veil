@@ -66,7 +66,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 时序安全比较等长才判等() {
+    fn constant_time_compare_equal_only_when_same_length() {
         assert!(ct_eq("abc123", "abc123"));
         assert!(!ct_eq("abc123", "abc124"));
         assert!(!ct_eq("abc", "abcd"));
@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_eq与ct_eq同值且不等长判假() {
+    fn secret_eq_matches_ct_eq_and_rejects_length_mismatch() {
         assert!(secret_eq("s3cr3t", "s3cr3t"));
         assert!(!secret_eq("s3cr3t", "s3cr3u"));
         assert!(!secret_eq("short", "short-long"));
@@ -87,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn 内网识别覆盖三段() {
+    fn private_ip_covers_three_ranges() {
         assert!(is_private_ip("127.0.0.1"));
         assert!(is_private_ip("10.1.2.3"));
         assert!(is_private_ip("192.168.0.5"));
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn 内网识别覆盖链路本地与运营商级nat() {
+    fn private_ip_covers_link_local_and_carrier_nat() {
         assert!(is_private_ip("169.254.10.20"));
         assert!(is_private_ip("100.64.0.1"));
         assert!(is_private_ip("100.127.255.255"));

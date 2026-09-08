@@ -876,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn 白名单精确匹配与伪造成员拒绝() {
+    fn whitelist_exact_match_rejects_forged_members() {
         let wl = vec!["@admin:example.com".to_string()];
         assert!(is_mxid_allowed("@admin:example.com", &wl));
         assert!(!is_mxid_allowed("@ghost:example.com", &wl));
@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn 非法白名单成员启动门禁拒绝() {
+    fn invalid_whitelist_member_rejected_at_startup() {
         assert!(validate_whitelist_mxids(&["@admin:example.com".to_string()]).is_ok());
         assert!(validate_whitelist_mxids(&["@keivry@matrix.example".to_string()]).is_err());
         assert!(validate_whitelist_mxids(&["admin:example.com".to_string()]).is_err());
@@ -895,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn 退避指数增长封顶60s() {
+    fn backoff_grows_exponentially_capped_at_60s() {
         assert_eq!(sync_backoff_secs(0), 1);
         assert_eq!(sync_backoff_secs(1), 2);
         assert_eq!(sync_backoff_secs(5), 32);
@@ -904,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn token持久化读写往返() {
+    fn sync_token_persist_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
             "veil-sync-token-{}-{}",
             std::process::id(),
@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn 未知表情与未知分支映射noop() {
+    fn unknown_emoji_and_branch_map_to_noop() {
         assert_eq!(reaction_to_decision(MatrixBranch::Credential, "👍"), None);
         assert_eq!(reaction_to_decision(MatrixBranch::Unknown, "✅"), None);
         assert_eq!(reaction_to_decision(MatrixBranch::Credential, "🔓"), None);
@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn 文本三指令解析() {
+    fn text_commands_parse_three_instructions() {
         assert_eq!(parse_text_command("lock proxy"), TextCommand::Lock);
         assert_eq!(parse_text_command("  LOCK  "), TextCommand::Lock);
         assert_eq!(parse_text_command("status"), TextCommand::Status);
@@ -951,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn 五分支映射与标识() {
+    fn five_branches_map_and_identify() {
         assert_eq!(MatrixBranch::from_reason("unlock"), MatrixBranch::Unlock);
         assert_eq!(
             MatrixBranch::from_reason("注册审批"),
@@ -974,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn 审批摘要无明文() {
+    fn approval_summary_contains_no_plaintext() {
         let bot = MatrixBot::new(
             "https://m.example.com".to_string(),
             "!r:example.com".to_string(),
@@ -986,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 审批通过拒绝幂等与失配忽略() {
+    async fn approve_reject_idempotent_and_mismatch_ignored() {
         let gw = approval();
         assert!(gw.submit("$ev1").await);
         assert!(!gw.submit("$ev1").await);
@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 超时返回none并清理默认拒绝() {
+    async fn timeout_returns_none_and_cleans_up_with_default_deny() {
         let gw = approval();
         gw.submit("$slow").await;
         let out = gw.ask("$slow", Duration::from_millis(120)).await;
@@ -1019,7 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 孤儿pending60s清扫回收() {
+    async fn orphan_pending_swept_after_60s() {
         let gw = approval();
         gw.submit("$orphan").await;
         {
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn 超时口径凭据300s审计90s() {
+    fn timeout_credential_300s_audit_90s() {
         assert_eq!(CREDENTIAL_TIMEOUT_SECS, 300);
         assert_eq!(AUDIT_TIMEOUT_SECS, 90);
         let gw = approval();
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 未知事件与失配分支noop不改变状态() {
+    async fn unknown_event_and_branch_mismatch_noop_preserves_state() {
         let gw = approval();
         gw.submit_branch("$known", MatrixBranch::Credential).await;
         let unknown = ReactionInput {
@@ -1090,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 五分支reaction落定与三指令回显() {
+    async fn five_branch_reactions_settle_with_text_command_echo() {
         let gw = approval();
         gw.submit_branch("$cred", MatrixBranch::Credential).await;
         let approve = ReactionInput {
@@ -1152,7 +1152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock全清无残留且文案对齐原仓() {
+    async fn lock_clears_all_without_residue_and_matches_legacy_copy() {
         let gw = approval();
         gw.submit_branch("$a", MatrixBranch::Credential).await;
         gw.submit_branch("$b", MatrixBranch::Audit).await;
@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn sync解析提反应与文本并过滤非目标房间() {
+    fn sync_parses_reactions_and_text_filtering_other_rooms() {
         let sync = serde_json::json!({
             "next_batch": "s1",
             "rooms": {
@@ -1239,7 +1239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 并发单ask同决议() {
+    async fn concurrent_single_ask_shares_same_decision() {
         use std::sync::Arc;
         let gw = Arc::new(approval());
         gw.submit("$shared").await;
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 解锁分支表情语义与超时清理() {
+    async fn unlock_branch_emoji_semantics_with_timeout_cleanup() {
         assert_eq!(
             reaction_to_decision(MatrixBranch::Unlock, "✅"),
             Some((true, false))
@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn 审批文案五分支三段无明文() {
+    fn approval_copy_five_branches_three_stages_without_plaintext() {
         let bot = MatrixBot::new(
             "https://m.example.com".to_string(),
             "!r:example.com".to_string(),
