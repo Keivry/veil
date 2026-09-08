@@ -197,10 +197,10 @@ fn parse_register_entries(body: &RegisterBody) -> std::collections::BTreeMap<Str
                     }
                     serde_json::Value::Array(items) => {
                         for i in items {
-                            if let Some(s) = i.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                                if !fields.contains(&s.to_string()) {
-                                    fields.push(s.to_string());
-                                }
+                            if let Some(s) = i.as_str().map(str::trim).filter(|s| !s.is_empty())
+                                && !fields.contains(&s.to_string())
+                            {
+                                fields.push(s.to_string());
                             }
                         }
                     }
@@ -220,10 +220,9 @@ fn parse_register_allow_mode(body: &RegisterBody) -> Option<crate::config::AutoA
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        && let Ok(mode) = crate::config::AutoApprove::from_str(raw)
     {
-        if let Ok(mode) = crate::config::AutoApprove::from_str(raw) {
-            return Some(mode);
-        }
+        return Some(mode);
     }
     body.auto.map(|a| {
         if a {
@@ -440,7 +439,7 @@ pub async fn llm_proxy_handler(State(state): State<AppState>, req: Request) -> R
 use {
     crate::{
         approval::{PendingApprovals, PendingRecord},
-        config::{AuditMode, Config, effective_placeholder_prompt},
+        config::{AuditMode, Config, effective_placeholder_prompt, resolve_upstream_with_ingress},
         service::{
             audit::{self, AuditPolicy},
             audit_hold::{AuditHold, RequestKeepalive},
@@ -455,12 +454,13 @@ use {
                 extract_usage_nonstream,
                 is_stream_body,
                 resolve_protocol,
-                resolve_upstream,
             },
             metrics::MetricsStore,
             pii::PiiDetector,
             redaction::Scope,
-            sse::{Speed, SseParser, set_truncated},
+            sse::{
+                Speed, SseParser, classify_residue, is_done_payload, set_truncated, strip_sse_bom,
+            },
         },
     },
     std::{path::PathBuf, sync::Arc, time::Instant},
@@ -595,6 +595,8 @@ pub struct NonstreamCtx {
     pub admin_metrics: Arc<MetricsStore>,
     pub sqlite_precise: bool,
     pub req_start: Instant,
+    pub audit_mode: AuditMode,
+    pub audit_policy_file: Option<PathBuf>,
 }
 
 /// `serve_nonstream` 的结果：完整响应，或上游意外回 SSE 时把未消费的
@@ -681,11 +683,60 @@ pub async fn serve_nonstream(
             ctx.sqlite_precise,
             now_secs(),
         );
+        // 非流 tool 提取 + 审计（§2.3）：阻断时返回协议正确的 block 体代替上游响应。
+        let audit_policy = match ctx.audit_policy_file.clone() {
+            Some(path) => match AuditPolicy::load_from_file(Some(path.as_path())) {
+                Ok(policy) => policy,
+                Err(err) => {
+                    tracing::warn!("审计策略文件加载失败，使用默认策略: {err}");
+                    AuditPolicy::default_policy()
+                }
+            },
+            None => AuditPolicy::default_policy(),
+        };
+        let conv_id = llm_gateway::extract_conv_id(&v).unwrap_or_else(|| {
+            llm_gateway::resolve_conv_id(None, &v, Some(&ctx.gateway_metrics), "nonstream-block")
+                .0
+        });
+        if let Some(block_body) =
+            block_inject::evaluate_nonstream(ctx.protocol, &v, ctx.audit_mode, &audit_policy, &conv_id)
+        {
+            ctx.admin_metrics.record_aux_counts(
+                ctx.protocol,
+                now_secs(),
+                0,
+                0,
+                1,
+            );
+            let mut resp = (
+                StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
+                Json(block_body),
+            )
+                .into_response();
+            if ctx.normalized_out {
+                resp.headers_mut().insert(
+                    "x-veil-normalized",
+                    header::HeaderValue::from_static("json-whitespace"),
+                );
+            }
+            resp.headers_mut().insert(
+                "x-veil-protocol",
+                header::HeaderValue::from_static(protocol_header_value(ctx.protocol)),
+            );
+            return NonstreamOutcome::Responded(resp);
+        }
+        ctx.admin_metrics.record_aux_counts(
+            ctx.protocol,
+            now_secs(),
+            0,
+            0,
+            0,
+        );
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let restored = ctx.scope.restore_response(&ctx.vault, &text);
+        let (restored, spans) = ctx.scope.restore_response_with_spans(&ctx.vault, &text);
         let restored = ctx
             .scope
-            .redact_response_new_pii(&ctx.vault, &ctx.detector, &restored)
+            .redact_response_new_pii_with_skip(&ctx.vault, &ctx.detector, &restored, &spans)
             .await;
         let mut resp = (
             StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
@@ -715,6 +766,7 @@ pub struct StreamPumpCtx {
     pub detector: Arc<PiiDetector>,
     pub audit_mode: AuditMode,
     pub audit_policy_file: Option<PathBuf>,
+    pub approval_whitelist: Vec<String>,
     pub hold_max: usize,
     pub gateway_metrics: Arc<GatewayMetrics>,
     pub admin_metrics: Arc<MetricsStore>,
@@ -750,6 +802,7 @@ pub fn spawn_stream_pump(
             detector: resp_detector,
             audit_mode,
             audit_policy_file,
+            approval_whitelist,
             hold_max,
             gateway_metrics: metrics,
             admin_metrics,
@@ -792,6 +845,10 @@ pub fn spawn_stream_pump(
         let mut terminated = false;
         let mut rejected_sticky = false;
         let mut block_injected = false;
+        // 审计驱动的阻断（策略阻断/超限 fail-closed），与空流/截断合成区分口径。
+        let mut audit_blocked = false;
+        // 终端去重（§2.6 流式等价）：每协议恰一终止帧，多余 `[DONE]/message_stop/completed` 丢弃。
+        let mut terminal_sent = false;
         let mut stream_usage: Option<llm_gateway::Usage> = None;
         // Responses 终端去重旗：上游 `failed` 直接透传、`incomplete`/`error`
         // 合成为单个 `response.failed`，恒恰其一。
@@ -812,8 +869,8 @@ pub fn spawn_stream_pump(
                     continue;
                 }
                 if !ev.data.is_empty()
-                    && ev.data.trim() != "[DONE]"
-                    && let Ok(v) = serde_json::from_str::<Value>(&ev.data)
+                    && !is_done_payload(&ev.data)
+                    && let Ok(v) = serde_json::from_str::<Value>(strip_sse_bom(&ev.data))
                 {
                     if let Some(id) = llm_gateway::extract_conv_id(&v) {
                         conv_id = Some(id);
@@ -828,8 +885,7 @@ pub fn spawn_stream_pump(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if rejected_sticky {
-                    let trimmed = ev.data.trim();
-                    if trimmed == "[DONE]" {
+                    if is_done_payload(&ev.data) {
                         continue;
                     }
                     if !ev.data.is_empty() {
@@ -853,8 +909,8 @@ pub fn spawn_stream_pump(
                         }
                     }
                     if !ev.data.is_empty()
-                        && ev.data.trim() != "[DONE]"
-                        && let Ok(v) = serde_json::from_str::<Value>(&ev.data)
+                        && !is_done_payload(&ev.data)
+                        && let Ok(v) = serde_json::from_str::<Value>(strip_sse_bom(&ev.data))
                         && (!extract_tool_fragments(protocol, &v).is_empty()
                             || AuditHold::is_complete_event(&v))
                     {
@@ -869,6 +925,7 @@ pub fn spawn_stream_pump(
                     if is_incomplete || is_error {
                         if !responses_failed_sent {
                             responses_failed_sent = true;
+                            terminal_sent = true;
                             let fid = conv_id.clone().unwrap_or_else(|| {
                                 llm_gateway::resolve_conv_id(
                                     None,
@@ -900,8 +957,13 @@ pub fn spawn_stream_pump(
                         responses_failed_sent = true;
                     }
                 }
-                if !ev.data.is_empty() && ev.data.trim() != "[DONE]" {
-                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                if !ev.data.is_empty() && !is_done_payload(&ev.data) {
+                    if let Ok(v) = serde_json::from_str::<Value>(strip_sse_bom(&ev.data)) {
+                        // 终端后不再透出任何数据帧：恰一终止帧且其后无内容。
+                        if terminal_sent {
+                            continue;
+                        }
+                        let event_terminal = is_terminal_event(protocol, &v);
                         let frags = extract_tool_fragments(protocol, &v);
                         let is_tool_event = !frags.is_empty();
                         let minor = !is_tool_event && is_minor_event(protocol, &v);
@@ -952,7 +1014,13 @@ pub fn spawn_stream_pump(
                             && !matches!(audit_mode, AuditMode::Off)
                         {
                             for (idx, name, args) in hold.tool_triples() {
-                                match audit::evaluate(audit_mode, &name, &args, &audit_policy) {
+                                match audit::evaluate_with_whitelist(
+                                    audit_mode,
+                                    &name,
+                                    &args,
+                                    &audit_policy,
+                                    &approval_whitelist,
+                                ) {
                                     audit::AuditVerdict::Block { .. } => {
                                         hold.mark_rejected();
                                         reject_reason = Some("audit-policy-block".to_string());
@@ -969,8 +1037,45 @@ pub fn spawn_stream_pump(
                                 }
                             }
                         }
+                        // §2.5 前置：stop/item_done 只审计并清理对应 index 的槽
+                        //（外层序号），不得标记全局完成，后续块照常审计；
+                        // 命中阻断落 reject_reason，走下方统一阻断臂注入。
+                        if reject_reason.is_none()
+                            && !hold.is_rejected()
+                            && !matches!(audit_mode, AuditMode::Off)
+                            && AuditHold::is_index_complete_event(&v)
+                            && let Some(idx) = outer_event_index(protocol, &v)
+                        {
+                            for (_, name, args) in
+                                hold.tool_triples().into_iter().filter(|(i, _, _)| *i == idx)
+                            {
+                                match audit::evaluate_with_whitelist(
+                                    audit_mode,
+                                    &name,
+                                    &args,
+                                    &audit_policy,
+                                    &approval_whitelist,
+                                ) {
+                                    audit::AuditVerdict::Block { .. } => {
+                                        hold.mark_rejected();
+                                        reject_reason = Some("audit-policy-block".to_string());
+                                        break;
+                                    }
+                                    audit::AuditVerdict::NeedApproval { reason, summary } => {
+                                        audit_pending.insert(PendingRecord::new(
+                                            &format!("audit-hold-{idx}-{name}"),
+                                            &format!("{reason}: {summary}"),
+                                        ));
+                                    }
+                                    audit::AuditVerdict::Allow => {}
+                                }
+                            }
+                            hold.clear_index(idx);
+                        }
                         if let Some(reason) = reject_reason {
                             rejected_sticky = true;
+                            audit_blocked = true;
+                            terminal_sent = true;
                             agg.clear();
                             if !block_injected {
                                 block_injected = true;
@@ -997,15 +1102,24 @@ pub fn spawn_stream_pump(
                                 }
                                 block_inject::mark_terminal(&mut meta);
                             }
-                            if is_tool_event || AuditHold::is_complete_event(&v) {
+                            if is_tool_event
+                                || AuditHold::is_complete_event(&v)
+                                || AuditHold::is_index_complete_event(&v)
+                            {
                                 continue;
                             }
                         } else if AuditHold::is_complete_event(&v) && !approve_held {
                             hold.mark_completed();
                         }
-                        let restored = resp_scope.restore_response(&resp_vault, &ev.data);
+                        let (restored, spans) =
+                            resp_scope.restore_response_with_spans(&resp_vault, &ev.data);
                         let scanned = resp_scope
-                            .redact_response_new_pii(&resp_vault, &resp_detector, &restored)
+                            .redact_response_new_pii_with_skip(
+                                &resp_vault,
+                                &resp_detector,
+                                &restored,
+                                &spans,
+                            )
                             .await;
                         let restored_data = crate::service::sse::json_aware_line(&scanned, |s| s);
                         let prefix = ev
@@ -1013,15 +1127,28 @@ pub fn spawn_stream_pump(
                             .as_ref()
                             .map(|t| format!("event: {t}\n"))
                             .unwrap_or_default();
+                        if event_terminal {
+                            terminal_sent = true;
+                        }
                         agg.push_str(&prefix);
                         agg.push_str(&format!("data: {restored_data}\n\n"));
                         if !minor && hold.held() && !restored_data.is_empty() {
                             continue;
                         }
                     } else {
-                        let restored = resp_scope.restore_response(&resp_vault, &ev.data);
+                        // 非 JSON 文本同样走 span 跳过还原，终端后不再透出。
+                        if terminal_sent {
+                            continue;
+                        }
+                        let (restored, spans) =
+                            resp_scope.restore_response_with_spans(&resp_vault, &ev.data);
                         let scanned = resp_scope
-                            .redact_response_new_pii(&resp_vault, &resp_detector, &restored)
+                            .redact_response_new_pii_with_skip(
+                                &resp_vault,
+                                &resp_detector,
+                                &restored,
+                                &spans,
+                            )
                             .await;
                         let prefix = ev
                             .event_type
@@ -1031,17 +1158,26 @@ pub fn spawn_stream_pump(
                         agg.push_str(&prefix);
                         agg.push_str(&format!("data: {scanned}\n\n"));
                     }
-                } else {
+                } else if ev.data.is_empty() {
+                    // 空心跳帧：原样透出，不参与终端计数。
                     let prefix = ev
                         .event_type
                         .as_ref()
                         .map(|t| format!("event: {t}\n"))
                         .unwrap_or_default();
-                    if ev.data.trim() == "[DONE]" {
-                        agg.push_str(&format!("{prefix}data: [DONE]\n\n"));
-                    } else {
-                        agg.push_str(&format!("{prefix}data: {}\n\n", ev.data));
+                    agg.push_str(&format!("{prefix}data: {}\n\n", ev.data));
+                } else {
+                    // `[DONE]`（含 BOM 前缀）：恰一终止帧，多余去重。
+                    if terminal_sent {
+                        continue;
                     }
+                    terminal_sent = true;
+                    let prefix = ev
+                        .event_type
+                        .as_ref()
+                        .map(|t| format!("event: {t}\n"))
+                        .unwrap_or_default();
+                    agg.push_str(&format!("{prefix}data: [DONE]\n\n"));
                 }
                 if let Some(out) = crate::service::sse::select_emit(&mut agg, speed) {
                     metrics.add_sse_event();
@@ -1061,10 +1197,13 @@ pub fn spawn_stream_pump(
             forwarded += 1;
         }
         let residual = parser.residual_json_aware();
-        if !residual.is_empty() {
-            let restored = resp_scope.restore_response(&resp_vault, &residual);
+        // 残余分类（§2.6）：None 直接丢弃，不得 `data:` 直发；
+        // BOM/`[DONE]`/空白同样归入丢弃，终端去重已处理。
+        if let Some(classified) = classify_residue(&residual) {
+            let (restored, spans) =
+                resp_scope.restore_response_with_spans(&resp_vault, &classified);
             let scanned = resp_scope
-                .redact_response_new_pii(&resp_vault, &resp_detector, &restored)
+                .redact_response_new_pii_with_skip(&resp_vault, &resp_detector, &restored, &spans)
                 .await;
             if !scanned.is_empty() {
                 let _ = pump_tx.send(format!("data: {scanned}\n\n")).await;
@@ -1109,6 +1248,13 @@ pub fn spawn_stream_pump(
             meta.truncated_mode.as_ref().map(|m| m.as_str()),
             sqlite_precise,
             now_secs(),
+        );
+        admin_metrics.record_aux_counts(
+            protocol,
+            now_secs(),
+            0,
+            0,
+            u64::from(audit_blocked),
         );
         PumpOutcome {
             forwarded,
@@ -1159,7 +1305,22 @@ async fn gateway_serve(
     // dispatcher 仅保留 protocol/url 分发。
     let protocol = resolve_protocol(path, ct.as_deref(), Some(&state.gateway_metrics));
     let is_chat = protocol != Protocol::NonDialog;
-    let upstream_base = match resolve_upstream(&state.config, None) {
+    // 入口宿主机端口（entry-transport）：`Host: ip:port` 尾段解析，
+    // 缺失/非法回退 None（缺省上游），不猜测。
+    let ingress_port: Option<u16> = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|host| {
+            host.rsplit(':').next().and_then(|tail| {
+                if host.contains(':') {
+                    tail.trim().parse::<u16>().ok()
+                } else {
+                    None
+                }
+            })
+        });
+    let upstream_base = match resolve_upstream_with_ingress(&state.config, ingress_port) {
         Some(u) => u,
         None => {
             return (
@@ -1175,11 +1336,15 @@ async fn gateway_serve(
         state.config.pii_response_side,
         state.config.pii_fuzzy_restore,
     ));
-    let vault = Arc::new(CredentialVault::new());
-    let detector = Arc::new(PiiDetector::new());
-    detector.set_hardening(state.config.pii_detection_hardening);
+    // 全局单例快照（credential-vault-singleton）：网关只读复用进程级
+    // vault/detector，不得每请求新建空映射致还原断链。
+    let vault = state.vault.clone();
+    let detector = state.detector.clone();
     let sqlite_precise = state.sqlite_ok();
     let hold_max = state.config.audit_hold_max_bytes.max(1) as usize;
+    let audit_mode = state.config.audit_mode;
+    let audit_policy_file = state.config.audit_policy_file.clone();
+    let approval_whitelist = state.config.approval_whitelist.clone();
 
     if !is_chat {
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
@@ -1195,6 +1360,8 @@ async fn gateway_serve(
             admin_metrics: state.admin.metrics.clone(),
             sqlite_precise,
             req_start,
+            audit_mode,
+            audit_policy_file: audit_policy_file.clone(),
         };
         return match serve_nonstream(
             client,
@@ -1217,6 +1384,7 @@ async fn gateway_serve(
                     detector,
                     audit_mode: state.config.audit_mode,
                     audit_policy_file: state.config.audit_policy_file.clone(),
+                    approval_whitelist: state.config.approval_whitelist.clone(),
                     hold_max,
                     gateway_metrics: state.gateway_metrics.clone(),
                     admin_metrics: state.admin.metrics.clone(),
@@ -1248,8 +1416,9 @@ async fn gateway_serve(
         scope: scope.clone(),
         vault: vault.clone(),
         detector: detector.clone(),
-        audit_mode: state.config.audit_mode,
-        audit_policy_file: state.config.audit_policy_file.clone(),
+        audit_mode,
+        audit_policy_file: audit_policy_file.clone(),
+        approval_whitelist: approval_whitelist.clone(),
         hold_max,
         gateway_metrics: state.gateway_metrics.clone(),
         admin_metrics: state.admin.metrics.clone(),
@@ -1289,6 +1458,8 @@ async fn gateway_serve(
             admin_metrics: state.admin.metrics.clone(),
             sqlite_precise,
             req_start,
+            audit_mode,
+            audit_policy_file: audit_policy_file.clone(),
         };
         match serve_nonstream(
             client,
@@ -1365,6 +1536,8 @@ mod gateway_units_tests {
             ))),
             sqlite_precise: false,
             req_start: Instant::now(),
+            audit_mode: AuditMode::Off,
+            audit_policy_file: None,
         }
     }
 
@@ -1381,6 +1554,7 @@ mod gateway_units_tests {
             detector,
             audit_mode: AuditMode::Off,
             audit_policy_file: None,
+            approval_whitelist: Vec::new(),
             hold_max: 1_048_576,
             gateway_metrics: Arc::new(GatewayMetrics::default()),
             admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
@@ -1683,6 +1857,40 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 流式终端事件判定（§2.6 去重用）：chat 以 `[DONE]` 为准（非 JSON 分支处理，
+/// 此处恒 false）；anthropic 仅 `message_stop`；responses 仅 `completed/failed`
+///（`incomplete/error` 已提前映射为单个 `failed`）。
+fn is_terminal_event(protocol: crate::service::llm_gateway::Protocol, v: &Value) -> bool {
+    use crate::service::llm_gateway::Protocol as P;
+    match protocol {
+        P::Anthropic => v
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "message_stop"),
+        P::Responses => v
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "response.completed" || t == "response.failed"),
+        _ => false,
+    }
+}
+
+/// 外层事件序号（§2.5/§2.4）：anthropic 取事件级 `index`
+///（`content_block_start/delta.index`），responses 取 `output_index`；
+/// 缺失返回 None（调用方跳过按槽清理，不误清）。
+fn outer_event_index(protocol: crate::service::llm_gateway::Protocol, v: &Value) -> Option<u32> {
+    use crate::service::llm_gateway::Protocol as P;
+    let n = match protocol {
+        P::Anthropic => v.get("index")?.as_u64()?,
+        P::Responses => v
+            .get("output_index")
+            .or_else(|| v.get("index"))?
+            .as_u64()?,
+        _ => return None,
+    };
+    Some(n as u32)
+}
+
 fn extract_responses_seq(v: &Value) -> Option<u64> {
     v.get("sequence_number").and_then(|x| {
         x.as_u64()
@@ -1855,6 +2063,9 @@ fn extract_tool_fragments(
                     blocks.push(b);
                 }
             }
+            // §2.4 外层序号优先：`content_block_start/delta.index` 为事件级序号，
+            // 内层 `content_block/delta.index` 仅作回退，缺失再回退枚举下标。
+            let outer_index = v.get("index").and_then(|x| x.as_u64()).map(|n| n as u32);
             if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
                 blocks.extend(arr.iter());
             }
@@ -1866,11 +2077,11 @@ fn extract_tool_fragments(
                 }
             }
             for (i, b) in blocks.iter().enumerate() {
-                let idx = b
-                    .get("index")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(i as u32);
+                let idx = outer_index.or_else(|| {
+                    b.get("index")
+                        .and_then(|x| x.as_u64())
+                        .map(|n| n as u32)
+                }).unwrap_or(i as u32);
                 if let Some(fc) = b.get("function_call").and_then(|x| x.as_object()) {
                     let name = fc
                         .get("name")
