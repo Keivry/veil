@@ -168,6 +168,13 @@ pub struct Config {
     pub db_dir: PathBuf,
     pub tpm_dir: PathBuf,
     pub keepass_backend: KeepassBackendKind,
+    /// 凭据审批双模开关（`CREDENTIAL_BLOCK_WAIT`，默认关闭）：
+    /// `=1` 时 enrolled 篡改/未 enrolled 待审走 300s 阻塞等 reaction，
+    /// 默认保持 202 抛单（建单 + best-effort 发送即返回）。
+    pub credential_block_wait: bool,
+    /// PII 全局持久开关（`PII_GLOBAL_PERSIST`，默认关闭）：
+    /// 关闭时请求隔离（跨请求不互见），开启时同明文跨请求复用同一占位符。
+    pub pii_global_persist: bool,
 }
 
 /// KeePass 后端选型：默认 real，显式 `VEIL_KEEPASS_BACKEND=mock` 仅 CI 逃生。
@@ -228,6 +235,35 @@ pub fn resolve_kdbx(db_dir: &std::path::Path) -> Option<ResolvedKdbx> {
         db_path,
         keyfile_path,
     })
+}
+
+/// 入口端口上下文选路（§7.1 给 handler 集成方的接线位，不碰 `handler.rs`）。
+///
+/// 语义与 `service::llm_gateway::resolve_upstream` 同字，差异仅在输入形态：
+/// 本函数接受可选的宿主机入口端口（compose 下 `PORT_887x` 映射的宿主机侧端口，
+/// 如 8878），命中 `LLM_<port>` 则返回对应上游，否则回落 `LLM_UPSTREAM` 缺省；
+/// 缺省未设时回落任一 `LLM_<port>`（`HashMap` 迭代序不稳定，生产如需确定性
+/// 回落必须显式配置 `LLM_UPSTREAM`）。`None` 恒走缺省分支，不按端口猜测。
+/// 当前 `handler::gateway_serve` 仍以 `None` 调用（单端口运行时，二进制只监听
+/// `127.0.0.1:8877`），多端口生效需集成方把入口端口透传进来；改动面留给集成方，
+/// 本函数 + 单测先把“端口→上游”映射锁死。
+///
+/// 遗留兼容声明：`CREDENTIAL_MASTER_PASSWORD`/`CREDENTIAL_PORT` 为原仓遗留变量名，
+/// 本二进制不读取（`load_from` 只认下述新名）；主密码口令改走 TPM 解封
+/// （`service::tpm::startup_tpm_in`），部署密钥改用 `GET_BINARY_SECRET`/
+///
+/// `CREDENTIAL_SECRET`，宿主机端口改用 `PORT_8877/8878/8879`（仅改映射不改容器内
+/// 监听）。沿用旧名部署会静默不生效，迁移时必须改名（见 README 兼容表）。
+pub fn resolve_upstream_with_ingress(config: &Config, ingress_port: Option<u16>) -> Option<String> {
+    if let Some(port) = ingress_port
+        && let Some(u) = config.llm_upstreams.get(&port)
+    {
+        return Some(u.clone());
+    }
+    if let Some(u) = config.llm_default_upstream.clone() {
+        return Some(u);
+    }
+    config.llm_upstreams.values().next().cloned()
 }
 
 impl Config {
@@ -397,6 +433,8 @@ impl Config {
             })?,
             _ => KeepassBackendKind::Real,
         };
+        let credential_block_wait = parse_bool_off(&get, "CREDENTIAL_BLOCK_WAIT");
+        let pii_global_persist = parse_bool_off(&get, "PII_GLOBAL_PERSIST");
 
         Ok(Self {
             homeserver,
@@ -437,6 +475,8 @@ impl Config {
             db_dir,
             tpm_dir,
             keepass_backend,
+            credential_block_wait,
+            pii_global_persist,
         })
     }
 }
@@ -1630,6 +1670,39 @@ mod tests {
     }
 
     #[test]
+    fn 审批双模与pii持久默认关闭() {
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert!(!cfg.credential_block_wait);
+        assert!(!cfg.pii_global_persist);
+        for raw in ["1", "true", "yes", "on"] {
+            let mut env = base_env();
+            env.insert("CREDENTIAL_BLOCK_WAIT".to_string(), raw.to_string());
+            assert!(
+                Config::load_from(&env).unwrap().credential_block_wait,
+                "{raw}"
+            );
+            let mut env = base_env();
+            env.insert("PII_GLOBAL_PERSIST".to_string(), raw.to_string());
+            assert!(
+                Config::load_from(&env).unwrap().pii_global_persist,
+                "{raw}"
+            );
+        }
+        for raw in ["0", "false", "", "off"] {
+            let mut env = base_env();
+            if raw.is_empty() {
+                env.remove("CREDENTIAL_BLOCK_WAIT");
+            } else {
+                env.insert("CREDENTIAL_BLOCK_WAIT".to_string(), raw.to_string());
+            }
+            assert!(
+                !Config::load_from(&env).unwrap().credential_block_wait,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
     fn 无库返回空() {
         let dir = std::env::temp_dir().join(format!(
             "veil-resolve-empty-{}",
@@ -1643,5 +1716,74 @@ mod tests {
         assert!(resolve_kdbx(&dir).is_none());
         assert!(resolve_kdbx(&dir.join("不存在的子目录")).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn upstream_env() -> HashMap<String, String> {
+        let mut env = base_env();
+        env.insert(
+            "LLM_UPSTREAM".to_string(),
+            "http://缺省上游:11434".to_string(),
+        );
+        env.insert(
+            "LLM_8878".to_string(),
+            "http://八七七八上游:11434".to_string(),
+        );
+        env.insert(
+            "LLM_8879".to_string(),
+            "http://八七七九上游:11434".to_string(),
+        );
+        env
+    }
+
+    #[test]
+    fn 入口端口命中对应上游() {
+        let cfg = Config::load_from(&upstream_env()).unwrap();
+        assert_eq!(
+            resolve_upstream_with_ingress(&cfg, Some(8878)).as_deref(),
+            Some("http://八七七八上游:11434")
+        );
+        assert_eq!(
+            resolve_upstream_with_ingress(&cfg, Some(8879)).as_deref(),
+            Some("http://八七七九上游:11434")
+        );
+    }
+
+    #[test]
+    fn 未命中端口与空上下文回落缺省() {
+        let cfg = Config::load_from(&upstream_env()).unwrap();
+        for port in [None, Some(8877), Some(9999)] {
+            assert_eq!(
+                resolve_upstream_with_ingress(&cfg, port).as_deref(),
+                Some("http://缺省上游:11434"),
+                "端口 {port:?} 须回落缺省而非猜测"
+            );
+        }
+    }
+
+    #[test]
+    fn 无缺省时回落任一端口上游() {
+        let mut env = upstream_env();
+        env.remove("LLM_UPSTREAM");
+        let cfg = Config::load_from(&env).unwrap();
+        let got = resolve_upstream_with_ingress(&cfg, Some(9999)).expect("须有回落");
+        assert!(
+            got == "http://八七七八上游:11434" || got == "http://八七七九上游:11434",
+            "回落须为已知端口上游之一，实际: {got}"
+        );
+        assert!(resolve_upstream_with_ingress(&cfg, None).is_some());
+    }
+
+    #[test]
+    fn 遗留变量名不被读取() {
+        let mut env = base_env();
+        env.insert(
+            "CREDENTIAL_MASTER_PASSWORD".to_string(),
+            "旧主密码".to_string(),
+        );
+        env.insert("CREDENTIAL_PORT".to_string(), "9999".to_string());
+        let cfg = Config::load_from(&env).unwrap();
+        assert!(cfg.credential_secret.is_none());
+        assert!(!cfg.llm_upstreams.contains_key(&9999));
+        assert!(resolve_upstream_with_ingress(&cfg, Some(9999)).is_none());
     }
 }
