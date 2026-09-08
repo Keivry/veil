@@ -51,6 +51,8 @@ impl TpmUnlock for MockTpm {
 }
 
 /// 真实 TPM：经 `tpm2-tools` 子进程现场派生。
+/// 子进程单步超时 30s（慢速 TPM/虚拟化环境下 15s 易误杀，阈值只改接线不改语义）；
+/// 失败时错误内保留完整 stderr 诊断文本，warn 分支同样保留（排障用，不截断）。
 #[derive(Debug, Clone)]
 pub struct RealTpm {
     pub tpm_dir: PathBuf,
@@ -61,14 +63,14 @@ impl RealTpm {
     pub fn new() -> Self {
         Self {
             tpm_dir: PathBuf::from("/data/tpm"),
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(30),
         }
     }
 
     pub fn with_dir(tpm_dir: PathBuf) -> Self {
         Self {
             tpm_dir,
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(30),
         }
     }
 
@@ -119,7 +121,8 @@ impl RealTpm {
                         );
                     }
                     if !stderr.trim().is_empty() {
-                        tracing::warn!("{program} stderr 非空（可能包含警告）");
+                        // stderr 全文保留进诊断（TPM 工具链警告常带排障关键行，不截断）。
+                        tracing::warn!("{program} stderr 非空: {}", stderr.trim());
                     }
                     return Ok(stdout);
                 }
@@ -148,6 +151,10 @@ impl Default for RealTpm {
 }
 
 impl TpmUnlock for RealTpm {
+    /// 存活探测：`tpm2_pcrread sha256:0` 只读 PCR，不触密封对象。
+    /// 与 `unseal` 路径（`createprimary → load → unseal` 全回放）的差异有意为之：
+    /// 探测只回答“TPM 硬件/守护进程是否在位”，密封模板回放正确性由 `unseal`
+    /// 首次调用的真实错误透出，不在探测阶段预演（避免启动期双倍耗时与临时目录残留）。
     fn is_available(&self) -> bool {
         std::process::Command::new("tpm2_pcrread")
             .arg("sha256:0")
@@ -337,11 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn 超时默认15秒() {
-        assert_eq!(RealTpm::new().timeout, Duration::from_secs(15));
+    fn 超时默认30秒() {
+        assert_eq!(RealTpm::new().timeout, Duration::from_secs(30));
         assert_eq!(
             RealTpm::with_dir(PathBuf::from("/x")).timeout,
-            Duration::from_secs(15)
+            Duration::from_secs(30)
         );
     }
 }

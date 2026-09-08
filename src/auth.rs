@@ -1,5 +1,7 @@
 use subtle::ConstantTimeEq as _;
 
+/// 定长哈希比较（`ct_eq`）：调用方 MUST 只传入等长输入（如 SHA256 hex）；
+/// 变长 Secret 一律用 [`secret_eq`]，不得直接用本函数（变长切片比较必然早退泄漏长度）。
 pub fn ct_eq(a: &str, b: &str) -> bool {
     let ab = a.as_bytes();
     let bb = b.as_bytes();
@@ -9,10 +11,12 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     ab.ct_eq(bb).into()
 }
 
-/// 凭据 Secret 等长比较（HMAC-SHA256 域分隔后等长比较，不早退泄漏长度）。
-/// 口径对标 `service::admin::admin_token_eq`：变长输入仍先走等长 tag 比较，
-/// 再与长度门“与”合并；调用方 MUST 用本函数比较 Secret 类敏感值，
-/// 不得直接用 `ct_eq`（`ct_eq` 保留给定长哈希比较）。
+/// 凭据 Secret 变长比较（HMAC-SHA256 域分隔后比较 32 字节固定 tag，恒时无早退）。
+/// 口径对标 `service::admin::admin_token_eq` 的恒时精神，但修复了长度泄漏：
+/// 变长原文先经 HMAC 压缩为等长 tag 再比较，长度信息已混入 tag，MUST NOT 再单独
+/// 比较原文长度（任何变长早退都会泄漏长度）；tag 碰撞概率可忽略（SHA256 第二原像）。
+/// 调用方 MUST 用本函数比较 Secret 类敏感值，不得直接用 `ct_eq`
+/// （`ct_eq` 只保留给定长哈希比较）。
 pub fn secret_eq(provided: &str, expected: &str) -> bool {
     use hmac::{KeyInit as _, Mac as _};
     type H = hmac::Hmac<sha2::Sha256>;
@@ -22,10 +26,8 @@ pub fn secret_eq(provided: &str, expected: &str) -> bool {
     mac_e.update(expected.as_bytes());
     let p = mac_p.finalize().into_bytes();
     let e = mac_e.finalize().into_bytes();
-    let tags_eq: bool = p.ct_eq(&e).into();
-    let len_eq: bool =
-        provided.as_bytes().ct_eq(expected.as_bytes()).into() && provided.len() == expected.len();
-    tags_eq && len_eq && provided.len() == expected.len()
+    // 仅比较等长 tag：`subtle` 对等长数组恒时无早退；原文长度不再参与判定。
+    p.ct_eq(&e).into()
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -77,7 +79,10 @@ mod tests {
         assert!(secret_eq("s3cr3t", "s3cr3t"));
         assert!(!secret_eq("s3cr3t", "s3cr3u"));
         assert!(!secret_eq("short", "short-long"));
+        assert!(!secret_eq("short-long", "short"));
+        assert!(!secret_eq("s3cr3t", "s3cr3tX"));
         assert!(!secret_eq("", "x"));
+        assert!(!secret_eq("x", ""));
         assert!(secret_eq("", ""));
     }
 

@@ -221,6 +221,21 @@ impl RealKeePass {
 
     fn is_cached(&self) -> bool { self.cache.lock().is_ok_and(|g| g.is_some()) }
 
+    /// 解锁探针：主口令提供器能给出非空口令即视为已解锁。
+    /// 与 [`RealKeePass::is_unlocked`] 的差异有意为之：快检只看文件存在（零副作用，
+    /// `/health` 高频调用安全），本探针会实际调用提供器（可能触发 TPM 解封，
+    /// 但 `tpm_password_provider` 自带缓存，重复调用不重复解封）。
+    /// 接线说明（给 handler 集成方）：`/health` 沿用 `is_unlocked` 快检；
+    /// 需要“口令级解锁”门禁的路径（如启动期预热）调用本探针。
+    pub fn is_unlocked_by_password(&self) -> bool {
+        if !self.db_path.is_file() {
+            return false;
+        }
+        (self.password_provider)()
+            .map(|pw| !pw.is_empty())
+            .unwrap_or(false)
+    }
+
     fn lookup_cached(&self, title: &str) -> Option<EntrySnapshot> {
         self.cache
             .lock()
@@ -232,6 +247,9 @@ impl RealKeePass {
 }
 
 impl KeePassBackend for RealKeePass {
+    /// 快检：库文件存在即视为配置就绪（`/health` 用，不触发解密、无副作用）。
+    /// 真正“已解锁”（主口令非空可用）见 [`RealKeePass::is_unlocked_by_password`]，
+    /// 取用路径失败仍以 `fetch_entry` 的实时错误为准，本函数不做解锁承诺。
     fn is_unlocked(&self) -> bool { self.db_path.is_file() }
 
     fn fetch_entry(
@@ -284,14 +302,19 @@ fn open_blocking(
     })
 }
 
+/// 同名多条目取首条：按库内遍历序（组深度优先、条目插入序）返回首个命中，
+/// 不做二次排序。原仓语义即“首条胜出”；按用户名/URL 再排序会改变既有库的取用
+/// 结果，属于静默行为漂移，故此处只取首条。调用方如需确定性，应在库内保证
+/// 同名唯一（注册表侧约束），而非依赖网关排序。
 fn snapshot_of(db: &keepass::Database, title: &str) -> Option<EntrySnapshot> {
     let mut all = Vec::new();
     collect_entries(db.root(), &mut all);
-    let mut candidates: Vec<&EntrySnapshot> = all.iter().filter(|e| e.title == title).collect();
-    candidates.sort_by(|a, b| a.username.cmp(&b.username).then_with(|| a.url.cmp(&b.url)));
-    candidates.into_iter().next().cloned()
+    all.into_iter().find(|e| e.title == title)
 }
 
+/// 条目收集：跳过 `Recycle Bin` 整组（含其子组，删除条目不得被取用）；
+/// `Notes` 字段不纳入自定义字段（备注常含长文本，转审/审计时会放大明文面，
+/// 且原仓不同版本对其口径不一，此处显式声明跳过，其余标准字段映射见上）。
 fn collect_entries(group: keepass::db::GroupRef<'_>, out: &mut Vec<EntrySnapshot>) {
     if group.name == "Recycle Bin" {
         return;
@@ -529,6 +552,51 @@ mod tests {
         assert!(first.len() >= 4);
         let second = provider().expect("二次调用须复用缓存");
         assert_eq!(first.as_slice(), second.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn 同名多条目取首条不排序() {
+        let dir = unique_temp_dir("first");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(
+            &db_path,
+            b"pw",
+            &[
+                ("同名", "zeta-user", "first-secret", "", vec![]),
+                ("同名", "alpha-user", "second-secret", "", vec![]),
+            ],
+        );
+        let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+        let backend = RealKeePass::new(db_path, None, provider);
+        let snapshot = backend.fetch_entry("同名".to_string()).await.unwrap();
+        assert_eq!(snapshot.username, "zeta-user");
+        assert_eq!(snapshot.password, "first-secret");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 解锁探针判口令非空() {
+        let dir = unique_temp_dir("probe");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
+        let ok_provider: PasswordProvider =
+            std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+        let ok = RealKeePass::new(db_path.clone(), None, ok_provider);
+        assert!(ok.is_unlocked());
+        assert!(ok.is_unlocked_by_password());
+        let empty_provider: PasswordProvider =
+            std::sync::Arc::new(|| Ok(Zeroizing::new(Vec::new())));
+        let empty = RealKeePass::new(db_path, None, empty_provider);
+        assert!(empty.is_unlocked());
+        assert!(!empty.is_unlocked_by_password());
+        let absent = RealKeePass::new(
+            dir.join("absent.kdbx"),
+            None,
+            std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec()))),
+        );
+        assert!(!absent.is_unlocked());
+        assert!(!absent.is_unlocked_by_password());
         std::fs::remove_dir_all(&dir).ok();
     }
 
