@@ -1065,6 +1065,101 @@ mod tests {
         assert_eq!(hash, crate::auth::sha256_hex(b"a@b.com"));
     }
 
+    #[tokio::test]
+    async fn series_四窗口跨日近似求和查询语义() {
+        let db = tmp_db("series-sem");
+        let _ = std::fs::remove_file(&db);
+        let day10 = 86_400 * 10 + 100;
+        let day11 = 86_400 * 11 + 100;
+        let store = MetricsStore::new(db.clone());
+        store.record_chat(Protocol::Chat, 8, Some(&usage(1, 2, 3)), None, true, day10);
+        store.record_chat(
+            Protocol::Chat,
+            9,
+            Some(&usage(4, 5, 9)),
+            None,
+            true,
+            day10 + 60,
+        );
+        store.record_chat(
+            Protocol::Chat,
+            9000,
+            Some(&usage(0, 0, 0)),
+            None,
+            true,
+            day11,
+        );
+        store.flush().await.unwrap();
+        let daily = store.query_series("daily", None, None).await.unwrap();
+        assert_eq!(daily.len(), 2);
+        assert!(daily[0].window < daily[1].window);
+        let same_day: u64 = daily
+            .iter()
+            .filter(|p| p.requests == 2)
+            .map(|p| p.total_tokens)
+            .sum();
+        assert_eq!(same_day, 12);
+        let hourly = store.query_series("hourly", None, None).await.unwrap();
+        assert!(hourly.len() >= 2);
+        let five = store.query_series("five_min", None, None).await.unwrap();
+        assert!(!five.is_empty());
+        let snap = store.snapshot();
+        assert_eq!(snap.requests, 3);
+        assert_eq!(snap.total_tokens, 12);
+        assert_eq!(snap.p95_ms, p95_approx(&snap.latency_buckets));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn series_since与protocol过滤语义() {
+        let db = tmp_db("series-filter");
+        let _ = std::fs::remove_file(&db);
+        let ts = now();
+        let store = MetricsStore::new(db.clone());
+        store.record_chat(Protocol::Chat, 10, Some(&usage(1, 1, 2)), None, true, ts);
+        store.record_chat(
+            Protocol::Responses,
+            10,
+            Some(&usage(2, 2, 4)),
+            None,
+            true,
+            ts,
+        );
+        store.flush().await.unwrap();
+        let chat_only = store
+            .query_series("daily", None, Some("chat/completions".to_string()))
+            .await
+            .unwrap();
+        assert!(chat_only.iter().all(|p| p.protocol == "chat/completions"));
+        assert_eq!(chat_only.iter().map(|p| p.requests).sum::<u64>(), 1);
+        let all = store.query_series("daily", None, None).await.unwrap();
+        assert!(all.iter().map(|p| p.requests).sum::<u64>() >= 2);
+        let since_far = "d99999999".to_string();
+        let empty = store
+            .query_series("daily", Some(since_far), None)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn pii_value_掩码合并与计数查询语义() {
+        let cfg = PiiSamplerConfig::for_test(true, false, None);
+        let s = PiiValueSampler::new(cfg, tmp_db("pii-query"));
+        let (m1, h1) = s.sample("phone", "13812345678", true).unwrap();
+        assert!(m1.starts_with('1') && m1.ends_with('8'));
+        s.sample("phone", "13812345678", true);
+        s.sample("email", "a@b.com", true);
+        let top = s.top_n(5);
+        assert_eq!(top.iter().find(|v| v.hash == h1).unwrap().hits, 2);
+        assert_eq!(top.len(), 2);
+        let (sampled, disabled, non_chat) = s.stats();
+        assert_eq!((sampled, disabled, non_chat), (3, 0, 0));
+        assert!(s.sample("phone", "13812345678", false).is_none());
+        assert_eq!(PiiValueSampler::mask_value("ab"), "***");
+    }
+
     #[test]
     fn 采样配置取自配置结构体而非进程环境() {
         use std::collections::HashMap;

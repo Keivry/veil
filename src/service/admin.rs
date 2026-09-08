@@ -75,6 +75,30 @@ pub const EVENT_RING_CAP: usize = 512;
 /// 事件查询默认上限。
 pub const EVENT_DEFAULT_LIMIT: usize = 100;
 
+/// 旧查询 `range` 兼容：`1h/24h/7d/30d` 映射新口径 `granularity`；未知值返回 `None`。
+/// 映射等价性：`1h→five_min`、`24h→hourly`、`7d/30d→daily`，与新口径同窗查询等价。
+pub fn compat_granularity_for_range(range: &str) -> Option<&'static str> {
+    match range.trim().to_lowercase().as_str() {
+        "1h" => Some("five_min"),
+        "24h" => Some("hourly"),
+        "7d" | "30d" => Some("daily"),
+        _ => None,
+    }
+}
+
+/// 旧 `verdict` 值兼容：大小写不敏感归一到 `allow/block/need_approval` 新口径；
+/// 未知值返回 `None`（调用方忽略过滤、仅弃用标注，避免空结果误导）。
+pub fn normalize_verdict_compat(verdict: &str) -> Option<&'static str> {
+    match verdict.trim().to_lowercase().as_str() {
+        "allow" | "allowed" | "pass" | "approved" => Some("allow"),
+        "block" | "blocked" | "deny" | "rejected" => Some("block"),
+        "need_approval" | "needapproval" | "pending" | "approve" | "approval" => {
+            Some("need_approval")
+        }
+        _ => None,
+    }
+}
+
 /// HMAC 等长比较（`hmac` 依赖）：域分隔固定 key 下分别 MAC 后等长比较，
 /// 输入长度不等仍走等长比较再判假，不泄露匹配前缀长度。
 pub fn admin_token_eq(provided: &str, expected: &str) -> bool {
@@ -279,6 +303,14 @@ impl AdminState {
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.broadcaster.subscribe()
     }
+
+    /// 环内是否存在该 `kind`（`verdict` 兼容过滤命中判定用）。
+    pub fn has_kind(&self, kind: &str) -> bool {
+        self.events
+            .lock()
+            .map(|ring| ring.iter().any(|e| e.kind == kind))
+            .unwrap_or(false)
+    }
 }
 
 /// SSE 并发守卫标记（释放由 handler 调用 `release_sse_for`）。
@@ -445,6 +477,8 @@ pub async fn admin_health(
 }
 
 /// `GET /_admin/metrics`：指标快照（聚合环 + 网关只读计数合并）。
+/// 兼容旧查询 `?model=&upstream=`：仅弃用标注回显，不做过滤（快照为全局口径，
+/// 过滤会返回空结果误导；调用方应改用 `series?protocol=` 按协议查询）。
 pub async fn admin_metrics(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -467,7 +501,7 @@ pub async fn admin_metrics(
     }
     let snap = state.admin.metrics.snapshot();
     let gm = &state.gateway_metrics;
-    Json(json!({
+    let mut body = json!({
         "ok": true,
         "is_precise": snap.is_precise,
         "requests": snap.requests,
@@ -488,11 +522,24 @@ pub async fn admin_metrics(
         "sse_events": gm.sse_event_total(),
         "ring_len": snap.ring_len,
         "dropped": snap.dropped,
-    }))
-    .into_response()
+    });
+    let compat: HashMap<&str, &String> = ["model", "upstream"]
+        .into_iter()
+        .filter_map(|k| query.get(k).map(|v| (k, v)))
+        .collect();
+    if !compat.is_empty() {
+        body["deprecated"] =
+            "model/upstream 已弃用：metrics 为全局快照不做过滤，请改用 series?protocol= 按协议查询"
+                .into();
+        body["compat"] = json!(compat);
+    }
+    Json(body).into_response()
 }
 
 /// `GET /_admin/series`：时序查询（`?granularity=daily|hourly|five_min&since=&protocol=`）。
+/// 兼容旧查询：`?range=1h/24h/7d/30d` 映射 `granularity`（`granularity` 显式优先）；
+/// `?model=&upstream=` 仅弃用标注回显，不转 `protocol` 过滤（旧值为模型名/上游 URL，
+/// 与协议尾缀不等价，强转会返回空结果误导；调用方应改用 `protocol=`）。
 pub async fn admin_series(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -513,33 +560,61 @@ pub async fn admin_series(
     ) {
         return r;
     }
-    let granularity = query
-        .get("granularity")
-        .map(|s| s.as_str())
-        .unwrap_or("hourly");
-    if !matches!(granularity, "daily" | "hourly" | "five_min" | "5min") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "granularity 取值 daily/hourly/five_min"}})),
-        )
-            .into_response();
-    }
+    let range = query.get("range").cloned();
+    let granularity = match query.get("granularity") {
+        Some(g) if matches!(g.as_str(), "daily" | "hourly" | "five_min" | "5min") => g.clone(),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "granularity 取值 daily/hourly/five_min"}})),
+            )
+                .into_response();
+        }
+        None => match range.as_deref().and_then(compat_granularity_for_range) {
+            Some(g) => g.to_string(),
+            None if range.is_some() => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "range 取值 1h/24h/7d/30d（或改用 granularity=daily/hourly/five_min）"}})),
+                )
+                    .into_response();
+            }
+            None => "hourly".to_string(),
+        },
+    };
     let since = query.get("since").cloned();
     let protocol = query.get("protocol").cloned();
+    let mut compat: HashMap<&str, &String> = HashMap::new();
+    if let Some(r) = range.as_ref() {
+        compat.insert("range", r);
+    }
+    for k in ["model", "upstream"] {
+        if let Some(v) = query.get(k) {
+            compat.insert(k, v);
+        }
+    }
     match state
         .admin
         .metrics
-        .query_series(granularity, since, protocol)
+        .query_series(&granularity, since, protocol)
         .await
     {
         Ok(points) => {
-            Json(json!({"ok": true, "granularity": granularity, "points": points})).into_response()
+            let mut body = json!({"ok": true, "granularity": granularity, "points": points});
+            if !compat.is_empty() {
+                body["deprecated"] =
+                    "range/model/upstream 已弃用：请改用 granularity/since/protocol 新口径".into();
+                body["compat"] = json!(compat);
+            }
+            Json(body).into_response()
         }
         Err(e) => VeilError::internal(e).into_response(),
     }
 }
 
 /// `GET /_admin/events`：审计事件查询（`?kind=&since=&limit=`，摘要已脱敏）。
+/// 兼容旧查询：`?verdict=` 接受旧值并归一（命中环内 `kind` 才做过滤，否则忽略过滤
+/// 仅弃用标注，避免空结果误导）；`?model=&upstream=` 仅弃用标注回显。
 pub async fn admin_events(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -561,15 +636,43 @@ pub async fn admin_events(
         return r;
     }
     let kind = query.get("kind").cloned();
+    let verdict = query.get("verdict").cloned();
+    let verdict_norm = verdict.as_deref().and_then(normalize_verdict_compat);
+    let kind_filter: Option<String> = match (&kind, verdict_norm) {
+        (Some(k), _) => Some(k.clone()),
+        (None, Some(v)) if state.admin.has_kind(v) => Some(v.to_string()),
+        _ => None,
+    };
     let since: Option<i64> = query.get("since").and_then(|s| s.parse().ok());
     let limit: usize = query
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(EVENT_DEFAULT_LIMIT);
-    let events = state.admin.query_events(kind.as_deref(), since, limit);
-    // hover 口径：附掩码 TopN（不含明文）。
+    let events = state
+        .admin
+        .query_events(kind_filter.as_deref(), since, limit);
     let samples = state.admin.sampler.top_n(20);
-    Json(json!({"ok": true, "events": events, "pii_value_samples": samples})).into_response()
+    let mut body = json!({"ok": true, "events": events, "pii_value_samples": samples});
+    let mut compat: HashMap<&str, String> = HashMap::new();
+    if let Some(v) = verdict {
+        compat.insert(
+            "verdict",
+            match verdict_norm {
+                Some(n) => format!("{v}→{n}"),
+                None => v,
+            },
+        );
+    }
+    for k in ["model", "upstream"] {
+        if let Some(v) = query.get(k) {
+            compat.insert(k, v.clone());
+        }
+    }
+    if !compat.is_empty() {
+        body["deprecated"] = "verdict/model/upstream 已弃用：请改用 kind/since/limit 新口径".into();
+        body["compat"] = json!(compat);
+    }
+    Json(body).into_response()
 }
 
 /// `GET /_admin/events/stream`：SSE 实时推送（query 鉴权仅此路由有效）。
@@ -921,10 +1024,114 @@ mod tests {
     }
 
     #[test]
+    fn 旧range映射新口径等价() {
+        assert_eq!(compat_granularity_for_range("1h"), Some("five_min"));
+        assert_eq!(compat_granularity_for_range("24h"), Some("hourly"));
+        assert_eq!(compat_granularity_for_range("7d"), Some("daily"));
+        assert_eq!(compat_granularity_for_range("30d"), Some("daily"));
+        assert_eq!(compat_granularity_for_range("24H"), Some("hourly"));
+        assert_eq!(compat_granularity_for_range(" 7d "), Some("daily"));
+        assert_eq!(compat_granularity_for_range("90d"), None);
+        assert_eq!(compat_granularity_for_range(""), None);
+    }
+
+    #[test]
+    fn 旧verdict归一新口径() {
+        for v in ["allow", "allowed", "pass", "approved", "ALLOW"] {
+            assert_eq!(normalize_verdict_compat(v), Some("allow"), "{v}");
+        }
+        for v in ["block", "blocked", "deny", "rejected", "BLOCK"] {
+            assert_eq!(normalize_verdict_compat(v), Some("block"), "{v}");
+        }
+        for v in ["need_approval", "pending", "approve", "approval"] {
+            assert_eq!(normalize_verdict_compat(v), Some("need_approval"), "{v}");
+        }
+        assert_eq!(normalize_verdict_compat("bogus"), None);
+        assert_eq!(normalize_verdict_compat(""), None);
+    }
+
+    #[test]
+    fn verdict兼容命中kind才过滤() {
+        let st = test_admin_state();
+        st.push_event("audit", "危险操作摘要", None);
+        assert!(st.has_kind("audit"));
+        assert!(!st.has_kind("block"));
+        let norm = normalize_verdict_compat("blocked");
+        assert_eq!(norm, Some("block"));
+        assert!(!st.has_kind(norm.unwrap()));
+        let all = st.query_events(None, None, 10);
+        assert_eq!(all.len(), 1);
+        assert!(st.query_events(Some("audit"), None, 10).len() == 1);
+        assert!(st.query_events(Some("block"), None, 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn series_model_upstream兼容仅标注不过滤() {
+        use crate::{config::Config, state::SqliteOutcome};
+        let dir = std::env::temp_dir().join(format!("veil-admin-series-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let env = HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+        ]);
+        let state = AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: dir.join("m.sqlite"),
+                memory_only: false,
+            },
+        );
+        let mut q: HashMap<String, String> = HashMap::new();
+        q.insert("model".to_string(), "gpt-4".to_string());
+        q.insert("upstream".to_string(), "https://x".to_string());
+        q.insert("granularity".to_string(), "daily".to_string());
+        let resp = admin_series(
+            State(state),
+            PeerIp(test_ip()),
+            headers_with(Some("observability-admin-token-0123456789"), None),
+            Query(q),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v.get("compat").is_some());
+        assert!(v["points"].as_array().is_some());
+    }
+
+    #[test]
     fn admin_index占位文案含六路由() {
         let body = json!({
             "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream"],
         });
         assert_eq!(body["routes"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn 后订阅者不收历史只收实时() {
+        let st = test_admin_state();
+        st.push_event("audit", "历史摘要", None);
+        let mut late = st.subscribe();
+        assert!(late.try_recv().is_err(), "后订阅不得收到历史广播");
+        let mut early = st.subscribe();
+        let ev = st.push_event("audit", "实时摘要", None);
+        let got_late: String = late.try_recv().expect("后订阅须收到实时事件");
+        let got_early: String = early.try_recv().expect("先订阅同样收到实时事件");
+        assert!(got_late.contains("实时摘要"), "{got_late}");
+        assert!(got_early.contains("实时摘要"), "{got_early}");
+        assert_eq!(ev.summary, summarize("实时摘要", SUMMARY_MAX_CHARS));
+        assert!(late.try_recv().is_err(), "单事件不得重复投递");
     }
 }
