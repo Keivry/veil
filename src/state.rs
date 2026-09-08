@@ -27,8 +27,8 @@ use {
 
 /// sqlite 库文件名。
 pub const SQLITE_FILE_NAME: &str = "metrics.sqlite";
-/// 忙等待超时（毫秒），与原仓 `busy_timeout=5000` 同值。
-pub const SQLITE_BUSY_TIMEOUT_MS: i64 = 5000;
+/// 忙等待超时（毫秒）：归属 `fs_perm` 单一来源，此处转发防外部引用断裂。
+pub use crate::fs_perm::SQLITE_BUSY_TIMEOUT_MS;
 /// 用户版本号，与原仓 `user_version=1` 同值。
 pub const SQLITE_USER_VERSION: i64 = 1;
 
@@ -44,8 +44,8 @@ pub struct AppState {
     pub keepass: Arc<dyn KeePassBackend>,
     pub pending: Arc<PendingApprovals>,
     pub approval: Arc<crate::service::matrix::MatrixApproval>,
-    pub credential_hits: Arc<Mutex<crate::service::RateTable>>,
-    pub register_hits: Arc<Mutex<crate::service::RateTable>>,
+    pub credential_hits: Arc<tokio::sync::Mutex<crate::service::RateTable>>,
+    pub register_hits: Arc<tokio::sync::Mutex<crate::service::RateTable>>,
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
     pub admin: Arc<crate::service::admin::AdminState>,
     pub http_client: Arc<reqwest::Client>,
@@ -79,8 +79,8 @@ impl AppState {
             keepass: Arc::new(MockKeePass::locked()),
             pending: Arc::new(PendingApprovals::default()),
             approval,
-            credential_hits: Arc::new(Mutex::new(crate::service::RateTable::new())),
-            register_hits: Arc::new(Mutex::new(crate::service::RateTable::new())),
+            credential_hits: Arc::new(tokio::sync::Mutex::new(crate::service::RateTable::new())),
+            register_hits: Arc::new(tokio::sync::Mutex::new(crate::service::RateTable::new())),
             gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
             admin,
             http_client,
@@ -166,39 +166,22 @@ fn outcome_from_open_result(
 
 fn open_sqlite_blocking(data_dir: &Path) -> anyhow::Result<rusqlite::Connection> {
     std::fs::create_dir_all(data_dir)?;
-    chmod_path(data_dir, 0o700);
+    chmod_dir_0700(data_dir);
 
     let db_path = data_dir.join(SQLITE_FILE_NAME);
-    let conn = rusqlite::Connection::open(&db_path)?;
-    conn.execute_batch(&format!(
-        "PRAGMA journal_mode=WAL;\
-         PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};\
-         PRAGMA synchronous=NORMAL;\
-         PRAGMA user_version={SQLITE_USER_VERSION};"
-    ))?;
+    let conn = crate::fs_perm::open_wal(&db_path)?;
+    conn.execute_batch(&format!("PRAGMA user_version={SQLITE_USER_VERSION};"))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);",
     )?;
-    chmod_sqlite_files(&db_path);
+    crate::fs_perm::ensure_0600(&db_path);
     Ok(conn)
 }
 
-fn chmod_sqlite_files(db_path: &Path) {
-    chmod_path(db_path, 0o600);
-    for suffix in ["-wal", "-shm"] {
-        let mut sibling = db_path.as_os_str().to_owned();
-        sibling.push(suffix);
-        chmod_path(Path::new(&sibling), 0o600);
-    }
-}
-
-fn chmod_path(path: &Path, mode: u32) {
+fn chmod_dir_0700(dir: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
-    if !path.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        tracing::warn!("chmod {mode:o} 失败: {}: {e}", path.display());
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        tracing::warn!("chmod 700 失败: {}: {e}", dir.display());
     }
 }
 

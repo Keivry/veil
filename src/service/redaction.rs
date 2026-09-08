@@ -255,7 +255,11 @@ pub struct BoundaryHold {
 
 impl BoundaryHold {
     pub fn new(window_chars: usize) -> Self {
-        Self { held_prefix: None, held_data: None, window_chars }
+        Self {
+            held_prefix: None,
+            held_data: None,
+            window_chars,
+        }
     }
 
     pub fn has_held(&self) -> bool { self.held_data.is_some() }
@@ -283,10 +287,10 @@ impl BoundaryHold {
         let (tail_f, tail_map, tail_base) = {
             let (_, tail) = tail_window(&held_data, self.window_chars);
             let base = held_data.len().saturating_sub(tail.len());
-            let (f, m) = filter_window(tail);
+            let (f, m) = filter_window(tail, true, false);
             (f, m, base)
         };
-        let (head_f, head_map) = filter_window(head_window(&data, self.window_chars));
+        let (head_f, head_map) = filter_window(head_window(&data, self.window_chars), false, true);
         let mut window = String::with_capacity(tail_f.len() + head_f.len());
         window.push_str(&tail_f);
         let seam = window.len();
@@ -325,9 +329,15 @@ impl BoundaryHold {
 /// 窗口过滤：在原文上去除 JSON 信封（`"` `{` `}` `[` `]` `,` 与 `"key":` 键），
 /// 返回过滤文本及逐字符原字节映射。`"key":` 要求引号后首字符为字母/下划线，
 /// 故纯数字值（IPv6 组、电话片段）不受影响；`:` 本身保留（IPv6 跨缝需要）。
-/// 全字母组 IPv6 紧邻缝合缝仍可能受 `"key":` 误删影响，为可接受残留
-/// （逐帧检测仍覆盖完整形态）。
-fn filter_window(s: &str) -> (String, Vec<(usize, usize)>) {
+/// D5 缝邻保护：`"word":` 匹配中 `word` 全字母且长度≤4 时，若紧邻缝合缝
+/// （尾窗末端 `protect_trailing` / 首窗开头 `protect_leading`）则不删——
+/// 此类短词极可能是 IPv6 全字母组（如 `abcd`）或文本短词，误删会破坏跨缝检测；
+/// 正常 JSON 键多为更长词或位于窗中部，过滤行为不变。
+fn filter_window(
+    s: &str,
+    protect_trailing: bool,
+    protect_leading: bool,
+) -> (String, Vec<(usize, usize)>) {
     let mut out = String::with_capacity(s.len());
     let mut map: Vec<(usize, usize)> = Vec::new();
     let chars: Vec<(usize, char)> = s.char_indices().collect();
@@ -347,6 +357,15 @@ fn filter_window(s: &str) -> (String, Vec<(usize, usize)>) {
                 && chars[j].1 == '"'
                 && chars[j + 1].1 == ':'
             {
+                // D5：短全字母词缝邻豁免（IPv6 组/文本短词保护）。
+                let word_all_alpha = chars[i + 1..j].iter().all(|(_, c)| c.is_ascii_alphabetic());
+                let word_len = j - (i + 1);
+                let at_trailing_seam = protect_trailing && j + 2 == chars.len();
+                let at_leading_seam = protect_leading && i == 0;
+                if word_all_alpha && word_len <= 4 && (at_trailing_seam || at_leading_seam) {
+                    i += 1;
+                    continue;
+                }
                 i = j + 2;
                 continue;
             }
@@ -366,11 +385,7 @@ fn filter_window(s: &str) -> (String, Vec<(usize, usize)>) {
 
 /// 过滤坐标映射回原坐标：`[fs, fe)`（过滤字节区间）→ 原字节 `(start, end)`。
 /// 非字符边界返回 `None`（调用方跳过）。
-fn map_filtered_span(
-    map: &[(usize, usize)],
-    fs: usize,
-    fe: usize,
-) -> Option<(usize, usize)> {
+fn map_filtered_span(map: &[(usize, usize)], fs: usize, fe: usize) -> Option<(usize, usize)> {
     if fs >= fe {
         return None;
     }
@@ -440,8 +455,9 @@ fn head_window(s: &str, n_chars: usize) -> &str {
     }
 }
 
-/// 字节区间掩码（等字符数 `*` 替换）：越界/非字符边界/含 JSON 结构字符时拒绝，
-/// 保证信封结构不被破坏。
+/// 字节区间掩码（等字符数 `*` 替换）：越界/非字符边界拒绝；
+/// D5 逐字符豁免：信封字符（`{ } " [ ]`）位原样保留，仅掩码其余位，
+/// 含信封的跨缝命中不再整段漏掩，JSON 结构恒完整可解析。
 fn mask_span_bytes(text: &mut String, start: usize, end: usize) {
     if start >= end || end > text.len() {
         return;
@@ -449,11 +465,16 @@ fn mask_span_bytes(text: &mut String, start: usize, end: usize) {
     if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
         return;
     }
-    let span = &text[start..end];
-    if span.contains(['{', '}', '"', '[', ']']) {
-        return;
-    }
-    let masked: String = span.chars().map(|_| '*').collect();
+    let masked: String = text[start..end]
+        .chars()
+        .map(|c| {
+            if matches!(c, '{' | '}' | '"' | '[' | ']') {
+                c
+            } else {
+                '*'
+            }
+        })
+        .collect();
     text.replace_range(start..end, &masked);
 }
 
@@ -464,7 +485,10 @@ pub const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
 /// 其余（含空）启用。网关实际以 `Config::parse_placeholder_prompt` 为准，
 /// 本函数仅供单测对账，两者语义一致。
 pub fn placeholder_prompt_enabled(raw: &str) -> bool {
-    !matches!(raw.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off")
+    !matches!(
+        raw.trim().to_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// span 加法 API：去重后位置化替换（原 `apply_spans` 语义不变，本函数仅叠加去重层）。
@@ -666,7 +690,9 @@ fn scan_token_forms(text: &str) -> Vec<(usize, usize, String)> {
             let token = &rest[..prefix_len + end + 2];
             let inner = &token[prefix_len..token.len() - 2];
             if !inner.is_empty()
-                && inner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && inner
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
             {
                 out.push((i, i + token.len(), token.to_string()));
                 i += token.len();
@@ -861,7 +887,8 @@ mod tests {
     }
 
     #[test]
-    fn fix5默认子串不重排仅开启才声明头() {        let original = br#"{"b": 1,  "a": 2}"#;
+    fn fix5默认子串不重排仅开启才声明头() {
+        let original = br#"{"b": 1,  "a": 2}"#;
         let normalized = br#"{"a":2,"b":1}"#;
         let (bytes, header) = select_request_bytes(original, normalized, false);
         assert_eq!(bytes, original);
@@ -901,7 +928,9 @@ mod tests {
         assert!(restored.contains("13812345678"), "{restored}");
         assert!(!spans.is_empty());
         assert!(
-            spans.iter().any(|(s, e)| &restored[*s..*e] == "13812345678"),
+            spans
+                .iter()
+                .any(|(s, e)| &restored[*s..*e] == "13812345678"),
             "{spans:?}"
         );
         // 带 skip：还原明文保持明文。
@@ -949,7 +978,10 @@ mod tests {
 
     #[test]
     fn span加法去重语义() {
-        let out = apply_spans_dedup("hello world", &[(6, 11, "W".to_string()), (6, 11, "W".to_string())]);
+        let out = apply_spans_dedup(
+            "hello world",
+            &[(6, 11, "W".to_string()), (6, 11, "W".to_string())],
+        );
         assert_eq!(out, "hello W");
     }
 
@@ -970,7 +1002,11 @@ mod tests {
     #[test]
     fn 边界hold跨缝手机号双侧掩码() {
         let mut h = BoundaryHold::new(64);
-        let (p0, d0) = h.push("event: message\n".to_string(), "call 138".to_string(), |_, _| vec![]);
+        let (p0, d0) = h.push(
+            "event: message\n".to_string(),
+            "call 138".to_string(),
+            |_, _| vec![],
+        );
         assert!(p0.is_empty() && d0.is_empty(), "首帧延迟无放行");
         let span_fn = |_: &str, sm: usize| {
             vec![(5, 16)]
@@ -978,7 +1014,11 @@ mod tests {
                 .filter(|(s, e)| *s < sm && *e > sm)
                 .collect()
         };
-        let (p1, d1) = h.push("event: message\n".to_string(), "12345678 ok".to_string(), span_fn);
+        let (p1, d1) = h.push(
+            "event: message\n".to_string(),
+            "12345678 ok".to_string(),
+            span_fn,
+        );
         assert_eq!(p1, "event: message\n");
         assert_eq!(d1, "call ***", "上一帧尾部残片须掩码: {d1}");
         let (pf, df) = h.flush().expect("次帧须滞留");
@@ -1001,14 +1041,58 @@ mod tests {
     #[test]
     fn 边界hold零窗直通且json结构守卫() {
         let mut h = BoundaryHold::new(0);
-        let (p, d) = h.push("e\n".to_string(), "{\"a\":1}".to_string(), |_, _| vec![(0, 7)]);
+        let (p, d) = h.push("e\n".to_string(), "{\"a\":1}".to_string(), |_, _| {
+            vec![(0, 7)]
+        });
         assert_eq!((p.as_str(), d.as_str()), ("e\n", "{\"a\":1}"));
         let mut t = "{\"a\":1}".to_string();
         mask_span_bytes(&mut t, 0, 7);
-        assert_eq!(t, "{\"a\":1}", "含结构字符不得掩码");
+        assert_eq!(t, "{\"*\"**}", "信封位保留、其余位逐字掩码");
         let mut t2 = "13812345678".to_string();
         mask_span_bytes(&mut t2, 0, 11);
         assert_eq!(t2, "***********");
+    }
+
+    #[test]
+    fn 掩码逐字豁免且roundtrip合法() {
+        // 贴信封 PII：数字紧邻引号/冒号，非信封位仍被掩码。
+        let mut t = "{\"content\":\"13812345678\"}".to_string();
+        let start = "{\"content\":\"".len();
+        mask_span_bytes(&mut t, start, start + 11);
+        assert_eq!(t, "{\"content\":\"***********\"}");
+        let v: serde_json::Value = serde_json::from_str(&t).expect("掩码后仍为合法 JSON");
+        assert_eq!(v["content"], "***********");
+        // 含信封的跨缝区间：信封位原样保留。
+        let mut u = "ab{\"x".to_string();
+        mask_span_bytes(&mut u, 0, 5);
+        assert_eq!(u, "**{\"*");
+        let _ = serde_json::json!({"ok": true});
+    }
+
+    #[test]
+    fn filter_window_ipv6全字母组缝邻保护() {
+        // 尾窗末端短词 `"abcd":`：缝邻保护开启时保留 `abcd` 组。
+        let (guarded, _) = filter_window("xx\"abcd\":", true, false);
+        assert!(guarded.contains("abcd"), "缝邻短词不得误删: {guarded}");
+        // 同一形态无保护时照常过滤（行为锚点）。
+        let (stripped, _) = filter_window("xx\"abcd\":", false, false);
+        assert_eq!(stripped, "xx");
+        // 首窗开头短词同理。
+        let (h_guarded, _) = filter_window("\"abcd\":yy", false, true);
+        assert!(
+            h_guarded.contains("abcd"),
+            "首窗缝邻短词不得误删: {h_guarded}"
+        );
+        let (h_stripped, _) = filter_window("\"abcd\":yy", false, false);
+        assert_eq!(h_stripped, "yy");
+        // 长键照常过滤（既有行为不变，缝邻亦不豁免）。
+        let (long_tail, _) = filter_window("xx\"content\":1", true, false);
+        assert!(!long_tail.contains("content"), "长键仍须过滤: {long_tail}");
+        let (long_head, _) = filter_window("\"content\":1", false, true);
+        assert!(!long_head.contains("content"), "长键仍须过滤: {long_head}");
+        // 窗中部短词照常过滤（非缝邻不保护）。
+        let (mid, _) = filter_window("xx\"abcd\":yy", false, false);
+        assert!(!mid.contains("abcd"), "窗中部短词仍过滤: {mid}");
     }
 
     #[test]
@@ -1021,17 +1105,20 @@ mod tests {
         let window2 = "abc def".to_string();
         assert!(marker_cross_spans(&window2, 4).is_empty());
         let window3 = "__PII_1_ab12cd34__ tail".to_string();
-        assert!(marker_cross_spans(&window3, 19).is_empty(), "完整 token 左侧不算跨缝");
+        assert!(
+            marker_cross_spans(&window3, 19).is_empty(),
+            "完整 token 左侧不算跨缝"
+        );
     }
 
     #[test]
     fn 信封过滤缝合跨帧数字() {
         let prev = "{\"delta\":{\"content\":\"call 138\"}}";
         let cur = "{\"delta\":{\"content\":\"12345678 ok\"}}";
-        let (tail_f, _) = filter_window(prev);
-        let (head_f, _) = filter_window(cur);
+        let (tail_f, _) = filter_window(prev, true, false);
+        let (head_f, _) = filter_window(cur, false, true);
         assert!(tail_f.ends_with("call 138"), "尾部解码文本保留: {tail_f}");
-        assert!(head_f.starts_with(":delta:content:") == false, "{head_f}");
+        assert!(!head_f.starts_with(":delta:content:"), "{head_f}");
         let mut window = String::new();
         window.push_str(&tail_f);
         let seam = window.len();
@@ -1065,5 +1152,100 @@ mod tests {
         assert!(d1.contains("\"content\""), "信封键须完整保留: {d1}");
         let (_, df) = h.flush().expect("次帧须滞留");
         assert!(!df.contains("12345678"), "次帧头部延续须掩码: {df}");
+    }
+
+    #[tokio::test]
+    async fn 字典5000防联合正则爆炸耗时锚() {
+        let detector = PiiDetector::new();
+        let dict: Vec<(String, String)> = (0..5000)
+            .map(|i| (format!("合成姓名{i:05}号"), "name".to_string()))
+            .collect();
+        detector.load_dict(&dict);
+        let vault = CredentialVault::new();
+        let scope = Scope::new();
+        let text = "正文含 合成姓名01234号 ok 与其余文字混合".to_string();
+        let start = std::time::Instant::now();
+        let out = scope.redact_request(&vault, &detector, &text).await;
+        let elapsed = start.elapsed();
+        assert!(!out.contains("合成姓名01234号"), "{out}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "5000 字典单次扫描须远低于宽松上界（防 13.8ms 爆炸回归），实测 {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 增量扫描耗时锚宽松上界() {
+        let vault = vault_with_secret("anchor-secret-007");
+        let detector = PiiDetector::new();
+        let scope = Scope::new();
+        let start = std::time::Instant::now();
+        for i in 0..100 {
+            let text = format!("{{\"k{i}\":\"v{i} anchor-secret-007 13812345678\"}}");
+            let out = scope.redact_request(&vault, &detector, &text).await;
+            assert!(!out.contains("anchor-secret-007"), "{out}");
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "100 次增量扫描须远低于宽松上界，实测 {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn scope请求隔离并发互不可见() {
+        let detector = std::sync::Arc::new(PiiDetector::new());
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let d = std::sync::Arc::clone(&detector);
+            handles.push(tokio::spawn(async move {
+                let vault = CredentialVault::new();
+                let secret = format!("隔离密钥-{i:02}");
+                vault.register(&secret).unwrap();
+                let scope = Scope::new();
+                let text = format!("{{\"s\":\"{secret}\"}}");
+                scope.redact_request(&vault, &d, &text).await
+            }));
+        }
+        let mut outs = Vec::new();
+        for h in handles {
+            outs.push(h.await.expect("隔离任务不得失败"));
+        }
+        for (i, out) in outs.iter().enumerate() {
+            for j in 0..4 {
+                assert!(
+                    !out.contains(&format!("隔离密钥-{j:02}")),
+                    "scope{i} 不得透出任何明文密钥（含自身注册前形态）: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boundaryhold组合fuzz往返不破坏信封() {
+        let frags = ["__PII_", "7__", "\"content\":\"", "abc", "\"}"];
+        let seps = ["", "\"k\":", "{", "},{\"next\":"];
+        let mut n = 0u64;
+        for (fi, frag) in frags.iter().enumerate() {
+            for seps_item in seps.iter() {
+                n += 1;
+                let x = (n.wrapping_mul(6364136223846793005) >> 33) as usize;
+                let a = format!("{{\"a\":\"{}{}\"}}", frag, seps_item);
+                let b = format!("{{\"b\":\"{}-{x}\"}}", frags[(fi + 1) % frags.len()]);
+                let c = format!("data: {{\"c\":{x}}}\ndata: {{\"d\":{x}}}\n\n");
+                let mut h = BoundaryHold::new(64);
+                let (p0, d0) = h.push("event: m\n".to_string(), a.clone(), |_, _| vec![]);
+                assert!(p0.is_empty() && d0.is_empty());
+                let (p1, d1) = h.push("event: m\n".to_string(), b.clone(), |_, _| vec![]);
+                assert_eq!(p1, "event: m\n");
+                assert_eq!(d1, a, "无掩码时上一帧须原样放行");
+                let (p2, d2) = h.push("event: m\n".to_string(), c.clone(), |_, _| vec![]);
+                assert_eq!((p2, d2), ("event: m\n".to_string(), b));
+                let (pf, df) = h.flush().expect("末帧须滞留可取");
+                assert_eq!((pf, df), ("event: m\n".to_string(), c));
+                assert!(!h.has_held());
+            }
+        }
+        assert_eq!(n, (frags.len() * seps.len()) as u64);
     }
 }

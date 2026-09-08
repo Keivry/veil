@@ -165,4 +165,23 @@ mod tests {
         assert_eq!(table.len(), 1, "同 key 重复建单不得翻倍");
         assert_eq!(table.get("k").unwrap().reason, "auto_approve_none");
     }
+
+    #[test]
+    fn 并发双解锁同key仅单记录无死锁() {
+        use std::sync::Arc;
+        let table = Arc::new(PendingApprovals::default());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let t = Arc::clone(&table);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    t.insert(PendingRecord::new("unlock-k", "hash_mismatch"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("并发插入不得死锁");
+        }
+        assert_eq!(table.len(), 1, "并发双解锁仅一次 Matrix ask 建单");
+    }
 }

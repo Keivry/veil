@@ -121,7 +121,7 @@ impl AuditHold {
         item_key: &str,
         output_index: u32,
         seq: Option<u64>,
-        id: Option<&str>,
+        _id: Option<&str>,
         name: Option<&str>,
         args_delta: &str,
     ) -> HoldVerdict {
@@ -300,6 +300,8 @@ impl AuditHold {
         self.args_by_index.get(&index).map(|s| s.as_str())
     }
 
+    /// hold 期间新危险调用是否拒绝（预留：流泵未接线——当前泵路径不调用本
+    /// 函数，危险调用按 pending 建单语义处理；接线见网关 change）。
     pub fn reject_new_dangerous_during_hold(&self, is_dangerous: bool) -> bool {
         self.held() && is_dangerous
     }
@@ -459,6 +461,56 @@ mod tests {
         );
         assert!(hold.is_rejected());
         assert_eq!(hold.accumulated(0), None);
+    }
+
+    #[test]
+    fn 中途abort与早断清理均为fail_closed无挂起() {
+        let mut hold = AuditHold::new(1024);
+        assert_eq!(
+            hold.push_fragment(0, Some("a"), Some("run"), "{\"x\":"),
+            HoldVerdict::Approved
+        );
+        hold.mark_rejected();
+        assert!(hold.is_rejected());
+        assert!(!hold.held(), "abort 后不得再挂起等待");
+        assert_eq!(
+            hold.push_fragment(0, None, None, "1}"),
+            HoldVerdict::Rejected,
+            "abort 后续分片一律拒绝"
+        );
+        let mut early = AuditHold::new(1024);
+        assert_eq!(
+            early.push_fragment(1, Some("b"), Some("run"), "{\"y\":"),
+            HoldVerdict::Approved
+        );
+        early.mark_completed();
+        assert!(!early.held(), "早断完成即清理，不残留挂起");
+    }
+
+    #[test]
+    fn 双index独立累积不串扰() {
+        let mut hold = AuditHold::new(1024);
+        assert_eq!(
+            hold.push_fragment(0, Some("a"), Some("run_a"), "{\"x\":"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(
+            hold.push_fragment(1, Some("b"), Some("run_b"), "{\"y\":"),
+            HoldVerdict::Approved
+        );
+        assert_eq!(hold.accumulated(0), Some("{\"x\":"));
+        assert_eq!(hold.accumulated(1), Some("{\"y\":"));
+        hold.clear_index(0);
+        assert_eq!(hold.accumulated(0), None);
+        assert_eq!(hold.accumulated(1), Some("{\"y\":"), "清槽不得污染他槽");
+        assert!(hold.held(), "单槽清理后整体仍挂起审计");
+    }
+
+    #[test]
+    fn 超时断连竞态区间常量锁定() {
+        assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MIN, 110);
+        assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MAX, 130);
+        assert_eq!(crate::config::AUDIT_TIMEOUT_DEFAULT, 90);
     }
 
     #[test]

@@ -305,7 +305,7 @@ get revoke --name "check-mail"
 PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁，跨请求不互见）；
 凭据 `vault` 与 PII `detector` 为进程单例只读复用（还原不断链）。与原仓差异：
 原仓 PII 全局复用（跨请求同明文同 token，prompt-cache 友好但可关联），本仓隐私更严，
-代价是跨请求 prompt-cache 命中率下降，属有意权衡。
+代价是跨请求 prompt-cache 命中率下降，属有意权衡（命中率量化待测，`TODO(metrics)`，不阻塞）。
 
 ### 7.4 遗留变量兼容表
 
@@ -322,7 +322,7 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 紧急吊销 `POST /revoke/emergency`：入参含 `file_present` 文件在位标记，
   管理 token 可走请求体或 `X-Admin-Token` 头；内网判定只认 TCP 远端地址
   （`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头（防伪造绕过）。
-  与常规吊销同注册表定位条目（见 `src/handler.rs::emergency_revoke_handler`）。
+  与常规吊销同注册表定位条目（见 `src/handler/credential.rs::emergency_revoke_handler`）。
 - `GET /registrations`：原仓无鉴权直读；本仓要求管理面鉴权（`X-Admin-Token` /
   Cookie / 仅 SSE 回退 query），无 token 恒 401。旧脚本直读须补 token，
   否则按 401 处理（有意收敛，见 `observability-admin` spec）。

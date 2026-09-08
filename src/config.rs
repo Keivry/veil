@@ -20,6 +20,42 @@ pub const PII_HOLD_MAX_DEFAULT: i64 = 64;
 pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: i64 = 1_048_576;
 /// 管理 token 建议最小长度，不足仅告警不断链。
 pub const ADMIN_TOKEN_MIN_LEN: usize = 32;
+/// 通用网关 ingress JSON 上限 10MB（检查点：`handler::llm` 入口 `to_bytes`；
+/// spec `admin-ratelimit-contract` + design D4：与 8MB 审计/扫描类上限分属不同检查点，
+/// 差异为有意设计；超限返回 413）。
+pub const GATEWAY_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+/// 审计/扫描类子限 ceiling 8MB（检查点归属声明：审计 hold 与扫描上限类）。
+/// 现网可配子限（`AUDIT_HOLD_MAX_BYTES` 默认 1MB）均不得超过本 ceiling；
+/// 本常量为回归锚点，不接任何请求入口，不改变现行子限行为。
+/// 归属 `config.rs`（D1 常量下沉），`handler::llm` 原位 `pub use` 转发。
+pub const AUDIT_SUBLIMIT_CEILING_BYTES: usize = 8 * 1024 * 1024;
+/// 审计/扫描类子限 ceiling 8MB（检查点归属声明：审计 hold 与扫描上限类）。
+/// 现网可配子限（`AUDIT_HOLD_MAX_BYTES` 默认 1MB）均不得超过本 ceiling；
+/// 本常量为回归锚点，不接任何请求入口，不改变现行子限行为。
+/// 原仓遗留变量名：二进制不读取，检出时启动期 warn 指引改名（见 [`legacy_ignored_detected`]）。
+pub const LEGACY_IGNORED_VARS: [(&str, &str); 3] = [
+    (
+        "CREDENTIAL_MASTER_PASSWORD",
+        "主密码口令改走 TPM 解封（startup_tpm_in）",
+    ),
+    (
+        "CREDENTIAL_PORT",
+        "宿主机端口改用 PORT_8877/8878/8879（仅改映射）",
+    ),
+    (
+        "CREDENTIAL_PROXY_DEBUG_DIR",
+        "请求落盘排障改用结构化日志 + AUDIT_POLICY_FILE 审计面",
+    ),
+];
+
+/// 检出环境中的遗留变量（非空即命中；只读判定，不改变任何行为）。
+pub fn legacy_ignored_detected(env: &HashMap<String, String>) -> Vec<&'static str> {
+    LEGACY_IGNORED_VARS
+        .iter()
+        .filter(|(name, _)| env.get(*name).is_some_and(|v| !v.trim().is_empty()))
+        .map(|(name, _)| *name)
+        .collect()
+}
 /// 上游转发 `reqwest::Client` 整体超时默认值（秒，保守值）。
 pub const HTTP_TIMEOUT_SECS_DEFAULT: u64 = 30;
 /// 上游转发连接池每主机空闲连接上限默认值（保守值）。
@@ -237,14 +273,14 @@ pub fn resolve_kdbx(db_dir: &std::path::Path) -> Option<ResolvedKdbx> {
     })
 }
 
-/// 入口端口上下文选路（§7.1 给 handler 集成方的接线位，不碰 `handler.rs`）。
+/// 入口端口上下文选路（§7.1 给 handler 集成方的接线位，不碰 `handler/llm/` 目录）。
 ///
 /// 语义与 `service::llm_gateway::resolve_upstream` 同字，差异仅在输入形态：
 /// 本函数接受可选的宿主机入口端口（compose 下 `PORT_887x` 映射的宿主机侧端口，
 /// 如 8878），命中 `LLM_<port>` 则返回对应上游，否则回落 `LLM_UPSTREAM` 缺省；
 /// 缺省未设时回落任一 `LLM_<port>`（`HashMap` 迭代序不稳定，生产如需确定性
 /// 回落必须显式配置 `LLM_UPSTREAM`）。`None` 恒走缺省分支，不按端口猜测。
-/// 当前 `handler::gateway_serve` 仍以 `None` 调用（单端口运行时，二进制只监听
+/// 当前 `handler::llm::gateway_serve` 仍以 `None` 调用（单端口运行时，二进制只监听
 /// `127.0.0.1:8877`），多端口生效需集成方把入口端口透传进来；改动面留给集成方，
 /// 本函数 + 单测先把“端口→上游”映射锁死。
 ///
@@ -276,6 +312,14 @@ impl Config {
     /// 可注入的加载核心，单测用、心智负担低。
     pub fn load_from(env: &HashMap<String, String>) -> Result<Self> {
         let get = |name: &str| env.get(name).map(|v| v.trim().to_string());
+        for name in legacy_ignored_detected(env) {
+            let hint = LEGACY_IGNORED_VARS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, h)| *h)
+                .unwrap_or("见 README §7.4");
+            tracing::warn!("{name} 已置位但二进制不读取（沿用旧名静默不生效）：{hint}");
+        }
 
         let observability_admin_token = require_non_empty(&get, "OBSERVABILITY_ADMIN_TOKEN")?;
         if let Some(cred) = get("CREDENTIAL_ADMIN_TOKEN")
@@ -1683,10 +1727,7 @@ mod tests {
             );
             let mut env = base_env();
             env.insert("PII_GLOBAL_PERSIST".to_string(), raw.to_string());
-            assert!(
-                Config::load_from(&env).unwrap().pii_global_persist,
-                "{raw}"
-            );
+            assert!(Config::load_from(&env).unwrap().pii_global_persist, "{raw}");
         }
         for raw in ["0", "false", "", "off"] {
             let mut env = base_env();
@@ -1781,6 +1822,20 @@ mod tests {
             "旧主密码".to_string(),
         );
         env.insert("CREDENTIAL_PORT".to_string(), "9999".to_string());
+        // 检出谓词：三遗留变量非空即命中（含 DEBUG_DIR），空值不命中。
+        assert_eq!(
+            legacy_ignored_detected(&env),
+            vec!["CREDENTIAL_MASTER_PASSWORD", "CREDENTIAL_PORT"]
+        );
+        env.insert(
+            "CREDENTIAL_PROXY_DEBUG_DIR".to_string(),
+            "/tmp/debug".to_string(),
+        );
+        assert_eq!(legacy_ignored_detected(&env).len(), 3);
+        let mut empty_hit = base_env();
+        empty_hit.insert("CREDENTIAL_PORT".to_string(), "   ".to_string());
+        assert!(legacy_ignored_detected(&empty_hit).is_empty());
+        // 行为仍为不读取：启动仅 warn，不断链、不生效。
         let cfg = Config::load_from(&env).unwrap();
         assert!(cfg.credential_secret.is_none());
         assert!(!cfg.llm_upstreams.contains_key(&9999));

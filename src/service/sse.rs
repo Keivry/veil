@@ -290,7 +290,7 @@ impl SseParser {
 /// 对标 Python `_sse.py`（BOM 后判 DONE，不把 BOM 帧当残余转发）。
 pub fn strip_sse_bom(s: &str) -> &str { s.trim_start_matches('\u{feff}') }
 
-/// DONE 载荷判定（§2.6）：BOM 剥离后 trim 等于 `[DONE]` 即终端；
+/// DONE 载荷判定（§2.6/D6 载荷级）：BOM 剥离后 trim 等于 `[DONE]` 即终端；
 /// 兼容残余路径的 `data:` 前缀形态（`data: [DONE]`/`data:[DONE]`，含 BOM）；
 /// chat 裸帧恒为 `data: [DONE]`，不得补 `event:`。
 pub fn is_done_payload(data: &str) -> bool {
@@ -305,8 +305,8 @@ pub fn is_done_payload(data: &str) -> bool {
 /// 残余分类（§2.6）：`None` 必须丢弃，不得 `data:` 直发；
 /// - 空/空白 → 丢弃；
 /// - `[DONE]`（含 BOM 前缀）→ 丢弃（终端去重已处理，避免重复终止）；
-/// - 其余 → `Some` 还原后文本（调用方经还原/脱敏后按正常帧发送；
-///   纯垃圾残余的彻底丢弃由 handler 接线方按需收紧，见接线说明）。
+/// - 其余 → `Some` 还原后文本（调用方经还原/脱敏后按正常帧发送； 纯垃圾残余的彻底丢弃由 handler
+///   接线方按需收紧，见接线说明）。
 pub fn classify_residue(tail: &str) -> Option<String> {
     let stripped = strip_sse_bom(tail);
     if stripped.trim().is_empty() {
@@ -614,7 +614,11 @@ mod tests {
             1,
             "BOM+重复 DONE 去重后恰一终止"
         );
-        assert!(frames.last().is_some_and(|f| super::super::block_inject::is_done_frame(f)));
+        assert!(
+            frames
+                .last()
+                .is_some_and(|f| super::super::block_inject::is_done_frame(f))
+        );
     }
 
     #[test]
@@ -630,5 +634,66 @@ mod tests {
         assert!(q.push_bytes("乙\n".as_bytes()).is_empty());
         let evs = q.push_bytes("data: 丙\n\n".as_bytes());
         assert_eq!(evs[0].data, "甲乙\n丙");
+    }
+
+    #[test]
+    fn 空retry与纯注释行被忽略不计事件() {
+        let mut p = SseParser::new();
+        let before = p.sse_event_count;
+        let evs = p.push_bytes(b"retry:\ndata: v\n\n");
+        assert_eq!(evs[0].retry, None, "空 retry 不得解析出数值");
+        assert_eq!(evs[0].data, "v");
+        let c1 = p.push_bytes(b": comment-a\n\n");
+        assert!(c1[0].is_comment_only);
+        let c2 = p.push_bytes(b": comment-b\n\n");
+        assert!(c2[0].is_comment_only);
+        assert_eq!(
+            p.sse_event_count,
+            before + 1,
+            "纯注释帧透传但不计入事件（comment 不计）"
+        );
+    }
+
+    #[test]
+    fn refusal三片段单事件重组() {
+        let mut p = SseParser::new();
+        let full = "data: {\"choices\":[{\"delta\":{\"refusal\":\"合成拒绝文\"}}]}\n\n";
+        let a = full.floor_char_boundary(full.len() / 3);
+        let b = full.floor_char_boundary(2 * full.len() / 3);
+        assert!(p.push_bytes(&full.as_bytes()[..a]).is_empty());
+        assert!(p.push_bytes(&full.as_bytes()[a..b]).is_empty());
+        let evs = p.push_bytes(&full.as_bytes()[b..]);
+        assert_eq!(evs.len(), 1, "三片段须重组为单事件单次还原");
+        assert!(evs[0].data.contains("合成拒绝文"));
+        assert_eq!(p.sse_event_count, 1, "幂等哨兵：单事件只计一次");
+    }
+
+    #[test]
+    fn flush文本幂等无双还原() {
+        let mut buf = Utf8ByteBuffer::new();
+        assert_eq!(buf.push("甲".as_bytes()), "甲");
+        let first = buf.flush_text();
+        assert!(first.is_empty(), "无残余时 flush 为空");
+        let second = buf.flush_text();
+        assert!(second.is_empty(), "重复 flush 不得二次产出（无双还原）");
+        let mut p = SseParser::new();
+        assert!(p.push_bytes(b"data: {\"a\":1}\n").is_empty());
+        let evs = p.push_bytes(b"\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "{\"a\":1}");
+    }
+
+    #[test]
+    fn bom单次剥离且注释帧透传() {
+        assert_eq!(strip_sse_bom("\u{feff}data: x"), "data: x");
+        assert_eq!(strip_sse_bom("\u{feff}\u{feff}data: x"), "data: x");
+        // 当前指定行为：行内 BOM 前缀的 data 行不被识别为数据行（BOM 剥离仅
+        // 作用于残余/DONE 判定路径），此处锁定该语义而不扩展解析口径。
+        let mut p = SseParser::new();
+        let evs = p.push_bytes("\u{feff}data: {\"b\":2}\n\n".as_bytes());
+        assert!(evs.is_empty(), "行内 BOM 帧当前不产出数据事件");
+        let c = p.push_bytes(b": note\n\n");
+        assert_eq!(c.len(), 1, "注释帧须透传");
+        assert!(c[0].is_comment_only);
     }
 }

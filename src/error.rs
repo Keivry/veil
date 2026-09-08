@@ -6,7 +6,9 @@
 //! `NotFound→404` / `EmptyBody→502` / `Unavailable→503` /
 //! `Upstream→透传上游码` / 其余→500（响应体不泄漏内部细节，仅记日志）。
 //! 例外：入口 body 超限 `413` 由网关入口直接构造（`payload_too_large`），
-//! 不经本枚举（超限发生在 JSON 解析之前，无错误变体可承载）。
+//! 不经本枚举（超限发生在 JSON 解析之前，无错误变体可承载）；限值见
+//! `handler/llm/mod.rs GATEWAY_BODY_LIMIT_BYTES`（将下沉 `config.rs` 原位转发，
+//! 见 `veil-arch-hygiene-round3` D1）。
 //!
 //! 映射口径（§1.2 验收）：
 //! - 认证失败 → 403

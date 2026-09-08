@@ -2,6 +2,7 @@ pub mod approval;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod fs_perm;
 pub mod handler;
 pub mod keepass;
 pub mod registry;

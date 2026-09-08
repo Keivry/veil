@@ -4,14 +4,12 @@
 pub mod credential;
 pub mod llm;
 
-pub use credential::*;
-pub use llm::*;
-
 use {
     crate::{service, state::AppState},
     axum::{Json, extract::State},
     serde_json::{Value, json},
 };
+pub use {credential::*, llm::*};
 
 pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
     let health = service::health_status(&state);

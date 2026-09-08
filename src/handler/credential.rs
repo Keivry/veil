@@ -5,7 +5,7 @@
 use {
     crate::{
         error::{Result, VeilError},
-        service::{self, AuthBlock, CredentialBody, CredentialHeaders},
+        service::{self, CredentialBody, CredentialHeaders},
         state::AppState,
     },
     axum::{
@@ -13,7 +13,7 @@ use {
         extract::{ConnectInfo, State},
         http::HeaderMap,
     },
-    serde::{Deserialize, Serialize},
+    serde::Deserialize,
     serde_json::{Value, json},
     std::net::SocketAddr,
 };
@@ -357,22 +357,6 @@ pub async fn approve_hash_change_handler(
 ) -> Result<Json<Value>> {
     let view = service::approve_hash_change(&state, &body.caller_path, &body.new_hash).await?;
     Ok(Json(json!({ "ok": true, "registration": view })))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CredentialRequestBody {
-    #[serde(default)]
-    pub secret: Option<String>,
-    #[serde(default)]
-    pub auth: Option<AuthBlock>,
-    #[serde(default)]
-    pub entry: Option<String>,
-    #[serde(default)]
-    pub field: Option<String>,
-    #[serde(default)]
-    pub fields: Option<Value>,
-    #[serde(default)]
-    pub token: Option<bool>,
 }
 
 #[cfg(test)]

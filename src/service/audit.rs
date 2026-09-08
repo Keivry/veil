@@ -151,8 +151,12 @@ impl AuditPolicy {
                 let key = k.trim().to_string();
                 let val = unquote(v.trim());
                 match key.as_str() {
-                    "extra_block_substrings" | "extra_sensitive_paths" | "allow" | "deny"
-                    | "internal_suffixes" | "dangerous" => {
+                    "extra_block_substrings"
+                    | "extra_sensitive_paths"
+                    | "allow"
+                    | "deny"
+                    | "internal_suffixes"
+                    | "dangerous" => {
                         if !val.is_empty() {
                             return Err(VeilError::Config {
                                 var: "AUDIT_POLICY_FILE".to_string(),
@@ -609,7 +613,7 @@ pub fn extract_host(args: &str) -> Option<String> {
     // URL 形态：先剥 scheme 再取 host（`svc.corp:8080/x` → `svc.corp:8080`，端口保留）。
     if let Some(pos) = args.find("https://").or_else(|| args.find("http://")) {
         let rest = &args[pos..];
-        if let Some(after) = rest.splitn(2, "://").nth(1) {
+        if let Some(after) = rest.split_once("://").map(|x| x.1) {
             let host = after
                 .split(['/', ' ', '"', '\''].as_ref())
                 .next()
@@ -624,8 +628,7 @@ pub fn extract_host(args: &str) -> Option<String> {
         let mut search = args;
         while let Some(idx) = search.find(verb) {
             let after_verb = idx + verb.len();
-            let before_ok = idx == 0
-                || !search.as_bytes()[idx - 1].is_ascii_alphanumeric();
+            let before_ok = idx == 0 || !search.as_bytes()[idx - 1].is_ascii_alphanumeric();
             if !before_ok {
                 search = &search[after_verb..];
                 continue;
@@ -653,12 +656,16 @@ pub fn extract_host(args: &str) -> Option<String> {
 pub fn is_internal_host(host: &str, internal_suffixes: &[String]) -> bool {
     let mut h = host.trim().to_lowercase();
     // 端口剥离（仅 host:port 单冒号形态，IPv6 字面量不动）。
-    if h.matches(':').count() == 1 && !h.starts_with('[')
+    if h.matches(':').count() == 1
+        && !h.starts_with('[')
         && let Some((bare, _)) = h.split_once(':')
     {
         h = bare.to_string();
     }
-    let h = h.trim_matches(|c| c == '[' || c == ']').trim_end_matches('.').to_string();
+    let h = h
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_string();
     if h.is_empty() {
         return false;
     }
@@ -677,9 +684,26 @@ pub fn audit_precheck(enabled: bool, tool_name: &str, args_prefix: &str) -> bool
         return false;
     }
     const DANGEROUS_PREFIXES: &[&str] = &[
-        "rm", "mkfs", "dd", "shutdown", "reboot", "poweroff", "chmod", "chown", "curl",
-        "wget", "nc", "ncat", "telnet", "ssh", "base64", "openssl", "bash", "sh",
-        "terminal", "execute_code",
+        "rm",
+        "mkfs",
+        "dd",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "chmod",
+        "chown",
+        "curl",
+        "wget",
+        "nc",
+        "ncat",
+        "telnet",
+        "ssh",
+        "base64",
+        "openssl",
+        "bash",
+        "sh",
+        "terminal",
+        "execute_code",
     ];
     let tool_lower = tool_name.trim().to_lowercase();
     if DANGEROUS_PREFIXES.contains(&tool_lower.as_str()) {
@@ -1289,10 +1313,7 @@ mod tests {
             extract_host("curl http://svc.corp:8080/x").as_deref(),
             Some("svc.corp:8080")
         );
-        assert_eq!(
-            extract_host("curl 8.8.8.8").as_deref(),
-            Some("8.8.8.8")
-        );
+        assert_eq!(extract_host("curl 8.8.8.8").as_deref(), Some("8.8.8.8"));
         // 内网目标：外传噪声被豁免；外部目标照常走规则。
         assert_eq!(
             is_dangerous("curl", "curl http://svc.corp/x --data hi", &p),
@@ -1347,9 +1368,23 @@ mod tests {
     fn 强化层异常零明文占位符() {
         let out = sanitize_hardened("password=hunter2", |t| Ok(t.to_string()));
         assert!(!out.contains("hunter2"), "{out}");
-        let bad = sanitize_hardened("password=hunter2", |_| {
-            Err(anyhow::anyhow!("强化层崩溃"))
-        });
+        let bad = sanitize_hardened("password=hunter2", |_| Err(anyhow::anyhow!("强化层崩溃")));
         assert_eq!(bad, "[REDACTED:unverified]");
+    }
+
+    #[test]
+    fn 审计链扫描耗时锚宽松上界() {
+        use crate::config::AuditMode;
+        let policy = AuditPolicy::default_policy();
+        let start = std::time::Instant::now();
+        for i in 0..2000 {
+            let v = evaluate(AuditMode::Block, "exec", &format!("{{\"x\":{i}}}"), &policy);
+            std::hint::black_box(v);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "审计链 2000 次评估须远低于宽松上界，实测 {:?}",
+            start.elapsed()
+        );
     }
 }

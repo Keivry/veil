@@ -139,25 +139,32 @@ impl RateTable {
     pub const SWEEP_SECS: u64 = 60;
 
     pub fn new() -> Self {
-        Self { hits: HashMap::new(), last_sweep: Instant::now() }
+        Self {
+            hits: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize { self.hits.len() }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool { self.hits.is_empty() }
 }
 
 impl Default for RateTable {
     fn default() -> Self { Self::new() }
 }
 
-fn check_rate(
-    hits: &std::sync::Mutex<RateTable>,
+/// 限流判定（异步锁：`tokio::sync::Mutex`，高并发凭据 burst 不阻塞 executor）。
+/// 临界区禁 `.await`——仅查改时间戳映射，持锁期间不得跨 `.await`（防持锁让出
+/// 放大尾延迟与锁竞争）；`tokio::sync::Mutex` 无毒化语义，加锁失败不可能，直接持有。
+async fn check_rate(
+    hits: &tokio::sync::Mutex<RateTable>,
     key: &str,
     window_secs: u64,
 ) -> Result<()> {
-    let mut guard = hits.lock().map_err(|_| VeilError::Storage {
-        message: "限流表锁定失败".to_string(),
-    })?;
+    let mut guard = hits.lock().await;
     let now = Instant::now();
     if guard.hits.len() > RateTable::SWEEP_LEN
         || now.duration_since(guard.last_sweep).as_secs() >= RateTable::SWEEP_SECS
@@ -296,9 +303,7 @@ async fn approval_dual_mode(
         return Err(record_pending(state, key, reason).await);
     }
     let event_id = submit_pending(state, key, reason).await;
-    let timeout = Duration::from_secs(
-        state.config.credential_approval_timeout_secs.max(1) as u64,
-    );
+    let timeout = Duration::from_secs(state.config.credential_approval_timeout_secs.max(1) as u64);
     match state.approval.ask(&event_id, timeout).await {
         Some(true) => query_keepass(state, entry, field, use_token).await,
         Some(false) => Err(VeilError::Auth {
@@ -456,7 +461,8 @@ pub async fn handle_credential(
         &state.credential_hits,
         &pending_key,
         CREDENTIAL_RATE_WINDOW_SECS,
-    )?;
+    )
+    .await?;
 
     let effective = match decision {
         None => {
@@ -651,7 +657,7 @@ pub async fn register_caller_extended(
     } else {
         format!("register:{source}")
     };
-    check_rate(&state.register_hits, &rate_key, REGISTER_RATE_WINDOW_SECS)?;
+    check_rate(&state.register_hits, &rate_key, REGISTER_RATE_WINDOW_SECS).await?;
     let view = {
         let mut registry = state.registry.write().await;
         let entry = registry.register_extended(params)?;
@@ -768,6 +774,22 @@ mod tests {
         let degraded = health_status(&test_state(false));
         assert!(!degraded.sqlite_ok);
         assert_eq!(degraded.sqlite_error.as_deref(), Some("ENOSPC"));
+    }
+
+    #[test]
+    fn 磁盘满分类与降级对偶标志() {
+        use crate::state::{SqliteOutcome, is_no_space_error};
+        let full = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(is_no_space_error(&full));
+        let other = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!is_no_space_error(&other));
+        let out = SqliteOutcome {
+            sqlite_ok: false,
+            sqlite_error: Some("ENOSPC (disk full)".to_string()),
+            db_path: std::path::PathBuf::from("/tmp/x.sqlite"),
+            memory_only: true,
+        };
+        assert!(!out.sqlite_ok && out.memory_only, "降级须成对出现");
     }
 
     fn cred_env(extra: &[(&str, &str)]) -> HashMap<String, String> {
@@ -902,6 +924,42 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn 审批三文案各有断言() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        // 已注册：重复注册冲突文案。
+        register_caller(&state, "/s/dup.sh", "h-dup", "src-dup")
+            .await
+            .unwrap();
+        let dup = register_caller(&state, "/s/dup.sh", "h-dup2", "src-dup")
+            .await
+            .unwrap_err();
+        assert!(
+            dup.to_string().contains("调用方已注册"),
+            "已注册文案: {dup}"
+        );
+        // 未注册：吊销缺条目文案。
+        let missing = revoke_caller(&state, "/s/never.sh").await.unwrap_err();
+        assert!(
+            missing.to_string().contains("调用方不存在"),
+            "未注册文案: {missing}"
+        );
+        // 终端直调：原文请求拒绝文案。
+        let mut raw = body("gethash", "/s/a.sh", None);
+        raw.token = Some(false);
+        let direct = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &raw)
+            .await
+            .unwrap_err();
+        match direct {
+            VeilError::Auth { message } => assert!(
+                message.contains("不允许终端直接调用"),
+                "终端直调文案: {message}"
+            ),
+            other => panic!("须为鉴权拒绝，实得: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1182,15 +1240,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn 限流表双触发清扫只删过期键() {
-        use std::sync::Mutex;
+    #[tokio::test]
+    async fn 限流表双触发清扫只删过期键() {
+        use tokio::sync::Mutex;
         let table = Mutex::new(RateTable::new());
         // 计数触发：超 1000 条后下一次检查清扫；窗口 0 使旧键全部过期。
         for i in 0..(RateTable::SWEEP_LEN + 5) {
-            check_rate(&table, &format!("cold-{i}"), 0).unwrap();
+            check_rate(&table, &format!("cold-{i}"), 0).await.unwrap();
         }
-        let guard = table.lock().unwrap();
+        let guard = table.lock().await;
         assert!(
             guard.len() <= RateTable::SWEEP_LEN + 6,
             "过期键须被清扫，长跑不膨胀: {}",
@@ -1198,22 +1256,21 @@ mod tests {
         );
         drop(guard);
         // 活跃键判定不受清扫影响：同键在窗口内仍限流。
-        check_rate(&table, "hot-key", 3600).unwrap();
-        let err = check_rate(&table, "hot-key", 3600).unwrap_err();
-        assert_eq!(
-            err.status_code(),
-            axum::http::StatusCode::TOO_MANY_REQUESTS
-        );
+        check_rate(&table, "hot-key", 3600).await.unwrap();
+        let err = check_rate(&table, "hot-key", 3600).await.unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
-    #[test]
-    fn 限流表硬上限挤出不影响本次判定() {
-        use std::sync::Mutex;
+    #[tokio::test]
+    async fn 限流表硬上限挤出不影响本次判定() {
+        use tokio::sync::Mutex;
         let table = Mutex::new(RateTable::new());
         for i in 0..(RateTable::MAX_ENTRIES + 10) {
-            check_rate(&table, &format!("k-{i}"), u64::MAX).unwrap();
+            check_rate(&table, &format!("k-{i}"), u64::MAX)
+                .await
+                .unwrap();
         }
-        let guard = table.lock().unwrap();
+        let guard = table.lock().await;
         assert_eq!(guard.len(), RateTable::MAX_ENTRIES, "硬上限须钳制");
     }
 

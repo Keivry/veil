@@ -80,9 +80,7 @@ pub const EVENT_DEFAULT_LIMIT: usize = 100;
 pub fn admin_rate_exempt_paths() -> [&'static str; 1] { ["/_admin/health"] }
 
 /// 是否豁免限流（health 恒 true）。
-pub fn is_rate_exempt(path: &str) -> bool {
-    admin_rate_exempt_paths().contains(&path)
-}
+pub fn is_rate_exempt(path: &str) -> bool { admin_rate_exempt_paths().contains(&path) }
 
 /// 旧查询 `range` 兼容：`1h/24h/7d/30d` 映射新口径 `granularity`；未知值返回 `None`。
 /// 映射等价性：`1h→five_min`、`24h→hourly`、`7d/30d→daily`，与新口径同窗查询等价。
@@ -108,27 +106,13 @@ pub fn normalize_verdict_compat(verdict: &str) -> Option<&'static str> {
     }
 }
 
-/// HMAC 等长比较（`hmac` 依赖）：域分隔固定 key 下分别 MAC 后等长比较，
-/// 输入长度不等仍走等长比较再判假，不泄露匹配前缀长度。
+/// 管理 token 变长比较：复用 `auth::secret_eq`（HMAC-SHA256 域分隔后比较
+/// 32 字节固定 tag，恒时无早退），自研实现已删，单一实现口径。
+/// 注：与凭据 Secret 共用同一域分隔 key——两者永不跨域比较，仅作等值
+/// 判定，域分隔合并无安全影响；调用方 MUST NOT 用本函数比较定长哈希
+/// （定长哈希用 `auth::ct_eq`）。
 pub fn admin_token_eq(provided: &str, expected: &str) -> bool {
-    use {
-        hmac::{KeyInit as _, Mac as _},
-        subtle::ConstantTimeEq as _,
-    };
-    type H = hmac::Hmac<sha2::Sha256>;
-    let mut mac_p = H::new_from_slice(b"veil-admin-token-v1").expect("HMAC key 恒合法");
-    mac_p.update(provided.as_bytes());
-    let mut mac_e = H::new_from_slice(b"veil-admin-token-v1").expect("HMAC key 恒合法");
-    mac_e.update(expected.as_bytes());
-    let p = mac_p.finalize().into_bytes();
-    let e = mac_e.finalize().into_bytes();
-    let tags_eq: bool = p.ct_eq(&e).into();
-    // 长度门与 tag 比较结果“与”合并（无短路，保持等时）。
-    let len_eq: bool =
-        provided.as_bytes().ct_eq(expected.as_bytes()).into() && provided.len() == expected.len();
-    // 变长输入 `ct_eq` 按实现可能早退；此处以 tag 比较耗时为主导，
-    // 长度不等仍已执行等长 tag 比较。
-    tags_eq && len_eq && provided.len() == expected.len()
+    crate::auth::secret_eq(provided, expected)
 }
 
 /// 从 `Cookie` 头提取 admin token（`__Host-admin_token` 优先，回退 `admin_token`
@@ -201,7 +185,7 @@ pub struct AdminState {
     pub metrics: std::sync::Arc<MetricsStore>,
     pub sampler: std::sync::Arc<PiiValueSampler>,
     rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
-    sse_count: Mutex<HashMap<IpAddr, usize>>,
+    sse_count: std::sync::Arc<Mutex<HashMap<IpAddr, usize>>>,
     events: Mutex<VecDeque<AdminEvent>>,
     broadcaster: tokio::sync::broadcast::Sender<String>,
     next_id: std::sync::atomic::AtomicU64,
@@ -221,7 +205,7 @@ impl AdminState {
             metrics: std::sync::Arc::new(MetricsStore::new(db_path.clone())),
             sampler: std::sync::Arc::new(PiiValueSampler::new(sampler_cfg, db_path)),
             rate: Mutex::new(HashMap::new()),
-            sse_count: Mutex::new(HashMap::new()),
+            sse_count: std::sync::Arc::new(Mutex::new(HashMap::new())),
             events: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAP)),
             broadcaster: tx,
             next_id: std::sync::atomic::AtomicU64::new(1),
@@ -235,7 +219,7 @@ impl AdminState {
             metrics: std::sync::Arc::new(MetricsStore::new(db_path.clone())),
             sampler: std::sync::Arc::new(sampler),
             rate: Mutex::new(HashMap::new()),
-            sse_count: Mutex::new(HashMap::new()),
+            sse_count: std::sync::Arc::new(Mutex::new(HashMap::new())),
             events: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAP)),
             broadcaster: tx,
             next_id: std::sync::atomic::AtomicU64::new(1),
@@ -261,7 +245,9 @@ impl AdminState {
         Ok(())
     }
 
-    /// SSE 并发守卫（5/IP）：持有至连接结束自动释放；满时返回 `None`（429）。
+    /// SSE 并发守卫（5/IP）：调用方 MUST 持有至连接结束，`Drop` 自动释放；
+    /// 满时返回 `None`（429）。禁止手动调 `release_sse_for`（双重释放会
+    /// 错减他路计数；该方法仅保留作 `Drop` 内部语义的公开别名）。
     pub fn acquire_sse(&self, ip: IpAddr) -> Option<SseGuard> {
         let mut guard = self.sse_count.lock().unwrap_or_else(|e| e.into_inner());
         let n = guard.get(&ip).copied().unwrap_or(0);
@@ -271,11 +257,12 @@ impl AdminState {
         guard.insert(ip, n + 1);
         Some(SseGuard {
             ip,
-            released: false,
+            slots: std::sync::Arc::clone(&self.sse_count),
         })
     }
 
-    /// 释放 SSE 计数（连接结束）。
+    /// 释放 SSE 计数（`SseGuard::drop` 内部语义的公开别名；调用方禁止在
+    /// 持有守卫时手动调用，否则与 `Drop` 双重释放错减计数）。
     pub fn release_sse_for(&self, ip: IpAddr) {
         let mut guard = self.sse_count.lock().unwrap_or_else(|e| e.into_inner());
         let n = guard.get(&ip).copied().unwrap_or(0);
@@ -361,11 +348,22 @@ impl AdminState {
     }
 }
 
-/// SSE 并发守卫标记（释放由 handler 调用 `release_sse_for`）。
+/// SSE 并发守卫：持有计数槽位，`Drop` 时自动释放（断连不泄漏）。
 pub struct SseGuard {
-    pub ip: IpAddr,
-    #[allow(dead_code)]
-    released: bool,
+    ip: IpAddr,
+    slots: std::sync::Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for SseGuard {
+    fn drop(&mut self) {
+        let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let n = guard.get(&self.ip).copied().unwrap_or(0);
+        if n <= 1 {
+            guard.remove(&self.ip);
+        } else {
+            guard.insert(self.ip, n - 1);
+        }
+    }
 }
 
 /// 直连对端 IP 提取器（只读 `ConnectInfo`，MUST NOT 读代理头）。
@@ -398,7 +396,8 @@ fn unauthorized(message: &str) -> Response {
         .into_response()
 }
 
-/// 超限响应：429 + `Retry-After`（秒）+ 错误码 `E_RATE_LIMITED`（spec 锁定）。/// 头名小写 `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）。
+/// 超限响应：429 + `Retry-After`（秒）+ 错误码 `E_RATE_LIMITED`（spec 锁定）。/// 头名小写
+/// `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）。
 fn rate_limited(retry_after: u64) -> Response {
     let mut resp = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -498,8 +497,7 @@ fn with_admin_cookie(mut resp: Response, headers: &HeaderMap, expected: &str) ->
         format!("admin_token={got}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600")
     };
     if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
-        resp.headers_mut()
-            .insert(axum::http::header::SET_COOKIE, v);
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
     }
     resp
 }
@@ -555,8 +553,10 @@ pub async fn admin_health(
         return r;
     }
     let health = crate::service::health_status(&state);
-    let body = Json(json!({"ok": true, "sqlite_ok": health.sqlite_ok, "sqlite_error": health.sqlite_error}))
-        .into_response();
+    let body = Json(
+        json!({"ok": true, "sqlite_ok": health.sqlite_ok, "sqlite_error": health.sqlite_error}),
+    )
+    .into_response();
     with_admin_cookie(body, &headers, &state.config.observability_admin_token)
 }
 
@@ -839,9 +839,11 @@ pub async fn admin_events_stream(
         return r;
     }
     // 并发超限：拒绝新连接（429 + Retry-After: 60），不触已建连接计数。
-    if state.admin.acquire_sse(ip).is_none() {
-        return rate_limited(60);
-    }
+    // 守卫 MUST 移入流中持有至结束，`Drop` 自动释放（断连不泄漏）。
+    let sse_guard = match state.admin.acquire_sse(ip) {
+        Some(g) => g,
+        None => return rate_limited(60),
+    };
     let rx = state.admin.subscribe();
     let admin = state.admin.clone();
     // 建连过滤维度（model/upstream）；近环回放与实时流同过滤。
@@ -855,6 +857,7 @@ pub async fn admin_events_stream(
         .filter(|s| filter.passes(s))
         .collect();
     let stream = async_stream::stream! {
+        let _sse_guard = sse_guard;
         for item in backlog {
             yield Ok::<_, anyhow::Error>(Event::default().data(item).event("message"));
         }
@@ -876,7 +879,7 @@ pub async fn admin_events_stream(
             }
         }
         // 5min 强制重连：服务端关闭流，客户端按 retry 重连。
-        admin.release_sse_for(ip);
+        // 计数释放由 `_sse_guard` 的 `Drop` 自动触发，不手动释放。
     };
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(SSE_PING_INTERVAL).text("ping"))
@@ -1047,12 +1050,12 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..SSE_MAX_PER_IP {
             guards.push(st.acquire_sse(test_ip()).unwrap());
-            // 持有守卫期间计数递增（守卫释放由 handler 在流结束时显式调用）。
+            // 持有守卫期间计数递增（守卫 `Drop` 时自动释放，禁止手动释放）。
         }
         assert_eq!(st.sse_current(test_ip()), SSE_MAX_PER_IP);
         assert!(st.acquire_sse(test_ip()).is_none());
         // 释放一路后可再建。
-        st.release_sse_for(test_ip());
+        drop(guards.pop());
         assert_eq!(st.sse_current(test_ip()), SSE_MAX_PER_IP - 1);
         assert!(st.acquire_sse(test_ip()).is_some());
         let _ = guards;
@@ -1112,11 +1115,8 @@ mod tests {
         // 拒绝路径不触计数：再拒一次计数仍为 5。
         assert!(st.acquire_sse(test_ip()).is_none());
         assert_eq!(st.sse_current(test_ip()), SSE_MAX_PER_IP);
-        let _ = guards;
-        // 逐路释放后归零。
-        for _ in 0..SSE_MAX_PER_IP {
-            st.release_sse_for(test_ip());
-        }
+        drop(guards);
+        // 守卫全部 `Drop` 后归零（断连不泄漏）。
         assert_eq!(st.sse_current(test_ip()), 0);
     }
 
@@ -1128,16 +1128,15 @@ mod tests {
             assert!(st.check_rate(test_ip()).is_ok());
         }
         assert!(st.check_rate(test_ip()).is_err());
+        let mut guards = Vec::new();
         for _ in 0..SSE_MAX_PER_IP {
-            assert!(st.acquire_sse(test_ip()).is_some());
+            guards.push(st.acquire_sse(test_ip()).unwrap());
         }
         assert!(st.acquire_sse(test_ip()).is_none());
         // 并发打满不影响他 IP 速率。
         assert!(st.check_rate(IpAddr::from([10, 0, 0, 9])).is_ok());
         // 释放本 IP 全部并发后归零，速率仍保持超限（独立窗口）。
-        for _ in 0..SSE_MAX_PER_IP {
-            st.release_sse_for(test_ip());
-        }
+        drop(guards);
         assert_eq!(st.sse_current(test_ip()), 0);
         assert!(st.check_rate(test_ip()).is_err());
     }
@@ -1266,7 +1265,8 @@ mod tests {
     }
 
     #[test]
-    fn 后订阅者不收历史只收实时() {        let st = test_admin_state();
+    fn 后订阅者不收历史只收实时() {
+        let st = test_admin_state();
         st.push_event("audit", "历史摘要", None);
         let mut late = st.subscribe();
         assert!(late.try_recv().is_err(), "后订阅不得收到历史广播");
@@ -1290,6 +1290,63 @@ mod tests {
     }
 
     #[test]
+    fn verdict归一全别名通过() {
+        for v in ["allow", "allowed", "pass", "approved", "ALLOW", " Pass "] {
+            assert_eq!(normalize_verdict_compat(v), Some("allow"), "{v}");
+        }
+        for v in ["block", "blocked", "deny", "rejected", "BLOCKED"] {
+            assert_eq!(normalize_verdict_compat(v), Some("block"), "{v}");
+        }
+        for v in [
+            "need_approval",
+            "needapproval",
+            "pending",
+            "approve",
+            "approval",
+        ] {
+            assert_eq!(normalize_verdict_compat(v), Some("need_approval"), "{v}");
+        }
+        assert_eq!(normalize_verdict_compat("weird"), None);
+        assert_eq!(normalize_verdict_compat(""), None);
+        for r in ["1h", "24h", "7d", "30d"] {
+            assert!(compat_granularity_for_range(r).is_some(), "{r}");
+        }
+        assert_eq!(compat_granularity_for_range("1h"), Some("five_min"));
+        assert_eq!(compat_granularity_for_range("24h"), Some("hourly"));
+        assert_eq!(compat_granularity_for_range("7d"), Some("daily"));
+        assert_eq!(compat_granularity_for_range("30d"), Some("daily"));
+        assert_eq!(compat_granularity_for_range("9d"), None);
+    }
+
+    #[test]
+    fn sse五并发上限与释放() {
+        let st = test_admin_state();
+        let ip = test_ip();
+        let mut guards = Vec::new();
+        for _ in 0..SSE_MAX_PER_IP {
+            guards.push(st.acquire_sse(ip).expect("5 并发内须放行"));
+        }
+        assert!(st.acquire_sse(ip).is_none(), "第 6 连接须拒绝");
+        assert_eq!(st.sse_current(ip), SSE_MAX_PER_IP);
+        drop(guards.pop());
+        assert!(st.acquire_sse(ip).is_some(), "释放后须可再建");
+    }
+
+    #[test]
+    fn pending建单后监控可查环() {
+        let st = test_admin_state();
+        st.push_event("pending", "危险调用待审批", None);
+        st.push_event("audit", "普通审计", None);
+        let pendings = st.query_events(Some("pending"), None, 100);
+        assert_eq!(pendings.len(), 1, "pending 须可按 kind 查环");
+        assert!(pendings[0].summary.contains("危险调用待审批"));
+        let all = st.query_events(None, None, 100);
+        assert_eq!(all.len(), 2);
+        let gated = st.query_events(None, None, 1);
+        assert_eq!(gated.len(), 1, "limit 须生效");
+    }
+
+    #[test]
     fn cookie兼容http回退() {
         let mut h = HeaderMap::new();
         h.insert("cookie", "__Host-admin_token=tok-https".parse().unwrap());
@@ -1301,7 +1358,9 @@ mod tests {
         let mut h3 = HeaderMap::new();
         h3.insert(
             "cookie",
-            "admin_token=tok-http; __Host-admin_token=tok-https".parse().unwrap(),
+            "admin_token=tok-http; __Host-admin_token=tok-https"
+                .parse()
+                .unwrap(),
         );
         assert_eq!(cookie_admin_token(&h3).as_deref(), Some("tok-https"));
         assert_eq!(cookie_admin_token(&HeaderMap::new()), None);
@@ -1315,7 +1374,10 @@ mod tests {
         let resp = with_admin_cookie(Json(json!({"ok": true})).into_response(), &h, expected);
         let sc = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(sc.starts_with("admin_token="), "{sc}");
-        assert!(sc.contains("HttpOnly") && sc.contains("SameSite=Strict"), "{sc}");
+        assert!(
+            sc.contains("HttpOnly") && sc.contains("SameSite=Strict"),
+            "{sc}"
+        );
         let mut h2 = HeaderMap::new();
         h2.insert("x-admin-token", expected.parse().unwrap());
         h2.insert("x-forwarded-proto", "https".parse().unwrap());
@@ -1336,7 +1398,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(load_admin_token_file(&dir), None);
         std::fs::write(dir.join("admin_token"), "file-token-abc\n").unwrap();
-        assert_eq!(load_admin_token_file(&dir).as_deref(), Some("file-token-abc"));
+        assert_eq!(
+            load_admin_token_file(&dir).as_deref(),
+            Some("file-token-abc")
+        );
         std::fs::remove_dir_all(&dir).ok();
         // 回环免 token 仅 dev + 回环。
         assert!(loopback_grace(true, "127.0.0.1"));

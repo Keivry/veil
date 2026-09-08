@@ -10,13 +10,16 @@
 //!   分标签计数，三态之外不落指标并记告警；
 //! - 非流式 usage 与流式同口径计入（`responses` 单层 `response.usage` + Anthropic `message.usage`
 //!   由网关 `extract_usage_nonstream` 产出，此处只做 聚合口径不断言网关，见 TODO(§7)）；
-//! - 写库一律 `spawn_blocking(rusqlite WAL)`，文件 0600（复用 §1 口径，不直调 §1 私有函数）。
+//! - 写库一律 `spawn_blocking(rusqlite WAL)`，文件 0600（复用 `fs_perm` 单源，不直调私有函数）；
+//!   PII 值级采样落盘走有界 `broadcast` 后台批量刷盘，同步入口永不直写。
 //!
-//! TODO(§7): 网关落点接入（`handler.rs gateway_serve` 内 `record_chat` 调用 +
-//! 审计 hold 事件 `push_event`）待 §5§6 并行施工完成后补线，此处只提供聚合口径。
+//! 接线状态（§7 落点已接线）：`record_chat` 已由 `handler/llm` 接线
+//! （非流 `nonstream::serve_nonstream` + 流泵 `pump::spawn_stream_pump` 收尾）；审计 hold 事件
+//! `push_event` 由网关调用方按需接线（见 `service::admin::AdminState::push_event`）。
 
 use {
     super::llm_gateway::{Protocol, Usage},
+    crate::fs_perm::{ensure_0600, open_wal},
     std::{
         collections::{HashMap, VecDeque},
         path::{Path, PathBuf},
@@ -30,8 +33,7 @@ use {
 /// 内存环容量（最近 10k 样本）。
 pub const RING_CAP: usize = 10_000;
 /// 延迟桶边界（毫秒），对标原仓 12 桶 Python 边界；11 条边界 → 12 桶（含上溢桶）。
-pub const LATENCY_BOUNDS_MS: [u64; 11] =
-    [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
+pub const LATENCY_BOUNDS_MS: [u64; 11] = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
 /// 延迟桶数（硬性 12）。
 pub const LATENCY_BUCKETS: usize = 12;
 /// `truncated_mode` 唯一三态（他值不落指标）。
@@ -201,7 +203,14 @@ impl MetricsStore {
             total_tokens: u.total_tokens,
             ..ExtendedUsage::default()
         });
-        self.record_chat_extended(protocol, latency_ms, ext.as_ref(), truncated_mode, is_precise, ts_secs)
+        self.record_chat_extended(
+            protocol,
+            latency_ms,
+            ext.as_ref(),
+            truncated_mode,
+            is_precise,
+            ts_secs,
+        )
     }
 
     /// 记录一次对话端点观测（扩展口径：含 `cached_read/write/unknown`）。
@@ -356,7 +365,8 @@ impl MetricsStore {
         }
     }
 
-    /// 覆盖式刷盘（`spawn_blocking` 外层由调用方包，见 [`flush`]）。
+    /// 覆盖式刷盘同步镜像（仅单测用；生产一律走异步 [`flush`](MetricsStore::flush)）。
+    #[cfg(test)]
     pub fn flush_to_sqlite_blocking(&self) -> anyhow::Result<()> {
         let snapshot: Vec<(AggKey, WindowAgg)> = self
             .aggs
@@ -493,28 +503,14 @@ pub struct SeriesPoint {
     pub truncated_synthesized_failed: u64,
 }
 
-fn connect_wal(db_path: &Path) -> anyhow::Result<rusqlite::Connection> {
-    if let Some(parent) = db_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
-    )?;
-    Ok(conn)
-}
-
 /// WAL 截断检查点（TRUNCATE）：刷盘后 best-effort 调用，把 `-wal` 合并回主库并截断，
 /// 防 `-wal` 常驻膨胀。返回 `(busy, checkpointed)`；调用方失败只 warn 不中断刷盘。
 pub fn wal_checkpoint_truncate(db_path: &Path) -> anyhow::Result<(u32, u32)> {
-    let conn = connect_wal(db_path)?;
-    let (busy, checkpointed): (u32, u32) = conn.query_row(
-        "PRAGMA wal_checkpoint(TRUNCATE)",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let conn = open_wal(db_path)?;
+    let (busy, checkpointed): (u32, u32) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
     Ok((busy, checkpointed))
 }
 
@@ -608,12 +604,12 @@ fn buckets_encode(b: &[u64; LATENCY_BUCKETS]) -> String {
 /// 覆盖式 UPSERT（`excluded.*` 全覆盖，重复 flush 不翻倍）。
 fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::Result<()> {
     if aggs.is_empty() {
-        let conn = connect_wal(db_path)?;
+        let conn = open_wal(db_path)?;
         ensure_tables(&conn)?;
-        chmod_0600(db_path);
+        ensure_0600(db_path);
         return Ok(());
     }
-    let conn = connect_wal(db_path)?;
+    let conn = open_wal(db_path)?;
     ensure_tables(&conn)?;
     for (key, agg) in aggs {
         let table = match key.granularity {
@@ -662,7 +658,7 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
         "DELETE FROM metrics_five_min WHERE (protocol, window) NOT IN \
          (SELECT protocol, MAX(window) FROM metrics_five_min GROUP BY protocol);",
     )?;
-    chmod_0600(db_path);
+    ensure_0600(db_path);
     drop(conn);
     if let Err(err) = wal_checkpoint_truncate(db_path) {
         tracing::warn!("wal_checkpoint(TRUNCATE) 失败（刷盘不受影响）: {err:#}");
@@ -671,7 +667,7 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
 }
 
 fn purge_retention_blocking(db_path: &Path) -> anyhow::Result<()> {
-    let conn = connect_wal(db_path)?;
+    let conn = open_wal(db_path)?;
     ensure_tables(&conn)?;
     // 窗口键为 `d{days}` / `h{hours}` / `m{win}` 整数序，字符串比较需转整数；
     // 保守策略：按行数裁剪（daily 保留 32 窗×协议，hourly 保留 7*24+2 窗×协议）。
@@ -690,7 +686,7 @@ fn purge_retention_blocking(db_path: &Path) -> anyhow::Result<()> {
         "DELETE FROM pii_value_samples WHERE last_seen < ?1",
         [cutoff],
     )?;
-    chmod_0600(db_path);
+    ensure_0600(db_path);
     Ok(())
 }
 
@@ -700,7 +696,7 @@ fn query_series_blocking(
     since: Option<&str>,
     protocol: Option<&str>,
 ) -> anyhow::Result<Vec<SeriesPoint>> {
-    let conn = connect_wal(db_path)?;
+    let conn = open_wal(db_path)?;
     ensure_tables(&conn)?;
     let table = match granularity {
         "daily" => "metrics_daily",
@@ -756,7 +752,7 @@ fn query_series_blocking(
 
 /// 重启回填行读取：三粒度表全量读回内存聚合（flush 覆盖式语义，重启不丢窗）。
 fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowAgg)>> {
-    let conn = connect_wal(db_path)?;
+    let conn = open_wal(db_path)?;
     ensure_tables(&conn)?;
     let mut out = Vec::new();
     for (gran, table) in [
@@ -804,21 +800,6 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
         }
     }
     Ok(out)
-}
-
-fn chmod_0600(path: &Path) {    use std::os::unix::fs::PermissionsExt as _;
-    if !path.exists() {
-        return;
-    }
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    for suffix in ["-wal", "-shm"] {
-        let mut sibling = path.as_os_str().to_owned();
-        sibling.push(suffix);
-        let p = Path::new(&sibling);
-        if p.exists() {
-            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-        }
-    }
 }
 
 // ── §7.3 摘要脱敏单一路径：redact → truncate ──────────────────────────────
@@ -943,14 +924,30 @@ struct SamplerCounts {
     sampled: u64,
     skipped_disabled: u64,
     skipped_non_chat: u64,
+    dropped_full: u64,
+}
+
+/// 采样落盘队列容量（有界通道背压：满时丢最老计 `dropped`，与指标环同语义）。
+pub const SAMPLE_QUEUE_CAP: usize = 512;
+/// 采样落盘行（掩码 + hash，不含明文）。
+#[derive(Debug, Clone)]
+struct SampleRow {
+    hash: String,
+    kind: String,
+    mask: String,
+    seen: i64,
 }
 
 /// PII 值级掩码采样：掩码当场生成，明文不出作用域（函数返回前丢弃）。
+/// 落盘经有界 `broadcast` 后台任务批量写库，`sample()` 同步入口只做内存合并 + 非阻塞发送，
+/// 永不在转发热路径同步写 sqlite（通道采 `broadcast` 而非 `mpsc`：`mpsc` 发送侧无驱逐 API，
+/// 满时只能丢最新；`broadcast` 滞后即丢最老并经 `Lagged(n)` 上报精确丢数）。
+/// 满队列丢最老计 `dropped_full`，可经 [`dropped_total`](PiiValueSampler::dropped_total) 查询。
 pub struct PiiValueSampler {
     cfg: PiiSamplerConfig,
-    db_path: PathBuf,
-    counts: Mutex<SamplerCounts>,
+    counts: std::sync::Arc<Mutex<SamplerCounts>>,
     recent: Mutex<VecDeque<SampleView>>,
+    tx: tokio::sync::broadcast::Sender<SampleRow>,
 }
 
 impl std::fmt::Debug for PiiValueSampler {
@@ -965,18 +962,33 @@ impl std::fmt::Debug for PiiValueSampler {
 
 impl PiiValueSampler {
     /// 新建（`db_path` 与 metrics 共库 `pii_value_samples` 表）。
+    /// 落盘驱动：`persist` 开启且处于 tokio 运行时内时起后台任务批量刷盘；
+    /// 同步单测（无运行时）下不行驱动，行滞留队列由 [`pending_len`](PiiValueSampler::pending_len)
+    /// 可查。
     pub fn new(cfg: PiiSamplerConfig, db_path: PathBuf) -> Self {
+        let (tx, _rx) = tokio::sync::broadcast::channel(SAMPLE_QUEUE_CAP);
+        let counts = std::sync::Arc::new(Mutex::new(SamplerCounts::default()));
+        if cfg.persist && tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(sample_flush_driver(
+                _rx,
+                db_path.clone(),
+                std::sync::Arc::clone(&counts),
+            ));
+        }
+        // 无运行时（同步单测）：`_rx` 随作用域析构，队列关闭；此形态下不启用
+        // persist 落盘，误发一律计 `dropped`（可查），见
+        // [`dropped_total`](PiiValueSampler::dropped_total)。
         Self {
             cfg,
-            db_path,
-            counts: Mutex::new(SamplerCounts::default()),
+            counts,
             recent: Mutex::new(VecDeque::with_capacity(256)),
+            tx,
         }
     }
 
     /// 值级掩码（当场生成）：首字符 + `***` + 末字符，超短值全掩码。
     /// 输入明文仅在本函数栈上存活，返回后调用方须立即丢弃。
-    pub fn mask_value(value: &str) -> String {
+    pub fn sample_mask(value: &str) -> String {
         let chars: Vec<char> = value.chars().collect();
         if chars.len() <= 2 {
             return "***".to_string();
@@ -1020,7 +1032,7 @@ impl PiiValueSampler {
             return None;
         }
         // 掩码当场生成，明文不出本作用域。
-        let mask = Self::mask_value(value);
+        let mask = Self::sample_mask(value);
         let hash = self.hash_value(value);
         if let Ok(mut c) = self.counts.lock() {
             c.sampled += 1;
@@ -1043,26 +1055,21 @@ impl PiiValueSampler {
             }
         }
         if self.cfg.persist {
-            let db_path = self.db_path.clone();
-            let hash_c = hash.clone();
-            let kind_c = kind.to_string();
-            let mask_c = mask.clone();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            // 同步落盘经 blocking 任务？此处为同步 API（§3 调用路径），用
-            // `spawn_blocking` 需 async；采样为低频后台路径，允许短暂直写
-            // （调用方在后台任务中触发，不阻塞转发主路径）。
-            if let Ok(conn) = connect_wal(&db_path) {
-                let _ = ensure_tables(&conn);
-                let _ = conn.execute(
-                    "INSERT INTO pii_value_samples(hash, kind, mask, hits, first_seen, last_seen)\
-                     VALUES (?1,?2,?3,1,?4,?4)\
-                     ON CONFLICT(hash) DO UPDATE SET hits=hits+1, last_seen=excluded.last_seen, mask=excluded.mask",
-                    rusqlite::params![hash_c, kind_c, mask_c, now],
-                );
-                chmod_0600(&db_path);
+            let row = SampleRow {
+                hash: hash.clone(),
+                kind: kind.to_string(),
+                mask: mask.clone(),
+                seen: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            };
+            // 同步入口永不阻塞：`broadcast` 发送恒即时返回（无接收端/满队列均不等待）；
+            // 无驱动（同步单测）发送失败计 dropped，满队列丢最老由驱动经 Lagged 计数。
+            if self.tx.send(row).is_err()
+                && let Ok(mut c) = self.counts.lock()
+            {
+                c.dropped_full += 1;
             }
         }
         Some((mask, hash))
@@ -1086,6 +1093,73 @@ impl PiiValueSampler {
             .lock()
             .map(|c| (c.sampled, c.skipped_disabled, c.skipped_non_chat))
             .unwrap_or_default()
+    }
+
+    /// 满队列丢最老计数（含无驱动发送失败；与指标环 `dropped` 同语义可查）。
+    pub fn dropped_total(&self) -> u64 { self.counts.lock().map(|c| c.dropped_full).unwrap_or(0) }
+
+    /// 队列滞留行数（单测断言落盘前缓冲用）。
+    #[cfg(test)]
+    fn pending_len(&self) -> usize { self.tx.len() }
+}
+
+/// 采样批量落盘（驱动经 `spawn_blocking` 调用，禁 async 直调）：单连接单事务
+/// UPSERT 全批，冲突 hash 合并 hits；失败由驱动吞掉（采样为趋势参考，不进主错链）。
+fn persist_sample_batch(db_path: &Path, batch: &[SampleRow]) -> anyhow::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let conn = open_wal(db_path)?;
+    ensure_tables(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO pii_value_samples(hash, kind, mask, hits, first_seen, last_seen)\
+             VALUES (?1,?2,?3,1,?4,?4)\
+             ON CONFLICT(hash) DO UPDATE SET hits=hits+1, last_seen=excluded.last_seen, mask=excluded.mask",
+        )?;
+        for row in batch {
+            stmt.execute(rusqlite::params![row.hash, row.kind, row.mask, row.seen])?;
+        }
+    }
+    tx.commit()?;
+    ensure_0600(db_path);
+    Ok(())
+}
+
+/// 采样后台刷盘驱动：收首行后排空批量，经 `spawn_blocking` 写库；
+/// 滞后（满队列丢最老）按 `Lagged(n)` 计入共享 `dropped`；发送端全弃后退出。
+async fn sample_flush_driver(
+    mut rx: tokio::sync::broadcast::Receiver<SampleRow>,
+    db_path: PathBuf,
+    counts: std::sync::Arc<Mutex<SamplerCounts>>,
+) {
+    loop {
+        let first = match rx.recv().await {
+            Ok(row) => row,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                if let Ok(mut c) = counts.lock() {
+                    c.dropped_full += n;
+                }
+                continue;
+            }
+        };
+        let mut batch = vec![first];
+        while batch.len() < 256 {
+            match rx.try_recv() {
+                Ok(row) => batch.push(row),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                    if let Ok(mut c) = counts.lock() {
+                        c.dropped_full += n;
+                    }
+                }
+            }
+        }
+        let db = db_path.clone();
+        let _ = tokio::task::spawn_blocking(move || persist_sample_batch(&db, &batch)).await;
     }
 }
 
@@ -1129,7 +1203,7 @@ mod tests {
     fn wal检查点截断可执行() {
         let db = tmp_db("checkpoint");
         let _ = std::fs::remove_file(&db);
-        let conn = connect_wal(&db).expect("WAL 库须可建");
+        let conn = open_wal(&db).expect("WAL 库须可建");
         conn.execute_batch("CREATE TABLE t(x TEXT); INSERT INTO t VALUES('a');")
             .expect("写入须成功");
         drop(conn);
@@ -1507,7 +1581,66 @@ mod tests {
         let (sampled, disabled, non_chat) = s.stats();
         assert_eq!((sampled, disabled, non_chat), (3, 0, 0));
         assert!(s.sample("phone", "13812345678", false).is_none());
-        assert_eq!(PiiValueSampler::mask_value("ab"), "***");
+        assert_eq!(PiiValueSampler::sample_mask("ab"), "***");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn 采样后台落盘生效() {
+        let db = tmp_db("pii-flush");
+        let _ = std::fs::remove_file(&db);
+        let cfg = PiiSamplerConfig::for_test(true, true, None);
+        let s = PiiValueSampler::new(cfg, db.clone());
+        let (mask, hash) = s.sample("phone", "13812345678", true).unwrap();
+        assert!(mask.contains("***"));
+        // 后台驱动批量落盘：轮询等行落库（让出后驱动运行，2s 内必达）。
+        let mut rows = 0;
+        for _ in 0..200 {
+            if let Ok(conn) = open_wal(&db) {
+                rows = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pii_value_samples WHERE hash=?1",
+                        [hash.clone()],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0);
+                if rows >= 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rows, 1, "后台 flush 须把采样行写入 pii_value_samples");
+        assert_eq!(s.dropped_total(), 0);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn 采样满队列丢最老可查() {
+        let db = tmp_db("pii-full");
+        let _ = std::fs::remove_file(&db);
+        let cfg = PiiSamplerConfig::for_test(true, true, None);
+        let s = PiiValueSampler::new(cfg, db.clone());
+        // 同步紧循环无让出点：单线程运行时驱动不得交错，512 缓冲 + 10 滞后精确可复算。
+        for i in 0..(SAMPLE_QUEUE_CAP + 10) {
+            let v = format!("1380000{i:04}");
+            let _ = s.sample("phone", &v, true);
+        }
+        assert_eq!(s.pending_len(), SAMPLE_QUEUE_CAP);
+        // 让出后驱动排空：滞后 10 计 dropped，512 行落库。
+        for _ in 0..200 {
+            if s.dropped_total() >= 10 && s.pending_len() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(s.dropped_total(), 10, "满队列须丢最老 10 行并计数");
+        assert_eq!(s.pending_len(), 0);
+        let conn = open_wal(&db).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pii_value_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, SAMPLE_QUEUE_CAP as i64);
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]
@@ -1546,5 +1679,25 @@ mod tests {
         assert!(!PiiSamplerConfig::for_test(true, true, Some("k".to_string())).needs_hmac_warn());
         assert!(!PiiSamplerConfig::for_test(false, true, None).needs_hmac_warn());
         assert!(!PiiSamplerConfig::for_test(false, false, None).needs_hmac_warn());
+    }
+
+    #[test]
+    fn 模型近似口径与窗口判定() {
+        assert!(is_precise_for_window(3600, 100));
+        assert!(is_precise_for_window(86400, 1000));
+        assert!(!is_precise_for_window(3599, 100), "覆盖不足须标近似");
+        assert!(!is_precise_for_window(3600, 99), "样本不足须标近似");
+        assert!(!is_precise_for_window(0, 0));
+    }
+
+    #[test]
+    fn 采样总开关关则零落盘零采样() {
+        let cfg = PiiSamplerConfig::for_test(false, true, None);
+        let s = PiiValueSampler::new(cfg, tmp_db("sample-off"));
+        assert!(s.sample("phone", "13812345678", true).is_none());
+        assert!(s.sample("phone", "13812345678", true).is_none());
+        let (sampled, disabled, _) = s.stats();
+        assert_eq!((sampled, disabled), (0, 2), "关闭时只记跳过不采样");
+        assert!(s.top_n(5).is_empty(), "零落盘：无样本可查");
     }
 }

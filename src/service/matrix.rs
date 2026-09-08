@@ -206,8 +206,7 @@ pub fn reaction_to_decision(branch: MatrixBranch, key: &str) -> Option<(bool, bo
 pub fn sync_backoff_secs(failures: u32) -> u64 {
     1u64.checked_shl(failures.min(10))
         .unwrap_or(u64::MAX)
-        .min(SYNC_MAX_BACKOFF_SECS)
-        .max(1)
+        .clamp(1, SYNC_MAX_BACKOFF_SECS)
 }
 
 /// since token 读取：缺失/空/失败返回 None（调用方全量同步）。
@@ -638,12 +637,20 @@ impl MatrixBot {
             }
             TextCommand::Status => {
                 let pending = approval.pending_len().await;
-                let s = if unlocked { "✅ 已解锁" } else { "🔒 未解锁" };
-                Some(format!("Proxy: {s} | 待审批: {pending} | LLM secrets: {secrets}"))
+                let s = if unlocked {
+                    "✅ 已解锁"
+                } else {
+                    "🔒 未解锁"
+                };
+                Some(format!(
+                    "Proxy: {s} | 待审批: {pending} | LLM secrets: {secrets}"
+                ))
             }
             TextCommand::Forget => {
                 let cleared = approval.forget_decided().await;
-                Some(format!("🧹 已清除 {cleared} 个已决审批单（网关侧另清 {secrets} 个口令映射）"))
+                Some(format!(
+                    "🧹 已清除 {cleared} 个已决审批单（网关侧另清 {secrets} 个口令映射）"
+                ))
             }
             TextCommand::Unknown => None,
         }
@@ -746,10 +753,9 @@ impl MatrixBot {
                             }
                             let command = parse_text_command(&text.body);
                             if let Some(reply) = Self::handle_text_command(&approval, command).await
+                                && let Err(err) = self.send_text(&reply).await
                             {
-                                if let Err(err) = self.send_text(&reply).await {
-                                    tracing::debug!("指令回执发送失败: {err:#}");
-                                }
+                                tracing::debug!("指令回执发送失败: {err:#}");
                             }
                         }
                     }
@@ -1159,8 +1165,7 @@ mod tests {
         assert_eq!(gw.pending_len().await, 0);
         let lock = MatrixBot::handle_text_command_full(&gw, TextCommand::Lock, true, 0).await;
         assert!(lock.is_some_and(|s| s.contains("🔒 Proxy 已锁定")));
-        let status =
-            MatrixBot::handle_text_command_full(&gw, TextCommand::Status, false, 3).await;
+        let status = MatrixBot::handle_text_command_full(&gw, TextCommand::Status, false, 3).await;
         assert_eq!(
             status.as_deref(),
             Some("Proxy: 🔒 未解锁 | 待审批: 0 | LLM secrets: 3")

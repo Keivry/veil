@@ -51,16 +51,16 @@ async fn mock_upstream_truncated() -> (String, tokio::task::JoinHandle<()>) {
     let app = axum::Router::new().route(
         "/{*tail}",
         axum::routing::any(|| async {
-            let frames = vec![
+            let frames = [
                 "data: {\"choices\":[{\"delta\":{\"content\":\"截断前分片甲\"}}]}\n\n".to_string(),
                 "data: {\"choices\":[{\"delta\":{\"content\":\"截断前分片乙\"}}]}\n\n".to_string(),
             ];
             let stream = async_stream::stream! {
                 // 首分片拆两次写，顺带覆盖跨包重组路径（按字符边界拆，不切断 UTF-8）。
                 let mid = frames[0].floor_char_boundary(frames[0].len() / 2);
-                yield Ok::<_, anyhow::Error>(bytes::Bytes::from(frames[0][..mid].as_bytes().to_vec()));
+                yield Ok::<_, anyhow::Error>(bytes::Bytes::from(frames[0].as_bytes()[..mid].to_vec()));
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                yield Ok::<_, anyhow::Error>(bytes::Bytes::from(frames[0][mid..].as_bytes().to_vec()));
+                yield Ok::<_, anyhow::Error>(bytes::Bytes::from(frames[0].as_bytes()[mid..].to_vec()));
                 yield Ok::<_, anyhow::Error>(bytes::Bytes::from(frames[1].clone()));
             };
             (

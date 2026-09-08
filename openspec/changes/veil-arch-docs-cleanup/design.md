@@ -19,7 +19,7 @@
 
 ### D1：handler 按入口拆分，状态码集中注释
 
-**决策**：`src/handler.rs` → `src/handler/mod.rs`（ re-export ）+ `credential.rs`（`credential/registrations/register/revoke/emergency/approve`）+ `llm.rs`（`llm_proxy/request_rewrite/serve_nonstream/spawn_stream_pump`）；`router.rs` 不变；`error.rs` 头部加状态码表注释（`Pending→202/Auth→403/Unauthorized→401/RateLimited→429/PayloadTooLarge→413/Unavailable→503/NotFound→404/BadRequest→400`）。
+**决策**：`src/handler.rs` → `src/handler/mod.rs`（ re-export ）+ `credential.rs`（`credential/registrations/register/revoke/emergency/approve`）+ `llm.rs`（`llm_proxy/request_rewrite/serve_nonstream/spawn_stream_pump`）；`router.rs` 不变；`error.rs` 头部加状态码表注释（`Pending→202/Auth→403/Unauthorized→401/RateLimited→429/PayloadTooLarge→413/Unavailable→503/NotFound→404/BadRequest→400`）。（注：截至 `bcc6c4e` 已为目录形态 `src/handler/{mod,credential,llm}.rs`，本条为历史决策存档。）
 
 **理由**：凭据与 LLM 错误域正交，混居导致单测必须全量 `AppState`。按入口拆后各模块可独立单测。
 
@@ -55,7 +55,7 @@
 ## Migration Plan
 
 1. 先 D4 文档（零风险），再 D2 限流（单测），再 D3 观测（定时），最后 D1 拆分（conformance 回归）。
-2. 拆分未合入前不删旧 `handler.rs`；合入后旧路径删除单 PR。
+2. 拆分未合入前不删旧 `handler.rs`；合入后旧路径删除单 PR。（注：截至 `bcc6c4e` 已为目录形态，旧单文件已删，本条为历史过程存档。）
 3. 回滚：文档/限流/观测均可独立 revert；拆分 revert 即恢复单文件。
 
 ## Open Questions

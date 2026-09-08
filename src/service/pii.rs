@@ -79,7 +79,9 @@ fn pii_token_re() -> &'static regex::Regex {
 /// 序号回查另作独立开关（`restore_with_fuzzy(fuzzy)` 参数），两者正交。
 fn pii_loose_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)__PII_\d+_[^_\s]{1,16}__").expect("PII 宽松正则恒合法"))
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)__PII_\d+_[^_\s]{1,16}__").expect("PII 宽松正则恒合法")
+    })
 }
 
 /// 凭据完整形态（PII 值注册拒绝用，避免双 token 串扰）。
@@ -353,18 +355,50 @@ pub fn is_keep_prefix_ip(value: &str, kind: &str) -> bool {
             return false;
         }
         const KEEP: &[&str] = &[
-            "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.",
-            "192.168.", "127.", "169.254.", "100.64.", "100.65.", "192.0.0.", "192.0.2.",
-            "198.51.100.", "203.0.113.", "198.18.", "198.19.", "224.", "225.", "226.", "227.",
-            "228.", "229.", "230.", "231.", "232.", "233.", "234.", "235.", "236.", "237.",
-            "238.", "239.", "240.", "0.",
+            "10.",
+            "172.16.",
+            "172.17.",
+            "172.18.",
+            "172.19.",
+            "172.2",
+            "172.30.",
+            "172.31.",
+            "192.168.",
+            "127.",
+            "169.254.",
+            "100.64.",
+            "100.65.",
+            "192.0.0.",
+            "192.0.2.",
+            "198.51.100.",
+            "203.0.113.",
+            "198.18.",
+            "198.19.",
+            "224.",
+            "225.",
+            "226.",
+            "227.",
+            "228.",
+            "229.",
+            "230.",
+            "231.",
+            "232.",
+            "233.",
+            "234.",
+            "235.",
+            "236.",
+            "237.",
+            "238.",
+            "239.",
+            "240.",
+            "0.",
         ];
         if v.starts_with("172.2") {
             // 172.16/12 精确：172.16–172.31。
-            if let Some(second) = v.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()) {
-                if (16..=31).contains(&second) {
-                    return true;
-                }
+            if let Some(second) = v.split('.').nth(1).and_then(|s| s.parse::<u8>().ok())
+                && (16..=31).contains(&second)
+            {
+                return true;
             }
             return false;
         }
@@ -377,7 +411,16 @@ pub fn is_keep_prefix_ip(value: &str, kind: &str) -> bool {
             return false;
         }
         const KEEP6: &[&str] = &[
-            "::1", "::", "fe80:", "fe9", "fea", "feb", "fc", "fd", "ff02", "2001:db8:",
+            "::1",
+            "::",
+            "fe80:",
+            "fe9",
+            "fea",
+            "feb",
+            "fc",
+            "fd",
+            "ff02",
+            "2001:db8:",
             "64:ff9b:",
         ];
         return KEEP6.iter().any(|p| v.starts_with(p));
@@ -1133,11 +1176,7 @@ impl PiiDetector {
     ) -> (usize, usize) {
         let n = self.load_custom_patterns(patterns);
         self.load_dict(dict);
-        let m = self
-            .dict
-            .read()
-            .map(|g| g.len())
-            .unwrap_or_default();
+        let m = self.dict.read().map(|g| g.len()).unwrap_or_default();
         (n, m)
     }
 
@@ -1178,13 +1217,7 @@ impl PiiDetector {
     /// 字典命中边界：对标 Python `_dict_boundary_ok`（硬化门控差异化）。
     /// `name/person` 在强化开时走严格 CJK 边界，关闭时退化为 ASCII 字母数字边界
     /// （后接 CJK 仍阻断，保张三丰不误伤）；其余类型仅挡 ASCII 字母数字粘连。
-    fn dict_boundary_ok(
-        text: &str,
-        start: usize,
-        end: usize,
-        typ: &str,
-        strict_cjk: bool,
-    ) -> bool {
+    fn dict_boundary_ok(text: &str, start: usize, end: usize, typ: &str, strict_cjk: bool) -> bool {
         let before = text[..start].chars().next_back();
         let after = text[end..].chars().next();
         let is_cjk = |c: char| ('\u{4e00}'..='\u{9fff}').contains(&c) || c.is_alphanumeric();
@@ -1195,8 +1228,7 @@ impl PiiDetector {
                 }
                 return true;
             }
-            let ascii_before =
-                before.is_some_and(|c| c.is_ascii() && c.is_alphanumeric());
+            let ascii_before = before.is_some_and(|c| c.is_ascii() && c.is_alphanumeric());
             if ascii_before || after.is_some_and(is_cjk) {
                 return false;
             }
@@ -1859,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn 订单URL参数不判卡() {
+    fn order_url_param_not_flagged_as_bank_card() {
         // Luhn 合法卡号作订单号时：URL 查询参数上下文抑制 bank_card。
         let card = "4532015112830366";
         for url in [
@@ -2004,7 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn 请求表容量分表与LRU淘汰() {
+    fn request_table_capacity_split_lru_eviction() {
         // 分表声明：请求/响应单表 1000，与凭据 5000 不在同一容量口径。
         assert_eq!(PII_MAX_ENTRIES, 1000);
         assert_eq!(crate::service::credential_vault::MAX_TOKEN_ENTRIES, 5000);
@@ -2115,7 +2147,10 @@ mod tests {
             mask_pii_value("ipv6", "2001:4860:4860::8888"),
             "2001****8888"
         );
-        assert_eq!(mask_pii_value("api_key", "sk-abcdefgh12345678"), "sk-a****5678");
+        assert_eq!(
+            mask_pii_value("api_key", "sk-abcdefgh12345678"),
+            "sk-a****5678"
+        );
         assert_eq!(mask_pii_value("other", "abcdef"), "abc****def");
         assert_eq!(mask_pii_value("phone", ""), "***");
     }

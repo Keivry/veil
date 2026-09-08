@@ -6,6 +6,7 @@ use {
         auth::sha256_hex,
         config::AutoApprove,
         error::{Result, VeilError},
+        fs_perm::ensure_0600,
     },
     serde::{Deserialize, Serialize},
     std::{collections::BTreeMap, path::Path},
@@ -95,6 +96,7 @@ impl CallerEntry {
         }
         AuthorizationDecision::Allow
     }
+
     pub fn status_emoji(&self) -> &'static str {
         if self.revoked {
             "❎"
@@ -242,11 +244,11 @@ impl CallerRegistry {
         std::fs::write(&tmp, &raw).map_err(|e| VeilError::Storage {
             message: format!("注册表暂存写入失败: {e}"),
         })?;
-        chmod_0600(&tmp);
+        ensure_0600(&tmp);
         std::fs::rename(&tmp, path).map_err(|e| VeilError::Storage {
             message: format!("注册表原子提交失败: {e}"),
         })?;
-        chmod_0600(path);
+        ensure_0600(path);
         Ok(())
     }
 
@@ -444,10 +446,7 @@ impl CallerRegistry {
                     caller_path: caller_path.clone(),
                     expected_hash: expected_hash.clone(),
                     script_sha256: bind_script_sha256(&caller_path, &expected_hash),
-                    enabled: c
-                        .get("enabled")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
+                    enabled: c.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
                     revoked: false,
                     auto_approve: None,
                     name: c
@@ -472,16 +471,9 @@ impl CallerRegistry {
         std::fs::copy(path, &bak).map_err(|e| VeilError::Storage {
             message: format!("旧注册表备份失败（拒绝迁移覆盖）: {e}"),
         })?;
-        chmod_0600(&bak);
+        ensure_0600(&bak);
         migrated.save_to(path)?;
         Ok(migrated)
-    }
-}
-
-fn chmod_0600(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!("注册表 chmod 0600 失败: {}: {e}", path.display());
     }
 }
 
@@ -597,7 +589,10 @@ mod tests {
         .unwrap();
         reg.set_enabled("/s/acl.sh", true).unwrap();
         let e = reg.lookup_by_path("/s/acl.sh").unwrap();
-        assert_eq!(e.authorize_entry("网易", Some("授权码")), AuthorizationDecision::Allow);
+        assert_eq!(
+            e.authorize_entry("网易", Some("授权码")),
+            AuthorizationDecision::Allow
+        );
         assert!(matches!(
             e.authorize_entry("未知条目", Some("授权码")),
             AuthorizationDecision::TurnToApproval { .. }
@@ -715,5 +710,33 @@ mod tests {
             e.effective_allow_mode(AutoApprove::Allow),
             AutoApprove::Pending
         );
+    }
+
+    #[test]
+    fn 缺条目无库无效分支与双吊销幂等() {
+        let mut reg = CallerRegistry::empty();
+        assert!(reg.lookup_by_path("/s/nope.sh").is_none(), "未注册缺条目");
+        let err = reg.revoke("/s/nope.sh").unwrap_err();
+        assert!(err.to_string().contains("调用方不存在"), "缺条目吊销须明错");
+        reg.register("/s/d.sh", "h1").unwrap();
+        reg.revoke("/s/d.sh").unwrap();
+        reg.revoke("/s/d.sh").expect("清理双删须幂等成功");
+        let e = reg.lookup_by_path("/s/d.sh").unwrap();
+        assert!(e.revoked && !e.enabled);
+        let missing = std::env::temp_dir().join(format!(
+            "veil-reg-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let loaded = CallerRegistry::load_from(&missing.join("no.json")).unwrap();
+        assert_eq!(loaded.len(), 0, "无库须兼容空表");
+        std::fs::create_dir_all(&missing).unwrap();
+        let bad = missing.join("bad.json");
+        std::fs::write(&bad, b"{not json").unwrap();
+        assert!(CallerRegistry::load_from(&bad).is_err(), "无效 JSON 须拒载");
+        std::fs::remove_dir_all(&missing).ok();
     }
 }
