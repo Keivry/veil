@@ -1,7 +1,7 @@
 use {
     crate::{
         approval::{ApprovalGateway as _, NoopApproval, PendingRecord},
-        auth::{ct_eq, is_private_ip},
+        auth::{ct_eq, is_private_ip, secret_eq},
         config::{AutoApprove, CREDENTIAL_RATE_WINDOW_SECS, REGISTER_RATE_WINDOW_SECS},
         error::{Result, VeilError},
         registry::CallerEntry,
@@ -100,6 +100,24 @@ pub struct RegistrationView {
     pub enabled: bool,
     pub revoked: bool,
     pub status: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub allow_mode: Option<AutoApprove>,
+}
+
+fn registration_view(entry: &CallerEntry) -> RegistrationView {
+    RegistrationView {
+        caller_path: entry.caller_path.clone(),
+        enabled: entry.enabled,
+        revoked: entry.revoked,
+        status: entry.status_emoji().to_string(),
+        name: entry.name.clone(),
+        description: entry.description.clone(),
+        allow_mode: entry.allow_mode.or(entry.auto_approve),
+    }
 }
 
 fn check_rate(
@@ -197,21 +215,40 @@ async fn record_pending(state: &AppState, key: &str, reason: &str) -> VeilError 
     let _ = gateway.request_approval(&record);
     state.pending.insert(record);
     let event_id = approval_event_id(key, reason);
-    state.approval.submit(&event_id).await;
-    let bot = matrix::MatrixBot::new(
+    let branch = matrix::MatrixBranch::from_reason(reason);
+    state.approval.submit_branch(&event_id, branch).await;
+    let bot = matrix::MatrixBot::with_client(
         state.config.homeserver.clone(),
         state.config.room_id.clone(),
         state.config.matrix_access_token.clone(),
+        (*state.http_client).clone(),
     );
     let summary = format!("{reason} :: {key}");
-    let branch = matrix::MatrixBranch::from_reason(reason);
     let text = bot.format_approval(branch, None, &summary);
+    tracing::info!("审批已发送: event {event_id} 原因 {reason}");
     tokio::spawn(async move {
-        let _ = bot.send_text(&text).await;
+        if let Err(err) = bot.send_text(&text).await {
+            tracing::warn!("审批消息发送失败: {err:#}");
+        }
     });
     VeilError::PendingApproval {
         message: format!("已转 Matrix 人工审批: {reason}"),
     }
+}
+
+fn notify_hash_change(state: &AppState, key: &str, detail: &str) {
+    let bot = matrix::MatrixBot::with_client(
+        state.config.homeserver.clone(),
+        state.config.room_id.clone(),
+        state.config.matrix_access_token.clone(),
+        (*state.http_client).clone(),
+    );
+    let summary = format!("哈希变更 :: {key} :: {detail}");
+    let text = bot.format_approval(matrix::MatrixBranch::Credential, None, &summary);
+    tokio::spawn(async move {
+        let _ = bot.send_text(&text).await;
+    });
+    tracing::warn!("调用方哈希变更通知: {summary}");
 }
 
 /// 凭据审批问询（300s 超时口径）：超时/发送失败返回 None，调用方按 rejected 处理。
@@ -255,7 +292,7 @@ pub async fn handle_credential(
         && !expected_secret.is_empty()
     {
         match effective_secret(headers, body) {
-            Some(got) if ct_eq(&got, expected_secret) => {}
+            Some(got) if secret_eq(&got, expected_secret) => {}
             _ => {
                 return Err(VeilError::Auth {
                     message: "三因子缺失或不一致：Secret 校验失败".to_string(),
@@ -278,19 +315,45 @@ pub async fn handle_credential(
     let use_token = body.token.unwrap_or(true);
 
     let pending_key = format!("{caller_path}:{caller_hash}");
+    let mut hash_grace = false;
     let decision = {
         let registry = state.registry.read().await;
         if !ct_eq(&header_hash, &caller_hash) {
             None
-        } else if let Some(entry) = registry.lookup_by_path(&caller_path) {
-            if !ct_eq(&header_hash, &entry.expected_hash) {
+        } else if let Some(caller) = registry.lookup_by_path(&caller_path) {
+            if ct_eq(&header_hash, &caller.expected_hash) {
+                if caller.revoked || !caller.enabled {
+                    return Err(VeilError::Auth {
+                        message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                    });
+                }
+                if !caller.check_entry_allowed(&entry, field.as_deref()) {
+                    return Err(VeilError::Auth {
+                        message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
+                    });
+                }
+                Some(caller.effective_allow_mode(state.config.auto_approve))
+            } else if caller.matches_old_hash(&header_hash) {
+                if caller.revoked || !caller.enabled {
+                    return Err(VeilError::Auth {
+                        message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                    });
+                }
+                if !caller.check_entry_allowed(&entry, field.as_deref()) {
+                    return Err(VeilError::Auth {
+                        message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
+                    });
+                }
+                hash_grace = true;
+                Some(caller.effective_allow_mode(state.config.auto_approve))
+            } else if !ct_eq(&header_hash, &caller.expected_hash) {
                 None
-            } else if entry.revoked || !entry.enabled {
+            } else if caller.revoked || !caller.enabled {
                 return Err(VeilError::Auth {
-                    message: format!("调用方已禁用（{}），拒绝", entry.status_emoji()),
+                    message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
                 });
             } else {
-                Some(entry.auto_approve.unwrap_or(state.config.auto_approve))
+                Some(caller.effective_allow_mode(state.config.auto_approve))
             }
         } else if registry.lookup_by_hash(&header_hash).is_some() {
             None
@@ -298,6 +361,9 @@ pub async fn handle_credential(
             Some(state.config.auto_approve)
         }
     };
+    if hash_grace {
+        notify_hash_change(state, &pending_key, "old_hash宽限内放行");
+    }
 
     let effective = match decision {
         None => {
@@ -402,10 +468,11 @@ pub async fn query_keepass(
 }
 
 fn notify_keepass_failure(state: &AppState, entry: &str, detail: &str) {
-    let bot = matrix::MatrixBot::new(
+    let bot = matrix::MatrixBot::with_client(
         state.config.homeserver.clone(),
         state.config.room_id.clone(),
         state.config.matrix_access_token.clone(),
+        (*state.http_client).clone(),
     );
     let summary = format!("KeePass 查询失败 :: {entry} :: {detail}");
     let text = bot.format_approval(matrix::MatrixBranch::Credential, Some(false), &summary);
@@ -425,7 +492,7 @@ pub async fn list_registrations(
     };
     let secret_ok = match (secret, state.config.credential_secret.as_deref()) {
         (Some(got), Some(expected)) if !got.is_empty() && !expected.is_empty() => {
-            ct_eq(got, expected)
+            secret_eq(got, expected)
         }
         _ => false,
     };
@@ -435,16 +502,7 @@ pub async fn list_registrations(
         });
     }
     let registry = state.registry.read().await;
-    Ok(registry
-        .snapshot()
-        .iter()
-        .map(|e: &CallerEntry| RegistrationView {
-            caller_path: e.caller_path.clone(),
-            enabled: e.enabled,
-            revoked: e.revoked,
-            status: e.status_emoji().to_string(),
-        })
-        .collect())
+    Ok(registry.snapshot().iter().map(registration_view).collect())
 }
 
 pub async fn register_caller(
@@ -453,18 +511,35 @@ pub async fn register_caller(
     caller_hash: &str,
     source: &str,
 ) -> Result<RegistrationView> {
-    if caller_path.is_empty() || caller_hash.is_empty() {
+    register_caller_extended(
+        state,
+        &crate::registry::RegisterParams {
+            caller_path: caller_path.to_string(),
+            caller_hash: caller_hash.to_string(),
+            ..crate::registry::RegisterParams::default()
+        },
+        source,
+    )
+    .await
+}
+
+pub async fn register_caller_extended(
+    state: &AppState,
+    params: &crate::registry::RegisterParams,
+    source: &str,
+) -> Result<RegistrationView> {
+    if params.caller_path.trim().is_empty() || params.caller_hash.trim().is_empty() {
         return Err(VeilError::BadRequest {
             message: "caller_path 与 caller_hash 均必填".to_string(),
         });
     }
     {
         let registry = state.registry.read().await;
-        if registry.lookup_by_path(caller_path).is_some()
-            || registry.lookup_by_hash(caller_hash).is_some()
+        if registry.lookup_by_path(params.caller_path.trim()).is_some()
+            || registry.lookup_by_hash(params.caller_hash.trim()).is_some()
         {
             return Err(VeilError::Conflict {
-                message: format!("调用方已注册: {caller_path}"),
+                message: format!("调用方已注册: {}", params.caller_path.trim()),
             });
         }
     }
@@ -476,13 +551,8 @@ pub async fn register_caller(
     check_rate(&state.register_hits, &rate_key, REGISTER_RATE_WINDOW_SECS)?;
     let view = {
         let mut registry = state.registry.write().await;
-        let entry = registry.register(caller_path, caller_hash)?;
-        let view = RegistrationView {
-            caller_path: entry.caller_path.clone(),
-            enabled: entry.enabled,
-            revoked: entry.revoked,
-            status: entry.status_emoji().to_string(),
-        };
+        let entry = registry.register_extended(params)?;
+        let view = registration_view(entry);
         registry.save_to(&state.registry_path).ok();
         view
     };
@@ -493,12 +563,7 @@ pub async fn revoke_caller(state: &AppState, key: &str) -> Result<RegistrationVi
     let view = {
         let mut registry = state.registry.write().await;
         let entry = registry.revoke(key)?;
-        let view = RegistrationView {
-            caller_path: entry.caller_path.clone(),
-            enabled: entry.enabled,
-            revoked: entry.revoked,
-            status: entry.status_emoji().to_string(),
-        };
+        let view = registration_view(entry);
         registry.save_to(&state.registry_path).ok();
         view
     };
@@ -545,15 +610,15 @@ pub async fn approve_hash_change(
     let view = {
         let mut registry = state.registry.write().await;
         let entry = registry.approve_hash_change(caller_path, new_hash)?;
-        let view = RegistrationView {
-            caller_path: entry.caller_path.clone(),
-            enabled: entry.enabled,
-            revoked: entry.revoked,
-            status: entry.status_emoji().to_string(),
-        };
+        let view = registration_view(entry);
         registry.save_to(&state.registry_path).ok();
         view
     };
+    notify_hash_change(
+        state,
+        caller_path,
+        "approve_hash_change 已生效，旧哈希进入3600s宽限",
+    );
     Ok(view)
 }
 
@@ -1151,5 +1216,179 @@ mod tests {
             None
         );
         assert_eq!(state.approval.pending_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn 发送失败仍回202建单() {
+        let env = cred_env(&[
+            ("APPROVAL_WHITELIST", "@admin:example.com"),
+            ("HOMESERVER", "http://127.0.0.1:9"),
+        ]);
+        let state = cred_state(&env);
+        register_caller(&state, "/s/down.sh", "goodhash", "wire-src")
+            .await
+            .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled("/s/down.sh", true)
+            .unwrap();
+        let err = handle_credential(
+            &state,
+            &headers("badhash", Some("s3cr3t")),
+            &body("badhash", "/s/down.sh", None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.approval.pending_len().await, 1);
+    }
+
+    use std::collections::BTreeMap as TestMap;
+
+    fn entries_for(entry: &str, fields: &[&str]) -> TestMap<String, Vec<String>> {
+        TestMap::from([(
+            entry.to_string(),
+            fields.iter().map(|s| (*s).to_string()).collect(),
+        )])
+    }
+
+    async fn enrolled_with_entries(
+        state: &AppState,
+        path: &str,
+        hash: &str,
+        entries: TestMap<String, Vec<String>>,
+    ) {
+        register_caller_extended(
+            state,
+            &crate::registry::RegisterParams {
+                caller_path: path.to_string(),
+                caller_hash: hash.to_string(),
+                name: "test".to_string(),
+                description: String::new(),
+                entries,
+                allow_mode: None,
+            },
+            &format!("acl-test-{path}"),
+        )
+        .await
+        .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled(path, true)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn 越权条目拒绝403() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        enrolled_with_entries(
+            &state,
+            "/s/acl.sh",
+            "aclhash",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let mut over = body("aclhash", "/s/acl.sh", None);
+        over.entry = Some("未知条目".to_string());
+        let err = handle_credential(&state, &headers("aclhash", Some("s3cr3t")), &over)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+        assert!(format!("{err:?}").contains("越权"));
+    }
+
+    #[tokio::test]
+    async fn 越权字段拒绝403() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        enrolled_with_entries(
+            &state,
+            "/s/aclf.sh",
+            "aclfhash",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let mut over = body("aclfhash", "/s/aclf.sh", None);
+        over.field = Some("未授权字段".to_string());
+        let err = handle_credential(&state, &headers("aclfhash", Some("s3cr3t")), &over)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn 授权范围内放行200() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        enrolled_with_entries(
+            &state,
+            "/s/ok.sh",
+            "okhash",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let out = handle_credential(
+            &state,
+            &headers("okhash", Some("s3cr3t")),
+            &body("okhash", "/s/ok.sh", None),
+        )
+        .await
+        .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+    }
+
+    #[tokio::test]
+    async fn 哈希篡改转审批202并通知() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        enrolled_with_entries(
+            &state,
+            "/s/tamper.sh",
+            "goodhash",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let err = handle_credential(
+            &state,
+            &headers("badhash", Some("s3cr3t")),
+            &body("badhash", "/s/tamper.sh", None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(state.pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn 旧哈希宽限内放行() {
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        enrolled_with_entries(
+            &state,
+            "/s/grace.sh",
+            "h1",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        state
+            .registry
+            .write()
+            .await
+            .approve_hash_change("/s/grace.sh", "h2")
+            .unwrap();
+        let out = handle_credential(
+            &state,
+            &headers("h1", Some("s3cr3t")),
+            &body("h1", "/s/grace.sh", None),
+        )
+        .await
+        .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
     }
 }

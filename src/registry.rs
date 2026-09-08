@@ -17,6 +17,45 @@ pub struct CallerEntry {
     pub revoked: bool,
     #[serde(default)]
     pub auto_approve: Option<AutoApprove>,
+    /// 调用方展示名（Go `name` 形态映射，缺省空）。
+    #[serde(default)]
+    pub name: String,
+    /// 调用方描述（Go `desc`/`description` 映射，缺省空）。
+    #[serde(default)]
+    pub description: String,
+    /// 条目到字段的授权映射（Go `entries` 形态映射；空表 = 未授权，默认拒绝）。
+    #[serde(default)]
+    pub entries: BTreeMap<String, Vec<String>>,
+    /// 单调用方自动放行模式（Go `allow_mode` 映射；`None` 时回退 `auto_approve`/全局）。
+    #[serde(default)]
+    pub allow_mode: Option<AutoApprove>,
+    /// 上次哈希（`approve_hash_change` 暂存，宽限期内旧哈希仍可用并通知）。
+    #[serde(default)]
+    pub old_hash: Option<String>,
+    /// 旧哈希过期时间（unix 秒）；`None` 表示无宽限。
+    #[serde(default)]
+    pub old_hash_expires_at: Option<u64>,
+}
+
+/// 旧哈希宽限窗口（秒，对标 Python 3600s 语义）。
+pub const OLD_HASH_GRACE_SECS: u64 = 3600;
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 注册扩展参数（网关侧做 Go 字段映射，协议不 breaking）。
+#[derive(Debug, Clone, Default)]
+pub struct RegisterParams {
+    pub caller_path: String,
+    pub caller_hash: String,
+    pub name: String,
+    pub description: String,
+    pub entries: BTreeMap<String, Vec<String>>,
+    pub allow_mode: Option<AutoApprove>,
 }
 
 impl CallerEntry {
@@ -27,6 +66,42 @@ impl CallerEntry {
             "✅"
         } else {
             "🔓"
+        }
+    }
+
+    pub fn effective_allow_mode(&self, fallback: AutoApprove) -> AutoApprove {
+        self.allow_mode.or(self.auto_approve).unwrap_or(fallback)
+    }
+
+    pub fn check_entry_allowed(&self, entry: &str, field: Option<&str>) -> bool {
+        let entry = entry.trim();
+        if entry.is_empty() || self.entries.is_empty() {
+            return false;
+        }
+        match self.entries.get(entry) {
+            None => false,
+            Some(allowed) => match field {
+                None => true,
+                Some(f) => {
+                    let f = f.trim();
+                    if f.is_empty() {
+                        return true;
+                    }
+                    if allowed.is_empty() {
+                        return true;
+                    }
+                    allowed.iter().any(|a| a == f)
+                }
+            },
+        }
+    }
+
+    pub fn matches_old_hash(&self, hash: &str) -> bool {
+        match (self.old_hash.as_deref(), self.old_hash_expires_at) {
+            (Some(old), Some(exp)) => {
+                !old.is_empty() && crate::auth::ct_eq(old, hash) && now_unix_secs() <= exp
+            }
+            _ => false,
         }
     }
 }
@@ -150,6 +225,21 @@ impl CallerRegistry {
     }
 
     pub fn register(&mut self, caller_path: &str, caller_hash: &str) -> Result<&CallerEntry> {
+        self.register_extended(&RegisterParams {
+            caller_path: caller_path.to_string(),
+            caller_hash: caller_hash.to_string(),
+            ..RegisterParams::default()
+        })
+    }
+
+    pub fn register_extended(&mut self, params: &RegisterParams) -> Result<&CallerEntry> {
+        let caller_path = params.caller_path.trim();
+        let caller_hash = params.caller_hash.trim();
+        if caller_path.is_empty() || caller_hash.is_empty() {
+            return Err(VeilError::BadRequest {
+                message: "caller_path 与 caller_hash 均必填".to_string(),
+            });
+        }
         if self.entries.contains_key(caller_path) {
             return Err(VeilError::Conflict {
                 message: format!("调用方已注册: {caller_path}"),
@@ -167,6 +257,12 @@ impl CallerRegistry {
             enabled: false,
             revoked: false,
             auto_approve: None,
+            name: params.name.trim().to_string(),
+            description: params.description.trim().to_string(),
+            entries: params.entries.clone(),
+            allow_mode: params.allow_mode,
+            old_hash: None,
+            old_hash_expires_at: None,
         };
         self.entries.insert(caller_path.to_string(), entry);
         self.entries
@@ -174,6 +270,14 @@ impl CallerRegistry {
             .ok_or_else(|| VeilError::Storage {
                 message: "注册表写入后回读失败".to_string(),
             })
+    }
+
+    pub fn set_entries(&mut self, key: &str, entries: BTreeMap<String, Vec<String>>) -> Result<()> {
+        let entry = self.find_mut(key).ok_or_else(|| VeilError::BadRequest {
+            message: format!("调用方不存在: {key}"),
+        })?;
+        entry.entries = entries;
+        Ok(())
     }
 
     pub fn revoke(&mut self, key: &str) -> Result<&CallerEntry> {
@@ -196,6 +300,10 @@ impl CallerRegistry {
             .ok_or_else(|| VeilError::BadRequest {
                 message: format!("调用方不存在: {caller_path}"),
             })?;
+        if !crate::auth::ct_eq(&entry.expected_hash, new_hash) {
+            entry.old_hash = Some(entry.expected_hash.clone());
+            entry.old_hash_expires_at = Some(now_unix_secs() + OLD_HASH_GRACE_SECS);
+        }
         entry.expected_hash = new_hash.to_string();
         entry.script_sha256 = bind_script_sha256(caller_path, new_hash);
         entry.revoked = false;
@@ -252,6 +360,12 @@ mod tests {
             enabled: false,
             revoked: false,
             auto_approve: None,
+            name: String::new(),
+            description: String::new(),
+            entries: BTreeMap::new(),
+            allow_mode: None,
+            old_hash: None,
+            old_hash_expires_at: None,
         }
     }
 
@@ -328,5 +442,87 @@ mod tests {
         assert_eq!(e.expected_hash, "h2");
         assert!(e.enabled && !e.revoked);
         assert_eq!(e.status_emoji(), "✅");
+    }
+
+    #[test]
+    fn 未知条目字段默认拒绝() {
+        let mut reg = CallerRegistry::empty();
+        reg.register_extended(&RegisterParams {
+            caller_path: "/s/acl.sh".to_string(),
+            caller_hash: "h1".to_string(),
+            name: "check-mail".to_string(),
+            description: "检查邮件".to_string(),
+            entries: BTreeMap::from([("网易".to_string(), vec!["授权码".to_string()])]),
+            allow_mode: None,
+        })
+        .unwrap();
+        let e = reg.lookup_by_path("/s/acl.sh").unwrap();
+        assert!(e.check_entry_allowed("网易", Some("授权码")));
+        assert!(e.check_entry_allowed("网易", None));
+        assert!(!e.check_entry_allowed("未知条目", Some("授权码")));
+        assert!(!e.check_entry_allowed("网易", Some("未授权字段")));
+        assert!(!e.check_entry_allowed("", Some("授权码")));
+    }
+
+    #[test]
+    fn 空授权表默认拒绝() {
+        let mut reg = CallerRegistry::empty();
+        reg.register("/s/empty.sh", "h9").unwrap();
+        let e = reg.lookup_by_path("/s/empty.sh").unwrap();
+        assert!(!e.check_entry_allowed("网易", Some("授权码")));
+        assert!(!e.check_entry_allowed("网易", None));
+    }
+
+    #[test]
+    fn 旧哈希宽限有效且过期失效() {
+        let mut reg = CallerRegistry::empty();
+        reg.register("/s/g.sh", "h1").unwrap();
+        reg.approve_hash_change("/s/g.sh", "h2").unwrap();
+        let e = reg.lookup_by_path("/s/g.sh").unwrap();
+        assert_eq!(e.old_hash.as_deref(), Some("h1"));
+        assert!(e.matches_old_hash("h1"));
+        assert!(!e.matches_old_hash("hX"));
+    }
+
+    #[test]
+    fn 落盘权限0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "veil-reg-0600-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller_registry.json");
+        let mut reg = CallerRegistry::empty();
+        reg.register("/s/a.sh", "h1").unwrap();
+        reg.save_to(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 扩展注册保留名称描述与授权映射() {
+        let mut reg = CallerRegistry::empty();
+        reg.register_extended(&RegisterParams {
+            caller_path: "/s/go.sh".to_string(),
+            caller_hash: "gh1".to_string(),
+            name: "check-mail".to_string(),
+            description: "检查邮件".to_string(),
+            entries: BTreeMap::from([("网易".to_string(), vec!["授权码".to_string()])]),
+            allow_mode: Some(AutoApprove::Pending),
+        })
+        .unwrap();
+        let e = reg.lookup_by_path("/s/go.sh").unwrap();
+        assert_eq!(e.name, "check-mail");
+        assert_eq!(e.description, "检查邮件");
+        assert_eq!(
+            e.effective_allow_mode(AutoApprove::Allow),
+            AutoApprove::Pending
+        );
     }
 }
