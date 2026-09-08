@@ -258,43 +258,12 @@ fn append_prompt_text(field: &mut Value, prompt: &str) {
     }
 }
 
-pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol) -> bool {
-    if protocol == Protocol::Anthropic {
-        let Some(map) = body.as_object_mut() else {
-            return false;
-        };
-        if let Some(sys) = map.get_mut("system") {
-            if matches!(sys, Value::String(_) | Value::Array(_)) {
-                append_prompt_text(sys, prompt);
-                return true;
-            }
-            tracing::warn!("Anthropic system 非法形态不注入，原体透传");
-            return false;
-        }
-        map.insert("system".to_string(), Value::String(prompt.to_string()));
-        return true;
-    }
-    let key = if protocol == Protocol::Responses {
-        "input"
-    } else {
-        "messages"
-    };
-    let Some(map) = body.as_object_mut() else {
-        return false;
-    };
-    let Some(field) = map.get_mut(key) else {
-        return false;
-    };
-    if protocol == Protocol::Responses && matches!(field, Value::String(_)) {
-        tracing::warn!("Responses 字符串 input 不注入，原体透传");
-        return false;
-    }
-    let Some(msgs) = field.as_array_mut() else {
-        return false;
-    };
+/// Responses 数组前插 system 说明（与 Chat `messages` 同语义）：
+/// 空数组追加首条；首条为 system 则合并 `content`；否则头部插入。
+fn front_insert_system(msgs: &mut Vec<Value>, prompt: &str) {
     if msgs.is_empty() {
         msgs.push(serde_json::json!({"role": "system", "content": prompt}));
-        return true;
+        return;
     }
     if let Some(Value::Object(first)) = msgs.first_mut()
         && first.get("role").and_then(|v| v.as_str()) == Some("system")
@@ -316,9 +285,84 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
                 first.insert("content".to_string(), Value::String(prompt.to_string()));
             }
         }
-        return true;
+        return;
     }
     msgs.insert(0, serde_json::json!({"role": "system", "content": prompt}));
+}
+
+/// Responses 文本字段注入（`input` 与 `instructions` 同等语义，§2.1）：
+/// - `String`：末尾追加说明（与 Anthropic `system` 字符串形态一致）；
+/// - `Array`：首条 system 前插；
+/// - 非法形态（数字/对象等）：warn 后不注入，调用方回退原体。
+fn inject_responses_text_field(field: &mut Value, key: &str, prompt: &str) -> bool {
+    match field {
+        Value::String(_) | Value::Array(_) => {}
+        _ => {
+            tracing::warn!("Responses {key} 非法形态不注入，原体透传");
+            return false;
+        }
+    }
+    match field {
+        Value::String(_) => {
+            append_prompt_text(field, prompt);
+            true
+        }
+        Value::Array(arr) => {
+            front_insert_system(arr, prompt);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 占位符说明注入（§2.1）：chat 前插 `messages` 首条 system；
+/// anthropic 合并 `system`；responses 对 `input` 与 `instructions`
+/// 同等注入（string 追加 / array 前插），非法形态 warn 后不注入。
+pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol) -> bool {
+    if protocol == Protocol::Anthropic {
+        let Some(map) = body.as_object_mut() else {
+            return false;
+        };
+        if let Some(sys) = map.get_mut("system") {
+            if matches!(sys, Value::String(_) | Value::Array(_)) {
+                append_prompt_text(sys, prompt);
+                return true;
+            }
+            tracing::warn!("Anthropic system 非法形态不注入，原体透传");
+            return false;
+        }
+        map.insert("system".to_string(), Value::String(prompt.to_string()));
+        return true;
+    }
+    // §2.1：Responses `input` 与 `instructions` 同等注入；string 按串追加、
+    // array 按首条前插；非法形态 warn 后不注入（回退原体）。
+    if protocol == Protocol::Responses {
+        let Some(map) = body.as_object_mut() else {
+            return false;
+        };
+        let mut injected = false;
+        for key in ["input", "instructions"] {
+            let Some(field) = map.get_mut(key) else {
+                continue;
+            };
+            injected |= inject_responses_text_field(field, key, prompt);
+        }
+        if !injected {
+            tracing::warn!("Responses input/instructions 缺失或非法，不注入");
+        }
+        return injected;
+    }
+    let key = "messages";
+    let Some(map) = body.as_object_mut() else {
+        return false;
+    };
+    let Some(field) = map.get_mut(key) else {
+        return false;
+    };
+    let Some(msgs) = field.as_array_mut() else {
+        return false;
+    };
+    front_insert_system(msgs, prompt);
     true
 }
 
@@ -332,7 +376,18 @@ pub fn placeholder_schema_ok(body: &Value, protocol: Protocol) -> bool {
             Some(Value::String(_)) | Some(Value::Array(_)) => true,
             Some(_) => false,
         },
-        Protocol::Responses => map.get("input").is_some_and(|v| v.is_array()),
+        // §2.1：Responses 允许 `input`/`instructions` 各为 string|array；
+        // 存在者须形态合法，且至少存在其一；非法回退不注入。
+        Protocol::Responses => {
+            let field_ok = |v: Option<&Value>| match v {
+                None => true,
+                Some(Value::String(_) | Value::Array(_)) => true,
+                Some(_) => false,
+            };
+            (map.get("input").is_some() || map.get("instructions").is_some())
+                && field_ok(map.get("input"))
+                && field_ok(map.get("instructions"))
+        }
         Protocol::Chat => map.get("messages").is_some_and(|v| v.is_array()),
         Protocol::NonDialog => false,
     }
@@ -518,8 +573,9 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
     }
 }
 
-/// 流式 usage 累加（Anthropic `message_start` + `message_delta` 双段按字段单调 max，
-/// 上游累计语义下不双计；其余协议同样按 max 归一，单样本流与旧口径一致）。
+/// 流式 usage 累加（§2.7 口径：统一 `max`，禁用 `sum`）。
+/// 上游分片语义为累计值（`message_start` 给全量、`message_delta` 给累计），
+/// 按字段单调取大；`sum` 会把同一 token 算两次（双计），此处禁止。
 pub fn accumulate_usage(acc: &mut Option<Usage>, next: Option<Usage>) {
     if let Some(u) = next {
         merge_usage(acc, u);
@@ -853,12 +909,18 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     blocks.push(msg);
                 }
             }
-            // 5.2：按事件 `index` 字段分桶（官方 `content_block_start/delta`
-            // 均带 `index`）；缺失才回退枚举下标，保证多 index 交错累积正确。
+            // §2.4：按外层事件 `index` 分桶（官方 `content_block_start.index` /
+            // `content_block_delta.index` 在事件顶层，内层 `content_block` /
+            // `delta` 常无 index）；内层 index 优先、外层回退、缺失才用枚举下标。
+            let outer_index: Option<u32> = payload
+                .get("index")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as u32);
             let bucket_index = |b: &Value, fallback: u32| -> u32 {
                 b.get("index")
                     .and_then(|x| x.as_u64())
                     .map(|n| n as u32)
+                    .or(outer_index)
                     .unwrap_or(fallback)
             };
             for (i, b) in blocks.iter().enumerate() {
@@ -1685,18 +1747,33 @@ mod tests {
     #[test]
     fn 占位符四形态注入回退() {
         let prompt = "PROMPT";
+        // §2.1：Responses 字符串 input 按串追加注入（与 input 数组同等）。
         let resp_str = serde_json::json!({"model":"m","input":"hello"});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&resp_str).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("字符串 input 须可注入");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["input"].as_str().unwrap().contains(prompt));
+        assert!(parsed["input"].as_str().unwrap().contains("hello"));
+        let mut v = resp_str.clone();
+        assert!(placeholder_inject_obj(&mut v, prompt, Protocol::Responses));
+        assert!(placeholder_schema_ok(&v, Protocol::Responses));
+        // 非法形态（数字 input）仍回退不注入。
+        let resp_bad = serde_json::json!({"model":"m","input":42});
         assert!(
             inject_placeholder_prompt(
-                &serde_json::to_string(&resp_str).unwrap(),
+                &serde_json::to_string(&resp_bad).unwrap(),
                 prompt,
                 Protocol::Responses,
             )
             .is_none()
         );
-        let mut v = resp_str.clone();
-        assert!(!placeholder_inject_obj(&mut v, prompt, Protocol::Responses));
-        assert!(!placeholder_schema_ok(&v, Protocol::Responses));
+        let mut vb = resp_bad.clone();
+        assert!(!placeholder_inject_obj(&mut vb, prompt, Protocol::Responses));
+        assert!(!placeholder_schema_ok(&vb, Protocol::Responses));
         let anth_bad = serde_json::json!({"model":"m","system":42});
         assert!(
             inject_placeholder_prompt(
@@ -1731,6 +1808,108 @@ mod tests {
         .unwrap();
         let parsed2: Value = serde_json::from_str(&out2).unwrap();
         assert!(parsed2["system"].as_str().unwrap().contains(prompt));
+    }
+
+    #[test]
+    fn responses_instructions与input同等注入() {
+        let prompt = "PROMPT";
+        // instructions 字符串与 input 字符串同时注入。
+        let both = serde_json::json!({"input":"hi","instructions":"be nice"});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&both).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("双字段须可注入");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["input"].as_str().unwrap().contains(prompt));
+        assert!(v["instructions"].as_str().unwrap().contains("be nice"));
+        assert!(v["instructions"].as_str().unwrap().contains(prompt));
+        // 仅 instructions（无 input）同样可注入。
+        let only = serde_json::json!({"instructions":["a"]});
+        let out2 = inject_placeholder_prompt(
+            &serde_json::to_string(&only).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("仅 instructions 须可注入");
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["instructions"][0]["role"], "system");
+        // instructions 非法形态不注入整体回退。
+        let bad = serde_json::json!({"input":[{"role":"user","content":"hi"}],"instructions":42});
+        assert!(
+            inject_placeholder_prompt(
+                &serde_json::to_string(&bad).unwrap(),
+                prompt,
+                Protocol::Responses,
+            )
+            .is_none()
+        );
+        // 两字段皆缺失不注入。
+        let none = serde_json::json!({"model":"m"});
+        assert!(
+            inject_placeholder_prompt(
+                &serde_json::to_string(&none).unwrap(),
+                prompt,
+                Protocol::Responses,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn anthropic外层index交错分桶不串() {
+        let start0 = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a0","name":"run"}});
+        let start1 = serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"a1","name":"run"}});
+        let d0 = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":"}});
+        let d1 = serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"y\":"}});
+        let c0 = extract_tool_calls(Protocol::Anthropic, &start0);
+        assert_eq!((c0.len(), c0[0].index), (1, 0));
+        assert_eq!(c0[0].id, "a0");
+        let c1 = extract_tool_calls(Protocol::Anthropic, &start1);
+        assert_eq!((c1.len(), c1[0].index), (1, 1));
+        let p0 = extract_tool_calls(Protocol::Anthropic, &d0);
+        assert_eq!((p0.len(), p0[0].index), (1, 0));
+        assert_eq!(p0[0].args, "{\"x\":");
+        let p1 = extract_tool_calls(Protocol::Anthropic, &d1);
+        assert_eq!((p1.len(), p1[0].index), (1, 1));
+        assert_eq!(p1[0].args, "{\"y\":");
+        let inner = serde_json::json!({"content":[{"type":"tool_use","index":7,"id":"z","name":"q","input":{}}]});
+        let ci = extract_tool_calls(Protocol::Anthropic, &inner);
+        assert_eq!(ci[0].index, 7);
+    }
+
+    #[test]
+    fn usage累计值分片取max不双计() {
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(
+            &mut acc,
+            extract_usage_stream(
+                Protocol::Anthropic,
+                &serde_json::json!({"message":{"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}),
+            ),
+        );
+        accumulate_usage(
+            &mut acc,
+            extract_usage_stream(
+                Protocol::Anthropic,
+                &serde_json::json!({"delta":{"usage":{"input_tokens":30,"output_tokens":0,"total_tokens":30}}}),
+            ),
+        );
+        let a = acc.as_ref().expect("须有累计值");
+        assert_eq!((a.prompt_tokens, a.total_tokens), (30, 30));
+        accumulate_usage(
+            &mut acc,
+            extract_usage_stream(
+                Protocol::Anthropic,
+                &serde_json::json!({"delta":{"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}}),
+            ),
+        );
+        let a2 = acc.as_ref().expect("须保持累计值");
+        assert_eq!(
+            (a2.prompt_tokens, a2.completion_tokens, a2.total_tokens),
+            (30, 1, 30)
+        );
     }
 
     #[test]

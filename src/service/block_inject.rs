@@ -1,4 +1,12 @@
-use super::sse::StreamMeta;
+use {
+    super::{
+        audit::{AuditPolicy, AuditVerdict, evaluate},
+        llm_gateway::{Protocol as GatewayProtocol, extract_tool_calls},
+        sse::StreamMeta,
+    },
+    crate::config::AuditMode,
+    serde_json::Value,
+};
 
 pub fn chat_block_frames(reason: &str) -> Vec<String> {
     vec![
@@ -52,7 +60,8 @@ pub fn chat_done_frame() -> String { "data: [DONE]\n\n".to_string() }
 
 pub fn is_done_frame(frame: &str) -> bool {
     frame.lines().any(|l| {
-        let t = l.trim();
+        // §2.6：BOM 剥离后判 DONE（`﻿data: [DONE]` 同样是终止帧，参与去重）。
+        let t = l.trim().trim_start_matches('\u{feff}');
         t == "data: [DONE]" || t == "data:[DONE]"
     })
 }
@@ -103,6 +112,64 @@ pub fn dedupe_terminal_frames(frames: Vec<String>, protocol: &str) -> Vec<String
 }
 
 pub fn should_discard_after_terminal(terminated: bool) -> bool { terminated }
+
+/// 非流阻断体（§2.3）：三协议各自正确的 JSON 形态，与流式阻断帧语义对齐：
+/// chat 为 `choices/finish_reason=stop` 消息体；anthropic 为 `stop_reason=end_turn`
+/// 文本体；responses 为 `status=failed` 错误体（失败语义，不伪造完成）。
+/// `NonDialog` 非对话不审计，返回 `Null`（调用方不应调用）。
+pub fn nonstream_block_body(
+    protocol: GatewayProtocol,
+    reason: &str,
+    conv_id: &str,
+) -> Value {
+    let text = format!("[blocked: {reason}]");
+    match protocol {
+        GatewayProtocol::Chat => serde_json::json!({
+            "choices": [{"finish_reason": "stop",
+                "message": {"role": "assistant", "content": text}}]
+        }),
+        GatewayProtocol::Anthropic => serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn"
+        }),
+        GatewayProtocol::Responses => serde_json::json!({
+            "id": conv_id, "status": "failed",
+            "error": {"message": text}
+        }),
+        GatewayProtocol::NonDialog => Value::Null,
+    }
+}
+
+/// 非流 tool 提取 + 审计（§2.3）：提取三协议 tool 调用
+/// （chat `tool_calls`、anthropic `tool_use`、responses `function_call`）
+/// 并逐条 `audit::evaluate`；任一条 `Block`/`NeedApproval` 即 fail-closed
+/// 返回 `Some(阻断体)`，全放行返回 `None`。
+/// handler 接线说明：`Some(body)` 直接替代上游响应返回（状态码沿用上游），
+/// `None` 走正常还原透传；approve 转人工需上层另行实现
+/// （本 helper 按阻断处理，不静默放行危险调用）。
+pub fn evaluate_nonstream(
+    protocol: GatewayProtocol,
+    body: &Value,
+    mode: AuditMode,
+    policy: &AuditPolicy,
+    conv_id: &str,
+) -> Option<Value> {
+    if matches!(mode, AuditMode::Off) {
+        return None;
+    }
+    let mut first_reason: Option<String> = None;
+    for call in extract_tool_calls(protocol, body) {
+        let name = call.name.as_deref().unwrap_or("");
+        match evaluate(mode, name, &call.args, policy) {
+            AuditVerdict::Allow => {}
+            AuditVerdict::Block { reason } | AuditVerdict::NeedApproval { reason, .. } => {
+                first_reason = Some(reason);
+                break;
+            }
+        }
+    }
+    first_reason.map(|r| nonstream_block_body(protocol, &r, conv_id))
+}
 
 pub fn empty_stream_frames(protocol: &str, conv_id: &str) -> Vec<String> {
     match protocol {
@@ -309,5 +376,38 @@ mod tests {
         assert!(!out[0].contains("response.failed"));
         assert!(should_discard_after_terminal(true));
         assert!(!should_discard_after_terminal(false));
+    }
+
+    #[test]
+    fn 非流危险调用被拦且形态协议正确() {
+        use crate::config::AuditMode;
+        use super::super::{audit::AuditPolicy, llm_gateway::Protocol};
+        let policy = AuditPolicy::default_policy();
+        let chat = serde_json::json!({"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}]});
+        let blocked = evaluate_nonstream(Protocol::Chat, &chat, AuditMode::Block, &policy, "r1")
+            .expect("危险调用须阻断");
+        assert!(blocked.to_string().contains("[blocked:"));
+        assert_eq!(blocked["choices"][0]["finish_reason"], "stop");
+        let benign = serde_json::json!({"choices":[{"message":{"content":"hi"}}]});
+        assert!(
+            evaluate_nonstream(Protocol::Chat, &benign, AuditMode::Block, &policy, "r1").is_none()
+        );
+        assert!(
+            evaluate_nonstream(Protocol::Chat, &chat, AuditMode::Off, &policy, "r1").is_none()
+        );
+        let anth = serde_json::json!({"content":[{"type":"tool_use","id":"a1","name":"exec","input":{"cmd":"rm -rf /"}}]});
+        let blocked_a =
+            evaluate_nonstream(Protocol::Anthropic, &anth, AuditMode::Block, &policy, "r1")
+                .expect("anthropic 危险须阻断");
+        assert_eq!(blocked_a["stop_reason"], "end_turn");
+        let resp = serde_json::json!({"output":[{"type":"function_call","id":"f1","name":"exec","arguments":"rm -rf /"}]});
+        let blocked_r =
+            evaluate_nonstream(Protocol::Responses, &resp, AuditMode::Block, &policy, "r1")
+                .expect("responses 危险须阻断");
+        assert_eq!(blocked_r["id"], "r1");
+        assert_eq!(blocked_r["status"], "failed");
+        assert!(!blocked_r.to_string().contains("response.completed"));
+        let need = evaluate_nonstream(Protocol::Chat, &chat, AuditMode::Approve, &policy, "r1");
+        assert!(need.is_some(), "approve 命中按阻断处理，不静默放行");
     }
 }
