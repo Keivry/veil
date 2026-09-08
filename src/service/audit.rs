@@ -38,13 +38,29 @@ impl AuditVerdict {
     pub fn is_allow(&self) -> bool { matches!(self, Self::Allow) }
 }
 
-/// 策略：内建危险规则 + 策略文件追加项。
+/// 策略：内建危险规则 + 策略文件追加项 + allow/deny 名单 + 内网后缀。
 #[derive(Debug, Clone, Default)]
 pub struct AuditPolicy {
     /// 追加的危险子串（小写归一后匹配）。
     pub extra_block_substrings: Vec<String>,
     /// 追加的敏感路径前缀。
     pub extra_sensitive_paths: Vec<String>,
+    /// 放行名单（tool 名精确匹配；危险内容仍先拦截，allow 仅表示无危险时放行）。
+    pub allow: Vec<String>,
+    /// 拒绝名单（tool 名精确匹配，优先于一切放行）。
+    pub deny: Vec<String>,
+    /// 内网域名后缀（命中则不判网络外传，如 `[".corp", ".internal"]`）。
+    pub internal_suffixes: Vec<String>,
+    /// 危险规则追加（`pattern/reason`，`network=true` 的命中须再过外部 host 判定）。
+    pub extra_dangerous: Vec<DangerRule>,
+}
+
+/// 策略文件危险规则项。
+#[derive(Debug, Clone, Default)]
+pub struct DangerRule {
+    pub pattern: String,
+    pub reason: String,
+    pub network: bool,
 }
 
 impl AuditPolicy {
@@ -88,6 +104,29 @@ impl AuditPolicy {
                     Some("extra_sensitive_paths") => {
                         policy.extra_sensitive_paths.push(item);
                     }
+                    Some("allow") => policy.allow.push(item),
+                    Some("deny") => policy.deny.push(item),
+                    Some("internal_suffixes") => {
+                        policy.internal_suffixes.push(item.to_lowercase());
+                    }
+                    Some("dangerous") => {
+                        // `pattern` 或 `pattern => reason`（network 规则后缀 ` [network]`）。
+                        let (pat, net) = match item.strip_suffix("[network]") {
+                            Some(p) => (p.trim().to_string(), true),
+                            None => (item.clone(), false),
+                        };
+                        let (pat, reason) = match pat.split_once("=>") {
+                            Some((p, r)) => (p.trim().to_string(), r.trim().to_string()),
+                            None => (pat.clone(), pat.clone()),
+                        };
+                        if !pat.is_empty() {
+                            policy.extra_dangerous.push(DangerRule {
+                                pattern: pat,
+                                reason,
+                                network: net,
+                            });
+                        }
+                    }
                     Some(other) => {
                         return Err(VeilError::Config {
                             var: "AUDIT_POLICY_FILE".to_string(),
@@ -113,7 +152,8 @@ impl AuditPolicy {
                 let key = k.trim().to_string();
                 let val = unquote(v.trim());
                 match key.as_str() {
-                    "extra_block_substrings" | "extra_sensitive_paths" => {
+                    "extra_block_substrings" | "extra_sensitive_paths" | "allow" | "deny"
+                    | "internal_suffixes" | "dangerous" => {
                         if !val.is_empty() {
                             return Err(VeilError::Config {
                                 var: "AUDIT_POLICY_FILE".to_string(),
@@ -562,8 +602,125 @@ fn is_exfiltration(lower: &str) -> bool {
         || lower.contains("/dev/tcp/")
 }
 
-/// 顶层判定：工具名 + 参数全文规范化后逐链节审查。
+/// 从 tool 参数提取网络目标 host（URL 或 `curl/wget/nc` 裸目标），不做 DNS 解析。
+pub fn extract_host(args: &str) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    // URL 形态：先剥 scheme 再取 host（`svc.corp:8080/x` → `svc.corp:8080`，端口保留）。
+    if let Some(pos) = args.find("https://").or_else(|| args.find("http://")) {
+        let rest = &args[pos..];
+        if let Some(after) = rest.splitn(2, "://").nth(1) {
+            let host = after
+                .split(['/', ' ', '"', '\''].as_ref())
+                .next()
+                .unwrap_or("");
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+    }
+    // 裸目标：`curl 8.8.8.8` / `curl evil.com`。
+    for verb in ["curl", "wget", "nc", "ncat", "telnet"] {
+        let mut search = args;
+        while let Some(idx) = search.find(verb) {
+            let after_verb = idx + verb.len();
+            let before_ok = idx == 0
+                || !search.as_bytes()[idx - 1].is_ascii_alphanumeric();
+            if !before_ok {
+                search = &search[after_verb..];
+                continue;
+            }
+            let rest = search[after_verb..].trim_start();
+            if rest.starts_with('-') || rest.is_empty() {
+                search = &search[after_verb..];
+                continue;
+            }
+            let host: String = rest
+                .split([' ', '"', '\'', ';', '|', '&'].as_ref())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !host.is_empty() && !host.starts_with("http") {
+                return Some(host);
+            }
+            search = &search[after_verb..];
+        }
+    }
+    None
+}
+
+/// 内网后缀判定：命中 `internal_suffixes`（大小写不敏感）则不判外传。
+pub fn is_internal_host(host: &str, internal_suffixes: &[String]) -> bool {
+    let mut h = host.trim().to_lowercase();
+    // 端口剥离（仅 host:port 单冒号形态，IPv6 字面量不动）。
+    if h.matches(':').count() == 1 && !h.starts_with('[')
+        && let Some((bare, _)) = h.split_once(':')
+    {
+        h = bare.to_string();
+    }
+    let h = h.trim_matches(|c| c == '[' || c == ']').trim_end_matches('.').to_string();
+    if h.is_empty() {
+        return false;
+    }
+    if h == "localhost" || h.ends_with(".local") || h.ends_with(".internal") {
+        return true;
+    }
+    internal_suffixes
+        .iter()
+        .any(|s| !s.is_empty() && h.ends_with(&s.to_lowercase()))
+}
+
+/// 审计预检（廉价同步前缀匹配）：tool 名命中危险前缀或参数前缀出现危险命令起始
+/// 即返回 true（调用方暂停 flush，等待完整判定；未启用审计恒 false）。
+pub fn audit_precheck(enabled: bool, tool_name: &str, args_prefix: &str) -> bool {
+    if !enabled {
+        return false;
+    }
+    const DANGEROUS_PREFIXES: &[&str] = &[
+        "rm", "mkfs", "dd", "shutdown", "reboot", "poweroff", "chmod", "chown", "curl",
+        "wget", "nc", "ncat", "telnet", "ssh", "base64", "openssl", "bash", "sh",
+        "terminal", "execute_code",
+    ];
+    let tool_lower = tool_name.trim().to_lowercase();
+    if DANGEROUS_PREFIXES.contains(&tool_lower.as_str()) {
+        return true;
+    }
+    let stripped = args_prefix.trim_start().to_lowercase();
+    if DANGEROUS_PREFIXES.iter().any(|p| {
+        stripped == *p
+            || stripped.starts_with(&format!("{p} "))
+            || stripped.starts_with(&format!("{p}-"))
+    }) {
+        return true;
+    }
+    // JSON 包装：危险命令出现在值起始处（`"cmd":"rm` / `cmd=rm` / `:rm`）。
+    DANGEROUS_PREFIXES.iter().any(|p| {
+        stripped.contains(&format!("\"{p}"))
+            || stripped.contains(&format!(":{p}"))
+            || stripped.contains(&format!("={p}"))
+    })
+}
+
+/// 旧 `AUDIT_ENABLED` 兼容：`AUDIT_MODE` 未显式设置且 `AUDIT_ENABLED=1/true/yes`
+/// 时视为 `block`（对标 Python `_ensure_audit_init`）。
+pub fn audit_enabled_compat(env: &HashMap<String, String>) -> Option<AuditMode> {
+    if env.contains_key("AUDIT_MODE") {
+        return None;
+    }
+    match env.get("AUDIT_ENABLED").map(|v| v.trim().to_lowercase()) {
+        Some(v) if v == "1" || v == "true" || v == "yes" => Some(AuditMode::Block),
+        _ => None,
+    }
+}
+
+/// 顶层判定：deny 名单 → 危险模式（含策略追加）→ allow 名单 → 默认放行。
+/// allow 仅表示无危险内容时放行，危险内容对名单内工具同样拦截。
 pub fn is_dangerous(tool_name: &str, args: &str, policy: &AuditPolicy) -> Option<String> {
+    // deny 名单精确匹配优先。
+    if policy.deny.iter().any(|d| d == tool_name) {
+        return Some("deny 名单精确匹配".to_string());
+    }
     let env = HashMap::new();
     let canon = canonicalize_args(args, &env);
     let canon_lower = canon.to_lowercase();
@@ -573,6 +730,27 @@ pub fn is_dangerous(tool_name: &str, args: &str, policy: &AuditPolicy) -> Option
     {
         return Some("危险 shell: 网络拉取管道进解释器".to_string());
     }
+    // 2.5) 策略文件危险规则追加（含 network 外部 host 复核）。
+    let tname = tool_name.to_lowercase();
+    let joined_lower = format!("{tname} {canon}").to_lowercase();
+    for rule in &policy.extra_dangerous {
+        if rule.pattern.is_empty() {
+            continue;
+        }
+        let pat = rule.pattern.to_lowercase();
+        if joined_lower.contains(&pat) || canon_lower.contains(&pat) {
+            if rule.network
+                && let Some(host) = extract_host(args)
+                && is_internal_host(&host, &policy.internal_suffixes)
+            {
+                continue;
+            }
+            return Some(rule.reason.clone());
+        }
+    }
+    // 2.6) 内网豁免：参数目标 host 命中内网后缀时，“网络外传”类命中视为内网不拦截。
+    let internal_target =
+        extract_host(args).is_some_and(|h| is_internal_host(&h, &policy.internal_suffixes));
     let tool_lower = tool_name.to_lowercase();
     // 工具名本身即敏感写入口（如 edit/write 融合判定）。
     if matches!(
@@ -582,30 +760,75 @@ pub fn is_dangerous(tool_name: &str, args: &str, policy: &AuditPolicy) -> Option
     {
         return Some("敏感路径写入".to_string());
     }
+    // 链节审查：内网目标时“网络外传”命中跳过（其余危险照常拦截）。
+    let check_chain = |chain: Vec<String>| -> Option<String> {
+        for seg in chain {
+            if let Some(reason) = classify_segment(&seg, policy) {
+                if reason == "网络外传" && internal_target {
+                    continue;
+                }
+                return Some(reason);
+            }
+        }
+        None
+    };
     if matches!(
         tool_lower.as_str(),
         "exec" | "run" | "shell" | "bash" | "sh" | "run_shell"
     ) || tool_lower.is_empty()
     {
-        for seg in split_chain(&canon) {
-            if let Some(reason) = classify_segment(&seg, policy) {
-                return Some(reason);
-            }
+        if let Some(reason) = check_chain(split_chain(&canon)) {
+            return Some(reason);
         }
         return None;
     }
     // 未知工具：仍审查参数文本（宁可误报由审批兜底，不静默放行危险链）。
     let joined = format!("{tool_name} {canon}");
-    for seg in split_chain(&joined) {
-        if let Some(reason) = classify_segment(&seg, policy) {
-            return Some(reason);
-        }
+    if let Some(reason) = check_chain(split_chain(&joined)) {
+        return Some(reason);
+    }
+    // allow 名单：无危险内容时放行（危险已在上游拦截）。
+    if policy.allow.iter().any(|a| a == tool_name) {
+        return None;
     }
     None
 }
 
-/// 按审计模式给出最终 verdict。
+/// 按审计模式给出最终 verdict（签名兼容版：保持模式原语义，空白名单降级由
+/// [`evaluate_with_whitelist`] 显式承载；网关启动期须以后者或配置门禁保证
+/// `approve` 非空白名单，fail-closed 不变量由启动门禁持有）。
 pub fn evaluate(
+    mode: AuditMode,
+    tool_name: &str,
+    args: &str,
+    policy: &AuditPolicy,
+) -> AuditVerdict {
+    evaluate_inner(mode, tool_name, args, policy)
+}
+
+/// 按审计模式给出最终 verdict（含 MXID 白名单校验）：
+/// `approve` 模式须配非空白名单，否则降级为 `block`（对标 Python 防御性校验，
+/// 防“空白名单跳过校验致任何房间成员可审批”）。
+/// 网关接线人注意：allow 名单命中与默认放行的区分（`allow-list` vs 默认事件）
+/// 由网关侧审计日志调用点记录，本函数两者均返回 [`AuditVerdict::Allow`]。
+pub fn evaluate_with_whitelist(
+    mode: AuditMode,
+    tool_name: &str,
+    args: &str,
+    policy: &AuditPolicy,
+    whitelist: &[String],
+) -> AuditVerdict {
+    let mode = match mode {
+        AuditMode::Approve if whitelist.is_empty() => {
+            tracing::error!("AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST，降级为 block 模式");
+            AuditMode::Block
+        }
+        m => m,
+    };
+    evaluate_inner(mode, tool_name, args, policy)
+}
+
+fn evaluate_inner(
     mode: AuditMode,
     tool_name: &str,
     args: &str,
@@ -637,6 +860,21 @@ pub const AUDIT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const AUDIT_LOG_KEEP: usize = 5;
 /// 摘要截断上限（字符数，先脱敏后截断）。
 pub const AUDIT_SUMMARY_TRUNCATE_CHARS: usize = 4096;
+
+/// 强化脱敏包装：先跑强化层回调，异常时返回 `[REDACTED:unverified]` 零明文落盘
+/// （不透出原文，不回退明文；调用方须告警并按 fail-closed 处理主请求）。
+pub fn sanitize_hardened(
+    text: &str,
+    hardened: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> String {
+    match hardened(text) {
+        Ok(out) => sanitize_for_log(&out),
+        Err(e) => {
+            tracing::error!("PII 强化层异常，摘要置占位符: {e:#}");
+            "[REDACTED:unverified]".to_string()
+        }
+    }
+}
 
 /// 先脱敏后截断的摘要：剥 `\x00-\x1f`，掩盖密钥形态，零明文，UTF-8 安全截断。
 pub fn sanitize_for_log(text: &str) -> String {
@@ -1018,5 +1256,101 @@ mod tests {
         assert!(clean.chars().count() <= AUDIT_SUMMARY_TRUNCATE_CHARS);
         assert!(!clean.contains(&"a".repeat(100)));
         assert!(clean.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn allow名单放行deny名单优先() {
+        let mut p = policy();
+        p.allow = vec!["read_file".to_string()];
+        p.deny = vec!["evil_tool".to_string()];
+        assert_eq!(
+            evaluate(AuditMode::Block, "read_file", "cat notes", &p),
+            AuditVerdict::Allow
+        );
+        assert!(matches!(
+            evaluate(AuditMode::Block, "evil_tool", "echo hi", &p),
+            AuditVerdict::Block { .. }
+        ));
+        // deny 优先于 allow。
+        p.allow.push("evil_tool".to_string());
+        assert!(matches!(
+            evaluate(AuditMode::Block, "evil_tool", "echo hi", &p),
+            AuditVerdict::Block { reason } if reason.contains("deny")
+        ));
+    }
+
+    #[test]
+    fn 内网后缀不判外传() {
+        let mut p = policy();
+        p.internal_suffixes = vec![".corp".to_string()];
+        assert!(is_internal_host("svc.corp", &p.internal_suffixes));
+        assert!(is_internal_host("localhost", &p.internal_suffixes));
+        assert!(!is_internal_host("evil.com", &p.internal_suffixes));
+        assert_eq!(
+            extract_host("curl http://svc.corp:8080/x").as_deref(),
+            Some("svc.corp:8080")
+        );
+        assert_eq!(
+            extract_host("curl 8.8.8.8").as_deref(),
+            Some("8.8.8.8")
+        );
+        // 内网目标：外传噪声被豁免；外部目标照常走规则。
+        assert_eq!(
+            is_dangerous("curl", "curl http://svc.corp/x --data hi", &p),
+            None
+        );
+    }
+
+    #[test]
+    fn 预检命中暂停未启用直通() {
+        assert!(!audit_precheck(false, "bash", "rm -rf /"));
+        assert!(audit_precheck(true, "bash", "echo hi"));
+        assert!(audit_precheck(true, "exec", "rm -rf /"));
+        assert!(audit_precheck(true, "exec", "{\"cmd\":\"rm -rf /\"}"));
+        assert!(!audit_precheck(true, "exec", "echo hello world"));
+    }
+
+    #[test]
+    fn 空白名单降级block与旧变量兼容() {
+        let p = policy();
+        assert!(matches!(
+            evaluate_with_whitelist(AuditMode::Approve, "exec", "rm -rf /", &p, &[]),
+            AuditVerdict::Block { .. }
+        ));
+        let wl = vec!["@admin:example.com".to_string()];
+        assert!(matches!(
+            evaluate_with_whitelist(AuditMode::Approve, "exec", "rm -rf /", &p, &wl),
+            AuditVerdict::NeedApproval { .. }
+        ));
+        let env: HashMap<String, String> =
+            HashMap::from([("AUDIT_ENABLED".to_string(), "1".to_string())]);
+        assert_eq!(audit_enabled_compat(&env), Some(AuditMode::Block));
+        let env2: HashMap<String, String> = HashMap::from([
+            ("AUDIT_MODE".to_string(), "off".to_string()),
+            ("AUDIT_ENABLED".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(audit_enabled_compat(&env2), None);
+    }
+
+    #[test]
+    fn 策略全形态兼容加载() {
+        let text = "allow:\n  - read_file\ndeny:\n  - evil\ninternal_suffixes:\n  - .corp\ndangerous:\n  - rm -rf / => 危险删除\n";
+        let p = AuditPolicy::parse_minimal_yaml(text).unwrap();
+        assert_eq!(p.allow, vec!["read_file"]);
+        assert_eq!(p.deny, vec!["evil"]);
+        assert_eq!(p.internal_suffixes, vec![".corp"]);
+        assert_eq!(p.extra_dangerous.len(), 1);
+        assert_eq!(p.extra_dangerous[0].reason, "危险删除");
+        assert!(is_dangerous("exec", "rm -rf /tmp", &p).is_some());
+    }
+
+    #[test]
+    fn 强化层异常零明文占位符() {
+        let out = sanitize_hardened("password=hunter2", |t| Ok(t.to_string()));
+        assert!(!out.contains("hunter2"), "{out}");
+        let bad = sanitize_hardened("password=hunter2", |_| {
+            Err(anyhow::anyhow!("强化层崩溃"))
+        });
+        assert_eq!(bad, "[REDACTED:unverified]");
     }
 }
