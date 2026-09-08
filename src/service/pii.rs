@@ -553,6 +553,45 @@ fn overlaps_any(spans: &[(usize, usize)], s: usize, e: usize) -> bool {
         .any(|(a, b)| *a <= s && s < *b || *a < e && e <= *b || s <= *a && *b <= e)
 }
 
+/// 超长输入分块：`char` 边界安全切分，`overlap` 字节交叠防跨界切断。
+/// 短输入返回单块 `(0, 全文)`；空输入返回空。
+fn split_chunks(text: &str, limit: usize, overlap: usize) -> Vec<(usize, String)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if text.len() <= limit {
+        return vec![(0, text.to_string())];
+    }
+    let step = limit.saturating_sub(overlap).max(1);
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off < text.len() {
+        let mut end = (off + limit).min(text.len());
+        while end > off && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= off {
+            end = off + 1;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        out.push((off, text[off..end].to_string()));
+        if end == text.len() {
+            break;
+        }
+        let mut next = off.saturating_add(step);
+        while next < text.len() && !text.is_char_boundary(next) {
+            next += 1;
+        }
+        if next <= off || next >= text.len() {
+            break;
+        }
+        off = next;
+    }
+    out
+}
+
 /// 文本中凭据值的位置区间（位置化优先：落入则 PII 跳过）。
 pub fn credential_spans(
     text: &str,
@@ -612,6 +651,7 @@ fn classify_hit<'t>(caps: &fancy_regex::Captures<'t, str>) -> Option<(&'static s
 
 /// 内置联合正则一次扫描（同步版，供 json-walk 叶回调）。
 /// 返回位置化命中；凭据区间/保护区间落入跳过（凭据优先）。
+/// 超长输入按 1MB 分块（交叠 256，`char` 边界安全），边界重复命中去重。
 pub fn scan_builtin_sync(text: &str, credential_p2t: &HashMap<String, String>) -> Vec<PiiHit> {
     if text.is_empty() || !coarse_hit(text) {
         return Vec::new();
@@ -619,7 +659,28 @@ pub fn scan_builtin_sync(text: &str, credential_p2t: &HashMap<String, String>) -
     let protected = protected_spans(text);
     let cred = credential_spans(text, credential_p2t);
     let mut out = Vec::new();
-    for caps in combined_re().captures_iter(text).flatten() {
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for (base, chunk) in split_chunks(text, SCAN_INPUT_LIMIT, 256) {
+        for (kind, value, s, e) in builtin_chunk_sync(&chunk) {
+            let (abs_s, abs_e) = (base + s, base + e);
+            if !seen.insert((abs_s, abs_e)) {
+                continue;
+            }
+            if overlaps_any(&protected, abs_s, abs_e) || overlaps_any(&cred, abs_s, abs_e) {
+                continue;
+            }
+            if credential_p2t.contains_key(&value) {
+                continue;
+            }
+            out.push((kind, value, abs_s, abs_e));
+        }
+    }
+    out
+}
+
+fn builtin_chunk_sync(chunk: &str) -> Vec<(String, String, usize, usize)> {
+    let mut out = Vec::new();
+    for caps in combined_re().captures_iter(chunk).flatten() {
         let Some((kind, raw)) = classify_hit(&caps) else {
             continue;
         };
@@ -647,8 +708,8 @@ pub fn scan_builtin_sync(text: &str, credential_p2t: &HashMap<String, String>) -
             }
             "bank_card" => {
                 let cs = start.saturating_sub(64);
-                let ce = (end + 16).min(text.len());
-                if url_query_param_re().is_match(&text[cs..ce]) {
+                let ce = (end + 16).min(chunk.len());
+                if url_query_param_re().is_match(&chunk[cs..ce]) {
                     continue;
                 }
                 if !luhn_ok(&value) {
@@ -661,19 +722,13 @@ pub fn scan_builtin_sync(text: &str, credential_p2t: &HashMap<String, String>) -
         if matches!(kind, "ipv4" | "ipv6") && is_reserved_ip(&value, kind) {
             continue;
         }
-        if overlaps_any(&protected, start, end) || overlaps_any(&cred, start, end) {
-            continue;
-        }
-        // 凭据优先（值级）：命中值本身是凭据则跳过。
-        if credential_p2t.contains_key(&value) {
-            continue;
-        }
         out.push((kind.to_string(), value, start, end));
     }
     out
 }
 
 /// 内置联合正则一次扫描（异步版，走全局 moka 校验 LRU）。
+/// 超长输入按 1MB 分块（交叠 256，`char` 边界安全），边界重复命中去重。
 pub async fn scan_builtin(text: &str, credential_p2t: &HashMap<String, String>) -> Vec<PiiHit> {
     if text.is_empty() || !coarse_hit(text) {
         return Vec::new();
@@ -681,55 +736,62 @@ pub async fn scan_builtin(text: &str, credential_p2t: &HashMap<String, String>) 
     let protected = protected_spans(text);
     let cred = credential_spans(text, credential_p2t);
     let mut out = Vec::new();
-    for caps in combined_re().captures_iter(text).flatten() {
-        let Some((kind, raw)) = classify_hit(&caps) else {
-            continue;
-        };
-        let mut value = raw.to_string();
-        let mut end = caps.get(0).map(|m| m.end()).unwrap_or(0);
-        let start = end.saturating_sub(raw.len());
-        match kind {
-            "ipv6" => {
-                let core = strip_ip_trailing(raw);
-                if !core.is_empty() && is_valid_ipv6(core) {
-                    value = core.to_string();
-                    end = start + value.len();
-                } else if !is_valid_ipv6(raw) {
-                    continue;
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for (base, chunk) in split_chunks(text, SCAN_INPUT_LIMIT, 256) {
+        for caps in combined_re().captures_iter(chunk.as_str()).flatten() {
+            let Some((kind, raw)) = classify_hit(&caps) else {
+                continue;
+            };
+            let mut value = raw.to_string();
+            let mut end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+            let start = end.saturating_sub(raw.len());
+            match kind {
+                "ipv6" => {
+                    let core = strip_ip_trailing(raw);
+                    if !core.is_empty() && is_valid_ipv6(core) {
+                        value = core.to_string();
+                        end = start + value.len();
+                    } else if !is_valid_ipv6(raw) {
+                        continue;
+                    }
                 }
+                "ipv4" => {
+                    let core = strip_ip_trailing(raw);
+                    if !core.is_empty() && is_valid_ipv4(core) {
+                        value = core.to_string();
+                        end = start + value.len();
+                    } else if !is_valid_ipv4(raw) {
+                        continue;
+                    }
+                }
+                "bank_card" => {
+                    let cs = start.saturating_sub(64);
+                    let ce = (end + 16).min(chunk.len());
+                    if url_query_param_re().is_match(&chunk[cs..ce]) {
+                        continue;
+                    }
+                    if !cached_luhn(&value).await {
+                        continue;
+                    }
+                }
+                "id_card" if !cached_id_ok(&value).await => continue,
+                _ => {}
             }
-            "ipv4" => {
-                let core = strip_ip_trailing(raw);
-                if !core.is_empty() && is_valid_ipv4(core) {
-                    value = core.to_string();
-                    end = start + value.len();
-                } else if !is_valid_ipv4(raw) {
-                    continue;
-                }
+            if matches!(kind, "ipv4" | "ipv6") && cached_reserved(&value, kind).await {
+                continue;
             }
-            "bank_card" => {
-                let cs = start.saturating_sub(64);
-                let ce = (end + 16).min(text.len());
-                if url_query_param_re().is_match(&text[cs..ce]) {
-                    continue;
-                }
-                if !cached_luhn(&value).await {
-                    continue;
-                }
+            let (abs_s, abs_e) = (base + start, base + end);
+            if !seen.insert((abs_s, abs_e)) {
+                continue;
             }
-            "id_card" if !cached_id_ok(&value).await => continue,
-            _ => {}
+            if overlaps_any(&protected, abs_s, abs_e) || overlaps_any(&cred, abs_s, abs_e) {
+                continue;
+            }
+            if credential_p2t.contains_key(&value) {
+                continue;
+            }
+            out.push((kind.to_string(), value, abs_s, abs_e));
         }
-        if matches!(kind, "ipv4" | "ipv6") && cached_reserved(&value, kind).await {
-            continue;
-        }
-        if overlaps_any(&protected, start, end) || overlaps_any(&cred, start, end) {
-            continue;
-        }
-        if credential_p2t.contains_key(&value) {
-            continue;
-        }
-        out.push((kind.to_string(), value, start, end));
     }
     out
 }
@@ -871,8 +933,32 @@ impl PiiDetector {
         false
     }
 
+    /// 命名组提取：收集 pattern 中全部 `(?P<name>...)` 的 name（转义括号跳过）。
+    fn named_groups(pattern: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'('
+                && pattern[i..].starts_with("(?P<")
+                && let Some(end) = pattern[i + 4..].find('>')
+            {
+                out.push(pattern[i + 4..i + 4 + end].to_string());
+                i += 4 + end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// 加载自定义正则 `[(name, pattern)]`，返回成功加载的条数。
-    /// 与内置重名 / 重复 / 编译失败 / 含 `\b` / 嵌套命名组 / 自检异常一律拒绝加载。
+    /// 与内置重名 / 重复 / 编译失败 / 含 `\b` / 命名组与外层 name 失配 /
+    /// 嵌套命名组 / 自检异常一律拒绝加载。
     pub fn load_custom_patterns(&self, patterns: &[(String, String)]) -> usize {
         if patterns.is_empty() {
             return 0;
@@ -893,6 +979,10 @@ impl PiiDetector {
             }
             if Self::has_word_boundary(pattern) {
                 tracing::warn!("自定义正则 {name} 含 \\b 词边界，中文环境失效，拒绝加载");
+                continue;
+            }
+            if Self::named_groups(pattern).iter().any(|g| g != name) {
+                tracing::warn!("自定义正则 {name} 内命名组与外层 name 失配，拒绝加载");
                 continue;
             }
             let compiled = match fancy_regex::Regex::new(pattern) {
@@ -1032,24 +1122,7 @@ impl PiiDetector {
         let disabled: HashSet<String> = self.disabled.lock().map(|g| g.clone()).unwrap_or_default();
         let protected = protected_spans(text);
         let cred = credential_spans(text, credential_p2t);
-        // 超长输入按 1MB 分块（overlap 256 防跨界切断）。
-        let chunks: Vec<(usize, String)> = if text.len() > SCAN_INPUT_LIMIT {
-            let overlap = 256usize;
-            let step = SCAN_INPUT_LIMIT.saturating_sub(overlap).max(1);
-            let mut v = Vec::new();
-            let mut off = 0;
-            while off < text.len() {
-                let end = (off + SCAN_INPUT_LIMIT).min(text.len());
-                v.push((off, text[off..end].to_string()));
-                if end == text.len() {
-                    break;
-                }
-                off += step;
-            }
-            v
-        } else {
-            vec![(0, text.to_string())]
-        };
+        let chunks: Vec<(usize, String)> = split_chunks(text, SCAN_INPUT_LIMIT, 256);
         let mut hits = Vec::new();
         let mut seen: HashSet<(usize, usize)> = HashSet::new();
         let mut timed_out: Vec<String> = Vec::new();
@@ -1428,10 +1501,391 @@ mod tests {
 
     #[test]
     fn 凭据优先跳过() {
-        // 某值同时命中凭据与 PII：PII 扫描必须跳过该区间。
         let mut cred = HashMap::new();
         cred.insert("13812345678".to_string(), "__VG_CRED_000001__".to_string());
         let hits = scan_builtin_sync("电话 13812345678", &cred);
         assert!(hits.is_empty(), "凭据值 PII 必须跳过: {hits:?}");
+    }
+
+    #[test]
+    fn 命名组与外层同名约束() {
+        let d = detector();
+        let n = d.load_custom_patterns(&[(
+            "emp_no".to_string(),
+            "(?P<other>(?<![\\d])AB\\d{6}(?![\\d]))".to_string(),
+        )]);
+        assert_eq!(n, 0, "内命名组失配必须拒绝");
+        assert!(d.custom_names_snapshot().is_empty());
+        let n = d.load_custom_patterns(&[(
+            "emp_no".to_string(),
+            "(?P<emp_no>(?<![\\d])AB\\d{6}(?![\\d]))".to_string(),
+        )]);
+        assert_eq!(n, 1, "同名必须放行");
+        let n = d.load_custom_patterns(&[("plain".to_string(), "ZZ-\\d{6}".to_string())]);
+        assert_eq!(n, 1, "无命名组必须放行");
+    }
+
+    #[test]
+    fn 嵌套命名组与跨文件去重拒绝() {
+        let d = detector();
+        let n = d.load_custom_patterns(&[(
+            "nested".to_string(),
+            "(?P<nested>a(?P<inner>b)c)".to_string(),
+        )]);
+        assert_eq!(n, 0, "嵌套命名组必须拒绝");
+        let n = d.load_custom_patterns(&[("dup".to_string(), "DUP-\\d+".to_string())]);
+        assert_eq!(n, 1);
+        let n = d.load_custom_patterns(&[("dup".to_string(), "DUP-\\d+".to_string())]);
+        assert_eq!(n, 0, "跨文件重名必须去重拒绝");
+        assert_eq!(
+            d.custom_names_snapshot()
+                .iter()
+                .filter(|n| *n == "dup")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn 自定义重叠占位符跳过与停用跳过() {
+        let d = detector();
+        d.load_custom_patterns(&[("tag".to_string(), "TAG-\\d+".to_string())]);
+        let hits = d
+            .scan_custom("已有 __PII_1_ab12cd34__ 与 TAG-99", &empty_cred())
+            .await;
+        assert!(hits.iter().any(|h| h.1 == "TAG-99"), "{hits:?}");
+        let hits = d
+            .scan_custom("data:image/png;base64,TAG-99", &empty_cred())
+            .await;
+        assert!(
+            hits.is_empty(),
+            "与 data URL 保护区间重叠必须跳过: {hits:?}"
+        );
+        d.account_rule("tag", true);
+        d.account_rule("tag", true);
+        d.account_rule("tag", true);
+        assert!(d.disabled_snapshot().contains(&"tag".to_string()));
+        let hits = d.scan_custom("TAG-77 独立出现", &empty_cred()).await;
+        assert!(
+            hits.iter().all(|h| h.0 != "tag"),
+            "停用规则必须跳过: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 超长输入分块不丢命中() {
+        let d = detector();
+        d.load_custom_patterns(&[("tail".to_string(), "TAIL-\\d{6}".to_string())]);
+        let mut big = "中".repeat(600_000);
+        big.push_str("TAIL-123456");
+        big.push_str(&"文".repeat(600_000));
+        assert!(big.len() > SCAN_INPUT_LIMIT);
+        let hits = d.scan_custom(&big, &empty_cred()).await;
+        assert!(
+            hits.iter().any(|h| h.1 == "TAIL-123456"),
+            "分块边界命中不得丢失"
+        );
+        let mut builtin_big = "前言 ".repeat(300_000);
+        builtin_big.push_str("联系 13812345678 处理");
+        let hits = scan_builtin_sync(&builtin_big, &empty_cred());
+        assert!(hits.iter().any(|h| h.0 == "phone"), "内置分块命中不得丢失");
+    }
+
+    #[tokio::test]
+    async fn 自定义cjk紧贴命中() {
+        let d = detector();
+        d.load_custom_patterns(&[(
+            "工号".to_string(),
+            "(?P<工号>(?<![\\d])工号\\d{6}(?![\\d]))".to_string(),
+        )]);
+        let hits = d.scan_custom("联系工号123456处理", &empty_cred()).await;
+        assert!(
+            hits.iter().any(|h| h.1 == "工号123456"),
+            "CJK 紧贴必须命中: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn ipv6_time_16项回归时间戳非ipv6且无缩写须8组() {
+        // 01-03: 典型 HH:MM:SS 时间戳恒非法（RFC4291 无 `::` 须 8 组）。
+        assert!(!is_valid_ipv6("12:34:56"), "时分秒不得判 IPv6");
+        assert!(!is_valid_ipv6("23:59:59"), "时分秒不得判 IPv6");
+        assert!(!is_valid_ipv6("00:00:00"), "全零时间戳不得判 IPv6");
+        // 04: 7 组无缩写非法。
+        assert!(!is_valid_ipv6("1:2:3:4:5:6:7"), "无::须足 8 组");
+        // 05: 9 组非法。
+        assert!(!is_valid_ipv6("1:2:3:4:5:6:7:8:9"), "超 8 组非法");
+        // 06: 8 组无缩写合法（公网可路由，后续扫描应命中）。
+        assert!(is_valid_ipv6("1:2:3:4:5:6:7:8"));
+        assert!(!is_reserved_ip("1:2:3:4:5:6:7:8", "ipv6"));
+        // 07: 全写公网合法。
+        assert!(is_valid_ipv6("2001:4860:4860:0:0:0:0:8888"));
+        // 08: 压缩形态合法。
+        assert!(is_valid_ipv6("2001:4860:4860::8888"));
+        // 09-11: 回环/链路本地/文档合法但保留豁免。
+        assert!(is_valid_ipv6("::1"));
+        assert!(is_reserved_ip("::1", "ipv6"));
+        assert!(is_valid_ipv6("fe80::1"));
+        assert!(is_reserved_ip("fe80::1", "ipv6"));
+        assert!(is_valid_ipv6("2001:db8::1"));
+        assert!(is_reserved_ip("2001:db8::1", "ipv6"));
+        // 12: 非十六进制非法。
+        assert!(!is_valid_ipv6("gggg::1"), "非法十六进制不得判 IPv6");
+        // 13: 带毫秒时间戳非法。
+        assert!(!is_valid_ipv6("12:34:56.789"), "毫秒时间戳不得判 IPv6");
+        // 14: ISO 日期时间中的时间段扫描不得出 ipv6。
+        let hits = scan_builtin_sync("2024-01-01T12:34:56 上线", &empty_cred());
+        assert!(
+            hits.iter().all(|h| h.0 != "ipv6"),
+            "日期时间不得检出 ipv6: {hits:?}"
+        );
+        // 15: 纯时间句子扫描不得出 ipv6。
+        let hits = scan_builtin_sync("会议 12:34:56 开始", &empty_cred());
+        assert!(
+            hits.iter().all(|h| h.0 != "ipv6"),
+            "时间戳不得检出 ipv6: {hits:?}"
+        );
+        // 16: 全写公网扫描命中且值完整（大小写均可）。
+        let hits = scan_builtin_sync("地址 1:2:3:4:5:6:7:8 结束", &empty_cred());
+        assert!(
+            hits.iter()
+                .any(|h| h.0 == "ipv6" && h.1 == "1:2:3:4:5:6:7:8"),
+            "全写公网须命中: {hits:?}"
+        );
+        let hits = scan_builtin_sync(
+            "地址 ABCD:EF01:2345:6789:ABCD:EF01:2345:6789 结束",
+            &empty_cred(),
+        );
+        assert!(
+            hits.iter().any(|h| h.0 == "ipv6"),
+            "大写全写须命中: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn perf_5000字典扫描耗时锚点() {
+        let d = detector();
+        let entries: Vec<(String, String)> = (0..5000)
+            .map(|i| (format!("敏感词{i:05}号"), "name".to_string()))
+            .collect();
+        let start = std::time::Instant::now();
+        d.load_dict(&entries);
+        let text = "公告 敏感词01234号 与 敏感词04999号 上线";
+        let hits = d.scan_dict_sync(text, &empty_cred());
+        let elapsed = start.elapsed();
+        assert!(
+            hits.iter().any(|h| h.1 == "敏感词01234号"),
+            "5000 字典首段须命中: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.1 == "敏感词04999号"),
+            "5000 字典尾段须命中: {hits:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "5000 字典加载+扫描须 <10s，实测 {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn perf_增量扫描耗时锚点() {
+        let d = detector();
+        let base = "联系 13812345678 地址 2001:4860:4860::8888 结束 ".repeat(20);
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        for round in 1..=10 {
+            let text = base.repeat(round);
+            let hits = d.scan_spans_sync(&text, &empty_cred());
+            total += hits.len();
+            assert!(
+                hits.iter().any(|h| h.0 == "phone"),
+                "第 {round} 轮增量须命中 phone"
+            );
+        }
+        let elapsed = start.elapsed();
+        assert!(total >= 10, "增量累计命中须递增: {total}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "10 轮增量扫描须 <10s，实测 {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn 订单URL参数不判卡() {
+        // Luhn 合法卡号作订单号时：URL 查询参数上下文抑制 bank_card。
+        let card = "4532015112830366";
+        for url in [
+            format!("https://pay.example.com/order?id={card} 支付"),
+            format!("https://pay.example.com/order?order={card} 支付"),
+            format!("https://pay.example.com/q?sn={card}&page=2 查询"),
+            format!("https://pay.example.com/q?amount={card} 结算"),
+        ] {
+            let hits = scan_builtin_sync(&url, &empty_cred());
+            assert!(
+                hits.iter().all(|h| h.0 != "bank_card"),
+                "URL 参数订单号不得判卡: {url} -> {hits:?}"
+            );
+        }
+        // 阳性对照：同一卡号裸露出现必须命中（守卫是上下文抑制，非漏报）。
+        let hits = scan_builtin_sync(&format!("卡号 {card} 付款"), &empty_cred());
+        assert!(
+            hits.iter().any(|h| h.0 == "bank_card" && h.1 == card),
+            "裸卡号须命中: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn base64与超长连续数字零误报() {
+        // base64 data URL 内嵌数字串：保护区间整体跳过。
+        let blob = format!("data:image/png;base64,MTM4{}AAAA", "13812345678");
+        let hits = scan_builtin_sync(&format!("图片 {blob} 结束"), &empty_cred());
+        assert!(
+            hits.iter().all(|h| h.0 != "phone"),
+            "data URL 内数字不得检出 phone: {hits:?}"
+        );
+        // 阳性对照：同一号码裸露出现必须命中。
+        let hits = scan_builtin_sync("联系 13812345678 处理", &empty_cred());
+        assert!(hits.iter().any(|h| h.0 == "phone"), "{hits:?}");
+        // 超长连续数字（22 位）：超出银行卡/身份证/手机长度上限且边界守卫齐备。
+        let long = "1381234567813812345678";
+        assert_eq!(long.len(), 22);
+        let hits = scan_builtin_sync(&format!("单号 {long} 结束"), &empty_cred());
+        assert!(
+            hits.iter()
+                .all(|h| h.0 != "bank_card" && h.0 != "id_card" && h.0 != "phone"),
+            "22 位连续数字零误报: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn 句末标点剥离后仍命中() {
+        // IPv4：ASCII 句末标点剥离后公网判定不变。
+        for text in [
+            "访问 8.8.8.8, 继续",
+            "访问 8.8.8.8; 继续",
+            "访问 (8.8.8.8) 继续",
+            "访问 [8.8.8.8] 继续",
+        ] {
+            let hits = scan_builtin_sync(text, &empty_cred());
+            assert!(
+                hits.iter().any(|h| h.0 == "ipv4" && h.1 == "8.8.8.8"),
+                "句末标点须剥离命中: {text} -> {hits:?}"
+            );
+        }
+        // IPv6：句末逗点/英文句号剥离。
+        let hits = scan_builtin_sync("地址 2001:4860:4860::8888, 可达", &empty_cred());
+        assert!(
+            hits.iter().any(|h| h.0 == "ipv6"),
+            "句末逗点 IPv6 须命中: {hits:?}"
+        );
+        // 手机号：中文句末标点不属数字边界，仍命中且值干净。
+        let hits = scan_builtin_sync("联系13812345678。谢谢", &empty_cred());
+        assert!(
+            hits.iter().any(|h| h.0 == "phone" && h.1 == "13812345678"),
+            "中文句号后手机须命中: {hits:?}"
+        );
+        // 邮箱：中文句号不属 TLD 边界，命中且值干净（英文句号归属域名，
+        // 口径与现有正则一致，此处只锁定中文句号形态）。
+        let hits = scan_builtin_sync("邮箱 test.user@example.com。结束", &empty_cred());
+        assert!(
+            hits.iter()
+                .any(|h| h.0 == "email" && h.1 == "test.user@example.com"),
+            "句末句号邮箱须命中且值干净: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn 冠码86与新密钥及62卡形态() {
+        // +86 冠码三形态均命中 phone。
+        for text in [
+            "联系 +86 13812345678 处理",
+            "联系 +86-13812345678 处理",
+            "联系 8613812345678 处理",
+        ] {
+            let hits = scan_builtin_sync(text, &empty_cred());
+            assert!(
+                kinds(&hits).contains(&"phone"),
+                "+86 冠码须命中: {text} -> {hits:?}"
+            );
+        }
+        // sk-proj-/sk-ant- 长前缀与 ghp_ 形态均命中 api_key。
+        for key in [
+            "sk-proj-abcdefgh12345678",
+            "sk-ant-abcdefgh12345678",
+            "ghp_abcdefgh12345678",
+        ] {
+            let hits = scan_builtin_sync(&format!("密钥 {key} 结束"), &empty_cred());
+            assert!(
+                hits.iter().any(|h| h.0 == "api_key" && h.1 == key),
+                "新密钥形态须命中: {key} -> {hits:?}"
+            );
+        }
+        // 62 开头 13 位 Luhn 合法卡命中；末位改动即非法不命中。
+        let hits = scan_builtin_sync("卡号 6200000000000 付款", &empty_cred());
+        assert!(
+            hits.iter()
+                .any(|h| h.0 == "bank_card" && h.1 == "6200000000000"),
+            "13 位 62 卡须命中: {hits:?}"
+        );
+        let hits = scan_builtin_sync("卡号 6200000000001 付款", &empty_cred());
+        assert!(
+            hits.iter().all(|h| h.0 != "bank_card"),
+            "Luhn 非法 62 卡不得命中: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn 宽松形态审计分类且未知透传() {
+        let scope = PiiScope::new();
+        // 完整形态但未注册：归类 unregistered。
+        assert_eq!(scope.count_malformed("__PII_9_ab12cd34__"), "unregistered");
+        // 残缺/非法形态：归类 malformed。
+        assert_eq!(scope.count_malformed("__PII_x__"), "malformed");
+        assert_eq!(scope.count_malformed("__PII_1_ab"), "malformed");
+        // 未知完整 token 还原时原样透传（不伪造明文）。
+        let out = scope.restore("回拨 __PII_9_ab12cd34__ 结束");
+        assert_eq!(
+            out, "回拨 __PII_9_ab12cd34__ 结束",
+            "未知 token 须透传: {out}"
+        );
+        // 已注册 token 仍精确还原，不受未知形态干扰。
+        let tok = scope.register("13812345678", false).unwrap();
+        let out = scope.restore(&format!("回拨 {tok} 与 __PII_9_ab12cd34__"));
+        assert!(out.contains("13812345678"), "{out}");
+        assert!(out.contains("__PII_9_ab12cd34__"), "{out}");
+    }
+
+    #[test]
+    fn 请求表容量分表与LRU淘汰() {
+        // 分表声明：请求/响应单表 1000，与凭据 5000 不在同一容量口径。
+        assert_eq!(PII_MAX_ENTRIES, 1000);
+        assert_eq!(crate::service::credential_vault::MAX_TOKEN_ENTRIES, 5000);
+        assert_ne!(
+            PII_MAX_ENTRIES,
+            crate::service::credential_vault::MAX_TOKEN_ENTRIES
+        );
+        let scope = PiiScope::new();
+        let first = scope.register("13812340000", false).unwrap();
+        let mut last_tok = String::new();
+        for i in 1..=(PII_MAX_ENTRIES as u32 + 4) {
+            last_tok = scope.register(&format!("139{:08}", i), false).unwrap();
+        }
+        // 最久未用被淘汰，新值驻留；淘汰腾出的序号被复用（空洞跳过）。
+        assert!(
+            !scope.contains_request_token(&first),
+            "最久条目须被 LRU 淘汰"
+        );
+        let newest = format!("139{:08}", PII_MAX_ENTRIES as u32 + 4);
+        assert!(scope.contains_request_token(&last_tok));
+        assert_eq!(
+            scope.register(&newest, false).unwrap(),
+            last_tok,
+            "最新条目须驻留复用同一 token"
+        );
+        // 响应表独立：响应侧注册不进请求还原表（分表隔离）。
+        let rt = scope.register("新增响应值-001", true).unwrap();
+        assert!(!scope.contains_request_token(&rt));
+        let restored = scope.restore(&format!("回 {rt}"));
+        assert!(restored.contains(&rt), "响应 token 原样保留: {restored}");
     }
 }

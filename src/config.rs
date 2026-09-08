@@ -338,12 +338,31 @@ impl Config {
         let pii_response_side = parse_bool_on(&get, "PII_RESPONSE_SIDE");
         let pii_fuzzy_restore = parse_bool_off(&get, "PII_FUZZY_RESTORE");
         let pii_detection_hardening = parse_bool_off(&get, "PII_DETECTION_HARDENING");
-        let pii_custom_rules_file =
-            load_custom_file(&get, "PII_CUSTOM_RULES_FILE", "PII_CUSTOM_RULES")?;
-        let pii_custom_patterns_file =
-            load_custom_file(&get, "PII_CUSTOM_PATTERNS_FILE", "PII_CUSTOM_PATTERNS")?;
-        let pii_custom_dict_file =
-            load_custom_file(&get, "PII_CUSTOM_DICT_FILE", "PII_CUSTOM_DICT")?;
+        let pii_custom_rules_file = load_custom_file(
+            &get,
+            &[
+                "PII_CUSTOM_RULES_FILE",
+                "PII_RULES_FILE",
+                "PII_CUSTOM_RULES",
+            ],
+        )?;
+        let pii_custom_patterns_file = load_custom_file(
+            &get,
+            &[
+                "PII_CUSTOM_PATTERNS_FILE",
+                "PII_CUSTOM_PATTERN_FILE",
+                "PII_CUSTOM_PATTERNS",
+            ],
+        )?;
+        let pii_custom_dict_file = load_custom_file(
+            &get,
+            &[
+                "PII_CUSTOM_DICT_FILE",
+                "PII_SENSITIVE_DICT_FILE",
+                "PII_SENSITIVE_NAMES_FILE",
+                "PII_CUSTOM_DICT",
+            ],
+        )?;
         let pii_value_sample_enabled = parse_bool_off(&get, "PII_VALUE_SAMPLE_ENABLED");
         let pii_value_sample_persist = parse_bool_on(&get, "PII_VALUE_SAMPLE_PERSIST");
         let pii_value_sample_hmac_key = get("PII_VALUE_SAMPLE_HMAC_KEY").filter(|v| !v.is_empty());
@@ -452,20 +471,30 @@ fn parse_bool_off(get: &dyn Fn(&str) -> Option<String>, var: &str) -> bool {
     }
 }
 
-/// 自定义 PII 文件 fail-closed 加载：`file_var` 优先、`short_var` 兼容，两者皆空为未配置。
-/// 已配置但缺文件/不可读/JSON 解析失败/形态非法一律拒绝启动，报错指明实际命中的变量名。
+/// 自定义 PII 文件 fail-closed 加载：`vars` 按优先级依次命中（主文件变量优先，
+/// 别名文件变量次之，短变量最后），三槽（rules/patterns/dict）相互叠加、互不排斥；
+/// 首个非空命中即为生效路径。已配置但缺文件/不可读/解析失败/形态非法一律拒绝启动，
+/// 报错指明实际命中的变量名；空文件（零字节/仅空白）仅 warn 不拒启动（零命中语义）。
+/// 格式：JSON 优先；`.yaml`/`.yml` 后缀或类 YAML 内容走极简 YAML 子集；
+/// `.txt` 后缀或字典类纯名单内容走 TXT 名单（每行一名，`#` 注释忽略）。
 fn load_custom_file(
     get: &dyn Fn(&str) -> Option<String>,
-    file_var: &str,
-    short_var: &str,
+    vars: &[&str],
 ) -> Result<Option<PathBuf>> {
-    let (var, raw) = match get(file_var).filter(|v| !v.is_empty()) {
-        Some(v) => (file_var, v),
-        None => match get(short_var).filter(|v| !v.is_empty()) {
-            Some(v) => (short_var, v),
-            None => return Ok(None),
-        },
-    };
+    let (var, raw) = vars
+        .iter()
+        .filter_map(|v| get(v).filter(|s| !s.is_empty()).map(|s| (*v, s)))
+        .next()
+        .map_or(
+            (
+                vars.first().copied().unwrap_or("PII_CUSTOM_RULES_FILE"),
+                String::new(),
+            ),
+            |(v, s)| (v, s),
+        );
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let path = PathBuf::from(&raw);
     if !path.is_file() {
         return Err(config_error(
@@ -479,14 +508,211 @@ fn load_custom_file(
             &format!("{var} 文件读取失败 {}: {e:?}，拒绝启动", path.display()),
         )
     })?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        config_error(
-            var,
-            &format!("{var} 文件 JSON 解析失败 {}: {e}，拒绝启动", path.display()),
-        )
-    })?;
+    if text.trim().is_empty() {
+        tracing::warn!(
+            "{var} 文件 {} 为空，仅告警不拒启动（零命中语义）",
+            path.display()
+        );
+        return Ok(Some(path));
+    }
+    let value = parse_custom_text(var, &path, &text)?;
+    // TXT 空名单（全注释/空行）同样仅 warn。
+    if value.as_array().is_some_and(|a| a.is_empty())
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+    {
+        tracing::warn!(
+            "{var} 文件 {} 名单为空，仅告警不拒启动（零命中语义）",
+            path.display()
+        );
+        return Ok(Some(path));
+    }
     validate_custom_shape(var, &path, &value)?;
     Ok(Some(path))
+}
+
+/// 自定义文件多格式解析：JSON → 极简 YAML 子集 → TXT 名单（字典）。
+/// 非字典槽的 TXT 内容按字符串数组解析后由形态校验拒绝（fail-closed）。
+fn parse_custom_text(var: &str, path: &std::path::Path, text: &str) -> Result<serde_json::Value> {
+    let is_dict = var.contains("DICT") || var.contains("NAMES");
+    let ext_yaml = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
+    let ext_txt = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+    if ext_txt {
+        return Ok(parse_txt_list(text));
+    }
+    if ext_yaml {
+        return parse_yaml_subset(text).map_err(|e| {
+            config_error(
+                var,
+                &format!("{var} 文件 {} YAML 解析失败: {e}，拒绝启动", path.display()),
+            )
+        });
+    }
+    // 无后缀：JSON 优先，失败则嗅探 YAML/TXT。
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(v) => Ok(v),
+        Err(json_err) => {
+            let trimmed = text.trim_start();
+            let looks_yaml = trimmed.starts_with('-')
+                || trimmed.starts_with('{')
+                || text.lines().any(|l| {
+                    let t = l.trim();
+                    !t.is_empty()
+                        && !t.starts_with('#')
+                        && !t.starts_with('{')
+                        && !t.starts_with('[')
+                        && t.contains(':')
+                });
+            if looks_yaml && let Ok(v) = parse_yaml_subset(text) {
+                return Ok(v);
+            }
+            // 字典槽纯名单回退 TXT（无冒号/括号的 bare 行）。
+            if is_dict && looks_txt_list(text) {
+                return Ok(parse_txt_list(text));
+            }
+            Err(config_error(
+                var,
+                &format!(
+                    "{var} 文件 JSON 解析失败 {}: {json_err}，拒绝启动",
+                    path.display()
+                ),
+            ))
+        }
+    }
+}
+
+/// TXT 名单：每行一名，`#` 整行/行尾注释忽略，空行跳过。
+fn parse_txt_list(text: &str) -> serde_json::Value {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let no_comment = line.split('#').next().unwrap_or("").trim();
+        if no_comment.is_empty() {
+            continue;
+        }
+        out.push(serde_json::Value::String(no_comment.to_string()));
+    }
+    serde_json::Value::Array(out)
+}
+
+/// 是否像 TXT 纯名单（每有效行都不含 JSON/YAML 结构字符）。
+fn looks_txt_list(text: &str) -> bool {
+    let mut any = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        any = true;
+        if t.contains(['{', '}', '[', ']', ':', '"', '\'']) || t.starts_with('-') {
+            return false;
+        }
+    }
+    any
+}
+
+fn strip_yaml_quotes(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
+    {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// 极简 YAML 子集（无外部依赖，对标原仓解析语义的最小交集）：
+/// 支持 `- name: foo` + `pattern: bar` 列表映射、`- somename` 字符串列表、
+/// `key: value` 顶层映射；`#` 注释与空行忽略，超集 YAML 按解析失败 fail-closed。
+fn parse_yaml_subset(text: &str) -> std::result::Result<serde_json::Value, String> {
+    use serde_json::{Map, Value as V};
+    let mut items: Vec<V> = Vec::new();
+    let mut mapping = Map::new();
+    let mut has_mapping_line = false;
+    let mut has_list_line = false;
+    let mut current: Option<Map<String, V>> = None;
+    let flush = |current: &mut Option<Map<String, V>>, items: &mut Vec<V>| {
+        if let Some(m) = current.take()
+            && !m.is_empty()
+        {
+            items.push(V::Object(m));
+        }
+    };
+    for (idx, raw_line) in text.lines().enumerate() {
+        let no_comment = match raw_line.find('#') {
+            Some(p) => &raw_line[..p],
+            None => raw_line,
+        };
+        if no_comment.trim().is_empty() {
+            continue;
+        }
+        let indent = no_comment.len() - no_comment.trim_start().len();
+        let t = no_comment.trim();
+        if let Some(dash_rest) = t.strip_prefix('-') {
+            has_list_line = true;
+            flush(&mut current, &mut items);
+            let rest = dash_rest.trim();
+            if rest.is_empty() {
+                current = Some(Map::new());
+                continue;
+            }
+            if let Some(colon) = rest.find(':') {
+                let (k, v) = rest.split_at(colon);
+                let v = v[1..].trim();
+                if k.trim().is_empty() {
+                    return Err(format!("第 {} 行键为空", idx + 1));
+                }
+                let mut m = Map::new();
+                m.insert(k.trim().to_string(), V::String(strip_yaml_quotes(v)));
+                current = Some(m);
+            } else {
+                items.push(V::String(strip_yaml_quotes(rest)));
+                current = None;
+            }
+            continue;
+        }
+        if let Some(colon) = t.find(':') {
+            let (k, v) = t.split_at(colon);
+            let (k, v) = (k.trim(), v[1..].trim());
+            if k.is_empty() || k.contains(' ') && indent == 0 && has_list_line {
+                return Err(format!("第 {} 行形态非法: {t:?}", idx + 1));
+            }
+            if indent == 0 && current.is_none() && !has_list_line {
+                // 顶层映射形态。
+                has_mapping_line = true;
+                mapping.insert(k.to_string(), V::String(strip_yaml_quotes(v)));
+            } else {
+                // 列表项续行（`  pattern: ...`）。
+                if k.is_empty() {
+                    return Err(format!("第 {} 行键为空", idx + 1));
+                }
+                match current.as_mut() {
+                    Some(m) => {
+                        m.insert(k.to_string(), V::String(strip_yaml_quotes(v)));
+                    }
+                    None => return Err(format!("第 {} 行缩进键无归属列表项: {t:?}", idx + 1)),
+                }
+            }
+            continue;
+        }
+        return Err(format!("第 {} 行无法解析: {t:?}", idx + 1));
+    }
+    flush(&mut current, &mut items);
+    if has_mapping_line && !has_list_line {
+        return Ok(V::Object(mapping));
+    }
+    if !items.is_empty() {
+        return Ok(V::Array(items));
+    }
+    if has_mapping_line {
+        return Ok(V::Object(mapping));
+    }
+    Err("空 YAML 文档".to_string())
 }
 
 /// 自定义文件形态校验：规则/模式须为 `{name, pattern}` 数组（模式兼容 `{name: pattern}` 映射），
@@ -497,7 +723,7 @@ fn validate_custom_shape(
     value: &serde_json::Value,
 ) -> Result<()> {
     use serde_json::Value as V;
-    let is_dict = var.contains("DICT");
+    let is_dict = var.contains("DICT") || var.contains("NAMES");
     match value {
         V::Array(items) => {
             for (i, item) in items.iter().enumerate() {
@@ -564,7 +790,7 @@ fn validate_custom_shape(
 
 fn parse_placeholder_prompt(get: &dyn Fn(&str) -> Option<String>) -> (bool, String) {
     let raw = get("PII_PLACEHOLDER_PROMPT").unwrap_or_default();
-    let enabled = !matches!(raw.trim().to_lowercase().as_str(), "0" | "false" | "no");
+    let enabled = !is_falsy(&raw);
     if !enabled {
         return (false, String::new());
     }
@@ -1189,6 +1415,218 @@ mod tests {
         assert_eq!(found.db_path, dir.join("z.kdbx"));
         assert_eq!(found.keyfile_path, None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn yaml合并文件加载成功() {
+        let rules = custom_tmp_file(
+            "compat-rules.yaml",
+            "# 自定义规则\n- name: ext-id\n  pattern: EXT-\\d{6}\n- name: emp_no\n  pattern: (?P<emp_no>(?<![\\d])工号\\d{6}(?![\\d]))\n",
+        );
+        let patterns = custom_tmp_file(
+            "compat-patterns.yaml",
+            "p1: bar\\d+\n# 注释行\np2: foo\\d+\n",
+        );
+        let dict = custom_tmp_file("compat-dict.yaml", "- 张三丰\n- 李四\n");
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            rules.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_PATTERNS_FILE".to_string(),
+            patterns.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_DICT_FILE".to_string(),
+            dict.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.pii_custom_rules_file.as_deref(), Some(rules.as_path()));
+        assert_eq!(
+            cfg.pii_custom_patterns_file.as_deref(),
+            Some(patterns.as_path())
+        );
+        assert_eq!(cfg.pii_custom_dict_file.as_deref(), Some(dict.as_path()));
+        for p in [rules, patterns, dict] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn txt名单加载成功注释忽略() {
+        let dict = custom_tmp_file(
+            "compat-dict.txt",
+            "# 敏感名单\n张三丰\n\n李四 # 行尾注释\n# 全行注释\n王五\n",
+        );
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_DICT_FILE".to_string(),
+            dict.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.pii_custom_dict_file.as_deref(), Some(dict.as_path()));
+        std::fs::remove_file(dict).ok();
+    }
+
+    #[test]
+    fn 四别名各自生效() {
+        let rules = custom_tmp_file("alias-a.json", r#"[{"name":"x1","pattern":"X1\\d+"}]"#);
+        let patterns = custom_tmp_file("alias-b.json", r#"{"p1":"P1\\d+"}"#);
+        let dict = custom_tmp_file("alias-c.json", r#"["张三"]"#);
+        let dict2 = custom_tmp_file("alias-d.json", r#"["李四"]"#);
+        for (var, path, check) in [
+            ("PII_RULES_FILE", &rules, "rules"),
+            ("PII_CUSTOM_PATTERN_FILE", &patterns, "patterns"),
+            ("PII_SENSITIVE_DICT_FILE", &dict, "dict"),
+            ("PII_SENSITIVE_NAMES_FILE", &dict2, "dict"),
+        ] {
+            let mut env = base_env();
+            env.insert(var.to_string(), path.to_string_lossy().into_owned());
+            let cfg = Config::load_from(&env).unwrap();
+            match check {
+                "rules" => assert_eq!(
+                    cfg.pii_custom_rules_file.as_deref(),
+                    Some(path.as_path()),
+                    "{var}"
+                ),
+                "patterns" => assert_eq!(
+                    cfg.pii_custom_patterns_file.as_deref(),
+                    Some(path.as_path()),
+                    "{var}"
+                ),
+                _ => assert_eq!(
+                    cfg.pii_custom_dict_file.as_deref(),
+                    Some(path.as_path()),
+                    "{var}"
+                ),
+            }
+        }
+        for p in [rules, patterns, dict, dict2] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn 三变量叠加主文件优先可共存() {
+        let merged = custom_tmp_file(
+            "overlay-merged.json",
+            r#"[{"name":"m1","pattern":"M1\\d+"}]"#,
+        );
+        let alias = custom_tmp_file(
+            "overlay-alias.json",
+            r#"[{"name":"a1","pattern":"A1\\d+"}]"#,
+        );
+        let short = custom_tmp_file(
+            "overlay-short.json",
+            r#"[{"name":"s1","pattern":"S1\\d+"}]"#,
+        );
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            merged.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_RULES_FILE".to_string(),
+            alias.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_RULES".to_string(),
+            short.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.pii_custom_rules_file.as_deref(), Some(merged.as_path()));
+        let patterns = custom_tmp_file("overlay-p.json", r#"{"pp":"PP\\d+"}"#);
+        let dict = custom_tmp_file("overlay-d.json", r#"["赵六"]"#);
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            merged.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_PATTERNS_FILE".to_string(),
+            patterns.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PII_CUSTOM_DICT_FILE".to_string(),
+            dict.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert!(cfg.pii_custom_rules_file.is_some());
+        assert!(cfg.pii_custom_patterns_file.is_some());
+        assert!(cfg.pii_custom_dict_file.is_some());
+        let mut env = base_env();
+        env.insert(
+            "PII_SENSITIVE_DICT_FILE".to_string(),
+            "/nonexistent/veil-别名缺失.json".to_string(),
+        );
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("PII_SENSITIVE_DICT_FILE"));
+        for p in [merged, alias, short, patterns, dict] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn 空文件零命中仅告警放行() {
+        let empty = custom_tmp_file("compat-empty.json", "   \n");
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            empty.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.pii_custom_rules_file.as_deref(), Some(empty.as_path()));
+        let comments_only = custom_tmp_file("compat-comments.txt", "# 只有注释\n# 无名单\n");
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_DICT_FILE".to_string(),
+            comments_only.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(
+            cfg.pii_custom_dict_file.as_deref(),
+            Some(comments_only.as_path())
+        );
+        std::fs::remove_file(empty).ok();
+        std::fs::remove_file(comments_only).ok();
+    }
+
+    #[test]
+    fn yaml非法形态拒启动() {
+        let bad = custom_tmp_file("compat-bad.yaml", ":\n: :\n- \n???\n");
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            bad.to_string_lossy().into_owned(),
+        );
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("PII_CUSTOM_RULES_FILE"));
+        std::fs::remove_file(bad).ok();
+    }
+
+    #[test]
+    fn 示例yaml启动可加载() {
+        let mut env = base_env();
+        env.insert(
+            "PII_CUSTOM_RULES_FILE".to_string(),
+            "examples/pii-custom.yaml".to_string(),
+        );
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(
+            cfg.pii_custom_rules_file.as_deref(),
+            Some(std::path::Path::new("examples/pii-custom.yaml"))
+        );
+    }
+
+    #[test]
+    fn 占位符off关闭复用falsy() {
+        for raw in ["off", "OFF", "  off  "] {
+            let mut env = base_env();
+            env.insert("PII_PLACEHOLDER_PROMPT".to_string(), raw.to_string());
+            let cfg = Config::load_from(&env).unwrap();
+            assert!(!cfg.placeholder_prompt_enabled, "{raw}");
+        }
     }
 
     #[test]
