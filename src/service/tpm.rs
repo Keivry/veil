@@ -8,7 +8,7 @@
 //! `VEIL_ALLOW_MOCK_TPM=1` 仅 CI/本地联调显式放行 Mock）。KeePass 主密钥
 //! TPM 派生随真实 kdbx 后端延后（Non-Goal，见 credential-api spec）。
 
-use std::{fmt::Debug, path::PathBuf, process::Command, time::Duration};
+use std::{fmt::Debug, path::PathBuf, time::Duration};
 
 /// TPM 解封抽象：真实 TPM 与 CI Mock 同接口。
 pub trait TpmUnlock: Send + Sync + Debug {
@@ -53,31 +53,93 @@ impl TpmUnlock for MockTpm {
 /// 真实 TPM：经 `tpm2-tools` 子进程现场派生。
 #[derive(Debug, Clone)]
 pub struct RealTpm {
-    pub key_context: Option<PathBuf>,
+    pub tpm_dir: PathBuf,
     pub timeout: Duration,
 }
 
 impl RealTpm {
     pub fn new() -> Self {
         Self {
-            key_context: None,
+            tpm_dir: PathBuf::from("/data/tpm"),
             timeout: Duration::from_secs(15),
         }
     }
 
-    fn run(&self, program: &str, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|e| anyhow::anyhow!("TPM 子进程启动失败 {program}: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "TPM 子进程失败 {program} {}: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+    pub fn with_dir(tpm_dir: PathBuf) -> Self {
+        Self {
+            tpm_dir,
+            timeout: Duration::from_secs(15),
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    pub fn seal_pub(&self) -> PathBuf { self.tpm_dir.join("seal.pub") }
+
+    pub fn seal_priv(&self) -> PathBuf { self.tpm_dir.join("seal.priv") }
+
+    /// 与密封时相同的模板回放（owner + rsa2048 + sha256），供回归测试断言。
+    pub fn createprimary_args(&self, primary_ctx: &str) -> Vec<String> {
+        vec![
+            "-C".to_string(),
+            "o".to_string(),
+            "-G".to_string(),
+            "rsa2048".to_string(),
+            "-g".to_string(),
+            "sha256".to_string(),
+            "-c".to_string(),
+            primary_ctx.to_string(),
+        ]
+    }
+
+    fn run(&self, program: &str, args: &[&str]) -> anyhow::Result<String> {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("TPM 子进程启动失败 {program}: {e}"))?;
+        let timeout = self.timeout;
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        out.read_to_string(&mut stdout).ok();
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        err.read_to_string(&mut stderr).ok();
+                    }
+                    if !status.success() {
+                        anyhow::bail!(
+                            "TPM 子进程失败 {program} {}: {}",
+                            args.join(" "),
+                            stderr.trim()
+                        );
+                    }
+                    if !stderr.trim().is_empty() {
+                        tracing::warn!("{program} stderr 非空（可能包含警告）");
+                    }
+                    return Ok(stdout);
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        child.kill().ok();
+                        child.wait().ok();
+                        anyhow::bail!(
+                            "TPM 子进程超时 {program} {}（{}s），已终止",
+                            args.join(" "),
+                            timeout.as_secs()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    anyhow::bail!("TPM 子进程等待失败 {program}: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -87,13 +149,20 @@ impl Default for RealTpm {
 
 impl TpmUnlock for RealTpm {
     fn is_available(&self) -> bool {
-        Command::new("tpm2_pcrread")
+        std::process::Command::new("tpm2_pcrread")
             .arg("sha256:0")
             .output()
             .is_ok_and(|o| o.status.success())
     }
 
     fn unseal(&self) -> anyhow::Result<Vec<u8>> {
+        let seal_pub = self.seal_pub();
+        let seal_priv = self.seal_priv();
+        for path in [&seal_pub, &seal_priv] {
+            if !path.is_file() {
+                anyhow::bail!("TPM 密封文件缺失 {}，拒绝以空密钥运行", path.display());
+            }
+        }
         let workdir = std::env::temp_dir().join(format!("veil-tpm-{}", std::process::id()));
         std::fs::create_dir_all(&workdir)?;
         struct Guard(PathBuf);
@@ -103,35 +172,34 @@ impl TpmUnlock for RealTpm {
         let _guard = Guard(workdir.clone());
         let primary_ctx = workdir.join("primary.ctx");
         let primary_arg = primary_ctx.to_string_lossy().into_owned();
-        // 现场 createprimary → 后续 load/unseal；primary.ctx 不持久化，随临时目录删除。
-        self.run(
-            "tpm2_createprimary",
-            &["-C", "o", "-c", primary_arg.as_str()],
-        )?;
-        let sealed_pub = workdir.join("sealed.pub");
-        let sealed_priv = workdir.join("sealed.priv");
+        let template = self.createprimary_args(primary_arg.as_str());
+        let template_refs: Vec<&str> = template.iter().map(String::as_str).collect();
+        self.run("tpm2_createprimary", &template_refs)?;
+        let sealed_pub = seal_pub.to_string_lossy().into_owned();
+        let sealed_priv = seal_priv.to_string_lossy().into_owned();
         let ctx_arg = sealed_ctx_arg(&workdir);
-        if let Some(persistent) = self.key_context.as_ref() {
-            let p = persistent.to_string_lossy().into_owned();
-            self.run(
-                "tpm2_load",
-                &[
-                    "-C",
-                    primary_arg.as_str(),
-                    "-u",
-                    p.as_str(),
-                    "-r",
-                    p.as_str(),
-                    "-c",
-                    ctx_arg.as_str(),
-                ],
-            )?;
-        } else {
-            let _ = (sealed_pub, sealed_priv);
-            anyhow::bail!("TPM 无密封对象上下文，拒绝以空密钥运行");
-        }
+        self.run(
+            "tpm2_load",
+            &[
+                "-C",
+                primary_arg.as_str(),
+                "-u",
+                sealed_pub.as_str(),
+                "-r",
+                sealed_priv.as_str(),
+                "-c",
+                ctx_arg.as_str(),
+            ],
+        )?;
         let out = self.run("tpm2_unseal", &["-c", ctx_arg.as_str()])?;
-        Ok(out.into_bytes())
+        let trimmed = out.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            anyhow::bail!("TPM 解封返回空密码");
+        }
+        if trimmed.len() < 4 {
+            anyhow::bail!("TPM 解封返回的密码过短（{} 字符）", trimmed.len());
+        }
+        Ok(trimmed.as_bytes().to_vec())
     }
 }
 
@@ -149,12 +217,22 @@ pub fn require_hardware_tpm(tpm: &dyn TpmUnlock) -> anyhow::Result<Vec<u8>> {
 
 /// main 启动链门禁选型：默认真实 TPM fail-closed；
 /// （`VEIL_ALLOW_MOCK_TPM=1`）仅 CI/本地联调显式放行，生产 MUST NOT 启用。
-pub fn startup_tpm(allow_mock: bool) -> anyhow::Result<Vec<u8>> {
+pub fn mock_allowed_value(raw: &str) -> bool { raw.trim() == "1" }
+
+pub fn allow_mock_from_env() -> bool {
+    std::env::var("VEIL_ALLOW_MOCK_TPM").is_ok_and(|v| mock_allowed_value(&v))
+}
+
+pub fn startup_tpm_in(tpm_dir: &std::path::Path, allow_mock: bool) -> anyhow::Result<Vec<u8>> {
     if allow_mock {
         tracing::warn!("VEIL_ALLOW_MOCK_TPM=1：以 Mock TPM 运行，禁止生产使用");
         return MockTpm::unlocked(b"veil-dev-mock-tpm-seal").unseal();
     }
-    require_hardware_tpm(&RealTpm::new())
+    require_hardware_tpm(&RealTpm::with_dir(tpm_dir.to_path_buf()))
+}
+
+pub fn startup_tpm(allow_mock: bool) -> anyhow::Result<Vec<u8>> {
+    startup_tpm_in(std::path::Path::new("/data/tpm"), allow_mock)
 }
 
 #[cfg(test)]
@@ -202,5 +280,68 @@ mod tests {
         if !RealTpm::new().is_available() {
             assert!(startup_tpm(false).is_err());
         }
+    }
+
+    #[test]
+    fn 模板回放含owner_rsa2048_sha256() {
+        let tpm = RealTpm::with_dir(PathBuf::from("/data/tpm"));
+        let args = tpm.createprimary_args("primary.ctx");
+        let joined = args.join(" ");
+        assert!(joined.contains("-C") && joined.contains('o'), "{joined}");
+        assert!(joined.contains("rsa2048"), "{joined}");
+        assert!(joined.contains("sha256"), "{joined}");
+    }
+
+    #[test]
+    fn 密封路径取自tpm_dir() {
+        let tpm = RealTpm::with_dir(PathBuf::from("/srv/tpm"));
+        assert_eq!(tpm.seal_pub(), PathBuf::from("/srv/tpm/seal.pub"));
+        assert_eq!(tpm.seal_priv(), PathBuf::from("/srv/tpm/seal.priv"));
+        assert_eq!(
+            RealTpm::new().seal_pub(),
+            PathBuf::from("/data/tpm/seal.pub")
+        );
+    }
+
+    #[test]
+    fn 缺密封文件拒绝空密钥() {
+        let dir = std::env::temp_dir().join(format!(
+            "veil-tpm-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tpm = RealTpm::with_dir(dir.clone());
+        let err = tpm.unseal().unwrap_err().to_string();
+        assert!(
+            err.contains("密封文件缺失") && err.contains("空密钥"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock门禁仅精确1放行() {
+        assert!(mock_allowed_value("1"));
+        for raw in ["true", "True", "0", "", "  ", "01", "1 "] {
+            if raw == "1 " {
+                assert!(mock_allowed_value(raw), "{raw:?} 去空格后应放行");
+            } else {
+                assert!(!mock_allowed_value(raw), "{raw:?} 须走硬件门禁");
+            }
+        }
+        assert!(!mock_allowed_value("true"));
+    }
+
+    #[test]
+    fn 超时默认15秒() {
+        assert_eq!(RealTpm::new().timeout, Duration::from_secs(15));
+        assert_eq!(
+            RealTpm::with_dir(PathBuf::from("/x")).timeout,
+            Duration::from_secs(15)
+        );
     }
 }

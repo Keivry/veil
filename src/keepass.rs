@@ -106,11 +106,27 @@ pub type PasswordProvider =
     std::sync::Arc<dyn Fn() -> anyhow::Result<Zeroizing<Vec<u8>>> + Send + Sync>;
 
 pub fn tpm_password_provider(tpm_dir: PathBuf, allow_mock: bool) -> PasswordProvider {
+    let cache: std::sync::Arc<Mutex<Option<Zeroizing<Vec<u8>>>>> =
+        std::sync::Arc::new(Mutex::new(None));
     std::sync::Arc::new(move || {
-        let _ = &tpm_dir;
-        let sealed = crate::service::tpm::startup_tpm(allow_mock)
+        if let Ok(guard) = cache.lock()
+            && let Some(cached) = guard.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+        let sealed = crate::service::tpm::startup_tpm_in(&tpm_dir, allow_mock)
             .map_err(|e| anyhow::anyhow!("TPM 解封主密码失败: {e:#}"))?;
-        Ok(Zeroizing::new(sealed))
+        if sealed.is_empty() {
+            anyhow::bail!("TPM 解封返回空密码");
+        }
+        if sealed.len() < 4 {
+            anyhow::bail!("TPM 解封返回的密码过短（{} 字符）", sealed.len());
+        }
+        let guarded = Zeroizing::new(sealed);
+        if let Ok(mut slot) = cache.lock() {
+            *slot = Some(guarded.clone());
+        }
+        Ok(guarded)
     })
 }
 
@@ -157,6 +173,8 @@ impl RealKeePass {
                 message: "密码库未配置".to_string(),
             });
         }
+        // 单飞许可（tokio 信号量）可跨 await 持有；下方缓存锁（std Mutex）
+        // 绝不跨 await：每次只在同步小临界区内加锁，拿完快照立即释放。
         let _permit = self
             .semaphore
             .acquire()
@@ -164,13 +182,15 @@ impl RealKeePass {
             .map_err(|e| VeilError::KeePass {
                 message: format!("KeePass 内部错误: 信号量获取失败: {e}"),
             })?;
-        if let Some(snapshot) = self.lookup_cached(&title) {
-            return Ok(snapshot);
-        }
-        if self.is_cached() {
-            return Err(VeilError::NotFound {
-                message: format!("条目未找到: {title}"),
-            });
+        {
+            if let Some(snapshot) = self.lookup_cached(&title) {
+                return Ok(snapshot);
+            }
+            if self.is_cached() {
+                return Err(VeilError::NotFound {
+                    message: format!("条目未找到: {title}"),
+                });
+            }
         }
         let db_path = self.db_path.clone();
         let keyfile_path = self.keyfile_path.clone();
@@ -498,6 +518,40 @@ mod tests {
         backend.clear_cache();
         backend.fetch_entry("备用".to_string()).await.unwrap();
         assert_eq!(backend.open_count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tpm口令提供器缓存复用() {
+        let dir = unique_temp_dir("tpm-cache");
+        let provider = tpm_password_provider(dir.clone(), true);
+        let first = provider().expect("mock 放行须解封成功");
+        assert!(first.len() >= 4);
+        let second = provider().expect("二次调用须复用缓存");
+        assert_eq!(first.as_slice(), second.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn 二次查询不重解主密码() {
+        let dir = unique_temp_dir("tpm-reuse");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(
+            &db_path,
+            b"fixture-master-pw",
+            &[("网易", "u", "s", "", vec![])],
+        );
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let provider: PasswordProvider = std::sync::Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Zeroizing::new(b"fixture-master-pw".to_vec()))
+        });
+        let backend = RealKeePass::new(db_path, None, provider);
+        backend.fetch_entry("网易".to_string()).await.unwrap();
+        backend.fetch_entry("网易".to_string()).await.unwrap();
+        assert_eq!(backend.open_count(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
