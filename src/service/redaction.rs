@@ -109,6 +109,51 @@ impl Scope {
         strip_partials(&step3)
     }
 
+    /// 响应还原（含 span 透传，§2.2）：
+    /// 返回 `(还原文本, 还原明文区间)`；区间为还原文本中的字节下标。
+    /// 调用方做响应侧新检出时须经 [`Scope::redact_response_new_pii_with_skip`]
+    /// 跳过这些区间，否则刚还原的请求明文会被二次掩码为响应 token。
+    /// 不触 handler 接线：纯库函数，零网络副作用。
+    pub fn restore_response_with_spans(
+        &self,
+        vault: &CredentialVault,
+        text: &str,
+    ) -> (String, Vec<(usize, usize)>) {
+        let restored = self.restore_response(vault, text);
+        let mut spans = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, _, token) in scan_token_forms(text) {
+            if !seen.insert(token.clone()) {
+                continue;
+            }
+            // 经公开还原路径单 token 回查明文：未注册/幻觉形态回查不变或清空，直接跳过。
+            let plain = self.restore_response(vault, &token);
+            if plain.is_empty() || plain == token {
+                continue;
+            }
+            for (s, e) in find_sub_spans(&restored, &plain) {
+                spans.push((s, e));
+            }
+        }
+        spans.sort_unstable();
+        // 重叠区间保留最长者（短明文嵌在长明文内时只留长区间）。
+        let mut dedup: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            if let Some((ls, le)) = dedup.last_mut() {
+                if s < *le && e > *le {
+                    *ls = (*ls).min(s);
+                    *le = e;
+                    continue;
+                }
+                if s < *le {
+                    continue;
+                }
+            }
+            dedup.push((s, e));
+        }
+        (restored, dedup)
+    }
+
     /// 响应侧新检出：响应中出现的新 PII 注册进响应表（不进请求还原表），
     /// 以新占位符呈现，不还原为明文。
     /// `PII_RESPONSE_SIDE=0` 时直接返回原文（响应侧脱敏关闭）。
@@ -128,6 +173,57 @@ impl Scope {
         let out = json_walk::process_text(text, &mut leaf, json_walk::DEPTH_LIMIT);
         strip_partials(&out)
     }
+
+    /// 响应侧新检出（跳过还原区间，§2.2）：
+    /// 与 [`Scope::redact_response_new_pii`] 同语义，但 `skip`
+    /// （[`Scope::restore_response_with_spans`] 返回值）覆盖的原文区间原样保留，
+    /// 刚还原的请求明文保持明文。按区间切段后仅对非跳过段做新检出，
+    /// 再按原序拼接（跳过段字节级原样，坐标天然对齐）。
+    pub async fn redact_response_new_pii_with_skip(
+        &self,
+        vault: &CredentialVault,
+        detector: &PiiDetector,
+        text: &str,
+        skip: &[(usize, usize)],
+    ) -> String {
+        if !self.response_side {
+            return text.to_string();
+        }
+        let mut spans: Vec<(usize, usize)> = skip
+            .iter()
+            .filter(|(s, e)| *s < *e && *s <= text.len() && *e <= text.len())
+            .copied()
+            .collect();
+        if spans.is_empty() {
+            return self.redact_response_new_pii(vault, detector, text).await;
+        }
+        spans.sort_unstable();
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (s, e) in spans {
+            if s < cursor {
+                continue;
+            }
+            if s > cursor {
+                out.push_str(
+                    &self
+                        .redact_response_new_pii(vault, detector, &text[cursor..s])
+                        .await,
+                );
+            }
+            // 跳过段原样保留：还原出的请求明文不得二次掩码。
+            out.push_str(&text[s..e]);
+            cursor = e.max(cursor);
+        }
+        if cursor < text.len() {
+            out.push_str(
+                &self
+                    .redact_response_new_pii(vault, detector, &text[cursor..])
+                    .await,
+            );
+        }
+        strip_partials(&out)
+    }
 }
 
 /// 全出口残缺清理：凭据 + PII 两套半截形态统一入口。
@@ -145,6 +241,24 @@ pub fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
 
 pub const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
 pub const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
+
+/// 占位符说明注入开关（对标原仓口径）：仅 `0/false/no` 关闭，其余（含空/`off`）启用。
+/// 接线注记：`Config::is_falsy` 另把 `off` 视为关（更严收敛）；此处保留原仓口径供网关侧
+/// 对账，`off` 语义差异由配置归属方在发布说明中声明。
+pub fn placeholder_prompt_enabled(raw: &str) -> bool {
+    !matches!(raw.trim().to_lowercase().as_str(), "0" | "false" | "no")
+}
+
+/// span 加法 API：去重后位置化替换（原 `apply_spans` 语义不变，本函数仅叠加去重层）。
+pub fn apply_spans_dedup(text: &str, spans: &[(usize, usize, String)]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let uniq: Vec<(usize, usize, String)> = spans
+        .iter()
+        .filter(|(s, e, r)| seen.insert((*s, *e, r.clone())))
+        .cloned()
+        .collect();
+    super::pii::apply_spans(text, &uniq)
+}
 
 pub fn normalize_flag_enabled(raw: Option<&str>) -> bool { matches!(raw.map(str::trim), Some("1")) }
 
@@ -313,6 +427,57 @@ fn redact_leaf_response(
     apply_spans(&after_cred, &spans)
 }
 
+/// 扫描文本中的占位符形态（凭据/PII 完整形），返回 `(起始, 结束, token)` 字节区间。
+/// 只做形态初筛，真伪由公开还原路径回查确认，误报无害。
+fn scan_token_forms(text: &str) -> Vec<(usize, usize, String)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 字符边界步进：中文等多字节字符按整字跳过，不从字中切分。
+        let rest = &text[i..];
+        let prefix_len = if rest.starts_with("__VG_CRED_") {
+            "__VG_CRED_".len()
+        } else if rest.starts_with("__PII_") {
+            "__PII_".len()
+        } else {
+            i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            continue;
+        };
+        if let Some(end) = rest[prefix_len..].find("__") {
+            let token = &rest[..prefix_len + end + 2];
+            let inner = &token[prefix_len..token.len() - 2];
+            if !inner.is_empty()
+                && inner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                out.push((i, i + token.len(), token.to_string()));
+                i += token.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 在 `haystack` 中定位 `needle` 的全部非重叠出现点（字节区间）。
+fn find_sub_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(idx) = haystack[from..].find(needle) {
+        let (s, e) = (from + idx, from + idx + needle.len());
+        out.push((s, e));
+        from = e.max(from + 1);
+        if from >= haystack.len() {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,8 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn fix5默认子串不重排仅开启才声明头() {
-        let original = br#"{"b": 1,  "a": 2}"#;
+    fn fix5默认子串不重排仅开启才声明头() {        let original = br#"{"b": 1,  "a": 2}"#;
         let normalized = br#"{"a":2,"b":1}"#;
         let (bytes, header) = select_request_bytes(original, normalized, false);
         assert_eq!(bytes, original);
@@ -488,6 +652,70 @@ mod tests {
         assert!(redacted.contains("第三行 纯文本无敏感"), "{redacted}");
         let restored = scope.restore_response(&vault, &redacted);
         assert_eq!(restored, req, "往返须字节一致");
+    }
+
+    #[tokio::test]
+    async fn 还原span跳过防二次掩码() {
+        let vault = CredentialVault::new();
+        let detector = PiiDetector::new();
+        let scope = Scope::new();
+        let redacted = scope
+            .redact_request(&vault, &detector, r#"{"phone":"13812345678"}"#)
+            .await;
+        assert!(redacted.contains("__PII_"), "{redacted}");
+        let (restored, spans) = scope.restore_response_with_spans(&vault, &redacted);
+        assert!(restored.contains("13812345678"), "{restored}");
+        assert!(!spans.is_empty());
+        assert!(
+            spans.iter().any(|(s, e)| &restored[*s..*e] == "13812345678"),
+            "{spans:?}"
+        );
+        // 带 skip：还原明文保持明文。
+        let kept = scope
+            .redact_response_new_pii_with_skip(&vault, &detector, &restored, &spans)
+            .await;
+        assert!(kept.contains("13812345678"), "{kept}");
+        // 对照（不带 skip）：同一明文被套上响应 token，证明 skip 生效。
+        let masked = scope
+            .redact_response_new_pii(&vault, &detector, &restored)
+            .await;
+        assert!(!masked.contains("13812345678"), "{masked}");
+        assert!(masked.contains("__PII_"), "{masked}");
+    }
+
+    #[test]
+    fn 凭据还原span覆盖明文() {
+        let vault = CredentialVault::new();
+        vault.register("my-secret-001").expect("注册恒成功");
+        let scope = Scope::new();
+        let masked = vault.redact("密码 my-secret-001 结束");
+        assert!(!masked.contains("my-secret-001"), "{masked}");
+        let (restored, spans) = scope.restore_response_with_spans(&vault, &masked);
+        assert_eq!(restored, "密码 my-secret-001 结束");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&restored[spans[0].0..spans[0].1], "my-secret-001");
+        // 未知 token 不产生 span。
+        let (unchanged, empty) = scope.restore_response_with_spans(&vault, "纯文本无 token");
+        assert_eq!(unchanged, "纯文本无 token");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn 占位符关闭条件与原仓对齐() {
+        assert!(!placeholder_prompt_enabled("0"));
+        assert!(!placeholder_prompt_enabled("false"));
+        assert!(!placeholder_prompt_enabled("no"));
+        assert!(!placeholder_prompt_enabled(" NO "));
+        // 原仓口径：`off`/空均视为启用（`off` 差异见函数注记）。
+        assert!(placeholder_prompt_enabled("off"));
+        assert!(placeholder_prompt_enabled(""));
+        assert!(placeholder_prompt_enabled("1"));
+    }
+
+    #[test]
+    fn span加法去重语义() {
+        let out = apply_spans_dedup("hello world", &[(6, 11, "W".to_string()), (6, 11, "W".to_string())]);
+        assert_eq!(out, "hello W");
     }
 
     #[test]

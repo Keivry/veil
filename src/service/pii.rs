@@ -75,9 +75,11 @@ fn pii_token_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"__PII_\d+_[0-9a-f]{8}__").expect("PII token 正则恒合法"))
 }
 
+/// 宽松形态（fuzzy 还原用）：对标 Python `IGNORECASE` 语义，大小写变体均可回查；
+/// 序号回查另作独立开关（`restore_with_fuzzy(fuzzy)` 参数），两者正交。
 fn pii_loose_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"__PII_\d+_[^_\s]{1,16}__").expect("PII 宽松正则恒合法"))
+    RE.get_or_init(|| regex::Regex::new(r"(?i)__PII_\d+_[^_\s]{1,16}__").expect("PII 宽松正则恒合法"))
 }
 
 /// 凭据完整形态（PII 值注册拒绝用，避免双 token 串扰）。
@@ -197,6 +199,90 @@ pub fn is_valid_ipv4(value: &str) -> bool {
 /// 正则粗筛后的精确校验：仅合法 IPv6 视为命中。
 pub fn is_valid_ipv6(value: &str) -> bool { value.parse::<std::net::Ipv6Addr>().is_ok() }
 
+/// 按 kind 六分支掩码（对标原仓 `mask_pii_value`；超长统一截断 64）。
+/// phone/email/bank_card/ipv4/ipv6+api_key/other 六分支定制，空值返回 `***`。
+pub fn mask_pii_value(kind: &str, value: &str) -> String {
+    if value.is_empty() {
+        return "***".to_string();
+    }
+    let short = |v: &str| -> String {
+        let chars: Vec<char> = v.chars().collect();
+        if chars.len() < 2 {
+            "***".to_string()
+        } else if chars.len() < 6 {
+            format!("{}****{}", chars[0], chars[chars.len() - 1])
+        } else {
+            format!(
+                "{}****{}",
+                chars[..3].iter().collect::<String>(),
+                chars[chars.len() - 3..].iter().collect::<String>()
+            )
+        }
+    };
+    let masked = match kind.to_lowercase().as_str() {
+        "phone" => {
+            let chars: Vec<char> = value.chars().collect();
+            if chars.len() >= 7 {
+                format!(
+                    "{}****{}",
+                    chars[..3].iter().collect::<String>(),
+                    chars[chars.len() - 4..].iter().collect::<String>()
+                )
+            } else {
+                short(value)
+            }
+        }
+        "email" => match value.split_once('@') {
+            Some((_, domain)) if domain.contains('.') => {
+                let suffix = domain.rsplit('.').next().unwrap_or("");
+                if suffix.is_empty() {
+                    "***@***".to_string()
+                } else {
+                    format!("***@***.{suffix}")
+                }
+            }
+            _ => short(value),
+        },
+        "bank_card" | "bankcard" | "id_card" => {
+            let chars: Vec<char> = value.chars().collect();
+            if chars.len() >= 4 {
+                format!(
+                    "**** **** **** {}",
+                    chars[chars.len() - 4..].iter().collect::<String>()
+                )
+            } else {
+                short(value)
+            }
+        }
+        "ipv4" => {
+            let parts: Vec<&str> = value.split('.').collect();
+            if parts.len() == 4 {
+                format!("{}.{}.**.**", parts[0], parts[1])
+            } else {
+                short(value)
+            }
+        }
+        "ipv6" | "api_key" | "apikey" => {
+            let chars: Vec<char> = value.chars().collect();
+            if chars.len() >= 8 {
+                format!(
+                    "{}****{}",
+                    chars[..4].iter().collect::<String>(),
+                    chars[chars.len() - 4..].iter().collect::<String>()
+                )
+            } else {
+                short(value)
+            }
+        }
+        _ => short(value),
+    };
+    if masked.chars().count() > 64 {
+        masked.chars().take(64).collect()
+    } else {
+        masked
+    }
+}
+
 fn strip_ip_trailing(value: &str) -> &str { value.trim_end_matches(['.', ',', ';', ')', ']', '}']) }
 
 /// 保留豁免判定：私有/保留/回环/链路本地/组播/CGNAT/文档/未指定均豁免，
@@ -204,6 +290,10 @@ fn strip_ip_trailing(value: &str) -> &str { value.trim_end_matches(['.', ',', ';
 /// 判定前统一剥句末标点、IPv6 转小写；`fc`/`fd` 仅冒号形态豁免，
 /// 裸 `10`/`fcfake` 等子串不豁免（标准库解析天然保证精确性）。
 pub fn is_reserved_ip(value: &str, kind: &str) -> bool {
+    // 保留前缀兜底先行：标准库漏判的 IANA 特殊段按前缀豁免。
+    if is_keep_prefix_ip(value, kind) {
+        return true;
+    }
     if kind == "ipv4" {
         let v = normalize_ipv4_leading_zeros(strip_ip_trailing(value));
         let Ok(ip) = v.parse::<std::net::Ipv4Addr>() else {
@@ -253,6 +343,47 @@ pub fn is_reserved_ip(value: &str, kind: &str) -> bool {
     false
 }
 
+/// 保留前缀兜底（`ip_network` 对等）：标准库未单列的 IANA 特殊段显式覆盖。
+/// 仅合法解析形态才做前缀豁免（非法串不豁免，仅豁免方向）。
+pub fn is_keep_prefix_ip(value: &str, kind: &str) -> bool {
+    if kind == "ipv4" {
+        let v = normalize_ipv4_leading_zeros(strip_ip_trailing(value)).to_lowercase();
+        // 仅合法 IPv4 形态才做前缀豁免（`999.1.1.1`/`fcfake` 类不豁免）。
+        if v.parse::<std::net::Ipv4Addr>().is_err() {
+            return false;
+        }
+        const KEEP: &[&str] = &[
+            "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.",
+            "192.168.", "127.", "169.254.", "100.64.", "100.65.", "192.0.0.", "192.0.2.",
+            "198.51.100.", "203.0.113.", "198.18.", "198.19.", "224.", "225.", "226.", "227.",
+            "228.", "229.", "230.", "231.", "232.", "233.", "234.", "235.", "236.", "237.",
+            "238.", "239.", "240.", "0.",
+        ];
+        if v.starts_with("172.2") {
+            // 172.16/12 精确：172.16–172.31。
+            if let Some(second) = v.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()) {
+                if (16..=31).contains(&second) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return KEEP.iter().any(|p| v.starts_with(p));
+    }
+    if kind == "ipv6" {
+        let v = strip_ip_trailing(value).to_ascii_lowercase();
+        // 仅合法 IPv6 形态才做前缀豁免（裸 `fcfake` 类子串不豁免）。
+        if v.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        const KEEP6: &[&str] = &[
+            "::1", "::", "fe80:", "fe9", "fea", "feb", "fc", "fd", "ff02", "2001:db8:",
+            "64:ff9b:",
+        ];
+        return KEEP6.iter().any(|p| v.starts_with(p));
+    }
+    false
+}
 /// 全局校验结论 LRU：`moka 0.12` 显式 LRU 策略 `future::Cache`，
 /// 仅用于 PII 确定性校验（不存明文↔token 映射）。
 #[derive(Debug, Clone)]
@@ -933,32 +1064,10 @@ impl PiiDetector {
         false
     }
 
-    /// 命名组提取：收集 pattern 中全部 `(?P<name>...)` 的 name（转义括号跳过）。
-    fn named_groups(pattern: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let bytes = pattern.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'('
-                && pattern[i..].starts_with("(?P<")
-                && let Some(end) = pattern[i + 4..].find('>')
-            {
-                out.push(pattern[i + 4..i + 4 + end].to_string());
-                i += 4 + end + 1;
-                continue;
-            }
-            i += 1;
-        }
-        out
-    }
-
     /// 加载自定义正则 `[(name, pattern)]`，返回成功加载的条数。
-    /// 与内置重名 / 重复 / 编译失败 / 含 `\b` / 命名组与外层 name 失配 /
-    /// 嵌套命名组 / 自检异常一律拒绝加载。
+    /// 对标原仓口径：与内置重名 / 跨文件重名 / 编译失败 / 含 `\b` /
+    /// 嵌套命名组 / 自检异常一律拒绝加载；内命名组与外层 name 失配允许
+    /// （命中分类以外层 name 为准，原仓同口径，不因此拒载）。
     pub fn load_custom_patterns(&self, patterns: &[(String, String)]) -> usize {
         if patterns.is_empty() {
             return 0;
@@ -979,10 +1088,6 @@ impl PiiDetector {
             }
             if Self::has_word_boundary(pattern) {
                 tracing::warn!("自定义正则 {name} 含 \\b 词边界，中文环境失效，拒绝加载");
-                continue;
-            }
-            if Self::named_groups(pattern).iter().any(|g| g != name) {
-                tracing::warn!("自定义正则 {name} 内命名组与外层 name 失配，拒绝加载");
                 continue;
             }
             let compiled = match fancy_regex::Regex::new(pattern) {
@@ -1016,6 +1121,24 @@ impl PiiDetector {
             loaded += 1;
         }
         loaded
+    }
+
+    /// 三槽叠加加载：`PII_CUSTOM_RULES` 合并槽 + `PATTERNS` 分离槽 + `DICT` 名单槽
+    /// 一次调用全部载入并叠加生效（各槽独立去重，跨槽同名不互斥）。
+    /// 返回 `(正则条数, 字典条数)`。
+    pub fn load_custom_all(
+        &self,
+        patterns: &[(String, String)],
+        dict: &[(String, String)],
+    ) -> (usize, usize) {
+        let n = self.load_custom_patterns(patterns);
+        self.load_dict(dict);
+        let m = self
+            .dict
+            .read()
+            .map(|g| g.len())
+            .unwrap_or_default();
+        (n, m)
     }
 
     /// 已加载的自定义规则名（断言/可观测用）。
@@ -1052,14 +1175,29 @@ impl PiiDetector {
         *self.dict_re.write().expect("检测器锁无毒") = compiled;
     }
 
-    /// 字典命中边界：`name/person` 走严格 CJK 边界，
-    /// 其余类型仅挡 ASCII 字母数字粘连。
-    fn dict_boundary_ok(text: &str, start: usize, end: usize, typ: &str) -> bool {
+    /// 字典命中边界：对标 Python `_dict_boundary_ok`（硬化门控差异化）。
+    /// `name/person` 在强化开时走严格 CJK 边界，关闭时退化为 ASCII 字母数字边界
+    /// （后接 CJK 仍阻断，保张三丰不误伤）；其余类型仅挡 ASCII 字母数字粘连。
+    fn dict_boundary_ok(
+        text: &str,
+        start: usize,
+        end: usize,
+        typ: &str,
+        strict_cjk: bool,
+    ) -> bool {
         let before = text[..start].chars().next_back();
         let after = text[end..].chars().next();
         let is_cjk = |c: char| ('\u{4e00}'..='\u{9fff}').contains(&c) || c.is_alphanumeric();
         if typ == "name" || typ == "person" {
-            if before.is_some_and(is_cjk) || after.is_some_and(is_cjk) {
+            if strict_cjk {
+                if before.is_some_and(is_cjk) || after.is_some_and(is_cjk) {
+                    return false;
+                }
+                return true;
+            }
+            let ascii_before =
+                before.is_some_and(|c| c.is_ascii() && c.is_alphanumeric());
+            if ascii_before || after.is_some_and(is_cjk) {
                 return false;
             }
             return true;
@@ -1099,7 +1237,7 @@ impl PiiDetector {
                 .find(|(n, _)| *n == name)
                 .map(|(_, t)| t.as_str())
                 .unwrap_or("name");
-            if !Self::dict_boundary_ok(text, s, e, typ) {
+            if !Self::dict_boundary_ok(text, s, e, typ, self.hardening()) {
                 continue;
             }
             out.push((typ.to_string(), name, s, e));
@@ -1401,12 +1539,18 @@ mod tests {
         // 标点分界命中（严格 CJK 边界：两侧非 CJK 字母数字）。
         let hits = d.scan_dict_sync("hi 张三，你好", &empty_cred());
         assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
-        // 张三丰不误伤（后接 CJK 即阻断）。
+        // 张三丰不误伤（后接 CJK 即阻断，双模式一致）。
         let hits = d.scan_dict_sync("张三丰来了", &empty_cred());
         assert!(hits.iter().all(|h| h.1 != "张三"), "{hits:?}");
-        // 前接 CJK 同样阻断（严格前瞻语义）。
+        // 非硬化：前接 CJK 按原仓口径放行（before 仅 ASCII 门）；
+        // 硬化开：前接 CJK 阻断（严格 CJK 边界）。
+        let hits = d.scan_dict_sync("我张三", &empty_cred());
+        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
+        d.set_hardening(true);
         let hits = d.scan_dict_sync("我张三", &empty_cred());
         assert!(hits.iter().all(|h| h.1 != "张三"), "{hits:?}");
+        let hits = d.scan_dict_sync("hi 张三，你好", &empty_cred());
+        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
         // 主机名 ASCII 粘连不命中。
         let hits = d.scan_dict_sync("abcdb-prod-01x", &empty_cred());
         assert!(hits.iter().all(|h| h.1 != "db-prod-01"));
@@ -1510,17 +1654,13 @@ mod tests {
     #[test]
     fn 命名组与外层同名约束() {
         let d = detector();
+        // 原仓口径：内命名组与外层失配允许加载（分类以外层 name 为准）。
         let n = d.load_custom_patterns(&[(
             "emp_no".to_string(),
             "(?P<other>(?<![\\d])AB\\d{6}(?![\\d]))".to_string(),
         )]);
-        assert_eq!(n, 0, "内命名组失配必须拒绝");
-        assert!(d.custom_names_snapshot().is_empty());
-        let n = d.load_custom_patterns(&[(
-            "emp_no".to_string(),
-            "(?P<emp_no>(?<![\\d])AB\\d{6}(?![\\d]))".to_string(),
-        )]);
-        assert_eq!(n, 1, "同名必须放行");
+        assert_eq!(n, 1, "内命名组失配按原仓口径放行");
+        assert!(d.custom_names_snapshot().contains(&"emp_no".to_string()));
         let n = d.load_custom_patterns(&[("plain".to_string(), "ZZ-\\d{6}".to_string())]);
         assert_eq!(n, 1, "无命名组必须放行");
     }
@@ -1887,5 +2027,88 @@ mod tests {
         assert!(!scope.contains_request_token(&rt));
         let restored = scope.restore(&format!("回 {rt}"));
         assert!(restored.contains(&rt), "响应 token 原样保留: {restored}");
+    }
+
+    #[test]
+    fn fuzzy忽略大小写变体还原() {
+        let scope = PiiScope::new();
+        let token = scope.register("13812345678", false).unwrap();
+        let seq: usize = token
+            .strip_prefix("__PII_")
+            .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
+            .flatten()
+            .unwrap();
+        // 大写变体同样按序号回查（IGNORECASE 口径）。
+        let upper = format!("__PII_{seq}_ZZZZABCD__");
+        assert!(pii_loose_re().is_match(&upper), "宽松形态须忽略大小写");
+        let restored = scope.restore_with_fuzzy(&format!("回拨 {upper}"), true);
+        assert!(restored.contains("13812345678"), "{restored}");
+    }
+
+    #[test]
+    fn keep前缀兜底覆盖特殊段() {
+        assert!(is_keep_prefix_ip("10.1.2.3", "ipv4"));
+        assert!(is_keep_prefix_ip("100.64.0.1", "ipv4"));
+        assert!(is_keep_prefix_ip("192.0.2.1", "ipv4"));
+        assert!(is_keep_prefix_ip("fc00::1", "ipv6"));
+        assert!(!is_keep_prefix_ip("8.8.8.8", "ipv4"));
+        assert!(!is_keep_prefix_ip("2001:4860:4860::8888", "ipv6"));
+        assert!(is_reserved_ip("100.64.0.1", "ipv4"));
+    }
+
+    #[test]
+    fn 命名组失配放宽到原仓口径() {
+        let d = detector();
+        // 内命名组与外层 name 不同名：原仓口径允许加载（分类以外层为准）。
+        let n = d.load_custom_patterns(&[(
+            "outer".to_string(),
+            r"(?P<inner>(?<![\d])工号\d{6}(?![\d]))".to_string(),
+        )]);
+        assert_eq!(n, 1);
+        assert!(d.custom_names_snapshot().contains(&"outer".to_string()));
+    }
+
+    #[test]
+    fn 三槽叠加同时生效() {
+        let d = detector();
+        let (n, m) = d.load_custom_all(
+            &[(
+                "emp_no".to_string(),
+                r"(?<![\d])工号\d{6}(?![\d])".to_string(),
+            )],
+            &[("张三".to_string(), "name".to_string())],
+        );
+        assert_eq!((n, m), (1, 1));
+        let hits = d.scan_dict_sync("hi 张三，工号123456", &empty_cred());
+        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
+    }
+
+    #[test]
+    fn 字典独立扫描不并入联合正则() {
+        let d = detector();
+        d.load_dict(&[("张三".to_string(), "name".to_string())]);
+        // 联合正则扫描不含字典命中（独立扫描语义）。
+        let builtin = scan_builtin_sync("hi 张三，你好", &empty_cred());
+        assert!(builtin.iter().all(|h| h.1 != "张三"), "{builtin:?}");
+        let dict = d.scan_dict_sync("hi 张三，你好", &empty_cred());
+        assert!(dict.iter().any(|h| h.1 == "张三"), "{dict:?}");
+    }
+
+    #[test]
+    fn 掩码六分支形态正确() {
+        assert_eq!(mask_pii_value("phone", "13812345678"), "138****5678");
+        assert_eq!(mask_pii_value("email", "a@b.com"), "***@***.com");
+        assert_eq!(
+            mask_pii_value("bank_card", "4532015112830366"),
+            "**** **** **** 0366"
+        );
+        assert_eq!(mask_pii_value("ipv4", "8.8.8.8"), "8.8.**.**");
+        assert_eq!(
+            mask_pii_value("ipv6", "2001:4860:4860::8888"),
+            "2001****8888"
+        );
+        assert_eq!(mask_pii_value("api_key", "sk-abcdefgh12345678"), "sk-a****5678");
+        assert_eq!(mask_pii_value("other", "abcdef"), "abc****def");
+        assert_eq!(mask_pii_value("phone", ""), "***");
     }
 }
