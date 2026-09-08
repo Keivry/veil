@@ -58,6 +58,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 审计 | `AUDIT_POLICY_FILE` | 内建默认策略 | 审计策略文件路径 |
 | 审计 | `APPROVAL_WHITELIST` | 空 | 审批人 Matrix ID 逗号分隔（`@user:server`） |
 | TPM | `VEIL_ALLOW_MOCK_TPM` | 未设置（硬件强制） | 仅 `=1` 放行 Mock TPM，专供无硬件开发机与 CI；生产禁用（见下方指引） |
+| TPM | （硬编码）TPM 子进程单步超时 | `30s` | `tpm2_createprimary/load/unseal` 单步上限；存活探测走 `tpm2_pcrread sha256:0` 只读 PCR（不预演密封回放，差异有意，见 `src/service/tpm.rs`） |
 | LLM | `LLM_UPSTREAM` | 空 | 缺省上游 URL；`scripts/api_conformance.py` 将其指向 mock 上游 |
 | LLM | `LLM_<port>`（如 `LLM_8878`/`LLM_8879`） | 见 compose | 按宿主机入口端口选择上游 |
 | LLM | `HTTP_TIMEOUT_SECS` | `30` | 上游转发整体超时（秒） |
@@ -269,3 +270,41 @@ get revoke --name "check-mail"
   凭据表 `MAX_TOKEN_ENTRIES=5000`，PII 请求/响应单表 `PII_MAX_ENTRIES=1000`。
 - 影响：热点凭据驻留更久，冷凭据更快被淘汰；容量语义以本表为准。
 - 迁移：无配置项需改；如依赖旧 FIFO 逐出顺序做容量估算，请按上表容量重估。
+
+## 7. 传输与兼容声明
+
+### 7.1 逐跳（HOP）头集
+
+网关双向过滤 RFC 9110 §7.6.1 逐跳头固定 8 项（大小写不敏感）：
+`connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、
+`te`、`trailer`、`transfer-encoding`、`upgrade`，
+外加 `Connection` 头内列名的动态项。解码开启时（默认）额外剥离
+`content-encoding`/`content-length`（已解码，对外统一 `identity`），
+每次剥离记 `hop_filtered_total{dir}`。与原仓差异：原仓 Python 侧仅透传常用头，
+本仓显式全集过滤（见 `src/service/llm_gateway.rs::HOP_HEADERS`）。
+
+### 7.2 usage 口径
+
+多源 usage 取最大值（`max` 口径，不双计）：流式增量与完成帧 usage 按
+`prompt_tokens`/`completion_tokens`/`total_tokens` 三列各自取 max。
+旧大盘按 `sum` 估算会虚高，迁移到新口径请以本声明为准。
+
+### 7.3 遗留变量兼容表
+
+| 遗留变量 | 状态 | 改用 |
+|:---------|:-----|:-----|
+| `CREDENTIAL_MASTER_PASSWORD` | 二进制不读取 | 主密码口令改走 TPM 解封（`startup_tpm_in`） |
+| `CREDENTIAL_PORT` | 二进制不读取 | 宿主机端口改用 `PORT_8877/8878/8879`（仅改映射） |
+| `CREDENTIAL_PROXY_DEBUG_DIR` | 二进制不读取，无四件落盘 | 如需请求落盘排障，用结构化日志 + `AUDIT_POLICY_FILE` 审计面代替；恢复落盘需新 change 交付（落盘即涉密，需配套脱敏） |
+
+沿用旧名部署会静默不生效（环境变量全表之外的一律忽略），迁移时必须改名。
+
+### 7.4 吊销与注册鉴权声明
+
+- 紧急吊销 `POST /revoke/emergency`：入参含 `file_present` 文件在位标记，
+  管理 token 可走请求体或 `X-Admin-Token` 头；内网判定只认 TCP 远端地址
+  （`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头（防伪造绕过）。
+  与常规吊销同注册表定位条目（见 `src/handler.rs::emergency_revoke_handler`）。
+- `GET /registrations`：原仓无鉴权直读；本仓要求管理面鉴权（`X-Admin-Token` /
+  Cookie / 仅 SSE 回退 query），无 token 恒 401。旧脚本直读须补 token，
+  否则按 401 处理（有意收敛，见 `observability-admin` spec）。
