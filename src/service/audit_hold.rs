@@ -16,11 +16,13 @@ pub enum HoldVerdict {
     Rejected,
 }
 
+/// 经审批网关判定：`Approved`→放行，`Blocked`→拒绝，`Pending`→None（暂缓，收齐 done 后再审）。
 pub fn decide_via_gateway(
     gateway: &dyn ApprovalGateway,
     record: &PendingRecord,
 ) -> Option<HoldVerdict> {
     match gateway.request_approval(record) {
+        crate::approval::ApprovalOutcome::Approved => Some(HoldVerdict::Approved),
         crate::approval::ApprovalOutcome::Blocked => Some(HoldVerdict::Rejected),
         crate::approval::ApprovalOutcome::Pending => None,
     }
@@ -190,6 +192,11 @@ impl AuditHold {
             .collect()
     }
 
+    /// 全局完成事件判定（§2.5）：仅 `message_stop`/`completed` 类事件触发
+    /// 全局 `mark_completed`；`content_block_stop`/`item_done` 只清对应
+    /// index 槽（见 [`AuditHold::is_index_complete_event`] +
+    /// [`AuditHold::clear_index`]），此处恒为 false，避免第一块 stop 后
+    /// 第二块 tool 直接 Approved 逃逸。
     pub fn is_complete_event(payload: &Value) -> bool {
         if payload
             .get("type")
@@ -222,11 +229,12 @@ impl AuditHold {
         {
             return true;
         }
+        // §2.5：`content_block_stop`/`item_done` 只清对应 index 槽，
+        // 不得标记全局完成；全局完成仅由 `message_stop`/`completed` 触发。
         if let Some(t) = payload.get("type").and_then(|v| v.as_str())
             && matches!(
                 t,
-                "content_block_stop"
-                    | "item_done"
+                "message_stop"
                     | "response.completed"
                     | "response.failed"
                     | "response.output_item.done"
@@ -235,8 +243,24 @@ impl AuditHold {
         {
             return true;
         }
-        payload.get("item").is_some()
-            && payload.get("type").and_then(|v| v.as_str()) == Some("response.output_item.done")
+        false
+    }
+
+    /// 按 index 完成事件判定（§2.5）：`content_block_stop`/`item_done`
+    /// 只审计并清理对应 index 的槽，不标记全局完成。
+    pub fn is_index_complete_event(payload: &Value) -> bool {
+        payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "content_block_stop" || t == "item_done")
+    }
+
+    /// 按 index 清槽（§2.5）：移除该 index 的累积参数/名/id，
+    /// 全局 `completed`/`rejected` 状态不动，后续 index 照常累积审计。
+    pub fn clear_index(&mut self, index: u32) {
+        self.args_by_index.remove(&index);
+        self.name_by_index.remove(&index);
+        self.id_by_index.remove(&index);
     }
 
     pub fn mark_completed(&mut self) { self.completed = true; }
@@ -387,11 +411,21 @@ mod tests {
         assert!(AuditHold::is_complete_event(
             &serde_json::json!({"finish_reason":"tool_calls"})
         ));
-        assert!(AuditHold::is_complete_event(
+        // §2.5：stop/item_done 只触发按 index 清理，不标记全局完成。
+        assert!(AuditHold::is_index_complete_event(
             &serde_json::json!({"type":"content_block_stop"})
         ));
-        assert!(AuditHold::is_complete_event(
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"type":"content_block_stop"})
+        ));
+        assert!(AuditHold::is_index_complete_event(
             &serde_json::json!({"type":"item_done"})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"type":"item_done"})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"type":"message_stop"})
         ));
         assert!(AuditHold::is_complete_event(
             &serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]})
@@ -456,6 +490,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decide落实block与approve无noop占位() {
+        let rec = PendingRecord::new("k", "audit_hold");
+        struct AllowAll;
+        impl std::fmt::Debug for AllowAll {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("AllowAll")
+            }
+        }
+        impl ApprovalGateway for AllowAll {
+            fn request_approval(&self, _: &PendingRecord) -> crate::approval::ApprovalOutcome {
+                crate::approval::ApprovalOutcome::Approved
+            }
+        }
+        assert_eq!(
+            decide_via_gateway(&AllowAll, &rec),
+            Some(HoldVerdict::Approved)
+        );
+    }
+
+    #[test]
+    fn 完成判定无重复分支() {
+        // `response.output_item.done` 仅走 matches! 主分支，不再有尾部重复条件。
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"type": "response.output_item.done", "item": {"id": "x"}})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"item": {"id": "x"}, "type": "other"})
+        ));
+    }
+
     #[tokio::test]
     async fn keepalive句柄per_request独立且首包挂起保活() {
         let (tx1, _rx1) = tokio::sync::mpsc::channel::<String>(8);
@@ -509,11 +574,21 @@ mod tests {
 
     #[test]
     fn audit_approve_stream_anthropic_precheck三事件() {
-        assert!(AuditHold::is_complete_event(
+        // §2.5：stop/item_done 只清对应 index 槽；全局完成仅 message_stop。
+        assert!(AuditHold::is_index_complete_event(
             &serde_json::json!({"type":"content_block_stop"})
         ));
-        assert!(AuditHold::is_complete_event(
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"type":"content_block_stop"})
+        ));
+        assert!(AuditHold::is_index_complete_event(
             &serde_json::json!({"type":"item_done"})
+        ));
+        assert!(!AuditHold::is_complete_event(
+            &serde_json::json!({"type":"item_done"})
+        ));
+        assert!(AuditHold::is_complete_event(
+            &serde_json::json!({"type":"message_stop"})
         ));
         assert!(!AuditHold::is_complete_event(
             &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
@@ -524,6 +599,33 @@ mod tests {
         assert!(!AuditHold::is_complete_event(
             &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
         ));
+    }
+
+    #[test]
+    fn 第二tool块不清全局且照常审计() {
+        let mut hold = AuditHold::new(1024);
+        assert_eq!(
+            hold.push_fragment(0, Some("a0"), Some("run"), "{\"x\":1}"),
+            HoldVerdict::Approved
+        );
+        // 第一块 stop：只清 index 0，不标记全局完成。
+        let stop0 = serde_json::json!({"type":"content_block_stop","index":0});
+        assert!(AuditHold::is_index_complete_event(&stop0));
+        assert!(!AuditHold::is_complete_event(&stop0));
+        hold.clear_index(0);
+        assert!(hold.held(), "全局完成须保持未标记");
+        assert_eq!(hold.accumulated(0), None);
+        assert!(hold.tool_triples().is_empty());
+        // 第二块到达照常累积可审计，不直接 Approved 逃逸。
+        assert_eq!(
+            hold.push_fragment(1, Some("a1"), Some("run"), "{\"y\":2}"),
+            HoldVerdict::Approved
+        );
+        assert!(hold.held());
+        let triples = hold.tool_triples();
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].0, 1);
+        assert_eq!(triples[0].2, "{\"y\":2}");
     }
 
     #[test]

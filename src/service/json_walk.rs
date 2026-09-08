@@ -13,6 +13,12 @@
 pub const SCAN_INPUT_LIMIT: usize = 1_048_576;
 /// `str→inner` 嵌套 JSON 递归深度上限。
 pub const DEPTH_LIMIT: u32 = 5;
+/// 裸容器（dict/list）递归深度上限（§2.7 深炸弹守卫）：
+/// `depth` 仅计 `str→inner` 嵌套层数，裸容器层数另计；
+/// 超限子树回退原样（fallback-to-original），不栈溢出。
+/// 输入过长（`len > SCAN_INPUT_LIMIT`）同样回退 plain 处理；
+/// 结构破坏时 [`validate_json_roundtrip`] 回退原串。
+pub const CONTAINER_NEST_LIMIT: u32 = 128;
 
 /// 剥离前导 BOM（`\ufeff`，等价 `lstrip('\ufeff')`）。
 pub fn strip_bom(s: &str) -> &str { s.trim_start_matches('\u{feff}') }
@@ -54,21 +60,43 @@ pub fn json_walk(
     depth_limit: u32,
     depth: u32,
 ) -> serde_json::Value {
+    json_walk_nested(value, leaf, depth_limit, depth, 0)
+}
+
+/// 裸容器递归本体：dict/list 层数超 `CONTAINER_NEST_LIMIT` 时该子树
+/// 原样返回（fallback-to-original），防恶意深嵌套栈溢出。
+fn json_walk_nested(
+    value: serde_json::Value,
+    leaf: &mut dyn FnMut(String) -> String,
+    depth_limit: u32,
+    depth: u32,
+    nest: u32,
+) -> serde_json::Value {
     match value {
         serde_json::Value::String(s) => {
             serde_json::Value::String(walk_string_leaf(s, leaf, depth_limit, depth))
         }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .into_iter()
-                .map(|v| json_walk(v, leaf, depth_limit, depth))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .map(|(k, v)| (k, json_walk(v, leaf, depth_limit, depth)))
-                .collect(),
-        ),
+        serde_json::Value::Array(items) => {
+            if nest >= CONTAINER_NEST_LIMIT {
+                return serde_json::Value::Array(items);
+            }
+            serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| json_walk_nested(v, leaf, depth_limit, depth, nest + 1))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Object(map) => {
+            if nest >= CONTAINER_NEST_LIMIT {
+                return serde_json::Value::Object(map);
+            }
+            serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, json_walk_nested(v, leaf, depth_limit, depth, nest + 1)))
+                    .collect(),
+            )
+        }
         other => other,
     }
 }
@@ -200,6 +228,25 @@ mod tests {
         }
         let out = process_text(&s, &mut |x| x.replace("deep_value", "MASKED"), 5);
         assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+    }
+
+    #[test]
+    fn 深容器嵌套守卫不崩且回退原样() {
+        // 500 层裸数组：serde 解析限层失败走 plain 回退，不崩。
+        let mut v = serde_json::json!("leaf");
+        for _ in 0..500 {
+            v = serde_json::json!([v]);
+        }
+        let text = serde_json::to_string(&v).unwrap();
+        let out = process_text(&text, &mut |s| s.replace("leaf", "MASKED"), 5);
+        assert!(!out.is_empty());
+        // 程序化深 Value 直走 walk：超限子树原样保留，不栈溢出。
+        let walked = json_walk(v, &mut |s| s, 5, 0);
+        assert!(walked.is_array());
+        // 守卫边界内正常遍历不受影响。
+        let shallow = serde_json::json!({"a": [{"b": "leaf"}]});
+        let out2 = json_walk(shallow, &mut |s| s.replace("leaf", "MASKED"), 5, 0);
+        assert_eq!(out2["a"][0]["b"], "MASKED");
     }
 
     #[test]

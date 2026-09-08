@@ -273,15 +273,54 @@ impl SseParser {
     pub fn residual_json_aware(&mut self) -> String {
         let mut tail = self.byte_buf.flush_text();
         tail.push_str(&std::mem::take(&mut self.text_carry));
-        if tail.trim().is_empty() {
+        // §2.6：BOM 剥离后判空与 DONE；残余 DONE 丢弃（终端已由正常事件
+        // 处理，此处再 `data:` 直发会造成重复终止帧），不做 `data:` 转发。
+        let stripped = strip_sse_bom(&tail);
+        if stripped.trim().is_empty() {
             return String::new();
         }
-        json_aware_line(&tail, |s| s)
+        if is_done_payload(stripped) {
+            return String::new();
+        }
+        json_aware_line(stripped, |s| s)
     }
 }
 
+/// BOM 剥离（§2.6）：`data:` 载荷判 `[DONE]` 与 JSON 解析前先剥前导 BOM，
+/// 对标 Python `_sse.py`（BOM 后判 DONE，不把 BOM 帧当残余转发）。
+pub fn strip_sse_bom(s: &str) -> &str { s.trim_start_matches('\u{feff}') }
+
+/// DONE 载荷判定（§2.6）：BOM 剥离后 trim 等于 `[DONE]` 即终端；
+/// 兼容残余路径的 `data:` 前缀形态（`data: [DONE]`/`data:[DONE]`，含 BOM）；
+/// chat 裸帧恒为 `data: [DONE]`，不得补 `event:`。
+pub fn is_done_payload(data: &str) -> bool {
+    let t = strip_sse_bom(data).trim();
+    if t == "[DONE]" {
+        return true;
+    }
+    t.strip_prefix("data:")
+        .is_some_and(|rest| strip_sse_bom(rest).trim() == "[DONE]")
+}
+
+/// 残余分类（§2.6）：`None` 必须丢弃，不得 `data:` 直发；
+/// - 空/空白 → 丢弃；
+/// - `[DONE]`（含 BOM 前缀）→ 丢弃（终端去重已处理，避免重复终止）；
+/// - 其余 → `Some` 还原后文本（调用方经还原/脱敏后按正常帧发送；
+///   纯垃圾残余的彻底丢弃由 handler 接线方按需收紧，见接线说明）。
+pub fn classify_residue(tail: &str) -> Option<String> {
+    let stripped = strip_sse_bom(tail);
+    if stripped.trim().is_empty() {
+        return None;
+    }
+    if is_done_payload(stripped) {
+        return None;
+    }
+    Some(json_aware_line(stripped, |s| s))
+}
+
 pub fn json_aware_line(line: &str, restore: impl Fn(String) -> String) -> String {
-    let trimmed = line.trim();
+    // §2.6：BOM 剥离后判 JSON（BOM+JSON 不得当残余转发）。
+    let trimmed = strip_sse_bom(line).trim();
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
         && matches!(
@@ -526,6 +565,46 @@ mod tests {
         // 阈值差一字节仍缓冲。
         agg.push_str(&"y".repeat(4095));
         assert!(select_emit(&mut agg, Speed::Fast).is_none());
+    }
+
+    #[test]
+    fn bom_done残余丢弃且终端恰一() {
+        assert!(is_done_payload("\u{feff}[DONE]"));
+        assert!(is_done_payload("  [DONE]  "));
+        assert!(is_done_payload("data: [DONE]"));
+        assert!(is_done_payload("data:[DONE]"));
+        assert!(is_done_payload("\u{feff}data: [DONE]"));
+        assert!(!is_done_payload("[DONE] extra"));
+        assert!(!is_done_payload("{\"a\":1}"));
+        assert!(classify_residue("").is_none());
+        assert!(classify_residue("   ").is_none());
+        assert!(classify_residue("\u{feff}data: [DONE]").is_none());
+        assert!(classify_residue("\u{feff}[DONE]").is_none());
+        // JSON 残余保留还原（断连半帧不断链）。
+        let kept = classify_residue("data: {\"a\": 1").expect("半帧残余须保留");
+        assert!(kept.contains("\"a\""));
+        // BOM+JSON 正常解析，不当残余转发。
+        let out = json_aware_line("\u{feff}{\"a\": \"v1\"}", |s| s.replace("v1", "v2"));
+        assert!(out.contains("v2"));
+        // 残余 DONE 经 parser 直接丢弃，不 data: 转发。
+        let mut q = SseParser::new();
+        let _ = q.push_bytes("\u{feff}[DONE]".as_bytes());
+        assert!(q.residual_json_aware().is_empty());
+        // BOM 流经终端去重后恰一终止帧。
+        let frames = super::super::block_inject::dedupe_terminal_frames(
+            vec![
+                "event: message\ndata: {\"a\":1}\n\n".to_string(),
+                "data: [DONE]\n\n".to_string(),
+                "\u{feff}data: [DONE]\n\n".to_string(),
+            ],
+            "chat",
+        );
+        assert_eq!(
+            super::super::block_inject::count_done(&frames),
+            1,
+            "BOM+重复 DONE 去重后恰一终止"
+        );
+        assert!(frames.last().is_some_and(|f| super::super::block_inject::is_done_frame(f)));
     }
 
     #[test]
