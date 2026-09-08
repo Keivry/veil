@@ -66,12 +66,172 @@ pub async fn registrations_handler(
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterBody {
-    #[serde(default)]
+    #[serde(default, alias = "script_path", alias = "path")]
     pub caller_path: String,
-    #[serde(default)]
+    #[serde(default, alias = "script_hash", alias = "hash")]
     pub caller_hash: String,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, alias = "desc")]
+    pub description: String,
+    #[serde(default)]
+    pub entries: Option<serde_json::Value>,
+    #[serde(default)]
+    pub entry: Option<String>,
+    #[serde(default)]
+    pub fields: Option<serde_json::Value>,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default, alias = "auto_approve", alias = "allowMode")]
+    pub allow_mode: Option<String>,
+    #[serde(default)]
+    pub auto: Option<bool>,
+}
+
+fn parse_register_entries(body: &RegisterBody) -> std::collections::BTreeMap<String, Vec<String>> {
+    use std::collections::BTreeMap;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(v) = body.entries.as_ref() {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, fv) in map {
+                    let key = k.trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    let fields = match fv {
+                        serde_json::Value::String(s) => {
+                            let s = s.trim();
+                            if s.is_empty() {
+                                vec![]
+                            } else {
+                                vec![s.to_string()]
+                            }
+                        }
+                        serde_json::Value::Array(items) => items
+                            .iter()
+                            .filter_map(|i| i.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        _ => vec![],
+                    };
+                    out.insert(key.to_string(), fields);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    match item {
+                        serde_json::Value::String(s) => {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                out.entry(s.to_string()).or_default();
+                            }
+                        }
+                        serde_json::Value::Object(map) => {
+                            for (k, fv) in map {
+                                let key = k.trim();
+                                if key.is_empty() {
+                                    continue;
+                                }
+                                let fields = match fv {
+                                    serde_json::Value::String(s) => {
+                                        let s = s.trim();
+                                        if s.is_empty() {
+                                            vec![]
+                                        } else {
+                                            vec![s.to_string()]
+                                        }
+                                    }
+                                    serde_json::Value::Array(a) => a
+                                        .iter()
+                                        .filter_map(|i| i.as_str())
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .collect(),
+                                    _ => vec![],
+                                };
+                                out.insert(key.to_string(), fields);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            serde_json::Value::String(s) => {
+                let s = s.trim();
+                if !s.is_empty() {
+                    out.entry(s.to_string()).or_default();
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        let single_entry = body
+            .entry
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(e) = single_entry {
+            let mut fields: Vec<String> = vec![];
+            if let Some(f) = body
+                .field
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                fields.push(f.to_string());
+            }
+            if let Some(fv) = body.fields.as_ref() {
+                match fv {
+                    serde_json::Value::String(s) => {
+                        let s = s.trim();
+                        if !s.is_empty() && !fields.contains(&s.to_string()) {
+                            fields.push(s.to_string());
+                        }
+                    }
+                    serde_json::Value::Array(items) => {
+                        for i in items {
+                            if let Some(s) = i.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                                if !fields.contains(&s.to_string()) {
+                                    fields.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.insert(e.to_string(), fields);
+        }
+    }
+    out
+}
+
+fn parse_register_allow_mode(body: &RegisterBody) -> Option<crate::config::AutoApprove> {
+    use std::str::FromStr as _;
+    if let Some(raw) = body
+        .allow_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(mode) = crate::config::AutoApprove::from_str(raw) {
+            return Some(mode);
+        }
+    }
+    body.auto.map(|a| {
+        if a {
+            crate::config::AutoApprove::Allow
+        } else {
+            crate::config::AutoApprove::Deny
+        }
+    })
 }
 
 pub async fn register_caller_handler(
@@ -83,13 +243,21 @@ pub async fn register_caller_handler(
         .source
         .clone()
         .or_else(|| header_str(&headers, "x-source").or_else(|| Some("unknown".to_string())));
-    let view = service::register_caller(
-        &state,
-        &body.caller_path,
-        &body.caller_hash,
-        source.as_deref().unwrap_or("unknown"),
-    )
-    .await?;
+    let params = crate::registry::RegisterParams {
+        caller_path: if body.caller_path.trim().is_empty() {
+            String::new()
+        } else {
+            body.caller_path.trim().to_string()
+        },
+        caller_hash: body.caller_hash.trim().to_string(),
+        name: body.name.trim().to_string(),
+        description: body.description.trim().to_string(),
+        entries: parse_register_entries(&body),
+        allow_mode: parse_register_allow_mode(&body),
+    };
+    let view =
+        service::register_caller_extended(&state, &params, source.as_deref().unwrap_or("unknown"))
+            .await?;
     Ok(Json(json!({ "ok": true, "registration": view })))
 }
 
@@ -221,14 +389,14 @@ pub struct CredentialRequestBody {
 /// spec `admin-ratelimit-contract` + design D4：与 8MB 审计/扫描类上限分属
 /// 不同检查点，差异为有意设计；超限返回 413。
 pub const GATEWAY_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
-/// 审计/扫描类体上限 8MB（检查点归属声明：审计 hold 与扫描上限类）。
+/// 审计/扫描类子限 ceiling 8MB（检查点归属声明：审计 hold 与扫描上限类）。
 /// 现网可配子限（`AUDIT_HOLD_MAX_BYTES` 默认 1MB、`SCAN_INPUT_LIMIT` 1MB）均
 /// 不得超过本 ceiling；本常量由 `audit_scan_body_over_limit` 锁定归属，不改变
-/// 现行子限行为。
-pub const AUDIT_SCAN_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+/// 现行子限行为，不接任何请求入口（纯回归锚点）。
+pub const AUDIT_SUBLIMIT_CEILING_BYTES: usize = 8 * 1024 * 1024;
 
 /// 审计/扫描类体长归属判定（spec 8MB 上限的回归锚点，不接请求路径）。
-pub fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SCAN_BODY_LIMIT_BYTES }
+pub fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SUBLIMIT_CEILING_BYTES }
 
 /// 通用 ingress 超限响应：413 + 错误码 `E_PAYLOAD_TOO_LARGE`（spec 锁定）。
 fn payload_too_large(limit: usize) -> Response {
@@ -736,20 +904,45 @@ pub fn spawn_stream_pump(
                     if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
                         let frags = extract_tool_fragments(protocol, &v);
                         let is_tool_event = !frags.is_empty();
+                        let minor = !is_tool_event && is_minor_event(protocol, &v);
                         if rejected_sticky && is_tool_event {
                             continue;
                         }
                         let mut reject_reason: Option<String> = None;
-                        for frag in frags {
-                            if hold.push_fragment(
-                                frag.0,
-                                frag.1.as_deref(),
-                                frag.2.as_deref(),
-                                &frag.3,
-                            ) == crate::service::audit_hold::HoldVerdict::Rejected
-                            {
-                                reject_reason = Some("audit-hold-overflow".to_string());
-                                break;
+                        if minor {
+                            // 次要事件透传且审计声明放行：不进 hold、不审计。
+                        } else if protocol == Protocol::Responses {
+                            for frag in &frags {
+                                let key = AuditHold::responses_key(frag.1.as_deref(), frag.0);
+                                let seq = extract_responses_seq(&v);
+                                let verdict = hold.push_responses_fragment(
+                                    &key,
+                                    frag.0,
+                                    seq,
+                                    frag.1.as_deref(),
+                                    frag.2.as_deref(),
+                                    &frag.3,
+                                );
+                                if verdict == crate::service::audit_hold::HoldVerdict::Rejected {
+                                    reject_reason = Some("audit-hold-overflow".to_string());
+                                    break;
+                                }
+                                if AuditHold::is_complete_event(&v) {
+                                    hold.mark_responses_done(&key, Some(&frag.3));
+                                }
+                            }
+                        } else {
+                            for frag in &frags {
+                                if hold.push_fragment(
+                                    frag.0,
+                                    frag.1.as_deref(),
+                                    frag.2.as_deref(),
+                                    &frag.3,
+                                ) == crate::service::audit_hold::HoldVerdict::Rejected
+                                {
+                                    reject_reason = Some("audit-hold-overflow".to_string());
+                                    break;
+                                }
                             }
                         }
                         let mut approve_held = false;
@@ -822,7 +1015,7 @@ pub fn spawn_stream_pump(
                             .unwrap_or_default();
                         agg.push_str(&prefix);
                         agg.push_str(&format!("data: {restored_data}\n\n"));
-                        if hold.held() && !restored_data.is_empty() {
+                        if !minor && hold.held() && !restored_data.is_empty() {
                             continue;
                         }
                     } else {
@@ -879,27 +1072,20 @@ pub fn spawn_stream_pump(
         }
         if forwarded == 0 && !block_injected {
             block_injected = true;
-            for f in block_inject::ensure_event_lines(match protocol {
-                Protocol::Chat => block_inject::chat_block_frames("empty-stream"),
-                Protocol::Anthropic => block_inject::anthropic_block_frames("empty-stream"),
-                Protocol::Responses => {
-                    let tid = conv_id.clone().unwrap_or_else(|| {
-                        llm_gateway::resolve_conv_id(
-                            None,
-                            &serde_json::Value::Null,
-                            Some(&metrics),
-                            "truncated",
-                        )
-                        .0
-                    });
-                    block_inject::responses_truncated_frames(&tid)
-                }
-                Protocol::NonDialog => vec![],
-            }) {
+            let proto_name = protocol_header_value(protocol);
+            let tid = conv_id.clone().unwrap_or_else(|| {
+                llm_gateway::resolve_conv_id(
+                    None,
+                    &serde_json::Value::Null,
+                    Some(&metrics),
+                    "truncated",
+                )
+                .0
+            });
+            for f in block_inject::ensure_event_lines(block_inject::empty_stream_frames(
+                proto_name, &tid,
+            )) {
                 let _ = pump_tx.send(f).await;
-            }
-            if protocol == Protocol::Chat {
-                let _ = pump_tx.send("data: [DONE]\n\n".to_string()).await;
             }
             let _ = set_truncated(
                 &mut meta,
@@ -984,13 +1170,7 @@ async fn gateway_serve(
         }
     };
     let url = format!("{}{}", upstream_base.trim_end_matches('/'), path);
-    // Client 单例由 1.x 负责；此处保持现状构造，仅以只读引用传入各单元。
-    let client = reqwest::Client::builder()
-        .gzip(llm_gateway::DECODE_ENABLED)
-        .brotli(llm_gateway::DECODE_ENABLED)
-        .deflate(llm_gateway::DECODE_ENABLED)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client: &reqwest::Client = &state.http_client;
     let scope = Arc::new(Scope::with_opts(
         state.config.pii_response_side,
         state.config.pii_fuzzy_restore,
@@ -1017,7 +1197,7 @@ async fn gateway_serve(
             req_start,
         };
         return match serve_nonstream(
-            &client,
+            client,
             upstream_method,
             &url,
             parts.headers.clone(),
@@ -1082,7 +1262,7 @@ async fn gateway_serve(
     if rw.stream_flag {
         let fwd_headers = forward_headers(&parts.headers, &state.gateway_metrics);
         match llm_gateway::fetch_upstream_with_retry(
-            &client,
+            client,
             dialog_method,
             &url,
             fwd_headers,
@@ -1111,7 +1291,7 @@ async fn gateway_serve(
             req_start,
         };
         match serve_nonstream(
-            &client,
+            client,
             dialog_method,
             &url,
             parts.headers.clone(),
@@ -1503,6 +1683,58 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn extract_responses_seq(v: &Value) -> Option<u64> {
+    v.get("sequence_number").and_then(|x| {
+        x.as_u64()
+            .or_else(|| x.as_i64().and_then(|n| u64::try_from(n).ok()))
+    })
+}
+
+fn is_minor_event(protocol: crate::service::llm_gateway::Protocol, v: &Value) -> bool {
+    use crate::service::llm_gateway::Protocol as P;
+    match protocol {
+        P::Anthropic => {
+            let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            t.contains("thinking")
+                || t.contains("signature")
+                || t.contains("redacted")
+                || t.contains("citation")
+                || v.get("delta")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|dt| {
+                        dt.contains("thinking")
+                            || dt.contains("signature")
+                            || dt.contains("citation")
+                    })
+        }
+        P::Responses => {
+            let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            [
+                "reasoning",
+                "mcp",
+                "file_search",
+                "web_search",
+                "code_interpreter",
+                "image_gen",
+            ]
+            .iter()
+            .any(|k| t.contains(k))
+        }
+        P::Chat => v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|choices| {
+                choices.iter().any(|ch| {
+                    ["delta", "message"]
+                        .iter()
+                        .any(|k| ch.get(k).and_then(|c| c.get("refusal")).is_some())
+                })
+            }),
+        P::NonDialog => false,
+    }
+}
+
 fn extract_tool_fragments(
     protocol: crate::service::llm_gateway::Protocol,
     v: &Value,
@@ -1634,7 +1866,11 @@ fn extract_tool_fragments(
                 }
             }
             for (i, b) in blocks.iter().enumerate() {
-                let idx = i as u32;
+                let idx = b
+                    .get("index")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(i as u32);
                 if let Some(fc) = b.get("function_call").and_then(|x| x.as_object()) {
                     let name = fc
                         .get("name")
@@ -1912,13 +2148,93 @@ mod tests {
     }
 
     #[test]
+    fn anthropic按事件index分桶而非枚举下标() {
+        use crate::service::llm_gateway::Protocol as P;
+        let first = serde_json::json!({"content_block":{"type":"tool_use","index":4,"id":"a4","name":"t","input":{}}});
+        let frags = extract_tool_fragments(P::Anthropic, &first);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].0, 4);
+        let second =
+            serde_json::json!({"delta":{"type":"input_json_delta","index":4,"partial_json":"{}"}});
+        let frags2 = extract_tool_fragments(P::Anthropic, &second);
+        assert_eq!(frags2.len(), 1);
+        assert_eq!(frags2[0].0, 4);
+        assert_eq!(frags2[0].3, "{}");
+    }
+
+    #[test]
+    fn responses增量带序号且done全量() {
+        use crate::service::llm_gateway::Protocol as P;
+        let delta = serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"it1","sequence_number":3,"delta":"{\"a\":"});
+        let frags = extract_tool_fragments(P::Responses, &delta);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(extract_responses_seq(&delta), Some(3));
+        assert!(!AuditHold::is_complete_event(&delta));
+        let done = serde_json::json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"it1","sequence_number":4,"name":"run","arguments":"{\"a\":1}"});
+        let frags2 = extract_tool_fragments(P::Responses, &done);
+        assert_eq!(frags2.len(), 1);
+        assert_eq!(frags2[0].2.as_deref(), Some("run"));
+        assert!(AuditHold::is_complete_event(&done));
+    }
+
+    #[test]
+    fn 次要事件透传不审计() {
+        use crate::service::llm_gateway::Protocol as P;
+        assert!(is_minor_event(
+            P::Anthropic,
+            &serde_json::json!({"type":"thinking_delta","thinking":"hmm"})
+        ));
+        assert!(is_minor_event(
+            P::Anthropic,
+            &serde_json::json!({"delta":{"type":"signature_delta","signature":"s"}})
+        ));
+        assert!(is_minor_event(
+            P::Responses,
+            &serde_json::json!({"type":"response.reasoning.delta","delta":"x"})
+        ));
+        assert!(is_minor_event(
+            P::Responses,
+            &serde_json::json!({"type":"response.mcp_call.in_progress"})
+        ));
+        assert!(is_minor_event(
+            P::Chat,
+            &serde_json::json!({"choices":[{"delta":{"refusal":"no"}}]})
+        ));
+        assert!(!is_minor_event(
+            P::Chat,
+            &serde_json::json!({"choices":[{"delta":{"content":"hi"}}]})
+        ));
+        assert!(!is_minor_event(
+            P::Responses,
+            &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
+        ));
+    }
+
+    #[test]
+    fn refusal消息形态同样次要透传() {
+        use crate::service::llm_gateway::Protocol as P;
+        assert!(is_minor_event(
+            P::Chat,
+            &serde_json::json!({"choices":[{"message":{"refusal":"no"}}]})
+        ));
+        assert!(is_minor_event(
+            P::Anthropic,
+            &serde_json::json!({"type":"redacted_thinking","redacted_data":"x"})
+        ));
+        assert!(!is_minor_event(
+            P::NonDialog,
+            &serde_json::json!({"refusal":"no"})
+        ));
+    }
+
+    #[test]
     #[allow(clippy::assertions_on_constants)]
     fn 体上限分级取值与spec一致() {
         assert_eq!(GATEWAY_BODY_LIMIT_BYTES, 10 * 1024 * 1024);
-        assert_eq!(AUDIT_SCAN_BODY_LIMIT_BYTES, 8 * 1024 * 1024);
-        assert!(GATEWAY_BODY_LIMIT_BYTES > AUDIT_SCAN_BODY_LIMIT_BYTES);
-        assert!(!audit_scan_body_over_limit(AUDIT_SCAN_BODY_LIMIT_BYTES));
-        assert!(audit_scan_body_over_limit(AUDIT_SCAN_BODY_LIMIT_BYTES + 1));
+        assert_eq!(AUDIT_SUBLIMIT_CEILING_BYTES, 8 * 1024 * 1024);
+        assert!(GATEWAY_BODY_LIMIT_BYTES > AUDIT_SUBLIMIT_CEILING_BYTES);
+        assert!(!audit_scan_body_over_limit(AUDIT_SUBLIMIT_CEILING_BYTES));
+        assert!(audit_scan_body_over_limit(AUDIT_SUBLIMIT_CEILING_BYTES + 1));
     }
 
     #[tokio::test]
