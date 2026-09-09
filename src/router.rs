@@ -1,12 +1,36 @@
 use {
-    crate::{handler, service::admin, state::AppState},
+    crate::{
+        handler,
+        service::{admin, credential::AppStateParts},
+        state::AppState,
+    },
     axum::{
+        Json,
         Router,
+        extract::{Request, State},
+        http::StatusCode,
+        middleware::{self, Next},
+        response::{IntoResponse, Response},
         routing::{any, get, post},
     },
+    serde_json::json,
 };
 
+async fn observability_gate(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if state.config().observability_disabled && req.uri().path().starts_with("/_admin") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {"code": "E_NOT_FOUND", "message": "管理面已禁用"}})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 pub fn build_router(state: AppState) -> Router {
+    if state.config().observability_disabled {
+        tracing::warn!("OBSERVABILITY_DISABLE=1：管理面已禁用，/_admin 全返回 404");
+    }
     Router::new()
         .route("/_admin/", get(admin::admin_index))
         .route("/_admin", get(admin::admin_index))
@@ -28,6 +52,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/{*tail}", any(handler::llm_proxy_handler))
         .fallback(handler::llm_proxy_handler)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            observability_gate,
+        ))
         .with_state(state)
 }
 

@@ -21,7 +21,7 @@ use {
         },
     },
     crate::error::{Result, VeilError},
-    std::{collections::HashMap, path::PathBuf},
+    std::{collections::HashMap, path::PathBuf, time::Duration},
 };
 
 /// 审计审批默认超时（秒）。
@@ -45,6 +45,20 @@ pub const GATEWAY_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 /// 本常量为回归锚点，不接任何请求入口，不改变现行子限行为。
 /// 归属 `config.rs`（D1 常量下沉），`handler::llm` 原位 `pub use` 转发。
 pub const AUDIT_SUBLIMIT_CEILING_BYTES: usize = 8 * 1024 * 1024;
+/// SSE 单行上限 16KB（D5 下沉自 `service::sse`，只搬不改值；`sse.rs` 原位转发）：
+/// 超长行按 C11 截断并记 `truncated_line_dropped_bytes`；
+/// 理由：SSE 帧语义要求行完整，16KB 覆盖正常事件体（含 usage 完成帧），
+/// 超限即异常上游，截断不断链；放宽会放大单行内存占用，改值须复核泵测试。
+pub const LINE_LIMIT_BYTES: usize = 16 * 1024;
+/// 上游事件空闲超时 30s（D5 下沉自 `service::sse`，只搬不改值；`sse.rs` 原位转发）：
+/// 30s 无任何字节即收尾，避免半开连接永久挂起；
+/// 理由：与 `HTTP_TIMEOUT_SECS`（默认 30s）同数量级有意对齐，任一先到先收尾。
+pub const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 流内保活帧间隔 10s（D5 下沉自 `service::sse`，只搬不改值；`sse.rs` 原位转发；
+/// `audit_hold::RequestKeepalive` 经 `pump.rs::spawn_gated` 接线消费）：
+/// 理由：10s 远小于常见代理 NAT 空闲超时（60s+）且带宽可忽略，
+/// 与管理面 60s SSE ping 分属不同链路（流内保活 vs 管理推送），差异有意。
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// 上游转发 `reqwest::Client` 整体超时默认值（秒，保守值）。
 pub const HTTP_TIMEOUT_SECS_DEFAULT: u64 = 30;
 /// 上游转发连接池每主机空闲连接上限默认值（保守值）。
@@ -144,6 +158,9 @@ pub struct Config {
     pub room_id: String,
     pub matrix_access_token: String,
     pub observability_admin_token: String,
+    /// 可观测性总开关（`OBSERVABILITY_DISABLE`，仅精确 `1` 生效）：
+    /// 置位时网关入口拒绝管理面（`/_admin` 全 404，与 token 有效性无关）。
+    pub observability_disabled: bool,
     pub audit_mode: AuditMode,
     pub audit_timeout_secs: i64,
     pub approval_whitelist: Vec<String>,
@@ -404,6 +421,12 @@ impl Config {
             _ => KeepassBackendKind::Real,
         };
         let credential_block_wait = parse_bool_off(&get, "CREDENTIAL_BLOCK_WAIT");
+        // 可观测性总开关：仅精确 `1`（去空白后）生效，其余值（含 true/yes）不触发，
+        // 与 B1 Verify 边缘（值非 1 时不 404）对齐。
+        let observability_disabled = matches!(
+            get("OBSERVABILITY_DISABLE").as_deref().map(str::trim),
+            Some("1")
+        );
 
         Ok(Self {
             homeserver,
@@ -445,6 +468,7 @@ impl Config {
             tpm_dir,
             keepass_backend,
             credential_block_wait,
+            observability_disabled,
         })
     }
 }
