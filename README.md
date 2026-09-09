@@ -32,7 +32,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 认证 | `GET_BINARY_HASH` | 空 | 独立生效：置位时拒绝调用方冒用 get 自身哈希的直调（`caller_hash == GET_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `GET_BINARY_SECRET` 无联动 |
 | 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同 |
 | 认证 | `AUTO_APPROVE` | `true` | `true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批 |
-| 认证 | `CREDENTIAL_BLOCK_WAIT` | 关闭 | 凭据审批双模开关；`=1` 时 enrolled 篡改/未 enrolled 待审走 `300`s 阻塞等 reaction，默认 `202` 抛单（建单 + best-effort 发送即返回，接线见 `src/service/credential.rs::approval_dual_mode`）；示例：`CREDENTIAL_BLOCK_WAIT=1` |
+| 认证 | `CREDENTIAL_BLOCK_WAIT` | 关闭 | 凭据审批双模开关；`=1` 时 enrolled 篡改/未 enrolled 待审走 `300`s 阻塞等 reaction，默认 `202` 抛单（建单 + best-effort 发送即返回，接线见 `src/service/credential/approval.rs::approval_dual_mode`）；示例：`CREDENTIAL_BLOCK_WAIT=1` |
 | 入口 | `VEIL_ENTRY_MODE` | `full` | `full` / `credential-only` / `llm-only` |
 | 入口 | `CALLER_REGISTRY_PATH` | `<DATA_DIR>/caller_registry.json` | 调用方注册表路径 |
 | 存储 | `DATA_DIR` | `/data` | sqlite、审计日志父目录；派生 `/data/tpm`（`seal.pub`+`seal.priv`）与 `/data/db`（`.kdbx`+`.key`） |
@@ -69,6 +69,8 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | compose 专用 | `TPM_HOST_PATH` / `DB_HOST_PATH` | `./data/tpm` / `./data/db` | 宿主机只读挂载源；二进制直跑时忽略 |
 
 ### 端口语义：单端口运行时 vs compose 三端口映射
+
+**容器内单监听，不存在多端口运行时。**
 
 - 单进程单监听：二进制与容器内均只监听 `127.0.0.1:8877` 一个端口（见 `src/main.rs`），
   凭据 API 与 LLM 代理共用该端口（LLM 按路径透传）；不存在多端口运行时。
@@ -191,6 +193,8 @@ done
 | `metrics/events?model=&upstream=` | 忽略过滤（全局口径，避免空结果误导）+ 弃用标注 | `series?protocol=` 按协议查询 |
 | `events?verdict=<旧值>` | 接受 `allow/allowed/pass/approved/block/blocked/deny/rejected/need_approval/pending/approve` 并归一；命中环内 `kind` 才过滤，否则忽略过滤 + 弃用标注 | `events?kind=&since=&limit=` |
 
+诚实声明：B1.2 token 文件加载仅 `cfg(test)` 生效（生产 fail-closed 口径不变），B7 限流 e2e 为用例级自建 App 隔离桶（生产共享桶语义不变）。
+
 ## 4. 阈值表
 
 下表与 `admin-ratelimit-contract` spec 同字；差异均为有意设计（不同检查点），超限行为统一为
@@ -302,9 +306,11 @@ get revoke --name "check-mail"
 `connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、
 `te`、`trailer`、`transfer-encoding`、`upgrade`，
 外加 `Connection` 头内列名的动态项。解码开启时（默认）额外剥离
-`content-encoding`/`content-length`（已解码，对外统一 `identity`），
-每次剥离记 `hop_filtered_total{dir}`。与原仓差异：原仓 Python 侧仅透传常用头，
-本仓显式全集过滤（见 `src/service/llm_gateway/hop.rs:7` 的 `HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用）。
+`content-encoding`/`content-length`（已解码，对外统一 `identity`：如上游回
+`content-encoding: gzip`，下游响应无该头与 `content-length`），
+每次剥离记 `hop_filtered_total{dir}` 并打 `tracing::debug`（`header`/`dir` 字段）。与原仓差异：原仓 Python 侧仅透传常用头，
+本仓显式全集过滤（见 `src/service/llm_gateway/hop.rs:7` 的 `HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用；
+A5/D9 互引：编码剥离即对外统一 `identity`，见同文件 `filter_hop_headers_counted` 内联注释与单测 `gzip_stripped_as_identity_a5`）。
 
 ### 7.2 usage 口径
 
@@ -326,6 +332,19 @@ get revoke --name "check-mail"
 | `model` 分桶 | 无 | 新增，只加不改旧列 |
 
 迁移：依赖旧 `sum` 口径的告警阈值请按 `max` 重估；缓存与分桶列为新增列，旧查询不受影响。
+
+显式 false 即放弃流式用量，按 key 合并保留不覆写：请求自带
+`stream_options={"include_usage":false}` 时转发体保留 `false`，不覆写为 `true`
+（按 key 合并语义，见 `src/service/llm_gateway/protocol.rs` 与
+`src/handler/llm/rewrite.rs`）；此时流式无 usage 帧，metrics 空 usage 桶为预期而非异常。
+
+空 usage 桶排查指引：观测到某模型空 usage 桶时，先查请求是否显式 `false`
+（转发体保留原值即用户放弃流式用量），再判上游异常或采样缺失，不得直接按故障报修。
+
+非 502/401 错误 JSON 后处理声明（E6/D4）：非流上游回非 502/401 错误状态的 JSON 体
+（如 400 `truncation:disabled`）仍进完整后处理链（用量记录＋审计判定＋还原），
+下游状态码与正文保留、非字节等价为有意行为；仅非 JSON 的 502/401 错误体豁免透传
+（见 `src/handler/llm/nonstream.rs` 尾部分支）。
 
 ### 7.3 请求隔离声明
 
@@ -367,11 +386,12 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 
 - 下游响应头 `x-veil-normalized: json-whitespace` 当且仅当转发前请求体被重序列化为紧凑 JSON
   时置位；未置位时无此头（不以空值占位）。该头只发下游，不向上游转发。
-- 置位条件二选一：① `stream_options` 注入分支（恒经 `to_vec` 重序列化，与配置开关无关，
+- 置位条件三选一：① `stream_options` 注入分支（恒经 `to_vec` 重序列化，与配置开关无关，
   无条件置位，见 `src/handler/llm/rewrite.rs`）；② `NORMALIZE_JSON_WHITESPACE=1` 且请求体可解析为
-  JSON（紧凑化重序列化）。纯脱敏子串替换（字节级，未重序列化）与原文透传不置位。
+  JSON（紧凑化重序列化）；③ 占位符说明注入分支（经 `to_string` 紧凑重序列化，见 D1 方案 A）。
+  纯脱敏子串替换（字节级，未重序列化）与原文透传不置位，即使替换前后字节长度变化。
 - 非流两处响应与 SSE 流响应均按同一 `normalized_out` 置位（见 `src/handler/llm/nonstream.rs`、
-  `src/handler/llm/pump.rs::build_sse_response`）。
+  `src/handler/llm/pump/event.rs::build_sse_response`，经 `pump.rs` 与 `handler/llm/mod.rs` 重导出亦可用；D9 互引见 `arch-docs` spec）。
 
 ## 8. 遗留决策记录
 
@@ -401,6 +421,6 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - `VEIL_ENTRY_MODE` 三态：`full`（默认）/ `credential-only` / `llm-only`（另接受
   `credential-proxy-only` / `llm-proxy-only` 别名，非法值拒启动）。
 - 非 `full` 入口下 `approve_hash_change` 降级为阻断（返回鉴权失败，不执行哈希变更，
-  见 `src/service/credential.rs::approve_hash_change`）。
+  见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
 - Matrix `_ask` 返回 `None` 即 rejected 并清理；孤儿 pending 由 `60s` 清扫任务回收。
 - `AUTO_APPROVE` 三态：`true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批（见 §2）。

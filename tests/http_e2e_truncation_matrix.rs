@@ -55,9 +55,11 @@ async fn mock_upstream(frames: Vec<String>) -> (String, tokio::task::JoinHandle<
             let frames = frames.clone();
             async move {
                 let stream = async_stream::stream! {
+                    // B10 等待策略：mock 单向推送无客户端 readiness 可轮询，取 20ms
+                    // 固定有界等待（慢机安全；增量 15ms×帧数，总时长增量有界）。
                     for f in frames {
                         yield Ok::<_, anyhow::Error>(bytes::Bytes::from(f.into_bytes()));
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                 };
                 (

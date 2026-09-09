@@ -71,9 +71,11 @@ async fn mock_upstream_tricky() -> (String, tokio::task::JoinHandle<()>) {
             let payload = tricky_payload();
             let stream = async_stream::stream! {
                 // 切 7 字节小分片投递，强制跨包重组（含跨行与 CR-only 边界）。
+                // B10 等待策略：mock 单向推送无客户端 readiness 可轮询，取 20ms
+                // 固定有界等待（慢机安全；增量 15ms×分片数，总时长增量有界）。
                 for piece in payload.chunks(7) {
                     yield Ok::<_, anyhow::Error>(bytes::Bytes::from(piece.to_vec()));
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
             };
             (
