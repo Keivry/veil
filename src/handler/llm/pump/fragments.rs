@@ -4,6 +4,7 @@ use {
     crate::service::llm_gateway::{
         Protocol,
         anthropic_bucket_index,
+        chat_bucket,
         retrieval_args,
         retrieval_tool_name,
     },
@@ -45,7 +46,8 @@ pub(super) fn extract_tool_fragments(
                                     .and_then(|x| x.as_u64())
                                     .unwrap_or(i as u64)
                                     as u32;
-                                let id = synth(idx, call.get("id").and_then(|x| x.as_str()));
+                                let bucket = chat_bucket(ci, idx);
+                                let id = synth(bucket, call.get("id").and_then(|x| x.as_str()));
                                 let name = call
                                     .get("function")
                                     .and_then(|f| f.get("name"))
@@ -54,7 +56,7 @@ pub(super) fn extract_tool_fragments(
                                 let args = norm_args(
                                     call.get("function").and_then(|f| f.get("arguments")),
                                 );
-                                out.push((idx, Some(id), name, args));
+                                out.push((bucket, Some(id), name, args));
                             }
                         }
                         for legacy_key in ["function_call", "custom_tool_call"] {
@@ -71,15 +73,15 @@ pub(super) fn extract_tool_fragments(
                                     continue;
                                 };
                                 if legacy_key == "function_call" {
-                                    let idx = ci as u32;
+                                    let bucket = chat_bucket(ci, 0);
                                     let name = obj
                                         .get("name")
                                         .and_then(|x| x.as_str())
                                         .map(|s| s.to_string());
                                     let args = norm_args(obj.get("arguments"));
-                                    out.push((idx, Some(synth(idx, None)), name, args));
+                                    out.push((bucket, Some(synth(bucket, None)), name, args));
                                 } else {
-                                    let idx = i as u32;
+                                    let bucket = chat_bucket(ci, i as u32);
                                     let id_raw = obj
                                         .get("id")
                                         .or_else(|| obj.get("call_id"))
@@ -101,7 +103,7 @@ pub(super) fn extract_tool_fragments(
                                             .or_else(|| obj.get("args")),
                                     );
                                     if name.is_some() || !args.is_empty() || id_raw.is_some() {
-                                        out.push((idx, Some(synth(idx, id_raw)), name, args));
+                                        out.push((bucket, Some(synth(bucket, id_raw)), name, args));
                                     }
                                 }
                             }
@@ -491,6 +493,25 @@ mod fragments_tests {
         super::{super::event::is_minor_event, *},
         crate::service::audit_hold::AuditHold,
     };
+
+    #[test]
+    fn chat_fragments_multi_choice_same_index_isolated() {
+        // F-P1b 流侧：`n=2` 同 `index:0` 分桶隔离、参数不串扰，与非流同键。
+        use crate::service::llm_gateway::{Protocol as P, extract_tool_calls};
+        let v = serde_json::json!({"choices":[
+            {"delta":{"tool_calls":[{"index":0,"id":"c0a","function":{"name":"a","arguments":"{\"x\":1}"}}]}},
+            {"delta":{"tool_calls":[{"index":0,"id":"c0b","function":{"name":"b","arguments":"{\"y\":2}"}}]}}
+        ]});
+        let frags = extract_tool_fragments(P::Chat, &v);
+        assert_eq!(frags.len(), 2);
+        assert_ne!(frags[0].0, frags[1].0, "跨 choice 同 index 须分桶");
+        assert!(frags[0].3.contains("\"x\":1") && !frags[0].3.contains("\"y\""));
+        assert!(frags[1].3.contains("\"y\":2") && !frags[1].3.contains("\"x\""));
+        let calls = extract_tool_calls(P::Chat, &v);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].index, frags[0].0, "流/非流同槽");
+        assert_eq!(calls[1].index, frags[1].0, "流/非流同槽");
+    }
 
     #[test]
     fn streaming_legacy_function_call_matches_nonstream() {

@@ -258,6 +258,7 @@ pub use {
         ToolCall,
         anthropic_bucket_index,
         archive_unknown_id,
+        chat_bucket,
         extract_conv_id,
         extract_tool_calls,
         normalize_tool_args,

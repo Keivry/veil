@@ -10,10 +10,36 @@ pub fn should_inject_placeholders(
     is_chat && redaction_enabled && body_has_values
 }
 
+fn match_pii_token(tail: &[u8]) -> bool {
+    let mut j = 0;
+    while j < tail.len() && tail[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == 0 || j + 1 + 8 + 2 > tail.len() || tail[j] != b'_' {
+        return false;
+    }
+    tail[j + 1..j + 1 + 8].iter().all(|b| b.is_ascii_hexdigit())
+        && tail[j + 1 + 8..].starts_with(b"__")
+}
+
+fn match_cred_token(tail: &[u8]) -> bool {
+    // 严格子集说明：生产 token 恒为 `%06d` 6 位（见 credential_vault.rs），此处要求
+    // `\d{6,}` 是 vault 侧 `\d{4,}`（detector.rs 宽松识别，兼容历史 4-5 位幻觉形）的严格
+    // 子集；4-5 位形不触发注入门属有意保守（注入宜漏不宜误），还原侧仍按宽松口径处理。
+    let mut j = 0;
+    while j < tail.len() && tail[j].is_ascii_digit() {
+        j += 1;
+    }
+    j >= 6 && j + 2 <= tail.len() && tail[j..].starts_with(b"__")
+}
+
 pub fn has_placeholder_tokens(body: &[u8]) -> bool {
     let mut i = 0;
     while i < body.len() {
-        if body[i..].starts_with(b"__PII_") || body[i..].starts_with(b"__VG_CRED_") {
+        let rest = &body[i..];
+        if (rest.starts_with(b"__PII_") && match_pii_token(&rest[6..]))
+            || (rest.starts_with(b"__VG_CRED_") && match_cred_token(&rest[10..]))
+        {
             return true;
         }
         i += 1;
@@ -146,6 +172,21 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
         }
         return injected;
     }
+    if protocol == Protocol::Anthropic {
+        let Some(map) = body.as_object_mut() else {
+            return false;
+        };
+        if let Some(sys) = map.get_mut("system") {
+            if matches!(sys, Value::String(_) | Value::Array(_)) {
+                append_prompt_text(sys, prompt);
+                return true;
+            }
+            tracing::warn!("Anthropic system 非法形态不注入，原体透传");
+            return false;
+        }
+        map.insert("system".to_string(), Value::String(prompt.to_string()));
+        return true;
+    }
     let key = "messages";
     let Some(map) = body.as_object_mut() else {
         return false;
@@ -187,6 +228,33 @@ pub fn placeholder_schema_ok(body: &Value, protocol: Protocol) -> bool {
     }
 }
 
+fn text_has_prompt(v: &Value, prompt: &str) -> bool {
+    match v {
+        Value::String(s) => s.contains(prompt),
+        Value::Array(arr) => arr.iter().any(|e| {
+            e.get("content").is_some_and(|c| text_has_prompt(c, prompt))
+                || e.get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.contains(prompt))
+        }),
+        _ => false,
+    }
+}
+
+fn first_system_has_prompt(obj: &serde_json::Map<String, Value>, key: &str, prompt: &str) -> bool {
+    obj.get(key)
+        .and_then(|v| v.as_array())
+        .and_then(|msgs| {
+            msgs.first()
+                .filter(|first| first.get("role").and_then(|r| r.as_str()) == Some("system"))
+        })
+        .is_some_and(|first| {
+            first
+                .get("content")
+                .is_some_and(|c| text_has_prompt(c, prompt))
+        })
+}
+
 pub fn inject_placeholder_prompt(
     body_text: &str,
     prompt: &str,
@@ -207,12 +275,50 @@ pub fn inject_placeholder_prompt(
     // 保持原值（`inject_responses_text_field` 内已不触碰非法形态）；
     // 仅当双字段均缺失/非法（无任何注入）时整体返回 `None`。
     // `placeholder_schema_ok` 保留作他协议与单测的最终兜底。
+    // F-P2a 幂等守卫：目标位置已含说明不再重复前插，返回 `None`
+    // 使调用方保留原字节（字节等价透传，不置位 normalized）。
     if protocol == Protocol::Responses {
-        if !placeholder_inject_obj(&mut obj, prompt, protocol) {
+        let already = ["input", "instructions"].iter().all(|key| {
+            obj.as_object()
+                .and_then(|m| m.get(*key))
+                .is_none_or(|f| text_has_prompt(f, prompt))
+        }) && obj
+            .as_object()
+            .is_some_and(|m| m.get("input").is_some() || m.get("instructions").is_some());
+        if already {
+            return None;
+        }
+        let mut injected = false;
+        let map = obj.as_object_mut()?;
+        for key in ["input", "instructions"] {
+            let Some(field) = map.get_mut(key) else {
+                continue;
+            };
+            if text_has_prompt(field, prompt) {
+                continue;
+            }
+            injected |= inject_responses_text_field(field, key, prompt);
+        }
+        if !injected {
             tracing::warn!("Responses input/instructions 缺失或非法，不注入");
             return None;
         }
         return serde_json::to_string(&obj).ok();
+    }
+    if protocol == Protocol::Anthropic
+        && obj
+            .as_object()
+            .and_then(|m| m.get("system"))
+            .is_some_and(|s| text_has_prompt(s, prompt))
+    {
+        return None;
+    }
+    if protocol == Protocol::Chat
+        && obj
+            .as_object()
+            .is_some_and(|m| first_system_has_prompt(m, "messages", prompt))
+    {
+        return None;
     }
     if !placeholder_inject_obj(&mut obj, prompt, protocol) {
         return None;
@@ -782,7 +888,12 @@ mod placeholder_parity_tests {
 
     #[test]
     fn t3_r5_injected_star_literal_not_a_token() {
-        assert!(has_placeholder_tokens(b"__PII_*__"));
+        // F-P2a：说明文案自身的 `__PII_*__` 字面不再触发注入门控；
+        // 还原侧仍原样保留字面（vault 行为不变）。
+        assert!(!has_placeholder_tokens(b"__PII_*__"));
+        assert!(!has_placeholder_tokens(
+            PLACEHOLDER_PROMPT_DEFAULT.as_bytes()
+        ));
         let vault = CredentialVault::new();
         let out = vault.restore("说明：__PII_*__ 是占位符");
         assert!(out.contains("__PII_*__"), "字面描述不被还原");
@@ -790,6 +901,48 @@ mod placeholder_parity_tests {
         let mixed = format!("说明：__PII_*__ 是占位符；真实的是 {tok}");
         assert!(vault.restore(&mixed).contains("1380013800abc"));
         assert!(vault.restore(&mixed).contains("__PII_*__"));
+    }
+
+    #[test]
+    fn f2a_exact_token_shape_gate_with_idempotent_inject() {
+        // F-P2a 精确形态：全形态判 true，字面/残缺判 false。
+        assert!(has_placeholder_tokens(b"a __PII_1_ab12cd34__ b"));
+        assert!(has_placeholder_tokens(b"a __VG_CRED_000001__ b"));
+        assert!(!has_placeholder_tokens(b"__PII_*__"));
+        assert!(!has_placeholder_tokens(b"__VG_CRED_*__"));
+        assert!(!has_placeholder_tokens(b"__PII_1_ab12cd3__"));
+        assert!(!has_placeholder_tokens(b"__PII__ab12cd34__"));
+        assert!(!has_placeholder_tokens(b"__PI_1_ab12cd34__"));
+        assert!(!has_placeholder_tokens(b"no tokens here"));
+        // F-P2a 幂等：已含说明不再前插，三协议均字节等价回退 `None`。
+        let chat = serde_json::json!({"messages":[
+            {"role":"user","content":"hi __PII_1_ab12cd34__"}]});
+        let once = inject(&chat, Protocol::Chat).expect("首次须可注入");
+        assert_eq!(once["messages"][0]["role"], "system");
+        let text = serde_json::to_string(&once).unwrap();
+        assert!(
+            inject_placeholder_prompt(&text, PROMPT, Protocol::Chat).is_none(),
+            "二次注入须幂等跳过"
+        );
+        let anth = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let once = inject(&anth, Protocol::Anthropic).expect("首次须可注入");
+        let text = serde_json::to_string(&once).unwrap();
+        assert!(
+            inject_placeholder_prompt(&text, PROMPT, Protocol::Anthropic).is_none(),
+            "二次注入须幂等跳过"
+        );
+        let resp = serde_json::json!({"input":"hi __VG_CRED_000001__"});
+        let once = inject(&resp, Protocol::Responses).expect("首次须可注入");
+        let text = serde_json::to_string(&once).unwrap();
+        assert!(
+            inject_placeholder_prompt(&text, PROMPT, Protocol::Responses).is_none(),
+            "二次注入须幂等跳过"
+        );
+        // Responses 部分已含：仅未含字段注入，已含字段原样保留。
+        let partial = serde_json::json!({"input":PROMPT,"instructions":"be nice"});
+        let out = inject(&partial, Protocol::Responses).expect("未含字段仍须注入");
+        assert_eq!(out["input"], PROMPT);
+        assert!(out["instructions"].as_str().unwrap().contains(PROMPT));
     }
 
     #[test]

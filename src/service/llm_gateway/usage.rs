@@ -109,6 +109,15 @@ pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage
             .as_object()
             .and_then(|o| usage_from_obj(o, protocol)),
         Protocol::Responses => {
+            // F-P1a：官方非流顶层 `usage` 优先，其次 `response.usage`，
+            // 最后 `response.response.usage` 回退；缓存列同口径。
+            if let Some(u) = body
+                .get("usage")
+                .and_then(|v| v.as_object())
+                .and_then(|o| usage_from_obj(o, protocol))
+            {
+                return Some(u);
+            }
             let outer = body.get("response")?.as_object()?;
             if let Some(u) = outer
                 .get("usage")
@@ -143,18 +152,20 @@ pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage
 
 /// 流式 SSE 事件载荷捕获 usage（对标 Python `_capture_usage_ctx`）。
 ///
-/// 口径：顶层 `usage` 优先；Responses 单层 `response.usage` 优先、双层
+/// 口径：顶层 `usage` 优先；Responses `response.usage`、双层
 /// `response.response.usage` 回退；Anthropic `delta.usage` / `message.usage`
 /// 回退；缺失返回 `None` 不估算。数值归一与 [`extract_usage_nonstream`] 同口径
 /// （`input_tokens`/`output_tokens`/`total` 回退，`total` 缺失时 `prompt+completion`）。
 pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage> {
     let obj = payload.as_object()?;
-    // 快路径：无 usage/cached_tokens/裸 token 键的心跳分片直接跳过，避免全量归一。
-    let raw = payload.to_string();
-    if !raw.contains("\"usage\"")
-        && !raw.contains("\"cached_tokens\"")
-        && !raw.contains("input_tokens")
-        && !raw.contains("output_tokens")
+    // F-P2b 快路径：借用判断有无用量承载键，心跳分片零分配跳过。
+    // 完备性：能产出 `Some` 的路径必含四键之一（顶层 `usage`；
+    // Responses 嵌套 `response`；Anthropic 嵌套 `delta`/`message`），
+    // 门外一律归一亦为 `None`，结论等价。
+    if !obj.contains_key("usage")
+        && !obj.contains_key("response")
+        && !obj.contains_key("delta")
+        && !obj.contains_key("message")
     {
         return None;
     }
@@ -227,7 +238,13 @@ mod tests {
             9
         );
         let bad_resp = serde_json::json!({"usage":{"total_tokens":9}});
-        assert!(extract_usage_nonstream(Protocol::Responses, &bad_resp).is_none());
+        // F-P1a：顶层 `usage` 优先后该体命中顶层，不再回退嵌套。
+        assert_eq!(
+            extract_usage_nonstream(Protocol::Responses, &bad_resp)
+                .unwrap()
+                .total_tokens,
+            9
+        );
         let anth =
             serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}});
         assert_eq!(
@@ -295,6 +312,58 @@ mod tests {
             (10, 20, 30),
             "双段按字段单调 max，不求和双计"
         );
+    }
+
+    #[test]
+    fn responses_top_level_usage_preferred_over_nested() {
+        // F-P1a 真实体锁定：官方 Responses 非流顶层 `usage`（`resp_xxx` 体）。
+        let std = serde_json::json!({"id":"resp_abc","object":"response",
+            "output":[{"type":"message"}],
+            "usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57,
+                "input_tokens_details":{"cached_tokens":3}}});
+        let u = extract_usage_nonstream(Protocol::Responses, &std).unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (12, 45, 57)
+        );
+        assert_eq!(u.cached_read, 3, "顶层缓存列同口径命中");
+        // 顶层与嵌套并存时顶层优先。
+        let both = serde_json::json!({"usage":{"input_tokens":12,"output_tokens":45},
+            "response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}});
+        let u = extract_usage_nonstream(Protocol::Responses, &both).unwrap();
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (12, 45));
+        // 流式顶层同口径（`response.completed` 官方事件形态为单层嵌套，不断链）。
+        let ev = serde_json::json!({"type":"response.completed",
+            "response":{"id":"resp_abc","usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57}}});
+        let u = extract_usage_stream(Protocol::Responses, &ev).unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (12, 45, 57)
+        );
+        let top_ev =
+            serde_json::json!({"usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57}});
+        let u = extract_usage_stream(Protocol::Responses, &top_ev).unwrap();
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (12, 45));
+    }
+
+    #[test]
+    fn stream_fast_path_borrowed_gate_matches_full_normalization() {
+        // F-P2b：无承载键分片零分配跳过，有用量分片结论不变。
+        assert!(
+            extract_usage_stream(Protocol::Chat, &serde_json::json!({"type":"ping"})).is_none()
+        );
+        assert!(
+            extract_usage_stream(
+                Protocol::Chat,
+                &serde_json::json!({"delta":"input_tokens mention without keys"})
+            )
+            .is_none()
+        );
+        let chat_ev =
+            serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        assert!(extract_usage_stream(Protocol::Chat, &chat_ev).is_some());
+        let heartbeat = serde_json::json!({"delta":"hi"});
+        assert!(extract_usage_stream(Protocol::Anthropic, &heartbeat).is_none());
     }
 
     #[test]

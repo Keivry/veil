@@ -115,6 +115,12 @@ fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Optio
     })
 }
 
+/// Chat 桶键混入 choice 序号（F-P1b）：`ci*64+index`，`n>1` 时跨 choice
+/// 同 `index` 分桶隔离；`ci=0` 时与旧键等值，单 choice 快照不变。
+pub fn chat_bucket(ci: usize, idx: u32) -> u32 {
+    (ci as u32).saturating_mul(64).saturating_add(idx)
+}
+
 /// Anthropic 分桶唯一实现（P0-2.2）：外层事件 `index` > 内层块 `index` >
 /// 枚举下标；流式（`handler::llm::pump`）与非流共用，单优先级单实现。
 pub fn anthropic_bucket_index(outer: Option<u32>, block: &Value, fallback: u32) -> u32 {
@@ -129,8 +135,8 @@ pub fn anthropic_bucket_index(outer: Option<u32>, block: &Value, fallback: u32) 
 }
 
 /// 非流/流 tool 调用提取：外层 `index` 语义经 [`anthropic_bucket_index`]
-/// 与流式分桶单实现对齐（chat 取 call.index/枚举下标、legacy 取 choice 序号；
-/// anthropic 外层→内层→枚举回退；responses 取 output_index/index）。
+/// 与流式分桶单实现对齐（chat 取 `chat_bucket(ci, call.index)`、legacy 取
+/// `chat_bucket(ci, 0)`；anthropic 外层→内层→枚举回退；responses 取 output_index/index）。
 pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> {
     let mut out = Vec::new();
     match protocol {
@@ -148,8 +154,9 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                                         .and_then(|x| x.as_u64())
                                         .unwrap_or(i as u64)
                                         as u32;
+                                    let bucket = chat_bucket(ci, idx);
                                     let (id, id_synth) =
-                                        synth_id(idx, call.get("id").and_then(|x| x.as_str()));
+                                        synth_id(bucket, call.get("id").and_then(|x| x.as_str()));
                                     let name = call
                                         .get("function")
                                         .and_then(|f| f.get("name"))
@@ -162,7 +169,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                                         tracing::warn!("chat tool 三元组缺失，暂缓审计放行");
                                     }
                                     out.push(ToolCall {
-                                        index: idx,
+                                        index: bucket,
                                         id,
                                         name,
                                         args,
@@ -180,8 +187,8 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                                     for (i, item) in items.iter().enumerate() {
                                         if let Some(obj) = item.as_object() {
                                             if legacy_key == "function_call" {
-                                                let idx = ci as u32;
-                                                let (id, id_synth) = synth_id(idx, None);
+                                                let bucket = chat_bucket(ci, 0);
+                                                let (id, id_synth) = synth_id(bucket, None);
                                                 let name = obj
                                                     .get("name")
                                                     .and_then(|v| v.as_str())
@@ -189,14 +196,14 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                                                 let args =
                                                     normalize_tool_args(obj.get("arguments"));
                                                 out.push(ToolCall {
-                                                    index: idx,
+                                                    index: bucket,
                                                     id,
                                                     name,
                                                     args,
                                                     id_synth,
                                                 });
                                             } else if let Some(c) =
-                                                custom_obj_to_call(i as u32, obj)
+                                                custom_obj_to_call(chat_bucket(ci, i as u32), obj)
                                             {
                                                 out.push(c);
                                             }
@@ -593,6 +600,47 @@ pub fn resolve_conv_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_multi_choice_same_index_isolated_by_ci() {
+        // F-P1b：`n=2` 同 `index:0` 须分桶隔离，参数不串扰。
+        let v = serde_json::json!({"choices":[
+            {"delta":{"tool_calls":[{"index":0,"id":"c0a","function":{"name":"a","arguments":"{\"x\":1}"}}]}},
+            {"delta":{"tool_calls":[{"index":0,"id":"c0b","function":{"name":"b","arguments":"{\"y\":2}"}}]}}
+        ]});
+        let calls = extract_tool_calls(Protocol::Chat, &v);
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].index, calls[1].index, "跨 choice 同 index 须分桶");
+        assert_eq!(calls[0].id, "c0a");
+        assert_eq!(calls[1].id, "c0b");
+        assert!(!calls[0].id_synth && !calls[1].id_synth);
+        assert!(calls[0].args.contains("\"x\":1") && !calls[0].args.contains("\"y\""));
+        assert!(calls[1].args.contains("\"y\":2") && !calls[1].args.contains("\"x\""));
+        // 缺 id 时合成名同步混入 ci，跨 choice 不重名。
+        let no_id = serde_json::json!({"choices":[
+            {"delta":{"tool_calls":[{"index":0,"function":{"name":"a","arguments":"{}"}}]}},
+            {"delta":{"tool_calls":[{"index":0,"function":{"name":"b","arguments":"{}"}}]}}
+        ]});
+        let synth = extract_tool_calls(Protocol::Chat, &no_id);
+        assert_eq!(synth.len(), 2);
+        assert_ne!(synth[0].id, synth[1].id);
+        assert!(synth[0].id_synth && synth[1].id_synth);
+        // custom 方言同步混入 ci。
+        let custom = serde_json::json!({"choices":[
+            {"delta":{"custom_tool_call":{"id":"k0","name":"t","input":{"p":0}}}},
+            {"delta":{"custom_tool_call":{"id":"k1","name":"t","input":{"p":1}}}}
+        ]});
+        let cc = extract_tool_calls(Protocol::Chat, &custom);
+        assert_eq!(cc.len(), 2);
+        assert_ne!(cc[0].index, cc[1].index);
+        // legacy 与新形态口径一致：同 choice 同槽基址。
+        let legacy = serde_json::json!({"choices":[
+            {"delta":{"function_call":{"name":"old","arguments":"{}"}}}
+        ]});
+        let lc = extract_tool_calls(Protocol::Chat, &legacy);
+        assert_eq!(lc.len(), 1);
+        assert_eq!(lc[0].index, chat_bucket(0, 0));
+    }
 
     #[test]
     fn t5_null_tool_fragment_skipped_without_entry() {
