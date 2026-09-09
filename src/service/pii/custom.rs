@@ -340,6 +340,32 @@ mod tests {
         std::time::Duration,
     };
 
+    #[tokio::test]
+    async fn b4_cjk_mixed_and_reserved_edges() {
+        use super::super::detector::is_reserved_ip;
+        assert!(is_reserved_ip("10.1.2.3", "ipv4"));
+        assert!(!is_reserved_ip("8.8.8.8", "ipv4"));
+        assert!(is_reserved_ip("fc00::1", "ipv6"));
+        assert!(!is_reserved_ip("2001:4860:4860::8888", "ipv6"));
+        let d = detector();
+        d.load_custom_patterns(&[(
+            "emp_no".to_string(),
+            r"(?P<emp_no>(?<![\d])工号\d{6}(?![\d]))".to_string(),
+        )]);
+        let hits = d
+            .scan_custom("Hi联系工号123456处理Done 上线", &empty_cred())
+            .await;
+        assert!(hits.iter().any(|h| h.1 == "工号123456"), "{hits:?}");
+        d.load_dict(&[("张三".to_string(), "name".to_string())]);
+        let hits = d.scan_dict_sync("Hi 张三，Done 来了", &empty_cred());
+        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
+        // ASCII 字母数字紧贴粘连按边界口径阻断（防误伤，不断字即正确）。
+        let hits = d.scan_dict_sync("Hi张三Done 来了", &empty_cred());
+        assert!(hits.iter().all(|h| h.1 != "张三"), "{hits:?}");
+        let hits = d.scan_dict_sync("中文测试文本", &empty_cred());
+        assert!(hits.iter().all(|h| h.1 != "中文测试文本"), "{hits:?}");
+    }
+
     #[test]
     fn custom_regex_with_word_boundary_rejected() {
         let d = detector();

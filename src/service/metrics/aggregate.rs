@@ -575,6 +575,43 @@ mod tests {
     }
 
     #[test]
+    fn b5_model_at_sign_passthrough_and_edges() {
+        // B5.2：`:@` 形态按普通字符保留通过；空归 unknown；超长截断；控制字符剥离。
+        assert_eq!(normalize_model("org:proj@gpt-4o"), "org:proj@gpt-4o");
+        assert_eq!(normalize_model("a:b@c"), "a:b@c");
+        assert_eq!(normalize_model(""), "unknown_model");
+        assert_eq!(
+            normalize_model(&"m".repeat(200)).chars().count(),
+            MODEL_MAX_CHARS
+        );
+        assert_eq!(normalize_model("\u{0}ab\n"), "ab");
+        let store = MetricsStore::new(tmp_db("b5-atmodel"));
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            "org:proj@gpt-4o",
+            5,
+            None,
+            None,
+            true,
+            now(),
+        ));
+        store.record_chat(chat_rec(Protocol::Chat, "", 5, None, None, true, now()));
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            &"m".repeat(200),
+            5,
+            None,
+            None,
+            true,
+            now(),
+        ));
+        let snap = store.snapshot();
+        assert_eq!(snap.per_model.get("org:proj@gpt-4o"), Some(&1));
+        assert_eq!(snap.per_model.get("unknown_model"), Some(&1));
+        assert_eq!(snap.requests, 3);
+    }
+
+    #[test]
     fn record_chat_buckets_by_normalized_model() {
         // C13：`record_chat` 按归一化 model 分桶（截断128+去控制字符）；
         // 阻断体回显断言见 `block_inject` 单测。

@@ -167,6 +167,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn b6_bom_depth_wrappers_nested() {
+        // B6.2：BOM 剥离、depth 超限截断不崩、三包装器逐项解析 + 嵌套包装器。
+        assert_eq!(strip_bom("\u{feff}abc"), "abc");
+        assert_eq!(strip_bom("\u{feff}\u{feff}abc"), "abc");
+        assert_eq!(strip_bom("abc"), "abc");
+        // 三包装器逐项：对象 / 数组 / 字符串叶。
+        let out = process_text(r#"{"w":{"x":"v"}}"#, &mut |s| s.to_string(), DEPTH_LIMIT);
+        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+        let out = process_text(r#"[{"x":"v"}]"#, &mut |s| s.to_string(), DEPTH_LIMIT);
+        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+        // 嵌套包装器：串中串中串逐层还原且转义安全。
+        let inner = serde_json::to_string(&serde_json::json!({"k": "p@ss\"q"})).unwrap();
+        let mid = serde_json::to_string(&serde_json::json!({"args": inner})).unwrap();
+        let outer =
+            serde_json::to_string(&serde_json::json!({"tool": "x", "nested": mid})).unwrap();
+        let out = process_text(&outer, &mut |s| s.replace("p@ss\"q", "MASKED"), DEPTH_LIMIT);
+        let v: serde_json::Value = serde_json::from_str(strip_bom(&out)).unwrap();
+        let mid_v: serde_json::Value = serde_json::from_str(v["nested"].as_str().unwrap()).unwrap();
+        let inner_v: serde_json::Value =
+            serde_json::from_str(mid_v["args"].as_str().unwrap()).unwrap();
+        assert_eq!(inner_v["k"], "MASKED");
+        // 超深截断不崩：输出仍为合法 JSON。
+        let mut s = "leaf".to_string();
+        for _ in 0..(DEPTH_LIMIT + 3) {
+            s = serde_json::to_string(&serde_json::json!({"w": s})).unwrap();
+        }
+        let out = process_text(&s, &mut |x| x.to_string(), DEPTH_LIMIT);
+        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+    }
+
+    #[test]
     fn nested_stringified_json_recurses_with_special_chars_safe() {
         // tool_calls.arguments 场景：内层含 p@ss"quote 与 \u 转义。
         let text = r#"{"tool":"x","arguments":"{\"key\":\"p@ss\\\"quote\",\"u\":\"\\u0031\"}"}"#;

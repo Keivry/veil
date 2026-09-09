@@ -353,6 +353,34 @@ mod tests {
     };
 
     #[test]
+    fn b4_trailing_punct_span_edges() {
+        // B4.1：句末标点保留在命中 span 之外（span 精确，标点在原文）。
+        let text = "电话 13812345678。谢谢";
+        let hits = scan_builtin_sync(text, &empty_cred());
+        let hit = hits.iter().find(|h| h.0 == "phone").expect("手机号须命中");
+        assert_eq!(&text[hit.2..hit.3], "13812345678");
+        assert!(text[hit.3..].starts_with('。'));
+        // 句号紧贴命中：span 排除句号。
+        let text = "Visit 8.8.8.8.";
+        let hits = scan_builtin_sync(text, &empty_cred());
+        let hit = hits
+            .iter()
+            .find(|h| h.0 == "ipv4")
+            .expect("公网 IPv4 须命中");
+        assert_eq!(&text[hit.2..hit.3], "8.8.8.8");
+        assert_eq!(&text[hit.3..], ".");
+        // 多句号：span 精确，余部全为句号。
+        let text = "电话 13812345678。。。";
+        let hits = scan_builtin_sync(text, &empty_cred());
+        let hit = hits.iter().find(|h| h.0 == "phone").expect("手机号须命中");
+        assert_eq!(&text[hit.2..hit.3], "13812345678");
+        assert_eq!(&text[hit.3..], "。。。");
+        // 句号紧贴已注册占位符：受保护无新命中。
+        let hits = scan_builtin_sync("回拨 __PII_7_ab12cd34__。", &empty_cred());
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
     fn partial_strip_keeps_complete_token() {
         assert_eq!(
             strip_pii_partials("__PII_1_ab12cd34__ tail"),

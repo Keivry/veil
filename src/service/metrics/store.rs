@@ -6,7 +6,7 @@
 
 use {
     super::{
-        super::llm_gateway::Protocol,
+        super::llm_gateway::{Protocol, is_passthrough},
         aggregate::{
             AggKey,
             ExtendedChatRecord,
@@ -91,7 +91,7 @@ impl MetricsStore {
             is_precise,
             ts_secs,
         } = rec;
-        if protocol == Protocol::NonDialog {
+        if is_passthrough(protocol) {
             return false;
         }
         let truncated = match truncated_mode {
@@ -205,7 +205,7 @@ impl MetricsStore {
         cred_hits: u64,
         audit_blocks: u64,
     ) {
-        if protocol == Protocol::NonDialog {
+        if is_passthrough(protocol) {
             return;
         }
         let proto = protocol.as_tail().to_string();
@@ -531,6 +531,91 @@ mod tests {
         },
         crate::service::llm_gateway::Protocol,
     };
+
+    #[test]
+    fn b5_ring_overflow_newest_retained_queryable() {
+        // B5.1：满队列丢最老且最新保留可查（环上限 + dropped 计数 + 快照含最新模型）。
+        let store = MetricsStore::new(tmp_db("b5-ring"));
+        for i in 0..super::super::aggregate::RING_CAP {
+            store.record_chat(chat_rec(
+                Protocol::Chat,
+                "b5-old",
+                10,
+                None,
+                None,
+                true,
+                now() + i as i64,
+            ));
+        }
+        for i in 0..3 {
+            store.record_chat(chat_rec(
+                Protocol::Chat,
+                "b5-newest",
+                10,
+                None,
+                None,
+                true,
+                now() + 100_000 + i as i64,
+            ));
+        }
+        assert_eq!(store.ring_len(), super::super::aggregate::RING_CAP);
+        assert_eq!(store.dropped_total(), 3);
+        let snap = store.snapshot();
+        assert!(snap.per_model.get("b5-newest") == Some(&3), "{snap:?}");
+        assert_eq!(snap.requests, super::super::aggregate::RING_CAP as u64);
+    }
+
+    #[tokio::test]
+    async fn b5_repeat_flush_aux_no_double_count() {
+        // B5.1/B5.3：重复触发 flush 不翻倍（含附属列）；store 层无定时去抖，
+        // 覆盖式 UPSERT 使多次触发效果等价一次（2s 节流锚在 SSE 层，见 sse.rs）。
+        let db = tmp_db("b5-flush-aux");
+        let _ = std::fs::remove_file(&db);
+        let ts = now();
+        let store = MetricsStore::new(db.clone());
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            "b5-m",
+            12,
+            Some(&usage(1, 2, 3)),
+            None,
+            true,
+            ts,
+        ));
+        store.record_aux_counts(Protocol::Chat, ts, 7, 3, 2);
+        store.flush().await.unwrap();
+        store.flush().await.unwrap();
+        let pts = store
+            .query_series("daily", None, Some("chat/completions".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].requests, 1);
+        assert_eq!(pts[0].pii_hits, 7);
+        assert_eq!(pts[0].cred_hits, 3);
+        assert_eq!(pts[0].audit_blocks, 2);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn b5_aux_same_event_dual_caliber_no_total_double() {
+        // B5.3：同一事件计入用量与附属双口径，总量不双计。
+        let store = MetricsStore::new(tmp_db("b5-dual"));
+        let ts = now();
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            "b5-dual-m",
+            12,
+            Some(&usage(4, 5, 9)),
+            None,
+            true,
+            ts,
+        ));
+        store.record_aux_counts(Protocol::Chat, ts, 2, 1, 1);
+        let snap = store.snapshot();
+        assert_eq!(snap.requests, 1, "附属计数不得增加总量: {snap:?}");
+        assert_eq!(snap.total_tokens, 9);
+    }
 
     #[test]
     fn memory_ring_capped_with_drop_count() {

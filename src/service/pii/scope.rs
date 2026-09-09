@@ -365,6 +365,26 @@ mod tests {
     }
 
     #[test]
+    fn b4_lru_hit_reuse_and_thousand_boundary() {
+        // B4.3：缓存命中复用与容量 1000 边界行为。
+        assert_eq!(PII_MAX_ENTRIES, 1000);
+        let scope = PiiScope::new();
+        // 命中复用：同值注册返回同一 token，还原一致。
+        let a = scope.register("13812345678", false).unwrap();
+        assert_eq!(scope.register("13812345678", false).unwrap(), a);
+        assert!(scope.restore(&format!("回拨 {a}")).contains("13812345678"));
+        // 首条 + 999 条 = 1000 满容量，下一序号为 1001。
+        for i in 0..999 {
+            scope.register(&format!("b4-val-{i:04}"), false).unwrap();
+        }
+        assert_eq!(scope.next_available_index(), PII_MAX_ENTRIES + 1);
+        // 再注一条触发淘汰：最旧（首 token）被逐出，空洞 1 可复用。
+        scope.register("b4-val-0999", false).unwrap();
+        assert!(!scope.contains_request_token(&a), "最久条目须被淘汰");
+        assert_eq!(scope.next_available_index(), 1);
+    }
+
+    #[test]
     fn fuzzy_case_insensitive_restore() {
         let scope = PiiScope::new();
         let token = scope.register("13812345678", false).unwrap();
@@ -465,6 +485,78 @@ mod vault_parity_tests {
         for _ in 0..10 {
             assert_eq!(gen_rand8().unwrap().len(), 8);
         }
+    }
+
+    #[test]
+    fn b6_rand8_batch_unique_and_holes_ordered() {
+        // B6.1：批量生成无碰撞、无可预测序列；连续空洞按序复用。
+        let scope = PiiScope::new();
+        let mut tokens = Vec::new();
+        for i in 0..100 {
+            let tok = scope.register(&format!("b6-batch-{i:03}"), false).unwrap();
+            assert!(pii_token_re().is_match(&tok), "{tok}");
+            tokens.push(tok);
+        }
+        assert_eq!(
+            tokens
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            100,
+            "批量 token 不得碰撞"
+        );
+        let rand8s: Vec<&str> = tokens.iter().map(|t| rand8_of(t)).collect();
+        assert!(
+            rand8s
+                .iter()
+                .all(|r| r.len() == 8 && r.chars().all(|c| c.is_ascii_hexdigit()))
+        );
+        assert!(
+            rand8s
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 95,
+            "rand8 须无可预测序列"
+        );
+        // 连续空洞复用顺序：填满后溢出 1 条（淘汰 seq 1，空洞 1），后续新值依次取 1/2/3，
+        // 每取一洞淘汰下一最旧（稳态下标口径）。
+        for i in 100..PII_MAX_ENTRIES {
+            scope.register(&format!("b6-fill-{i:04}"), false).unwrap();
+        }
+        assert_eq!(scope.next_available_index(), PII_MAX_ENTRIES + 1);
+        scope.register("b6-overflow-0", false).unwrap();
+        assert_eq!(scope.next_available_index(), 1);
+        for (i, expect) in [1usize, 2, 3].iter().enumerate() {
+            let tok = scope.register(&format!("b6-reuse-{i}"), false).unwrap();
+            assert_eq!(parse_pii_seq(&tok), Some(*expect), "{tok}");
+        }
+    }
+
+    #[test]
+    fn b6_fuzzy_illegal_matrix_state_unchanged() {
+        // B6.2：fuzzy 非法形态矩阵均被拒绝还原（原样保留），vault 状态不变。
+        let scope = PiiScope::new();
+        let tok = scope.register("13812345678", false).unwrap();
+        for bad in [
+            "__PII__",
+            "__PII_x_",
+            "__PII_999_zzzz__",
+            "__VG_CRED_000001__",
+            "not-a-token",
+        ] {
+            let out = scope.restore_with_fuzzy(&format!("回拨 {bad} 结束"), true);
+            assert_eq!(out, format!("回拨 {bad} 结束"), "{bad}");
+            assert!(!scope.contains_request_token(bad), "{bad}");
+        }
+        // 精确形态但未注册：非 fuzzy 下原样保留（fuzzy 下按序号回查为已知值，口径有意不同）。
+        let unknown_exact = "__PII_1_ab12cd34__";
+        assert_eq!(
+            scope.restore_with_fuzzy(&format!("回拨 {unknown_exact}"), false),
+            format!("回拨 {unknown_exact}")
+        );
+        // 非法输入不污染状态：已注册值仍精确还原。
+        assert_eq!(scope.restore(&tok), "13812345678");
     }
 
     #[test]

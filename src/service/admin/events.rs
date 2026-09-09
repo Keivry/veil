@@ -726,4 +726,26 @@ mod tests {
         assert!(observability_disabled(&env));
         assert!(!observability_disabled(&HashMap::new()));
     }
+
+    #[test]
+    fn admin_token_file_empty_vs_missing_edges() {
+        let dir =
+            std::env::temp_dir().join(format!("veil-admin-token-edge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 缺文件：读取失败路径，fail-closed 为 None（不 panic）。
+        assert_eq!(load_admin_token_file(&dir), None);
+        // 空文件：空值过滤路径，fail-closed 为 None（无空串 token 旁路）。
+        std::fs::write(dir.join("admin_token"), "").unwrap();
+        assert_eq!(load_admin_token_file(&dir), None);
+        // 纯空白文件：同空文件口径。
+        std::fs::write(dir.join("admin_token"), "  \n\t\n").unwrap();
+        assert_eq!(load_admin_token_file(&dir), None);
+        // 首尾空白有效值：trim 后生效。
+        std::fs::write(dir.join("admin_token"), "  file-token-xyz\n").unwrap();
+        assert_eq!(
+            load_admin_token_file(&dir).as_deref(),
+            Some("file-token-xyz")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

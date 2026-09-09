@@ -1,10 +1,22 @@
 //! PII 检测器：内置 recognizer 原语 + 校验 LRU + `PiiDetector` 核心扫描。
 //!
-//! 口径对标原仓 `_pii.py` 与 `_token.py`：6 recognizer（手机/身份证GB校验位/
+//! 口径对标原仓 `_pii.py` 与 `_token.py`：7 recognizer（手机/身份证GB校验位/
 //! 银行卡Luhn/邮箱/IPv4/IPv6/API key 最小长度16）合成为单一联合正则一次扫描；
 //! 中文与 CJK 边界用 lookaround 表达，MUST NOT 用 `\b`。token 形态
 //! `__PII_<seq>_<rand8>__`。全局 PII LRU（`moka 0.12`）仅缓存确定性校验结论，
 //! 不缓存任何明文↔token 映射，请求级映射永不跨请求互见。
+//!
+//! 原仓七类对照（D8 映射表，本仓 7 名恒 7，缺失类：无）：
+//!
+//! | 原仓 `_BUILTIN_PATTERNS` | 本仓 `BUILTIN_NAMES` | 备注 |
+//! |:--------------------------|:---------------------|:-----|
+//! | phone（手机号） | `phone` | 含 +86 冠码与中文紧贴，GB 口径同字 |
+//! | id_card（身份证） | `id_card` | GB 校验位复核，非法位不命中 |
+//! | bank_card（银行卡） | `bank_card` | Luhn 复核，非法号不命中 |
+//! | email（邮箱） | `email` | 联合正则命名组同字 |
+//! | ipv4 | `ipv4` | 保留/公网划分见 `reserved_allowlist_exempted` |
+//! | ipv6 | `ipv6` | 同上 |
+//! | api_key（密钥） | `api_key` | sk-/gh[pous]_/AKIA 前缀，最小长度 16 |
 
 use std::{
     collections::{HashMap, HashSet},
@@ -28,7 +40,7 @@ pub const RE_DOS_STRIKES: u32 = 3;
 /// 全局校验结论 LRU 容量。
 pub const VALIDATION_CACHE_CAP: u64 = 4096;
 
-/// 6 内置 recognizer 名（与自定义重名拒绝加载）。
+/// 7 内置 recognizer 名（与自定义重名拒绝加载；D8 互锁：长度恒 7 见 `builtin_names_len_locked`）。
 pub const BUILTIN_NAMES: [&str; 7] = [
     "email",
     "phone",
@@ -558,6 +570,26 @@ mod tests {
         test_support::{detector, empty_cred, kinds},
     };
 
+    #[test]
+    fn builtin_names_len_locked() {
+        assert_eq!(
+            BUILTIN_NAMES.len(),
+            7,
+            "D8 互锁：内置 recognizer 名恒为 7（email/phone/id_card/bank_card/ipv4/ipv6/api_key）"
+        );
+        for name in [
+            "email",
+            "phone",
+            "id_card",
+            "bank_card",
+            "ipv4",
+            "ipv6",
+            "api_key",
+        ] {
+            assert!(BUILTIN_NAMES.contains(&name), "缺失内置名: {name}");
+        }
+    }
+
     #[tokio::test]
     async fn six_recognizer_kinds_match() {
         let d = detector();
@@ -711,6 +743,41 @@ mod tests {
         assert!(!is_keep_prefix_ip("8.8.8.8", "ipv4"));
         assert!(!is_keep_prefix_ip("2001:4860:4860::8888", "ipv6"));
         assert!(is_reserved_ip("100.64.0.1", "ipv4"));
+    }
+
+    #[test]
+    fn b4_mixed_forms_regression() {
+        // B4.1/B4.2 回归：时间戳混合、前导零归一、订单号规则、CJK/URL编码边缘。
+        assert_eq!(normalize_ipv4_leading_zeros("010.000.000.001"), "10.0.0.1");
+        assert_eq!(
+            normalize_ipv4_leading_zeros("192.168.001.001"),
+            "192.168.1.1"
+        );
+        let d = detector();
+        // 时间戳与公网 IPv6 混合：时间戳不误杀，公网 IPv6 仍命中。
+        let hits = d.scan_spans_sync("会议12:34:56，网关2001:4860:4860::8888在线", &empty_cred());
+        assert!(kinds(&hits).contains(&"ipv6"), "{hits:?}");
+        assert!(hits.iter().all(|h| h.1 != "12:34:56"), "{hits:?}");
+        // 前导零公网 IPv4 按归一口径命中（默认非硬化；010 打头归一后落 10/8 保留段故用 8 打头）。
+        let hits = d.scan_spans_sync("访问 8.008.008.008 获取", &empty_cred());
+        assert!(kinds(&hits).contains(&"ipv4"), "{hits:?}");
+        // URL 订单号按豁免规则处理（不判卡），裸卡号仍命中。
+        let hits = d.scan_spans_sync(
+            "https://pay.example.com/order?id=4532015112830366 支付",
+            &empty_cred(),
+        );
+        assert!(hits.iter().all(|h| h.0 != "bank_card"), "{hits:?}");
+        let hits = d.scan_spans_sync("卡号 4532015112830366 扣款", &empty_cred());
+        assert!(hits.iter().any(|h| h.0 == "bank_card"), "{hits:?}");
+        // URL 编码形态不误判、不崩溃。
+        let hits = d.scan_spans_sync("https://x.example.com/?id=%34%35%33%32 支付", &empty_cred());
+        assert!(hits.iter().all(|h| h.0 != "bank_card"), "{hits:?}");
+        // 中英混排不断字误杀。
+        let hits = d.scan_spans_sync("Contact联系13812345678Done处理", &empty_cred());
+        assert!(kinds(&hits).contains(&"phone"), "{hits:?}");
+        // 纯 CJK 无敏感零命中。
+        let hits = d.scan_spans_sync("中文测试文本不含敏感信息", &empty_cred());
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     #[test]
