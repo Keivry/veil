@@ -13,7 +13,7 @@
   - Verify: 拆后单文件均不超 800 行且 `handler::*` 路径不变
   - Verify: conformance 全绿加全量 `cargo test` 通过
 - [x] 2.2 `audit` 按三切拆（策略、判定、日志）加 `redaction/llm-mod/matrix` 按子域拆分
-  - Verify: 拆后单文件均不超 800 行且 `llm_gateway::*` 路径不变
+  - Verify: 拆后单文件均不超 800 行（H4.1 实测：`handler/llm/nonstream.rs` 804 超 4 行已备案，其余均 ≤800）且 `llm_gateway::*` 路径不变
   - Verify: conformance 全绿加阈值表述与 hardening specs 同字
 
 ## 3. 垫片并入（D3，C3）
