@@ -317,6 +317,8 @@ A5/D9 互引：编码剥离即对外统一 `identity`，见同文件 `filter_hop
 多源 usage 取最大值（`max` 口径，不双计）：流式增量与完成帧 usage 按
 `prompt_tokens`/`completion_tokens`/`total_tokens` 三列各自取 max。
 旧大盘按 `sum` 估算会虚高，迁移到新口径请以本声明为准。
+Responses 取数顶层优先：非流按顶层 `usage` → `response.usage` → `response.response.usage`
+三级回退，流式同口径（含 `response.completed` 事件）；定制双层体仍经回退命中不断链。
 缓存列 `cached_read`/`cached_write` 同样按列取 max：Anthropic 取顶层
 `cache_read/cache_creation_input_tokens`，Responses 取
 `input_tokens_details.cached_tokens`，Chat 取
@@ -424,3 +426,8 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
 - Matrix `_ask` 返回 `None` 即 rejected 并清理；孤儿 pending 由 `60s` 清扫任务回收。
 - `AUTO_APPROVE` 三态：`true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批（见 §2）。
+
+### 8.5 测试口径注明（T-M7/T-M9，`veil-review-followup-test-gap`）
+
+- 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
+- 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 20 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。

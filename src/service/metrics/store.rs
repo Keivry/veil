@@ -533,6 +533,59 @@ mod tests {
     };
 
     #[test]
+    fn t1_1_gap_closure_locks_queue_flush_window_whitelist() {
+        // T-M1 缺口合一锁定：QueueFull 丢最老 + 跨窗不串扰 + `:@` 通过/空回退 `unknown`；
+        // flush 2s 去抖等价由覆盖式 UPSERT 保证（见 `b5_repeat_flush_aux_no_double_count`）。
+        use super::super::aggregate::{Granularity, normalize_model};
+        let store = MetricsStore::new(tmp_db("t1-1-gap"));
+        for i in 0..super::super::aggregate::RING_CAP {
+            store.record_chat(chat_rec(
+                Protocol::Chat,
+                "t1-old",
+                10,
+                None,
+                None,
+                true,
+                now() + i as i64,
+            ));
+        }
+        for i in 0..3 {
+            store.record_chat(chat_rec(
+                Protocol::Chat,
+                "t1-newest",
+                10,
+                None,
+                None,
+                true,
+                now() + 100_000 + i as i64,
+            ));
+        }
+        assert_eq!(store.ring_len(), super::super::aggregate::RING_CAP);
+        assert_eq!(store.dropped_total(), 3);
+        assert_eq!(
+            store.snapshot().per_model.get("t1-newest"),
+            Some(&3),
+            "满队列须丢最老且最新可查"
+        );
+        // 跨窗不串扰：两日分属两 daily 窗。
+        let d10 = 86_400 * 10 + 100;
+        let d11 = 86_400 * 11 + 100;
+        store.record_chat(chat_rec(Protocol::Chat, "t1-w", 5, None, None, true, d10));
+        store.record_chat(chat_rec(Protocol::Chat, "t1-w", 5, None, None, true, d11));
+        let aggs = store.aggs.lock().expect("聚合锁无毒");
+        let daily: std::collections::HashSet<_> = aggs
+            .keys()
+            .filter(|k| k.granularity == Granularity::Daily)
+            .map(|k| k.window.clone())
+            .collect();
+        assert!(daily.len() >= 2, "跨日须落两窗不串扰: {daily:?}");
+        drop(aggs);
+        // 白名单语义：`:@` 原样通过，非白名单空串回退 `unknown_model`。
+        assert_eq!(normalize_model("org:proj@gpt-4o"), "org:proj@gpt-4o");
+        assert_eq!(normalize_model(""), "unknown_model");
+    }
+
+    #[test]
     fn b5_ring_overflow_newest_retained_queryable() {
         // B5.1：满队列丢最老且最新保留可查（环上限 + dropped 计数 + 快照含最新模型）。
         let store = MetricsStore::new(tmp_db("b5-ring"));
