@@ -1,6 +1,10 @@
 //! 凭据 token（§3.1）：`__VG_CRED_%06d__` 全局映射 +
 //! 请求级作用域隔离 + 残缺清理 + 幻觉完整 token 剥离 + 凭据优先。
 //!
+//! H3.1 owner 声明：token 映射实体（`CredentialVault/TOKEN_PREFIX/MAX_TOKEN_ENTRIES`）
+//! 归本文件；KeePass 查询与注册/吊销运维归 `service::credential::vault_ops`
+//! （其经本文件做取值 token 化）；两处职责正交、互不垫片。
+//!
 //! 口径对标原仓 `_token.py`：`_make_token` 零填充 6 位序号、
 //! `_register_secret` 复用与 `MAX_TOKEN_ENTRIES=5000` 有界 LRU、
 //! `_redact` 按明文长度降序单次替换、`_strip_partials` 接全出口。

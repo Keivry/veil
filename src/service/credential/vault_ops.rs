@@ -1,4 +1,7 @@
 //! KeePass 查询 + 注册表运维：凭据取值脱敏、注册/吊销/哈希变更。
+//!
+//! H3.1 owner 声明：查询与运维归本文件；token 映射实体归
+//! `service::credential_vault`（取值经其 token 化）；两处互不垫片。
 
 use {
     super::{

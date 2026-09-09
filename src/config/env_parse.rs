@@ -503,6 +503,18 @@ mod tests {
     use {super::*, test_support::base_env};
 
     #[test]
+    fn file_len_under_800_or_split() {
+        // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，
+        // 须按 H1 门面+子模块模板拆分，不得只改数字放行。
+        const SELF_SRC: &str = include_str!("env_parse.rs");
+        let lines = SELF_SRC.lines().count();
+        assert!(
+            lines <= 800,
+            "env_parse.rs {lines} 行超 800 红线：须拆分（见 veil-review-followup-arch-hygiene H1/H2.1）"
+        );
+    }
+
+    #[test]
     fn missing_required_each_rejects_startup_naming_var() {
         for var in [
             "HOMESERVER",

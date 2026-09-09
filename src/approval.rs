@@ -1,5 +1,9 @@
 //! D1 审批收敛：三文件分工（本文件存单据 + 问询网关 trait）。
 //!
+//! H3.1 owner 锁定：单据存储（`PendingApprovals`）+ 问询 trait（`ApprovalGateway`）
+//! 归本文件，双模执行（`approval_dual_mode`）归 `service::credential::approval`，
+//! 分支流转归 `service::matrix`；三处职责正交、互不垫片，新代码按此归属。
+//!
 //! - 本文件：`PendingApprovals` 待审单据存储（`Mutex<HashMap>`，`PENDING_TTL_SECS` 60s 孤儿上限）+
 //!   `ApprovalGateway` 问询网关 trait（`ask`/`ask_audit` + 300s/90s 分表超时）。
 //! - `service::credential::approval`：`approval_dual_mode` 双模（默认 202 抛单建单即返；

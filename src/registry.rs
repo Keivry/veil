@@ -481,6 +481,18 @@ impl CallerRegistry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn file_len_under_800_or_split() {
+        // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，
+        // 须按 H1 门面+子模块模板拆分，不得只改数字放行。
+        const SELF_SRC: &str = include_str!("registry.rs");
+        let lines = SELF_SRC.lines().count();
+        assert!(
+            lines <= 800,
+            "registry.rs {lines} 行超 800 红线：须拆分（见 veil-review-followup-arch-hygiene H1/H2.1）"
+        );
+    }
+
     fn entry(path: &str, hash: &str) -> CallerEntry {
         CallerEntry {
             caller_path: path.to_string(),

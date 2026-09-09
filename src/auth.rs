@@ -1,3 +1,9 @@
+//! H3.1 owner 声明：本文件为哈希/密钥比较工具实体
+//! （`ct_eq` 定长哈希、`secret_eq` 变长 Secret、`sha256_hex`、`is_private_ip`），
+//! 与 `service::credential::auth`（三因子网关核验入口）职责不同、非垫片关系；
+//! 新比较原语归本文件，新网关鉴权逻辑归 `credential::auth`（其经 `crate::auth`
+//! 复用本原语），不得互抄。
+
 use subtle::ConstantTimeEq as _;
 
 /// 定长哈希比较（`ct_eq`）：调用方 MUST 只传入等长输入（如 SHA256 hex）；

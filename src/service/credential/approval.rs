@@ -1,4 +1,8 @@
 //! 审批/pending 链：建单、双模问询、哈希变更通知、问询口径。
+//!
+//! H3.1 owner 声明：双模执行（`approval_dual_mode`）归本文件；单据存储与问询
+//! trait 归 `crate::approval`（经其 `ApprovalGateway/PendingRecord` 接口协作），
+//! 分支流转归 `service::matrix`；三处互不垫片。
 
 use {
     super::{super::matrix, AppStateParts, vault_ops::query_keepass},
