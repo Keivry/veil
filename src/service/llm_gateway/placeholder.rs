@@ -83,10 +83,10 @@ fn front_insert_system(msgs: &mut Vec<Value>, prompt: &str) {
     msgs.insert(0, serde_json::json!({"role": "system", "content": prompt}));
 }
 
-/// Responses 文本字段注入（`input` 与 `instructions` 同等语义，§2.1）：
+/// Responses 文本字段注入（`input` 与 `instructions` 同等语义，§2.1；E2 独立回退）：
 /// - `String`：末尾追加说明（与 Anthropic `system` 字符串形态一致）；
 /// - `Array`：首条 system 前插；
-/// - 非法形态（数字/对象等）：warn 后不注入，调用方回退原体。
+/// - 非法形态（数字/对象等）：warn 后不注入，该字段保持原值（不连坐合法字段）。
 fn inject_responses_text_field(field: &mut Value, key: &str, prompt: &str) -> bool {
     match field {
         Value::String(_) | Value::Array(_) => {}
@@ -128,7 +128,8 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
         return true;
     }
     // §2.1：Responses `input` 与 `instructions` 同等注入；string 按串追加、
-    // array 按首条前插；非法形态 warn 后不注入（回退原体）。
+    // array 按首条前插；E2 独立回退：非法字段 warn 后保持原值，仅双字段
+    // 均无注入时整体不注入。
     if protocol == Protocol::Responses {
         let Some(map) = body.as_object_mut() else {
             return false;
@@ -201,6 +202,17 @@ pub fn inject_placeholder_prompt(
     let mut obj: Value = serde_json::from_str(body_text.trim_start_matches('\u{feff}')).ok()?;
     if !obj.is_object() {
         return None;
+    }
+    // E2：Responses 双字段独立注入独立回退：合法字段注入保留，非法字段
+    // 保持原值（`inject_responses_text_field` 内已不触碰非法形态）；
+    // 仅当双字段均缺失/非法（无任何注入）时整体返回 `None`。
+    // `placeholder_schema_ok` 保留作他协议与单测的最终兜底。
+    if protocol == Protocol::Responses {
+        if !placeholder_inject_obj(&mut obj, prompt, protocol) {
+            tracing::warn!("Responses input/instructions 缺失或非法，不注入");
+            return None;
+        }
+        return serde_json::to_string(&obj).ok();
     }
     if !placeholder_inject_obj(&mut obj, prompt, protocol) {
         return None;
@@ -408,11 +420,22 @@ mod tests {
         .expect("仅 instructions 须可注入");
         let v2: Value = serde_json::from_str(&out2).unwrap();
         assert_eq!(v2["instructions"][0]["role"], "system");
-        // instructions 非法形态不注入整体回退。
-        let bad = serde_json::json!({"input":[{"role":"user","content":"hi"}],"instructions":42});
+        // E2 部分非法独立回退：`input` 合法注入保留，`instructions` 非法保持原值。
+        let partial = serde_json::json!({"input":"hi","instructions":42});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&partial).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("合法字段注入须保留");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["input"].as_str().unwrap().contains(prompt));
+        assert_eq!(v["instructions"], 42);
+        // 双字段均非法整体回退。
+        let both_bad = serde_json::json!({"input":42,"instructions":42});
         assert!(
             inject_placeholder_prompt(
-                &serde_json::to_string(&bad).unwrap(),
+                &serde_json::to_string(&both_bad).unwrap(),
                 prompt,
                 Protocol::Responses,
             )
@@ -428,6 +451,46 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn placeholder_responses_partial_illegal_keeps_valid() {
+        let prompt = "PROMPT";
+        // R5.1：`input` 合法 string 加 `instructions` 非法 number 时，
+        // `input` 注入保留、`instructions` 原值不变。
+        let body = serde_json::json!({"model":"m","input":"hello","instructions":42});
+        let out = inject_placeholder_prompt(
+            &serde_json::to_string(&body).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("部分合法须保留注入");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["input"].as_str().unwrap().contains("hello"));
+        assert!(v["input"].as_str().unwrap().contains(prompt));
+        assert_eq!(v["instructions"], 42);
+        // 反向：`instructions` 合法、`input` 非法时同样独立。
+        let rev = serde_json::json!({"input":42,"instructions":"be nice"});
+        let out2 = inject_placeholder_prompt(
+            &serde_json::to_string(&rev).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("反向部分合法须保留注入");
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["input"], 42);
+        assert!(v2["instructions"].as_str().unwrap().contains(prompt));
+        // 双合法场景双字段均注入。
+        let both = serde_json::json!({"input":"hi","instructions":"be nice"});
+        let out3 = inject_placeholder_prompt(
+            &serde_json::to_string(&both).unwrap(),
+            prompt,
+            Protocol::Responses,
+        )
+        .expect("双合法须注入");
+        let v3: Value = serde_json::from_str(&out3).unwrap();
+        assert!(v3["input"].as_str().unwrap().contains(prompt));
+        assert!(v3["instructions"].as_str().unwrap().contains(prompt));
     }
 }
 

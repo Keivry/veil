@@ -60,8 +60,10 @@ pub fn filter_hop_headers_counted(
     }
     // 编码配对：解码开启则对外 `identity`，剥编码与长度（在 hop 剥离之后执行）。
     if decode_enabled {
+        // A5/D9：一行可观测声明——剥离即对外统一 `identity`。
         for enc in ["content-encoding", "content-length"] {
             if headers.remove(enc).is_some() {
+                tracing::debug!(header = enc, dir = dir, "编码头已剥离，对外统一 identity");
                 removed += 1;
             }
         }
@@ -105,6 +107,23 @@ mod tests {
         assert!(h.get("content-encoding").is_none());
         assert!(h.get("content-length").is_none());
         assert_eq!(m.hop_filtered_count("downstream"), 11);
+    }
+
+    #[test]
+    fn gzip_stripped_as_identity_a5() {
+        // A5/D9：`content-encoding: gzip` 解码开启时剥离且记数，对外统一 `identity`。
+        use axum::http::{HeaderMap, HeaderValue};
+        let m = GatewayMetrics::default();
+        let mut h = HeaderMap::new();
+        h.insert("content-encoding", HeaderValue::from_static("gzip"));
+        h.insert("content-length", HeaderValue::from_static("128"));
+        h.insert("x-real", HeaderValue::from_static("keep"));
+        let n = filter_hop_headers_counted(&mut h, "downstream", true, Some(&m));
+        assert_eq!(n, 2);
+        assert!(h.get("content-encoding").is_none());
+        assert!(h.get("content-length").is_none());
+        assert!(h.get("x-real").is_some());
+        assert_eq!(m.hop_filtered_count("downstream"), 2);
     }
 
     #[test]

@@ -277,8 +277,8 @@ pub fn nonstream_block_body(
 /// 一致：不断链、不合成阻断帧）；全放行返回 `None`。
 /// R5 职责声明：本模块只合成帧/体（阻断体/截断帧/空流帧），不累积字节；
 /// 字节累积归 `audit_hold::AuditHold`（只累积、不合成帧），两边不交叉。
-/// handler 接线说明：`Some(body)` 直接替代上游响应返回（状态码沿用上游），
-/// `None` 走正常还原透传。
+/// handler 接线说明：`Some(body)` 直接替代上游响应返回（E4 状态码统一恒 200，
+/// 与流式恒 200 闭合对称，不再沿用上游码），`None` 走正常还原透传。
 pub fn evaluate_nonstream(
     protocol: GatewayProtocol,
     body: &Value,

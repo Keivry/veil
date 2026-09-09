@@ -1,21 +1,12 @@
 use {
     super::llm_gateway::{GatewayMetrics, Protocol},
-    std::time::{Duration, Instant},
+    std::time::Instant,
 };
 
-/// SSE 单行上限 16KB：超长行按 C11 截断并记 `truncated_line_dropped_bytes`；
-/// 硬编码理由：SSE 帧语义要求行完整，16KB 覆盖正常事件体（含 usage 完成帧），
-/// 超限即异常上游，截断不断链；放宽会放大单行内存占用，改值须复核泵测试。
-pub const LINE_LIMIT_BYTES: usize = 16 * 1024;
-/// 上游事件空闲超时 30s：30s 无任何字节即收尾，避免半开连接永久挂起；
-/// 硬编码理由：与 `HTTP_TIMEOUT_SECS`（默认 30s）同数量级有意对齐，任一先到先收尾。
-pub const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// 流内保活帧间隔 10s（`audit_hold::RequestKeepalive` 消费）：
-/// 硬编码理由：10s 远小于常见代理 NAT 空闲超时（60s+）且带宽可忽略，
-/// 与管理面 60s SSE ping 分属不同链路（流内保活 vs 管理推送），差异有意。
+/// SSE 三常量唯一定义归属 `config`（D5 下沉，只搬不改值），此处原位转发防外部引用断裂。
+pub use crate::config::{EVENT_IDLE_TIMEOUT, KEEPALIVE_INTERVAL, LINE_LIMIT_BYTES};
 /// D5：`KeepaliveTracker`（时间戳自检形态，生产零接线）已删除，保活唯一实现为
-/// `RequestKeepalive`（`pump.rs` 经 `spawn_gated` 接线）。
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// `RequestKeepalive`（`pump.rs` 经 `spawn_gated` 接线，间隔消费 `KEEPALIVE_INTERVAL` 10s）。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncatedMode {

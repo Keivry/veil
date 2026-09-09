@@ -97,6 +97,10 @@ pub fn resolve_protocol(
     if hit { proto } else { Protocol::NonDialog }
 }
 
+/// D4 透传谓词：`NonDialog` 为唯一字节透传协议（无用量/审计/还原）。
+/// 全仓布尔判定统一经此函数，新增协议变体只改一处；穷举 `match` 臂保留模式。
+pub fn is_passthrough(protocol: Protocol) -> bool { protocol == Protocol::NonDialog }
+
 pub fn is_stream_body(body: &Value) -> bool {
     body.as_object().is_some_and(|m| {
         m.get("stream")
@@ -195,6 +199,14 @@ mod tests {
             resolve_protocol("/v1/chat/completions", Some("application/json"), Some(&m)),
             Protocol::Chat
         );
+    }
+
+    #[test]
+    fn passthrough_predicate_matches_nondialog_only() {
+        assert!(is_passthrough(Protocol::NonDialog));
+        for p in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
+            assert!(!is_passthrough(p), "{p:?}");
+        }
     }
 
     #[test]

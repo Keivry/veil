@@ -89,7 +89,11 @@ pub async fn request_rewrite(
             protocol,
         )
     {
+        // D1 方案 A（veil-review-llm-edge）：占位符说明注入经 `inject_placeholder_prompt`
+        // 内部 `to_string` 紧凑重序列化，字节已非等价，故置位 `normalized_out`
+        //（README §7.7 置位条件③），下游按同一标志声明 `x-veil-normalized`。
         body_bytes = injected.into_bytes();
+        normalized_out = true;
     }
     let init_conv = body_value.as_ref().and_then(llm_gateway::extract_conv_id);
     RewriteOutput {
@@ -285,6 +289,58 @@ mod rewrite_unit_tests {
         .await;
         let v: serde_json::Value = serde_json::from_slice(&out.body).expect("改写后仍为合法 JSON");
         assert_eq!(v["messages"][0]["role"], "system");
+    }
+
+    #[tokio::test]
+    async fn rewrite_placeholder_injection_declares_normalized_d1a() {
+        // E3/D1 方案 A 锁定：占位符说明注入（紧凑重序列化）须置位 normalized_out。
+        let config = test_config(&[]);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw =
+            br#"{"model":"m","messages":[{"role":"user","content":"hi __PII_1_ab12cd34__"}]}"#;
+        let out = request_rewrite(
+            raw.to_vec(),
+            Protocol::Chat,
+            &config,
+            scope,
+            vault,
+            detector,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&out.body).expect("改写后仍为合法 JSON");
+        assert_eq!(v["messages"][0]["role"], "system", "须已注入占位符说明");
+        assert!(
+            out.normalized_out,
+            "D1 方案 A：注入分支须声明 normalized_out"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_pure_redaction_byte_replace_keeps_normalized_false_e13() {
+        // E13/D2 锁定：纯脱敏字节替换（未重序列化）即使长度变化也不置位；
+        // 关闭占位符注入以隔离纯替换分支。
+        let config = test_config(&[("PII_PLACEHOLDER_PROMPT", "0")]);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw = br#"{"model":"m","messages":[{"role":"user","content":"call 13812345678"}]}"#;
+        let out = request_rewrite(
+            raw.to_vec(),
+            Protocol::Chat,
+            &config,
+            scope,
+            vault,
+            detector,
+        )
+        .await;
+        assert!(!out.normalized_out, "纯字节替换不得置位 normalized_out");
+        assert_ne!(
+            out.body.len(),
+            raw.len(),
+            "脱敏替换前后长度须不同（否则本用例无回归价值）"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.body).contains("__PII_"),
+            "须已发生脱敏替换"
+        );
     }
 
     #[tokio::test]

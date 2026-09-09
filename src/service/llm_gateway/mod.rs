@@ -44,6 +44,10 @@ pub struct GatewayMetrics {
     truncated_line_dropped_bytes: AtomicU64,
     /// P0-4.2/F1：NonDialog 非对话臂透传次数（流量验证用）。
     nondialog_passthrough: AtomicU64,
+    /// E5/D3：非流还原破裂重试仍失败、回退上游原文的次数。
+    restore_fallback: AtomicU64,
+    /// E8：Responses/Anthropic 终止判定 JSON 解析失败回退 contains 的次数。
+    terminal_fallback: AtomicU64,
 }
 
 impl GatewayMetrics {
@@ -130,6 +134,16 @@ impl GatewayMetrics {
     pub fn nondialog_passthrough_count(&self) -> u64 {
         self.nondialog_passthrough.load(Ordering::Relaxed)
     }
+
+    pub fn record_terminal_fallback(&self) {
+        self.terminal_fallback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn terminal_fallback_count(&self) -> u64 { self.terminal_fallback.load(Ordering::Relaxed) }
+
+    pub fn record_restore_fallback(&self) { self.restore_fallback.fetch_add(1, Ordering::Relaxed); }
+
+    pub fn restore_fallback_count(&self) -> u64 { self.restore_fallback.load(Ordering::Relaxed) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +249,7 @@ pub use {
         Protocol,
         inject_stream_options,
         is_chat_tail,
+        is_passthrough,
         is_stream_body,
         resolve_protocol,
         should_inject_stream_options,

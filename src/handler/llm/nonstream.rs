@@ -58,10 +58,11 @@ pub struct NonstreamCtx {
 }
 
 /// `serve_nonstream` 的结果：完整响应，或上游意外回 SSE 时把未消费的
-/// `reqwest::Response` 交回调用方转流泵（原 `looks_sse` 语义）。
+/// `reqwest::Response` 连同请求会话标识交回调用方转流泵（原 `looks_sse` 语义；
+/// E12/D7：泵内终端帧复用请求会话，不再空值合成）。
 pub enum NonstreamOutcome {
     Responded(Response),
-    Stream(reqwest::Response),
+    Stream(reqwest::Response, Option<String>),
 }
 
 /// 2.2 `nonstream` 一发一收：接收改写后请求，返回完整上游响应；
@@ -76,13 +77,17 @@ pub async fn serve_nonstream(
     ctx: NonstreamCtx,
 ) -> NonstreamOutcome {
     let fwd_headers = forward_headers(&headers, &ctx.gateway_metrics);
+    // E12/D7：转泵用请求会话标识（fetch 会 move `body`，须提前提取）。
+    let req_conv = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| llm_gateway::extract_conv_id(&v));
     let up = match llm_gateway::fetch_upstream_with_retry(client, method, url, fwd_headers, body)
         .await
     {
         Ok(up) => up,
         Err(_) => return NonstreamOutcome::Responded(empty_body_response()),
     };
-    if ctx.protocol == Protocol::NonDialog {
+    if llm_gateway::is_passthrough(ctx.protocol) {
         // P0-4.2/F1：非对话臂保持字节透传（与 Python 直通语义一致：无用量/
         // 审计/还原），记 `nondialog_passthrough` 供流量验证；若需补还原另立任务。
         ctx.gateway_metrics.record_nondialog_passthrough();
@@ -125,7 +130,9 @@ pub async fn serve_nonstream(
         .to_string();
     let looks_sse = should_pump_stream(&resp_ct, ctx.stream_flag);
     if looks_sse {
-        return NonstreamOutcome::Stream(up);
+        // E12/D7：转泵时透传请求会话标识（泵内终端帧复用，不断审计链）；
+        // 缺失则为 None，由调用方回退合成并记 `conv_missing`。
+        return NonstreamOutcome::Stream(up, req_conv);
     }
     let bytes = up.bytes().await.unwrap_or_default();
     let is_json = serde_json::from_slice::<Value>(&bytes).is_ok();
@@ -170,11 +177,8 @@ pub async fn serve_nonstream(
         ) {
             ctx.admin_metrics
                 .record_aux_counts(ctx.protocol, now_secs(), 0, 0, 1);
-            let mut resp = (
-                StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
-                Json(block_body),
-            )
-                .into_response();
+            // E4：非流阻断统一恒 200（与流式恒 200 闭合对称，不再沿用上游码）。
+            let mut resp = (StatusCode::OK, Json(block_body)).into_response();
             if ctx.normalized_out {
                 resp.headers_mut().insert(
                     "x-veil-normalized",
@@ -196,11 +200,18 @@ pub async fn serve_nonstream(
             .redact_response_new_pii_with_skip(&ctx.vault, &ctx.detector, &restored, &spans)
             .await;
         // P0-1.2：还原后双 `_jloads` 校验（对标 Python `_nonstream_build`）：
-        // 还原/脱敏可能把未转义明文写回 JSON 串内致破裂，失败回退上游原文并 warn。
+        // 还原/脱敏可能把未转义明文写回 JSON 串内致破裂；E5/D3 先 `strip_partials`
+        // 重试一次（半截形态可挽回时用剥离体），仍失败才回退上游原文并记 metrics + warn。
         if serde_json::from_str::<Value>(&restored).is_err() {
-            let preview: String = restored.chars().take(4000).collect();
-            tracing::warn!("非流还原后 JSON 校验失败，已回退上游原文: {preview}");
-            restored = text;
+            if let Some(stripped) = retry_stripped(&restored) {
+                tracing::warn!("非流还原后 JSON 校验失败，残缺剥离后挽回");
+                restored = stripped;
+            } else {
+                let preview: String = restored.chars().take(4000).collect();
+                tracing::warn!("非流还原后 JSON 校验失败，已回退上游原文: {preview}");
+                ctx.gateway_metrics.record_restore_fallback();
+                restored = text;
+            }
         }
         // P0-1.3：出口显式残缺剥离（凭据 `__VG_CRED_` + PII `__PII_` 半截形态）。
         // 还原/脱敏路径内已带剥离，此处幂等兜底响应侧关闭等旁路。
@@ -222,13 +233,24 @@ pub async fn serve_nonstream(
         );
         return NonstreamOutcome::Responded(resp);
     }
-    // P0-1.1 显式豁免：非 JSON 的 502/401 错误体无用量/工具调用可提取，
-    // 按设计备选路径原样透传（状态码保留），不吞错转空体。
+    // P0-1.1 显式豁免 + E6/D4 意图声明：仅非 JSON 的 502/401 错误体走此透传
+    //（无用量/工具调用可提取，按设计备选路径原样透传，状态码保留，不吞错转空体）；
+    // 非 502/401 的错误 JSON（如 400 `truncation:disabled`）已在上方 `if let Ok(v)`
+    // 分支走完整后处理链（用量记录 + 审计判定 + 还原），非字节等价为有意行为。
     if is_error_status {
         let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
         return NonstreamOutcome::Responded((status, bytes.to_vec()).into_response());
     }
     NonstreamOutcome::Responded(empty_body_response())
+}
+
+/// E5/D3 重试判定（纯函数）：还原体破裂时剥离残缺形态，剥离后可解析则返回
+/// 剥离体（挽回），否则返回 `None`（调用方回退上游原文）。
+fn retry_stripped(restored: &str) -> Option<String> {
+    let stripped = crate::service::redaction::strip_partials(restored);
+    serde_json::from_str::<Value>(&stripped)
+        .is_ok()
+        .then_some(stripped)
 }
 
 #[cfg(test)]
@@ -453,6 +475,310 @@ mod nonstream_empty_tests {
             panic!("空体上游须直接响应而非转流");
         };
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn b3_upstream_empty_and_blank_bodies_return_502() {
+        // B3.1：上游空体与 strip 后空体（仅空格/仅换行/空格换行混合）e2e 均 502，
+        // 错误码 E_EMPTY_BODY，不透传空 200。
+        let client = reqwest::Client::new();
+        for raw in [
+            vec![],
+            b"   ".to_vec(),
+            b"\n".to_vec(),
+            b"  \n \r\n ".to_vec(),
+        ] {
+            let (url, server) = loopback_server(200, "application/json", raw.clone()).await;
+            let outcome = serve_nonstream(
+                &client,
+                reqwest::Method::POST,
+                &url,
+                axum::http::HeaderMap::new(),
+                br#"{"model":"m","messages":[]}"#.to_vec(),
+                test_ctx(Protocol::Chat),
+            )
+            .await;
+            server.abort();
+            let NonstreamOutcome::Responded(resp) = outcome else {
+                panic!("空体上游须直接响应而非转流，输入 {raw:?}");
+            };
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_GATEWAY,
+                "输入 {raw:?}"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .expect("502 体须可读");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("E_EMPTY_BODY"), "输入 {raw:?} 实际 {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b3_nonempty_body_unaffected_passthrough() {
+        // B3.1：非空体不受影响，仍按原语义透传（200 + 原文）。
+        let client = reqwest::Client::new();
+        let upstream =
+            br#"{"id":"cmpl-1","model":"m","choices":[{"message":{"content":"hi"}}]}"#.to_vec();
+        let (url, server) = loopback_server(200, "application/json", upstream).await;
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            axum::http::HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            test_ctx(Protocol::Chat),
+        )
+        .await;
+        server.abort();
+        let NonstreamOutcome::Responded(resp) = outcome else {
+            panic!("非空 JSON 上游须直接响应");
+        };
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn b3_zero_bytes_gate_goes_502() {
+        // B3.2：bytes.len()==0 守门走 502 分支（JSON 与否无关）。
+        assert_eq!(
+            classify_empty(true, false, 0, false, 200),
+            EmptyAction::NonStreamTo502
+        );
+        assert_eq!(
+            classify_empty(true, false, 0, true, 200),
+            EmptyAction::NonStreamTo502
+        );
+    }
+
+    #[test]
+    fn b3_single_byte_valid_json_not_misjudged() {
+        // B3.2：非零字节不误判——单字节合法 JSON（`1`）通过守门。
+        assert_eq!(
+            classify_empty(true, false, 1, true, 200),
+            EmptyAction::PassthroughOk
+        );
+    }
+
+    #[test]
+    fn p2_quoted_whitespace_string_is_valid_json_passthrough() {
+        // P2：合法 JSON 空白串（带引号的 `"   "`，值为三空格字符串）不得误判为空体。
+        // 与 B3 裸空白（`   ` 无引号，非 JSON → 502）对称：引号在则 `is_json=true`
+        // 且 `len>0`，当前语义为 `PassthroughOk`；锁定防未来 strip 误改。
+        let raw = br#""   ""#.to_vec();
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_ok());
+        assert_eq!(
+            classify_empty(true, false, raw.len(), true, 200),
+            EmptyAction::PassthroughOk
+        );
+    }
+
+    #[tokio::test]
+    async fn nonstream_block_status_unified_200() {
+        // E4 统一恒 200：上游 502 + 危险调用命中阻断，下游仍回 200 加阻断体。
+        let client = reqwest::Client::new();
+        let body = br#"{"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}]}"#.to_vec();
+        let (url, server) = loopback_server(502, "application/json", body).await;
+        let mut ctx = test_ctx(Protocol::Chat);
+        ctx.audit_mode = AuditMode::Block;
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            axum::http::HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        server.abort();
+        let NonstreamOutcome::Responded(resp) = outcome else {
+            panic!("阻断须直接响应");
+        };
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("阻断体须可读");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("[blocked:"),
+            "须为阻断体而非上游原文"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_inject_status_symmetric_all_protocols() {
+        // E4 三协议对称：Chat/Anthropic/Responses 非流阻断恒为 200。
+        let client = reqwest::Client::new();
+        let cases = [
+            (
+                Protocol::Chat,
+                br#"{"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}]}"#.to_vec(),
+            ),
+            (
+                Protocol::Anthropic,
+                br#"{"content":[{"type":"tool_use","id":"a1","name":"exec","input":{"cmd":"rm -rf /"}}]}"#.to_vec(),
+            ),
+            (
+                Protocol::Responses,
+                br#"{"output":[{"type":"function_call","id":"f1","name":"exec","arguments":"rm -rf /"}]}"#.to_vec(),
+            ),
+        ];
+        for (protocol, upstream_body) in cases {
+            let (url, server) = loopback_server(502, "application/json", upstream_body).await;
+            let mut ctx = test_ctx(protocol);
+            ctx.audit_mode = AuditMode::Block;
+            let outcome = serve_nonstream(
+                &client,
+                reqwest::Method::POST,
+                &url,
+                axum::http::HeaderMap::new(),
+                br#"{"model":"m"}"#.to_vec(),
+                ctx,
+            )
+            .await;
+            server.abort();
+            let NonstreamOutcome::Responded(resp) = outcome else {
+                panic!("{protocol:?} 阻断须直接响应");
+            };
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "{protocol:?} 须恒 200"
+            );
+        }
+    }
+
+    #[test]
+    fn nonstream_restore_retry_stripped_rescues_partial_tail() {
+        // E5/D3 挽回：破裂体剥离残缺后可解析 → 返回剥离体而非原文。
+        let rescued =
+            super::retry_stripped(r#"{"id":"x"} __VG_CRED_00"#).expect("剥离后合法须挽回");
+        assert!(!rescued.contains("__VG_CRED_00"), "残缺须剥离: {rescued}");
+        assert!(serde_json::from_str::<serde_json::Value>(&rescued).is_ok());
+    }
+
+    #[test]
+    fn nonstream_restore_retry_stripped_gives_up_on_quote_break() {
+        // E5/D3 回退：引号破裂剥离无法修复 → None（调用方回退原文并记 metrics）。
+        assert!(super::retry_stripped(r#"{"content":"ab"cd"}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn nonstream_restore_fallback_records_metrics_e5() {
+        // E5/D3 回退可观测：引号破裂回退原文且记 `restore_fallback == 1`。
+        let metrics = Arc::new(llm_gateway::GatewayMetrics::default());
+        let scope = Arc::new(Scope::new());
+        let vault = Arc::new(CredentialVault::new());
+        let detector = Arc::new(PiiDetector::new());
+        let plain = "ab\"cd-ef";
+        let token = vault.register(plain).expect("测试凭据须注册成功");
+        let up_body = format!(
+            "{{\"id\":\"x\",\"choices\":[{{\"message\":{{\"content\":\"{token}\"}}}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}"
+        );
+        let (url, server) =
+            loopback_server(200, "application/json", up_body.clone().into_bytes()).await;
+        let client = reqwest::Client::new();
+        let mut ctx = test_ctx(Protocol::Chat);
+        ctx.scope = scope;
+        ctx.vault = vault;
+        ctx.detector = detector;
+        ctx.gateway_metrics = metrics.clone();
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            axum::http::HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        server.abort();
+        let NonstreamOutcome::Responded(resp) = outcome else {
+            panic!("JSON 上游不得转流泵");
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        assert_eq!(body.as_ref(), up_body.as_bytes(), "破裂还原须回退上游原文");
+        assert_eq!(
+            metrics.restore_fallback_count(),
+            1,
+            "回退须记 restore_fallback 计数"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonstream_400_json_traverses_post_processing_e6() {
+        // E6/D4：400 系 JSON 走完整后处理（用量记录 + 状态保留），非字节等价有意为之。
+        let admin = Arc::new(MetricsStore::new(std::path::PathBuf::from(
+            "/tmp/veil-e6-400-test.sqlite",
+        )));
+        let up_body = br#"{"error":{"message":"truncation with disabled is not supported","type":"invalid_request_error"}}"#.to_vec();
+        let (url, server) = loopback_server(400, "application/json", up_body).await;
+        let client = reqwest::Client::new();
+        let mut ctx = test_ctx(Protocol::Chat);
+        ctx.admin_metrics = admin.clone();
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            axum::http::HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        server.abort();
+        let NonstreamOutcome::Responded(resp) = outcome else {
+            panic!("400 错误体不得转流泵");
+        };
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("truncation"), "错误正文须透出: {text}");
+        assert_eq!(
+            admin.ring_len(),
+            1,
+            "400 JSON 体须记一条 record_chat 用量快照（后处理证据）"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonstream_to_stream_carries_request_conv_e12() {
+        // E12/D7：转泵分支透传请求会话标识，不再空值合成；缺失为 None。
+        let client = reqwest::Client::new();
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            axum::http::HeaderMap::new(),
+            br#"{"id":"chatcmpl-req-9","model":"m","messages":[]}"#.to_vec(),
+            test_ctx(Protocol::Chat),
+        )
+        .await;
+        server.abort();
+        let NonstreamOutcome::Stream(_, req_conv) = outcome else {
+            panic!("SSE 上游须转流泵");
+        };
+        assert_eq!(req_conv.as_deref(), Some("chatcmpl-req-9"));
+        let (url2, server2) =
+            loopback_server(200, "text/event-stream", b"data: [DONE]\n\n".to_vec()).await;
+        let outcome2 = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url2,
+            axum::http::HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            test_ctx(Protocol::Chat),
+        )
+        .await;
+        server2.abort();
+        let NonstreamOutcome::Stream(_, req_conv2) = outcome2 else {
+            panic!("SSE 上游须转流泵");
+        };
+        assert!(req_conv2.is_none(), "无会话请求透传 None，由调用方回退合成");
     }
 
     #[tokio::test]
