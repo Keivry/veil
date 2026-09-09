@@ -90,7 +90,7 @@
 - [x] 8.3 门禁线（`cargo fmt --check` + `cargo clippy -- -D warnings` 全绿，对应原仓 `ruff check + ruff format --check`；`cargo test` 全绿对应 `pytest` 全绿）
   - 验收：CI 三门禁全绿；clippy 零警告
 - [x] 8.4 42 文件移植映射表（原 `tests/*_test.py` @ 源 commit pin → Rust 内联单测（`src/**/tests`）+ 集成（`tests/`）+ 脚本（`scripts/`），逐项勾选，遗漏即 fail；sentinel 路径 `sentinel_{chat,anthropic,responses}.jsonl`；openai/anthropic SDK 版本随表 pin）
-  - 验收：下表 42 项全部勾选且对应 Rust 测试通过
+  - 验收：下表 42 项全部勾选且对应 Rust 测试通过（勘误：下表 `src/service/llm_gateway/mod.rs` 均指现 `src/service/llm_gateway/mod.rs`，单文件已拆为子模块目录，语义不变）
 
 | # | 原文件（@ 源 commit pin，随表锁定） | Rust 对应（内联单测 `src/**` / 集成 `tests/` / 脚本 `scripts/`；sentinel 路径见 8.1，openai/anthropic SDK 版本见 8.2 pin） | 状态 |
 |---|--------|----------------|------|
@@ -100,13 +100,13 @@
 | 1 | `token_test.py` | `src/service/credential_vault.rs` 内联单测 | - [x] |
 | 2 | `credential_test.py` | `src/service/mod.rs` + `src/router.rs` 内联单测 | - [x] |
 | 3 | `matrix_test.py` | `src/service/matrix.rs` 内联单测 | - [x] |
-| 4 | `llm_test.py` | `src/service/llm_gateway.rs` + `src/service/sse.rs` 内联单测 | - [x] |
+| 4 | `llm_test.py` | `src/service/llm_gateway/mod.rs` + `src/service/sse.rs` 内联单测 | - [x] |
 | 5 | `llm_truncation_test.py` | `src/service/sse.rs` 内联单测（截断三态同口径） | - [x] |
 | 6 | `llm_truncation_realdata_test.py` | `src/service/sse.rs` 内联单测（截断三态同口径） | - [x] |
-| 7 | `llm_empty_coverage_test.py` | `src/service/llm_gateway.rs` + `src/service/block_inject.rs` 内联单测 | - [x] |
+| 7 | `llm_empty_coverage_test.py` | `src/service/llm_gateway/mod.rs` + `src/service/block_inject.rs` 内联单测 | - [x] |
 | 8 | `sse_stream_loop_test.py` | `src/service/sse.rs` 内联单测 | - [x] |
 | 9 | `stream_restore_lock_test.py` | `src/service/sse.rs` 内联单测 | - [x] |
-| 10 | `usage_capture_responses_test.py` | `src/service/llm_gateway.rs` 内联单测（`extract_usage`） | - [x] |
+| 10 | `usage_capture_responses_test.py` | `src/service/llm_gateway/mod.rs` 内联单测（`extract_usage`） | - [x] |
 | 11 | `pii_test.py` | `src/service/pii.rs` 内联单测 | - [x] |
 | 12 | `pii_token_test.py` | `src/service/pii.rs` + `src/service/redaction.rs` 内联单测 | - [x] |
 | 13 | `pii_llm_test.py` | `src/service/redaction.rs` 内联单测 | - [x] |
@@ -115,8 +115,8 @@
 | 16 | `pii_ipv6_time_test.py` | `src/service/pii.rs` 内联单测 | - [x] |
 | 17 | `pii_value_samples_test.py` | `src/service/metrics.rs` 采样器内联单测 | - [x] |
 | 18 | `pii_regression_fix_test.py` | `src/service/pii.rs` 内联单测 | - [x] |
-| 19 | `pii_placeholder_prompt_test.py` | `src/service/llm_gateway.rs` 内联单测 | - [x] |
-| 20 | `pii_placeholder_prompt_integration_test.py` | `src/service/llm_gateway.rs` 内联单测 | - [x] |
+| 19 | `pii_placeholder_prompt_test.py` | `src/service/llm_gateway/mod.rs` 内联单测 | - [x] |
+| 20 | `pii_placeholder_prompt_integration_test.py` | `src/service/llm_gateway/mod.rs` 内联单测 | - [x] |
 | 21 | `detection_hardening_test.py` | `src/service/pii.rs` 内联单测 | - [x] |
 | 22 | `residual_hardening_test.py` | `src/service/sse.rs` + `src/service/redaction.rs` 内联单测 | - [x] |
 | 23 | `redact_extra_test.py` | `src/service/metrics.rs`（摘要脱敏）内联单测 | - [x] |
@@ -134,7 +134,7 @@
 | 35 | `observability_series_test.py` | `src/service/metrics.rs` + `src/service/admin.rs` 内联单测 | - [x] |
 | 36 | `observability_sse_metrics_test.py` | `src/service/admin.rs` 内联单测 | - [x] |
 | 37 | `observability_model_filter_test.py` | `src/service/metrics.rs` 内联单测 | - [x] |
-| 38 | `observability_non_dialog_test.py` | `src/service/llm_gateway.rs` + `src/service/metrics.rs` 内联单测 | - [x] |
+| 38 | `observability_non_dialog_test.py` | `src/service/llm_gateway/mod.rs` + `src/service/metrics.rs` 内联单测 | - [x] |
 | 39 | `observability_pii_value_test.py` | `src/service/metrics.rs` 采样器内联单测 | - [x] |
 | 40 | `observability_upstream_filter_test.py` | `src/service/metrics.rs` 内联单测 | - [x] |
 | 41 | `api_spec_conformance_test.py` | `scripts/api_conformance.py`（8.2 真实 SDK，14/14） | - [x] |

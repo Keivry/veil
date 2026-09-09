@@ -17,9 +17,9 @@
 
 ## Decisions
 
-### D1：`handler/llm.rs` 按三单元拆分，`llm_gateway.rs` 按协议拆模块
+### D1：`handler/llm/mod.rs` 按三单元拆分，`llm_gateway/mod.rs` 按协议拆模块（勘误：原文 `handler/llm.rs`/`llm_gateway.rs` 单文件，拆分已落地，语义不变）
 
-**决策**：`handler/llm.rs` → `handler/llm/{mod.rs,rewrite.rs,nonstream.rs,pump.rs}`（`mod.rs` 仅 re-export + `protocol_header_value/empty_body_response/should_pump_stream` 谓词留守）；`service/llm_gateway.rs` → `service/llm_gateway/{mod.rs,protocol.rs,usage.rs,hop.rs,placeholder.rs,tool.rs}`（`mod.rs` 重导出既有公开符号，对外路径不变）；`GATEWAY_BODY_LIMIT_BYTES` 与 `AUDIT_SUBLIMIT_CEILING_BYTES` 移 `config.rs`，原位 `pub use` 转发（防外部引用断裂）。
+**决策**：`handler/llm/mod.rs` → `handler/llm/{mod.rs,rewrite.rs,nonstream.rs,pump.rs}`（勘误：原文 `handler/llm.rs` 单文件，拆分已落地，语义不变）（`mod.rs` 仅 re-export + `protocol_header_value/empty_body_response/should_pump_stream` 谓词留守）；`service/llm_gateway/mod.rs` → `service/llm_gateway/{mod.rs,protocol.rs,usage.rs,hop.rs,placeholder.rs,tool.rs}`（勘误：原文 `service/llm_gateway.rs` 单文件，拆分已落地，语义不变）（`mod.rs` 重导出既有公开符号，对外路径不变）；`GATEWAY_BODY_LIMIT_BYTES` 与 `AUDIT_SUBLIMIT_CEILING_BYTES` 移 `config.rs`，原位 `pub use` 转发（防外部引用断裂）。
 
 **理由**：`gateway-pipeline-units`（rewrite/nonstream/pump）初衷未竟，五职责混居致单测须全量 `AppState`；按协议拆后 tool/usage 可独立单测。
 
@@ -41,11 +41,11 @@
 
 ### D4：死代码与复用清理
 
-**决策**：删 `handler/credential.rs:362 CredentialRequestBody`（统一 `service::CredentialBody`）；`admin.rs:365 SseGuard.released` 删字段并实现 `Drop::drop{release_sse_for(ip)}`（去 `#[allow(dead_code)]`，替代手动释放）；`admin.rs:125` 自研 HMAC 比较复用 `auth::secret_eq`（删 5 行）；`audit_hold.rs:303 reject_new_dangerous_during_hold` 保留但标注“预留：泵未接线，接线见 gateway change”；`error.rs:1` 注释加“413 入口直接构造，限值见 `config.rs`（由 `handler/llm.rs:16` 下沉）”。
+**决策**：删 `handler/credential.rs:362 CredentialRequestBody`（统一 `service::CredentialBody`）；`admin.rs:365 SseGuard.released` 删字段并实现 `Drop::drop{release_sse_for(ip)}`（去 `#[allow(dead_code)]`，替代手动释放）；`admin.rs:125` 自研 HMAC 比较复用 `auth::secret_eq`（删 5 行）；`audit_hold.rs:303 reject_new_dangerous_during_hold` 保留但标注“预留：泵未接线，接线见 gateway change”；`error.rs:1` 注释加“413 入口直接构造，限值见 `config.rs`（由 `handler/llm/mod.rs` 下沉）（勘误：原文 `handler/llm.rs:16`，路径已拆分，语义不变）”。
 
 ### D5：文档 5 处 + legacy warn + 双口径注释
 
-**决策**：README §7.5 路径改 `handler/credential.rs`；`metrics.rs:15` TODO 改“已接线 `handler/llm.rs:965`”；`config.rs:240,247` 注释改 `handler/llm.rs`；`veil-arch-docs-cleanup/design.md:22,58` 加“截至 bcc6c4e 已为目录形态”；启动期对 `CREDENTIAL_MASTER_PASSWORD/CREDENTIAL_PORT/CREDENTIAL_PROXY_DEBUG_DIR` 三遗留变量若检出则 warn“二进制不读取，改用见 README §7.4”（只读 env，不改行为）；PII 隔离 vs 凭据复用在 README §7.3 追加“跨请求 prompt-cache 命中下降属有意权衡”已存在则补量化占位（hit 率待测标注 `TODO(metrics)`，不阻塞）。
+**决策**：README §7.5 路径改 `handler/credential.rs`；`metrics.rs:15` TODO 改“已接线 `handler/llm/pump.rs`”（勘误：原文 `handler/llm.rs:965`，路径已拆分，语义不变）；`config.rs:240,247` 注释改 `handler/llm/mod.rs`（勘误：原文 `handler/llm.rs`，路径已拆分，语义不变）；`veil-arch-docs-cleanup/design.md:22,58` 加“截至 bcc6c4e 已为目录形态”；启动期对 `CREDENTIAL_MASTER_PASSWORD/CREDENTIAL_PORT/CREDENTIAL_PROXY_DEBUG_DIR` 三遗留变量若检出则 warn“二进制不读取，改用见 README §7.4”（只读 env，不改行为）；PII 隔离 vs 凭据复用在 README §7.3 追加“跨请求 prompt-cache 命中下降属有意权衡”已存在则补量化占位（hit 率待测标注 `TODO(metrics)`，不阻塞）。
 
 ## Risks / Trade-offs
 

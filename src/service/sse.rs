@@ -3,8 +3,18 @@ use {
     std::time::{Duration, Instant},
 };
 
+/// SSE 单行上限 16KB：超长行按 C11 截断并记 `truncated_line_dropped_bytes`；
+/// 硬编码理由：SSE 帧语义要求行完整，16KB 覆盖正常事件体（含 usage 完成帧），
+/// 超限即异常上游，截断不断链；放宽会放大单行内存占用，改值须复核泵测试。
 pub const LINE_LIMIT_BYTES: usize = 16 * 1024;
+/// 上游事件空闲超时 30s：30s 无任何字节即收尾，避免半开连接永久挂起；
+/// 硬编码理由：与 `HTTP_TIMEOUT_SECS`（默认 30s）同数量级有意对齐，任一先到先收尾。
 pub const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 流内保活帧间隔 10s（`audit_hold::RequestKeepalive` 消费）：
+/// 硬编码理由：10s 远小于常见代理 NAT 空闲超时（60s+）且带宽可忽略，
+/// 与管理面 60s SSE ping 分属不同链路（流内保活 vs 管理推送），差异有意。
+/// D5：`KeepaliveTracker`（时间戳自检形态，生产零接线）已删除，保活唯一实现为
+/// `RequestKeepalive`（`pump.rs` 经 `spawn_gated` 接线）。
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +64,8 @@ pub struct Utf8ByteBuffer {
 impl Utf8ByteBuffer {
     pub fn new() -> Self { Self::default() }
 
+    /// D6：仅单测使用，降级为测试可见（生产经 `SseParser` 只用 `push`/`flush_text`）。
+    #[cfg(test)]
     pub fn pending_len(&self) -> usize { self.buf.len() }
 
     pub fn push(&mut self, chunk: &[u8]) -> String {
@@ -92,30 +104,12 @@ pub struct SseEvent {
     pub retry: Option<u64>,
     pub comments: Vec<String>,
     pub is_comment_only: bool,
+    /// C11 截断标记：本事件含被截断的超长行（头 16KB 已分发审计，
+    /// 尾部记 `truncated_line_dropped_bytes`），下游不得视为完整帧。
+    pub truncated: bool,
 }
 
 pub fn keepalive_frame() -> String { ": keepalive\n\n".to_string() }
-
-#[derive(Debug)]
-pub struct KeepaliveTracker {
-    last_emit: Instant,
-}
-
-impl KeepaliveTracker {
-    pub fn new() -> Self {
-        Self {
-            last_emit: Instant::now(),
-        }
-    }
-
-    pub fn should_emit(&self) -> bool { self.last_emit.elapsed() >= KEEPALIVE_INTERVAL }
-
-    pub fn mark_emitted(&mut self) { self.last_emit = Instant::now(); }
-}
-
-impl Default for KeepaliveTracker {
-    fn default() -> Self { Self::new() }
-}
 
 #[derive(Debug)]
 pub struct SseParser {
@@ -127,6 +121,11 @@ pub struct SseParser {
     event_start: Option<Instant>,
     pub sse_event_count: u64,
     pub line_overflow: bool,
+    /// C11：超长行截断丢弃的尾部字节累计（调用方经
+    /// [`SseParser::take_truncated_line_dropped_bytes`] 排入 metrics）。
+    truncated_line_dropped_bytes: u64,
+    /// C11：当前块是否含截断行（分发时落到 [`SseEvent::truncated`] 后复位）。
+    block_truncated: bool,
 }
 
 impl Default for SseParser {
@@ -144,7 +143,14 @@ impl SseParser {
             event_start: None,
             sse_event_count: 0,
             line_overflow: false,
+            truncated_line_dropped_bytes: 0,
+            block_truncated: false,
         }
+    }
+
+    /// 取出并清零超长行丢弃字节累计（泵按块排入 metrics）。
+    pub fn take_truncated_line_dropped_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.truncated_line_dropped_bytes)
     }
 
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
@@ -190,6 +196,7 @@ impl SseParser {
         if self.event_idle_exceeded() {
             self.block_lines.clear();
             self.block_comments.clear();
+            self.block_truncated = false;
             self.line_bytes = 0;
             self.event_start = None;
         }
@@ -200,15 +207,30 @@ impl SseParser {
         if self.event_start.is_none() {
             self.event_start = Some(Instant::now());
         }
-        self.line_bytes += line.len();
-        if self.line_bytes > LINE_LIMIT_BYTES {
+        // C12：行内 BOM 先剥离再解析（复用 `json_walk::strip_bom`，
+        // 删除归 `veil-arch-hygiene-round4` R1，此处只路由新/改调用点）。
+        let line = super::json_walk::strip_bom(line);
+        // C11 超长行截断标记化：超 16KB 时保留界内头部随块分发审计，
+        // 尾部记字节计数，不静默整块丢；块满后同块余行全计数丢弃。
+        if !line.is_empty() && self.line_bytes >= LINE_LIMIT_BYTES {
+            self.truncated_line_dropped_bytes += line.len() as u64;
             self.line_overflow = true;
-            self.block_lines.clear();
-            self.block_comments.clear();
-            self.line_bytes = 0;
-            self.event_start = None;
+            self.block_truncated = true;
             return None;
         }
+        let truncated_head: Option<String> = if self.line_bytes + line.len() > LINE_LIMIT_BYTES {
+            let keep = LINE_LIMIT_BYTES - self.line_bytes;
+            let boundary = line.floor_char_boundary(keep.min(line.len()));
+            self.truncated_line_dropped_bytes += (line.len() - boundary) as u64;
+            self.line_overflow = true;
+            self.block_truncated = true;
+            Some(line[..boundary].to_string())
+        } else {
+            None
+        };
+        let effective: &str = truncated_head.as_deref().unwrap_or(line);
+        self.line_bytes += effective.len();
+        let line = effective;
         if line.is_empty() {
             return self.dispatch_block();
         }
@@ -218,6 +240,7 @@ impl SseParser {
                 let ev = SseEvent {
                     comments: std::mem::take(&mut self.block_comments),
                     is_comment_only: true,
+                    truncated: std::mem::take(&mut self.block_truncated),
                     ..Default::default()
                 };
                 self.line_bytes = 0;
@@ -238,6 +261,7 @@ impl SseParser {
         }
         let mut ev = SseEvent {
             comments: std::mem::take(&mut self.block_comments),
+            truncated: std::mem::take(&mut self.block_truncated),
             ..Default::default()
         };
         let mut data_parts: Vec<String> = Vec::new();
@@ -275,7 +299,7 @@ impl SseParser {
         tail.push_str(&std::mem::take(&mut self.text_carry));
         // §2.6：BOM 剥离后判空与 DONE；残余 DONE 丢弃（终端已由正常事件
         // 处理，此处再 `data:` 直发会造成重复终止帧），不做 `data:` 转发。
-        let stripped = strip_sse_bom(&tail);
+        let stripped = super::json_walk::strip_bom(&tail);
         if stripped.trim().is_empty() {
             return String::new();
         }
@@ -286,20 +310,17 @@ impl SseParser {
     }
 }
 
-/// BOM 剥离（§2.6）：`data:` 载荷判 `[DONE]` 与 JSON 解析前先剥前导 BOM，
-/// 对标 Python `_sse.py`（BOM 后判 DONE，不把 BOM 帧当残余转发）。
-pub fn strip_sse_bom(s: &str) -> &str { s.trim_start_matches('\u{feff}') }
-
 /// DONE 载荷判定（§2.6/D6 载荷级）：BOM 剥离后 trim 等于 `[DONE]` 即终端；
 /// 兼容残余路径的 `data:` 前缀形态（`data: [DONE]`/`data:[DONE]`，含 BOM）；
 /// chat 裸帧恒为 `data: [DONE]`，不得补 `event:`。
+/// R1：BOM 唯一来源为 `json_walk::strip_bom`（`strip_sse_bom` 已删，同体函数）。
 pub fn is_done_payload(data: &str) -> bool {
-    let t = strip_sse_bom(data).trim();
+    let t = super::json_walk::strip_bom(data).trim();
     if t == "[DONE]" {
         return true;
     }
     t.strip_prefix("data:")
-        .is_some_and(|rest| strip_sse_bom(rest).trim() == "[DONE]")
+        .is_some_and(|rest| super::json_walk::strip_bom(rest).trim() == "[DONE]")
 }
 
 /// 残余分类（§2.6）：`None` 必须丢弃，不得 `data:` 直发；
@@ -308,7 +329,7 @@ pub fn is_done_payload(data: &str) -> bool {
 /// - 其余 → `Some` 还原后文本（调用方经还原/脱敏后按正常帧发送； 纯垃圾残余的彻底丢弃由 handler
 ///   接线方按需收紧，见接线说明）。
 pub fn classify_residue(tail: &str) -> Option<String> {
-    let stripped = strip_sse_bom(tail);
+    let stripped = super::json_walk::strip_bom(tail);
     if stripped.trim().is_empty() {
         return None;
     }
@@ -320,7 +341,7 @@ pub fn classify_residue(tail: &str) -> Option<String> {
 
 pub fn json_aware_line(line: &str, restore: impl Fn(String) -> String) -> String {
     // §2.6：BOM 剥离后判 JSON（BOM+JSON 不得当残余转发）。
-    let trimmed = strip_sse_bom(line).trim();
+    let trimmed = super::json_walk::strip_bom(line).trim();
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
         && matches!(
@@ -440,17 +461,52 @@ mod tests {
     }
 
     #[test]
-    fn line_buffer_16kb_fallback_without_crash() {
+    fn line_buffer_16kb_truncates_with_counter_and_mark() {
+        // C11：超长行改丢弃为截断——头 16KB 保留分发审计，尾部计数，
+        // 事件带截断标记；后续正常帧不受影响。
         let mut p = SseParser::new();
-        let big = vec![b'x'; LINE_LIMIT_BYTES + 10];
+        let big = "x".repeat(LINE_LIMIT_BYTES + 10);
         let mut frame = b"data: ".to_vec();
-        frame.extend_from_slice(&big);
+        frame.extend_from_slice(big.as_bytes());
         frame.extend_from_slice(b"\n\n");
         let evs = p.push_bytes(&frame);
-        assert!(evs.is_empty());
+        assert_eq!(evs.len(), 1, "截断头须分发，不得静默整块丢");
+        assert!(evs[0].truncated, "截断事件须带标记");
         assert!(p.line_overflow);
+        assert_eq!(
+            evs[0].data.len(),
+            LINE_LIMIT_BYTES - "data: ".len(),
+            "头 16KB（含前缀）保留"
+        );
+        assert_eq!(
+            p.take_truncated_line_dropped_bytes(),
+            (big.len() + "data: ".len() - LINE_LIMIT_BYTES) as u64,
+            "尾部字节须计数"
+        );
+        assert_eq!(p.take_truncated_line_dropped_bytes(), 0, "取出后清零");
         let ok = p.push_bytes(b"data: fine\n\n");
+        assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].data, "fine");
+        assert!(!ok[0].truncated, "正常帧不得带截断标记");
+    }
+
+    #[test]
+    fn overlong_tool_fragment_stays_auditable_with_mark() {
+        // C11 超长 tool 分片：20KB 工具参数头截断后仍分发（审计可见），
+        // 尾部字节计数，标记随事件。
+        let mut p = SseParser::new();
+        let args = "y".repeat(20 * 1024);
+        let payload = format!("{{\"type\":\"tool_use\",\"partial_json\":\"{args}\"}}");
+        let frame = format!("data: {payload}\n\n");
+        let evs = p.push_bytes(frame.as_bytes());
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].truncated);
+        assert!(
+            evs[0].data.starts_with("{\"type\":\"tool_use\""),
+            "头部须保留可审计"
+        );
+        assert!(evs[0].data.len() < payload.len(), "尾部须被截断");
+        assert!(p.take_truncated_line_dropped_bytes() > 0);
     }
 
     #[test]
@@ -459,12 +515,6 @@ mod tests {
         assert_eq!(p.sse_event_count, 0);
         let f = keepalive_frame();
         assert_eq!(f, ": keepalive\n\n");
-        let mut slow = KeepaliveTracker::new();
-        let mut fast = KeepaliveTracker::new();
-        assert!(!slow.should_emit() && !fast.should_emit());
-        slow.last_emit -= KEEPALIVE_INTERVAL;
-        fast.last_emit -= KEEPALIVE_INTERVAL;
-        assert!(slow.should_emit() && fast.should_emit());
     }
 
     #[test]
@@ -684,16 +734,160 @@ mod tests {
     }
 
     #[test]
-    fn bom_stripped_once_with_comment_frame_passthrough() {
-        assert_eq!(strip_sse_bom("\u{feff}data: x"), "data: x");
-        assert_eq!(strip_sse_bom("\u{feff}\u{feff}data: x"), "data: x");
-        // 当前指定行为：行内 BOM 前缀的 data 行不被识别为数据行（BOM 剥离仅
-        // 作用于残余/DONE 判定路径），此处锁定该语义而不扩展解析口径。
+    fn bom_prefixed_frames_parse_like_non_bom() {
+        // C12：行内 BOM 先剥离再解析——BOM 前缀帧与非 BOM 等价分发。
+        // R1：经 `json_walk::strip_bom` 唯一来源断言（`strip_sse_bom` 已删）。
+        assert_eq!(
+            super::super::json_walk::strip_bom("\u{feff}data: x"),
+            "data: x"
+        );
+        assert_eq!(
+            super::super::json_walk::strip_bom("\u{feff}\u{feff}data: x"),
+            "data: x"
+        );
         let mut p = SseParser::new();
         let evs = p.push_bytes("\u{feff}data: {\"b\":2}\n\n".as_bytes());
-        assert!(evs.is_empty(), "行内 BOM 帧当前不产出数据事件");
+        assert_eq!(evs.len(), 1, "BOM 数据行须产出事件");
+        assert_eq!(evs[0].data, "{\"b\":2}");
+        assert!(!evs[0].truncated);
+        let mut q = SseParser::new();
+        let evs_q = q.push_bytes("data: {\"b\":2}\n\n".as_bytes());
+        assert_eq!(evs_q[0].data, evs[0].data, "BOM 与非 BOM 等价");
+        // BOM 事件名前缀同样识别；BOM 终止帧照常为 `[DONE]` 数据。
+        let mut r = SseParser::new();
+        let evs_r = r.push_bytes("\u{feff}event: message\n\u{feff}data: {\"b\":3}\n\n".as_bytes());
+        assert_eq!(evs_r.len(), 1);
+        assert_eq!(evs_r[0].event_type.as_deref(), Some("message"));
+        assert_eq!(evs_r[0].data, "{\"b\":3}");
+        let mut d = SseParser::new();
+        let evs_d = d.push_bytes("\u{feff}data: [DONE]\n\n".as_bytes());
+        assert_eq!(evs_d.len(), 1);
+        assert!(is_done_payload(&evs_d[0].data));
+        // 纯注释帧仍透传。
         let c = p.push_bytes(b": note\n\n");
         assert_eq!(c.len(), 1, "注释帧须透传");
         assert!(c[0].is_comment_only);
+    }
+}
+
+/// T4 快慢径/delta 切分回补：`select_emit` 两档语义 + 解析器分包等价。
+#[cfg(test)]
+mod speed_split_parity_tests {
+    use super::{Speed, SseParser, is_punct_boundary, select_emit};
+
+    #[test]
+    fn t4_slow_emits_immediately_fast_holds() {
+        let mut slow = "hello".to_string();
+        assert_eq!(
+            select_emit(&mut slow, Speed::Slow).as_deref(),
+            Some("hello")
+        );
+        assert!(slow.is_empty());
+        let mut fast = "hello".to_string();
+        assert!(select_emit(&mut fast, Speed::Fast).is_none());
+        assert_eq!(fast, "hello");
+    }
+
+    #[test]
+    fn t4_fast_slow_converge_on_punctuation() {
+        for tail in ["。", ".", "!", "?", ",", "，", ";", "：", "\n"] {
+            assert!(is_punct_boundary(&format!("x{tail}")), "{tail:?}");
+            let mut buf = format!("text{tail}");
+            assert_eq!(
+                select_emit(&mut buf, Speed::Fast).as_deref(),
+                Some(format!("text{tail}").as_str())
+            );
+        }
+        assert!(!is_punct_boundary("hello"));
+        assert!(!is_punct_boundary(""));
+    }
+
+    #[test]
+    fn t4_fast_slow_final_output_identical() {
+        let full = "第一句。第二句！第三句？尾";
+        let mut slow_out = String::new();
+        let mut buf = String::new();
+        for ch in full.chars() {
+            buf.push(ch);
+            if let Some(chunk) = select_emit(&mut buf, Speed::Slow) {
+                slow_out.push_str(&chunk);
+            }
+        }
+        slow_out.push_str(&buf);
+        let mut fast_out = String::new();
+        let mut buf = String::new();
+        for ch in full.chars() {
+            buf.push(ch);
+            if let Some(chunk) = select_emit(&mut buf, Speed::Fast) {
+                fast_out.push_str(&chunk);
+            }
+        }
+        fast_out.push_str(&buf);
+        assert_eq!(slow_out, full);
+        assert_eq!(fast_out, full);
+    }
+
+    #[test]
+    fn t4_delta_byte_splits_reassemble_identically() {
+        let raw =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好世界\"}}]}\n\ndata: [DONE]\n\n";
+        let whole: Vec<String> = {
+            let mut p = SseParser::new();
+            p.push_bytes(raw.as_bytes())
+                .iter()
+                .map(|e| e.data.clone())
+                .collect()
+        };
+        for at in [1usize, 7, 13, 29, 53] {
+            let at = raw.floor_char_boundary(at.min(raw.len()));
+            let mut p = SseParser::new();
+            let mut got = Vec::new();
+            got.extend(
+                p.push_bytes(&raw.as_bytes()[..at])
+                    .iter()
+                    .map(|e| e.data.clone()),
+            );
+            got.extend(
+                p.push_bytes(&raw.as_bytes()[at..])
+                    .iter()
+                    .map(|e| e.data.clone()),
+            );
+            assert_eq!(got, whole, "切分点 {at} 须与整体等价");
+        }
+    }
+
+    #[test]
+    fn t4_delta_char_streaming_single_event() {
+        let raw = "data: {\"delta\":{\"content\":\"abc\"}}\n\n";
+        let mut p = SseParser::new();
+        let mut events = 0;
+        for chunk in raw.as_bytes().chunks(3) {
+            events += p.push_bytes(chunk).len();
+        }
+        assert_eq!(events, 1, "逐片投喂须重组为单事件");
+    }
+
+    #[test]
+    fn t4_fast_threshold_bytes_not_chars() {
+        let mut buf = "中".repeat(1366);
+        assert!(
+            select_emit(&mut buf, Speed::Fast).is_some(),
+            "4098 字节≥阈值应吐"
+        );
+        let mut buf2 = "x".repeat(4095);
+        assert!(select_emit(&mut buf2, Speed::Fast).is_none());
+    }
+
+    #[test]
+    fn t9_sse_event_count_per_block() {
+        let mut p = SseParser::new();
+        assert_eq!(p.sse_event_count, 0);
+        let evs = p.push_bytes(b"data: a\n\ndata: b\n\ndata: c\n\n");
+        assert_eq!(evs.len(), 3);
+        assert_eq!(p.sse_event_count, 3, "每数据块计一次");
+        let comments = p.push_bytes(b": note\n\n");
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].is_comment_only);
+        assert_eq!(p.sse_event_count, 3, "纯注释块不计入事件");
     }
 }

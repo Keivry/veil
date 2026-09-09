@@ -1,6 +1,6 @@
 ## Why
 
-深度审查（Python `credential-proxy` v0.9.46 vs Rust `veil` master）发现 LLM 网关存在 7 处 P0 级合规分叉：`stream_options` 用户自带非空时漏注 `include_usage`（`llm_gateway.rs:190 is_none` vs Python `setdefault` 合并）；Anthropic 非流阻断体缺 `id/type/role/usage/model`（严格 SDK 校验失败）；Responses 阻断空 `completed` 无可读文本（可用性低于 Python 明文块）；`count_done` 用 `contains("[DONE]")` 误计 `arguments` 内同串；`stream:true + application/json` 组合双边路由分叉（Rust 转流泵 vs Python 走非流）；`data:` 双空格剥离口径不一；Chat 流阻断 `message` vs `delta`、Anthropic `blocked` 占位名二次调用风险未锁定。三 API（`v1/chat/completions` / `v1/messages` / `v1/responses`）其余结构/语义/工具调用均合规，本 change 只收敛上述分叉，不碰审计 verdict 与脱敏 recognizer 口径。
+深度审查（Python `credential-proxy` v0.9.46 vs Rust `veil` master）发现 LLM 网关存在 7 处 P0 级合规分叉：`stream_options` 用户自带非空时漏注 `include_usage`（`llm_gateway/protocol.rs:107 is_none` vs Python `setdefault` 合并）（勘误：原文 `llm_gateway.rs:190`，路径已拆分，语义不变）；Anthropic 非流阻断体缺 `id/type/role/usage/model`（严格 SDK 校验失败）；Responses 阻断空 `completed` 无可读文本（可用性低于 Python 明文块）；`count_done` 用 `contains("[DONE]")` 误计 `arguments` 内同串；`stream:true + application/json` 组合双边路由分叉（Rust 转流泵 vs Python 走非流）；`data:` 双空格剥离口径不一；Chat 流阻断 `message` vs `delta`、Anthropic `blocked` 占位名二次调用风险未锁定。三 API（`v1/chat/completions` / `v1/messages` / `v1/responses`）其余结构/语义/工具调用均合规，本 change 只收敛上述分叉，不碰审计 verdict 与脱敏 recognizer 口径。
 
 ## What Changes
 
@@ -31,6 +31,6 @@
 
 ## Impact
 
-- **新增文件**：`openspec/changes/veil-gateway-p0-fix/` 下 proposal/design/specs/tasks；apply 阶段改 `src/service/llm_gateway.rs`、`src/service/block_inject.rs` 及对应单测。
+- **新增文件**：`openspec/changes/veil-gateway-p0-fix/` 下 proposal/design/specs/tasks；apply 阶段改 `src/service/llm_gateway/mod.rs`、`src/service/block_inject.rs` 及对应单测（勘误：原文 `src/service/llm_gateway.rs`，路径已拆分，语义不变）。
 - **影响系统**：三协议流式/非流式阻断与 usage 尾包完整性、严格 SDK 兼容性、下游 Hermes 展示文案。
 - **依赖**：`serde_json` 前导空白容忍、`axum` SSE 帧形态；无需新依赖。

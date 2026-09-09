@@ -36,6 +36,6 @@ Python `credential-proxy` → Rust `veil` 重构的功能与测试审查发现 3
 
 ## Impact
 
-- **影响代码**：`src/service/matrix.rs`、`src/service/tpm.rs`、`src/keepass.rs`、`src/main.rs`、`src/registry.rs`、`src/service/mod.rs`、`src/handler.rs`、`src/state.rs`、`src/approval.rs`、`src/auth.rs`、`src/service/llm_gateway.rs`、`src/service/sse.rs`、`src/service/audit_hold.rs`、`src/service/block_inject.rs`、`src/service/pii.rs`、`src/config.rs`、`src/service/metrics.rs`、`src/service/admin.rs`、`src/router.rs`、`README.md`、`Cargo.toml`。
+- **影响代码**：`src/service/matrix.rs`、`src/service/tpm.rs`、`src/keepass.rs`、`src/main.rs`、`src/registry.rs`、`src/service/mod.rs`、`src/handler/mod.rs`、`src/state.rs`、`src/approval.rs`、`src/auth.rs`、`src/service/llm_gateway/mod.rs`、`src/service/sse.rs`、`src/service/audit_hold.rs`、`src/service/block_inject.rs`、`src/service/pii.rs`、`src/config.rs`、`src/service/metrics.rs`、`src/service/admin.rs`、`src/router.rs`、`README.md`、`Cargo.toml`。
 - **影响系统**：审批可用性（approve 全链路）、TPM 解锁、授权越权面、转发性能、流式审计窗口、可观测大盘兼容、部署文档确定性。
 - **依赖**：`tpm2-tools` 命令行模板、`reqwest` 连接池、`tokio` 运行时、`rusqlite` 聚合表、`axum` 限流层；测试依赖真实 kdbx 固件与三协议 SDK 回放。

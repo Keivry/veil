@@ -1,6 +1,6 @@
 ## Context
 
-见 `proposal.md` Why。现状：`src/service/matrix.rs` 有 `submit/ask/resolve/sweeper` 纯函数但 `poll_sync` 无人调用；`src/service/tpm.rs` 模板与路径双错且启动丢弃密钥；`src/registry.rs` 模型简化丢字段级 ACL；`src/handler.rs gateway_serve` 每请求新建 Client（违反 `veil-hardening/http-client-singleton`）；`extract_tool_calls` 对 Responses 仅识 `output[]`、对 Anthropic 用枚举下标；`config.rs` 自定义规则仅 JSON、`parse_placeholder_prompt` 漏 `off`；`admin.rs/metrics.rs` 查询形态已变但无兼容层。约束：不改 Go 二进制协议、不引入重型依赖、fail-closed 优先于兼容。
+见 `proposal.md` Why。现状：`src/service/matrix.rs` 有 `submit/ask/resolve/sweeper` 纯函数但 `poll_sync` 无人调用；`src/service/tpm.rs` 模板与路径双错且启动丢弃密钥；`src/registry.rs` 模型简化丢字段级 ACL；`src/handler/llm/mod.rs gateway_serve` 每请求新建 Client（违反 `veil-hardening/http-client-singleton`）（勘误：原文 `src/handler.rs`，路径已拆分，语义不变）；`extract_tool_calls` 对 Responses 仅识 `output[]`、对 Anthropic 用枚举下标；`config.rs` 自定义规则仅 JSON、`parse_placeholder_prompt` 漏 `off`；`admin.rs/metrics.rs` 查询形态已变但无兼容层。约束：不改 Go 二进制协议、不引入重型依赖、fail-closed 优先于兼容。
 
 ## Goals / Non-Goals
 

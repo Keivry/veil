@@ -53,7 +53,7 @@
 
 ### D6：口径统一与注释对齐
 
-**决策**：Anthropic `conv` 空回退统一 `blocked-0`（非流与流一致）；`NonDialog` 转泵 `init_conv` 归档走同一 `resolve_conv_id` 路径；`extract_tool_calls` 与 `extract_tool_fragments` 外层 `index` 语义在 `llm_gateway.rs:831` 头注释一句对齐声明；`is_done_payload/is_done_frame/count_done/terminal_count` 四函数头注释标定载荷级/帧级/行级分工。
+**决策**：Anthropic `conv` 空回退统一 `blocked-0`（非流与流一致）；`NonDialog` 转泵 `init_conv` 归档走同一 `resolve_conv_id` 路径；`extract_tool_calls` 与 `extract_tool_fragments` 外层 `index` 语义在 `llm_gateway/tool.rs` 头注释一句对齐声明（勘误：原文 `llm_gateway.rs:831`，路径已拆分，语义不变）；`is_done_payload/is_done_frame/count_done/terminal_count` 四函数头注释标定载荷级/帧级/行级分工。
 
 ## Risks / Trade-offs
 

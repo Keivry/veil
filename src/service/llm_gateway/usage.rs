@@ -7,6 +7,10 @@ pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// 缓存命中读（对标 `_metrics.py:155` `cached_read` 列）。
+    pub cached_read: u64,
+    /// 缓存写入（仅 Anthropic 有值，其余归零）。
+    pub cached_write: u64,
 }
 
 fn as_u64(v: &Value) -> Option<u64> {
@@ -14,7 +18,33 @@ fn as_u64(v: &Value) -> Option<u64> {
         .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
 }
 
-fn usage_from_obj(obj: &serde_json::Map<String, Value>) -> Option<Usage> {
+/// 三协议缓存列提取（对标 `_metrics.py:155`）：Anthropic 取顶层
+/// `cache_read/cache_creation_input_tokens`；Responses 取
+/// `input_tokens_details.cached_tokens`；Chat 取
+/// `prompt_tokens_details.cached_tokens`（`null` 细节对象按缺失归零）。
+fn cached_columns(protocol: Protocol, obj: &serde_json::Map<String, Value>) -> (u64, u64) {
+    let details_cached = |key: &str| {
+        obj.get(key)
+            .and_then(|v| v.as_object())
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(as_u64)
+            .unwrap_or(0)
+    };
+    match protocol {
+        Protocol::Anthropic => (
+            obj.get("cache_read_input_tokens")
+                .and_then(as_u64)
+                .unwrap_or(0),
+            obj.get("cache_creation_input_tokens")
+                .and_then(as_u64)
+                .unwrap_or(0),
+        ),
+        Protocol::Responses => (details_cached("input_tokens_details"), 0),
+        Protocol::Chat | Protocol::NonDialog => (details_cached("prompt_tokens_details"), 0),
+    }
+}
+
+fn usage_from_obj(obj: &serde_json::Map<String, Value>, protocol: Protocol) -> Option<Usage> {
     let has_known = [
         "prompt_tokens",
         "completion_tokens",
@@ -43,15 +73,20 @@ fn usage_from_obj(obj: &serde_json::Map<String, Value>) -> Option<Usage> {
         .and_then(as_u64)
         .or_else(|| obj.get("total").and_then(as_u64))
         .unwrap_or_else(|| prompt.saturating_add(completion));
+    let (cached_read, cached_write) = cached_columns(protocol, obj);
     Some(Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
+        cached_read,
+        cached_write,
     })
 }
 
-fn usage_in(obj: &serde_json::Map<String, Value>) -> Option<Usage> {
-    obj.get("usage")?.as_object().and_then(usage_from_obj)
+fn usage_in(obj: &serde_json::Map<String, Value>, protocol: Protocol) -> Option<Usage> {
+    obj.get("usage")?
+        .as_object()
+        .and_then(|o| usage_from_obj(o, protocol))
 }
 
 fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
@@ -60,6 +95,8 @@ fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
             a.prompt_tokens = a.prompt_tokens.max(next.prompt_tokens);
             a.completion_tokens = a.completion_tokens.max(next.completion_tokens);
             a.total_tokens = a.total_tokens.max(next.total_tokens);
+            a.cached_read = a.cached_read.max(next.cached_read);
+            a.cached_write = a.cached_write.max(next.cached_write);
         }
         None => *acc = Some(next),
     }
@@ -67,13 +104,16 @@ fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
 
 pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage> {
     match protocol {
-        Protocol::Chat => body.get("usage")?.as_object().and_then(usage_from_obj),
+        Protocol::Chat => body
+            .get("usage")?
+            .as_object()
+            .and_then(|o| usage_from_obj(o, protocol)),
         Protocol::Responses => {
             let outer = body.get("response")?.as_object()?;
             if let Some(u) = outer
                 .get("usage")
                 .and_then(|v| v.as_object())
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
             {
                 return Some(u);
             }
@@ -82,20 +122,20 @@ pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage
                 .as_object()?
                 .get("usage")?
                 .as_object()
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
         }
         Protocol::Anthropic => {
             if let Some(u) = body
                 .get("usage")
                 .and_then(|v| v.as_object())
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
             {
                 return Some(u);
             }
             body.get("message")?
                 .get("usage")?
                 .as_object()
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
         }
         Protocol::NonDialog => None,
     }
@@ -118,7 +158,7 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
     {
         return None;
     }
-    if let Some(u) = usage_in(obj) {
+    if let Some(u) = usage_in(obj, protocol) {
         return Some(u);
     }
     match protocol {
@@ -128,7 +168,7 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
             if let Some(u) = resp
                 .get("usage")
                 .and_then(|v| v.as_object())
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
             {
                 return Some(u);
             }
@@ -136,13 +176,13 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
                 .as_object()?
                 .get("usage")?
                 .as_object()
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
         }
         Protocol::Anthropic => {
             if let Some(u) = obj
                 .get("delta")
                 .and_then(|v| v.as_object())
-                .and_then(usage_in)
+                .and_then(|o| usage_in(o, protocol))
             {
                 return Some(u);
             }
@@ -150,7 +190,7 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
                 .as_object()?
                 .get("usage")?
                 .as_object()
-                .and_then(usage_from_obj)
+                .and_then(|o| usage_from_obj(o, protocol))
         }
         Protocol::NonDialog => None,
     }
@@ -317,6 +357,57 @@ mod tests {
             (a2.prompt_tokens, a2.completion_tokens, a2.total_tokens),
             (30, 1, 30)
         );
+    }
+
+    #[test]
+    fn cached_columns_follow_python_normalize_usage() {
+        // Given：三协议各自口径的缓存键
+        // When：归一提取
+        // Then：cached_read/write 落位，缺失归零（对标 `_metrics.py:155`）
+        let chat = serde_json::json!({"usage": {
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+            "prompt_tokens_details": {"cached_tokens": 4},
+        }});
+        let u = extract_usage_nonstream(Protocol::Chat, &chat).unwrap();
+        assert_eq!((u.cached_read, u.cached_write), (4, 0));
+
+        let chat_null = serde_json::json!({"usage": {
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+            "prompt_tokens_details": null,
+        }});
+        let u = extract_usage_nonstream(Protocol::Chat, &chat_null).unwrap();
+        assert_eq!((u.cached_read, u.cached_write), (0, 0));
+
+        let resp = serde_json::json!({"response": {"usage": {
+            "input_tokens": 8, "output_tokens": 3,
+            "input_tokens_details": {"cached_tokens": 6},
+        }}});
+        let u = extract_usage_nonstream(Protocol::Responses, &resp).unwrap();
+        assert_eq!((u.cached_read, u.cached_write), (6, 0));
+
+        let anth = serde_json::json!({"usage": {
+            "input_tokens": 8, "output_tokens": 3,
+            "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2,
+        }});
+        let u = extract_usage_nonstream(Protocol::Anthropic, &anth).unwrap();
+        assert_eq!((u.cached_read, u.cached_write), (5, 2));
+
+        // 流式累计按列取 max，不双计。
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(
+            &mut acc,
+            extract_usage_nonstream(Protocol::Anthropic, &anth),
+        );
+        let anth_small = serde_json::json!({"usage": {
+            "input_tokens": 1, "output_tokens": 1,
+            "cache_read_input_tokens": 1, "cache_creation_input_tokens": 9,
+        }});
+        accumulate_usage(
+            &mut acc,
+            extract_usage_nonstream(Protocol::Anthropic, &anth_small),
+        );
+        let a = acc.unwrap();
+        assert_eq!((a.cached_read, a.cached_write), (5, 9));
     }
 
     #[test]

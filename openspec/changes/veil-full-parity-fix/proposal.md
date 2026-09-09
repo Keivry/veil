@@ -39,6 +39,6 @@ Python `credential-proxy` → Rust `veil` 的全量比对审查发现：凭据/�
 
 ## Impact
 
-- **影响代码**：`src/service/mod.rs`、`src/handler.rs`、`src/service/credential_vault.rs`、`src/service/redaction.rs`、`src/service/pii.rs`、`src/service/llm_gateway.rs`、`src/service/json_walk.rs`、`src/service/sse.rs`、`src/service/audit.rs`、`src/service/audit_hold.rs`、`src/service/block_inject.rs`、`src/service/metrics.rs`、`src/service/admin.rs`、`src/registry.rs`、`src/auth.rs`、`src/config.rs`、`src/state.rs`、`src/router.rs`、`src/main.rs`、`src/keepass.rs`、`src/service/tpm.rs`、`src/service/matrix.rs`、`src/approval.rs`、`README.md`、`Cargo.toml`。
+- **影响代码**：`src/service/mod.rs`、`src/handler/mod.rs`、`src/service/credential_vault.rs`、`src/service/redaction.rs`、`src/service/pii.rs`、`src/service/llm_gateway/mod.rs`、`src/service/json_walk.rs`、`src/service/sse.rs`、`src/service/audit.rs`、`src/service/audit_hold.rs`、`src/service/block_inject.rs`、`src/service/metrics.rs`、`src/service/admin.rs`、`src/registry.rs`、`src/auth.rs`、`src/config.rs`、`src/state.rs`、`src/router.rs`、`src/main.rs`、`src/keepass.rs`、`src/service/tpm.rs`、`src/service/matrix.rs`、`src/approval.rs`、`README.md`、`Cargo.toml`（勘误：原文 `src/handler.rs`/`src/service/llm_gateway.rs`，路径已拆分，语义不变）。
 - **影响系统**：凭据可用性（Go 直连）、LLM 结构保真（工具调用）、审计拦截率、指标可比性、管理面兼容、部署文档确定性。
 - **依赖**：`tokio/moka/reqwest/rusqlite/axum` 现有依赖；测试需 mock 上游 + 真 kdbx 固件 + 三协议回放。

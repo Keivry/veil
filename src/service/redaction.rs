@@ -102,7 +102,10 @@ impl Scope {
     /// 响应侧还原：凭据 token → PII 请求 token → 幻觉剥离 → 残缺清理。
     /// PII 完整形态一律保留（响应期新 token 原样保留语义）。
     /// `fuzzy_restore` 开启时追加宽松形态按序号回查。
-    pub fn restore_response(&self, vault: &CredentialVault, text: &str) -> String {
+    /// R7：本函数为内部步骤，唯一公开还原入口为
+    /// [`Scope::restore_response_with_spans`]（生产调用方均经该入口）；
+    /// 可见性收敛为模块内，单测同文件可达。
+    fn restore_response(&self, vault: &CredentialVault, text: &str) -> String {
         let step1 = vault.restore(text);
         let step2 = self.pii.restore_with_fuzzy(&step1, self.fuzzy_restore);
         let step3 = vault.strip_hallucinated(&step2);
@@ -478,7 +481,10 @@ fn mask_span_bytes(text: &mut String, start: usize, end: usize) {
     text.replace_range(start..end, &masked);
 }
 
+/// 归一化声明头（protocol-parity Cvem）：注入改写请求体空白归一时声明，
+/// 名/值均为线协议常量，硬编码理由：下游按精确头名识别，改名即 BREAKING。
 pub const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
+/// 归一化声明头值（同上）。
 pub const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
 
 /// 占位符说明注入开关（与 `Config::is_falsy` 同口径）：`0/false/no/off` 关闭，
@@ -489,17 +495,6 @@ pub fn placeholder_prompt_enabled(raw: &str) -> bool {
         raw.trim().to_lowercase().as_str(),
         "0" | "false" | "no" | "off"
     )
-}
-
-/// span 加法 API：去重后位置化替换（原 `apply_spans` 语义不变，本函数仅叠加去重层）。
-pub fn apply_spans_dedup(text: &str, spans: &[(usize, usize, String)]) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let uniq: Vec<(usize, usize, String)> = spans
-        .iter()
-        .filter(|(s, e, r)| seen.insert((*s, *e, r.clone())))
-        .cloned()
-        .collect();
-    super::pii::apply_spans(text, &uniq)
 }
 
 pub fn normalize_flag_enabled(raw: Option<&str>) -> bool { matches!(raw.map(str::trim), Some("1")) }
@@ -614,7 +609,7 @@ fn redact_leaf(
         };
         spans.push((s, e, tok));
     }
-    apply_spans(&after_cred, &spans)
+    apply_spans(&after_cred, &spans, false)
 }
 
 /// 叶回调（响应侧）：注册进响应表（不进请求还原表）。
@@ -666,7 +661,7 @@ fn redact_leaf_response(
         };
         spans.push((s, e, tok));
     }
-    apply_spans(&after_cred, &spans)
+    apply_spans(&after_cred, &spans, false)
 }
 
 /// 扫描文本中的占位符形态（凭据/PII 完整形），返回 `(起始, 结束, token)` 字节区间。
@@ -978,9 +973,10 @@ mod tests {
 
     #[test]
     fn span_apply_dedup_semantics() {
-        let out = apply_spans_dedup(
+        let out = apply_spans(
             "hello world",
             &[(6, 11, "W".to_string()), (6, 11, "W".to_string())],
+            true,
         );
         assert_eq!(out, "hello W");
     }
@@ -1247,5 +1243,224 @@ mod tests {
             }
         }
         assert_eq!(n, (frags.len() * seps.len()) as u64);
+    }
+}
+
+/// T4 流式 hold 回补：dual_hold/前后缀 hold/数字同尾/单 hold 等价性。
+#[cfg(test)]
+mod streaming_hold_parity_tests {
+    use super::BoundaryHold;
+
+    const PHONE: &str = "13800138000";
+
+    fn phone_span(window: &str, seam: usize) -> Vec<(usize, usize)> {
+        window
+            .find(PHONE)
+            .map(|pos| (pos, pos + PHONE.len()))
+            .filter(|(s, e)| *s < seam && *e > seam)
+            .into_iter()
+            .collect()
+    }
+
+    fn run_split(full: &str, at: usize) -> String {
+        let (a, b) = full.split_at(at);
+        let mut h = BoundaryHold::new(64);
+        let (p0, d0) = h.push(String::new(), a.to_string(), phone_span);
+        assert!(p0.is_empty() && d0.is_empty(), "首帧须滞留");
+        let (p1, d1) = h.push(String::new(), b.to_string(), phone_span);
+        let (pf, df) = h.flush().expect("末帧须滞留可取");
+        assert!(!h.has_held());
+        format!("{p1}{d1}{pf}{df}")
+    }
+
+    #[test]
+    fn t4_pii_digit_same_tail_masked_both_sides() {
+        let full = format!("call {PHONE} end");
+        let at = full.find("00").expect("切分点须存在");
+        let out = run_split(&full, at);
+        assert!(!out.contains(PHONE), "跨缝号码须掩码，实际 {out:?}");
+        assert!(out.contains("call "), "缝前安全前缀须放行");
+        assert!(out.contains(" end"), "缝后安全后缀须放行");
+    }
+
+    #[test]
+    fn t4_single_hold_join_equivalent_across_split_points() {
+        let full = format!("prefix {PHONE} suffix");
+        let phone_at = full.find(PHONE).expect("号码须存在");
+        let phone_end = phone_at + PHONE.len();
+        let masked = full.replacen(PHONE, "***********", 1);
+        for at in [7usize, 10, 13, 16, 19] {
+            if !full.is_char_boundary(at) {
+                continue;
+            }
+            let out = run_split(&full, at);
+            if at > phone_at && at < phone_end {
+                assert_eq!(out, masked, "切分点 {at} 切断号码须掩码");
+            } else {
+                assert_eq!(out, full, "切分点 {at} 未切断号码须原样透传");
+            }
+        }
+    }
+
+    #[test]
+    fn t4_dual_hold_sequential_equivalent_to_combined() {
+        let first = "a 13800".to_string();
+        let second = "138000 b".to_string();
+        let mut seq = BoundaryHold::new(64);
+        let (p0, d0) = seq.push(String::new(), first.clone(), phone_span);
+        assert!(p0.is_empty() && d0.is_empty());
+        let (p1, d1) = seq.push(String::new(), second.clone(), phone_span);
+        let (pf, df) = seq.flush().expect("末帧须滞留可取");
+        let sequential = format!("{p1}{d1}{pf}{df}");
+        assert!(
+            !sequential.contains(PHONE),
+            "跨缝号码须全掩码，实际 {sequential:?}"
+        );
+        assert!(sequential.starts_with('a'), "安全首部须保留");
+        assert!(sequential.ends_with('b'), "安全尾部须保留");
+        assert_eq!(
+            sequential.chars().count(),
+            first.chars().count() + second.chars().count()
+        );
+    }
+
+    #[test]
+    fn t4_token_affix_prefix_suffix_preserved() {
+        let mut h = BoundaryHold::new(64);
+        let (p0, d0) = h.push("data: ".to_string(), "hello".to_string(), |_, _| vec![]);
+        assert!(p0.is_empty() && d0.is_empty(), "首帧前缀须随数据滞留");
+        let (p1, d1) = h.push("data: ".to_string(), " world".to_string(), |_, _| vec![]);
+        assert_eq!(p1, "data: ");
+        assert_eq!(d1, "hello");
+        let (pf, df) = h.flush().expect("末帧须滞留可取");
+        assert_eq!((pf, df), ("data: ".to_string(), " world".to_string()));
+    }
+
+    #[test]
+    fn t4_clear_discards_held_on_block() {
+        let mut h = BoundaryHold::new(64);
+        let _ = h.push("data: ".to_string(), "secret".to_string(), |_, _| vec![]);
+        assert!(h.has_held());
+        h.clear();
+        assert!(!h.has_held());
+        assert!(h.flush().is_none(), "阻断后滞留帧须丢弃不再透出");
+    }
+
+    #[test]
+    fn t4_no_seam_passthrough_byte_identical() {
+        let mut h = BoundaryHold::new(64);
+        let _ = h.push(String::new(), "hello world".to_string(), phone_span);
+        let (p1, d1) = h.push(String::new(), " all safe".to_string(), phone_span);
+        assert_eq!(d1, "hello world");
+        assert!(p1.is_empty());
+        let (_, df) = h.flush().expect("flush 须有值");
+        assert_eq!(df, " all safe");
+    }
+
+    #[test]
+    fn t4_flush_without_push_is_none() {
+        let mut h = BoundaryHold::new(64);
+        assert!(h.flush().is_none());
+        assert!(!h.has_held());
+    }
+}
+
+/// T12 hold 跨任务隔离：Rust 以请求级 `Scope` 所有权替代 ContextVar，
+/// 并发任务各持独立 Scope，映射互不可见、hold 状态机互不串扰。
+#[cfg(test)]
+mod concurrency_parity_tests {
+    use {
+        super::{BoundaryHold, Scope},
+        crate::service::{credential_vault::CredentialVault, pii::PiiDetector},
+        std::sync::Arc,
+    };
+
+    #[tokio::test]
+    async fn t12_scope_registration_isolated_across_tasks() {
+        let vault = Arc::new(CredentialVault::new());
+        let detector = Arc::new(PiiDetector::new());
+        let a = tokio::spawn({
+            let (vault, detector) = (vault.clone(), detector.clone());
+            async move {
+                let scope = Scope::new();
+                scope
+                    .redact_request(&vault, &detector, "号码 13800138000 结束")
+                    .await
+            }
+        });
+        let b = tokio::spawn({
+            let (vault, detector) = (vault.clone(), detector.clone());
+            async move {
+                let scope = Scope::new();
+                scope
+                    .redact_request(&vault, &detector, "号码 13800138000 结束")
+                    .await
+            }
+        });
+        let (out_a, out_b) = tokio::join!(a, b);
+        let (out_a, out_b) = (out_a.expect("任务 A 须成功"), out_b.expect("任务 B 须成功"));
+        assert!(out_a.contains("__PII_"), "A 须脱敏");
+        assert!(out_b.contains("__PII_"), "B 须脱敏");
+        assert_ne!(out_a, out_b, "独立 Scope 的 rand8 须不同（请求隔离）");
+    }
+
+    #[tokio::test]
+    async fn t12_hold_state_machine_isolated_across_tasks() {
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel::<String>();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel::<String>();
+        let task_a = tokio::spawn(async move {
+            let mut h = BoundaryHold::new(64);
+            let (p0, d0) = h.push("a:".to_string(), "frame-a1".to_string(), |_, _| vec![]);
+            assert!(p0.is_empty() && d0.is_empty());
+            tx_a.send("a-held".to_string()).expect("须发送");
+            let (p1, d1) = h.push("a:".to_string(), "frame-a2".to_string(), |_, _| vec![]);
+            assert_eq!((p1, d1), ("a:".to_string(), "frame-a1".to_string()));
+            let (pf, df) = h.flush().expect("须滞留");
+            assert_eq!((pf, df), ("a:".to_string(), "frame-a2".to_string()));
+        });
+        let task_b = tokio::spawn(async move {
+            let mut h = BoundaryHold::new(64);
+            let (p0, d0) = h.push("b:".to_string(), "frame-b1".to_string(), |_, _| vec![]);
+            assert!(p0.is_empty() && d0.is_empty());
+            tx_b.send("b-held".to_string()).expect("须发送");
+            let (p1, d1) = h.push("b:".to_string(), "frame-b2".to_string(), |_, _| vec![]);
+            assert_eq!((p1, d1), ("b:".to_string(), "frame-b1".to_string()));
+            assert!(h.has_held(), "B 仍有滞留");
+            let (pf, df) = h.flush().expect("须滞留");
+            assert_eq!((pf, df), ("b:".to_string(), "frame-b2".to_string()));
+        });
+        let (sa, sb) = tokio::join!(rx_a, rx_b);
+        assert_eq!(sa.expect("A 信号须到达"), "a-held");
+        assert_eq!(sb.expect("B 信号须到达"), "b-held");
+        task_a.await.expect("A 须成功");
+        task_b.await.expect("B 须成功");
+    }
+
+    #[test]
+    fn t12_restore_only_own_scope_tokens() {
+        let vault = CredentialVault::new();
+        let scope_a = Scope::new();
+        let scope_b = Scope::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("单线程运行时须可用");
+        let out_a = rt.block_on(scope_a.redact_request(
+            &vault,
+            &PiiDetector::new(),
+            "号码 13800138000 结束",
+        ));
+        let out_b = rt.block_on(scope_b.redact_request(
+            &vault,
+            &PiiDetector::new(),
+            "号码 13800138000 结束",
+        ));
+        assert_ne!(out_a, out_b);
+        assert!(scope_a.restore_response(&vault, &out_b).contains("__PII_"));
+        assert!(scope_b.restore_response(&vault, &out_a).contains("__PII_"));
+        assert!(
+            scope_a
+                .restore_response(&vault, &out_a)
+                .contains("13800138000")
+        );
     }
 }

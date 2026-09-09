@@ -32,6 +32,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 认证 | `GET_BINARY_HASH` | 空 | 独立生效：置位时拒绝调用方冒用 get 自身哈希的直调（`caller_hash == GET_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `GET_BINARY_SECRET` 无联动 |
 | 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同 |
 | 认证 | `AUTO_APPROVE` | `true` | `true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批 |
+| 认证 | `CREDENTIAL_BLOCK_WAIT` | 关闭 | 凭据审批双模开关；`=1` 时 enrolled 篡改/未 enrolled 待审走 `300`s 阻塞等 reaction，默认 `202` 抛单（建单 + best-effort 发送即返回，接线见 `src/service/credential.rs::approval_dual_mode`）；示例：`CREDENTIAL_BLOCK_WAIT=1` |
 | 入口 | `VEIL_ENTRY_MODE` | `full` | `full` / `credential-only` / `llm-only` |
 | 入口 | `CALLER_REGISTRY_PATH` | `<DATA_DIR>/caller_registry.json` | 调用方注册表路径 |
 | 存储 | `DATA_DIR` | `/data` | sqlite、审计日志父目录；派生 `/data/tpm`（`seal.pub`+`seal.priv`）与 `/data/db`（`.kdbx`+`.key`） |
@@ -235,7 +236,7 @@ get revoke --name "check-mail"
 
 ## 6. 行为变更（BREAKING）与迁移
 
-下述四处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
+下述五处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
 按迁移步骤调整后可回到预期行为，无静默变严或明文落盘增量。
 
 ### 6.1 脱敏总开关默认开启（原仓默认关闭）
@@ -282,6 +283,17 @@ get revoke --name "check-mail"
 - 迁移：沿用原仓语义（流中同步等待）需新 change 交付；当前行为以本条为准，e2e 以
   “pending 建单 + 不断链 + 危险原文按 pending 语义处理”断言。
 
+### 6.5 检索调用审计口径统一（流/非流曾相反）
+
+- 变更：`file_search_call`/`web_search_call`（含 `file_search`/`web_search`
+  前缀事件与条目类型）流式与非流式统一计为 tool 调用：名按类型派生
+  （`file_search`/`web_search`），参按 `arguments/input/args` 优先、
+  `queries/query` 回退序列化；检索**结果**（`results`）不进审计 hold
+  （体量风险，只看查询）。统一前流/非流判定相反，一方行为变化。
+- verdict 口径：检索调用与其他 tool 调用同 verdict 判定通道（流/非流同调用同结论，见 `stream-protocol-parity` spec）；检索**结果**体不进审计 hold，只看查询。
+- 影响：检索调用审计量可能上升（误报优于漏审）；监控检索审计量突变属预期。
+- 迁移：无配置项需改；依赖旧一方漏审口径的告警阈值请按新口径重估。
+
 ## 7. 传输与兼容声明
 
 ### 7.1 逐跳（HOP）头集
@@ -292,20 +304,36 @@ get revoke --name "check-mail"
 外加 `Connection` 头内列名的动态项。解码开启时（默认）额外剥离
 `content-encoding`/`content-length`（已解码，对外统一 `identity`），
 每次剥离记 `hop_filtered_total{dir}`。与原仓差异：原仓 Python 侧仅透传常用头，
-本仓显式全集过滤（见 `src/service/llm_gateway.rs::HOP_HEADERS`）。
+本仓显式全集过滤（见 `src/service/llm_gateway/hop.rs:7` 的 `HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用）。
 
 ### 7.2 usage 口径
 
 多源 usage 取最大值（`max` 口径，不双计）：流式增量与完成帧 usage 按
 `prompt_tokens`/`completion_tokens`/`total_tokens` 三列各自取 max。
 旧大盘按 `sum` 估算会虚高，迁移到新口径请以本声明为准。
+缓存列 `cached_read`/`cached_write` 同样按列取 max：Anthropic 取顶层
+`cache_read/cache_creation_input_tokens`，Responses 取
+`input_tokens_details.cached_tokens`，Chat 取
+`prompt_tokens_details.cached_tokens`（细节对象 `null`/缺失归零；
+非 Anthropic 的 `cached_write` 恒零）。`model` 分桶与缓存列只加不改旧列。
+
+旧大盘对照（迁移须知）：
+
+| 口径 | 旧大盘 | 新口径（本声明为准） |
+|:-----|:-------|:---------------------|
+| `prompt/completion/total_tokens` | `sum` 累加流式增量与完成帧（虚高） | 三列各自取 `max`（不双计） |
+| 缓存列 | 无此列 | 新增 `cached_read`/`cached_write`，只加不改旧列 |
+| `model` 分桶 | 无 | 新增，只加不改旧列 |
+
+迁移：依赖旧 `sum` 口径的告警阈值请按 `max` 重估；缓存与分桶列为新增列，旧查询不受影响。
 
 ### 7.3 请求隔离声明
 
 PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁，跨请求不互见）；
 凭据 `vault` 与 PII `detector` 为进程单例只读复用（还原不断链）。与原仓差异：
 原仓 PII 全局复用（跨请求同明文同 token，prompt-cache 友好但可关联），本仓隐私更严，
-代价是跨请求 prompt-cache 命中率下降，属有意权衡（命中率量化待测，`TODO(metrics)`，不阻塞）。
+代价是跨请求 prompt-cache 命中率下降，属有意权衡（命中率差异本地不测量：命中率是上游 provider
+侧计费指标，网关侧不可见真值，且请求隔离是隐私硬要求；`TODO(metrics)` 以此为 wont-measure 闭环，见 §8 与 `src/service/metrics.rs` 模块文档）。
 
 ### 7.4 遗留变量兼容表
 
@@ -326,3 +354,53 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - `GET /registrations`：原仓无鉴权直读；本仓要求管理面鉴权（`X-Admin-Token` /
   Cookie / 仅 SSE 回退 query），无 token 恒 401。旧脚本直读须补 token，
   否则按 401 处理（有意收敛，见 `observability-admin` spec）。
+
+### 7.6 非对话透传声明
+
+- 非对话路径（`Protocol::NonDialog`，如模型列表等非 `chat/messages/responses`
+  尾缀）保持字节透传： hop 头过滤后原文转发，不做用量记录、审计判定与
+  凭据/PII 还原（与原仓直通语义一致）。
+- 每次透传记 `GatewayMetrics.nondialog_passthrough`（流量验证用）；
+  若流量验证表明该臂承载对话体需补还原/审计/用量，另立任务跟进。
+
+### 7.7 请求归一化声明（`x-veil-normalized`，注入即声明）
+
+- 下游响应头 `x-veil-normalized: json-whitespace` 当且仅当转发前请求体被重序列化为紧凑 JSON
+  时置位；未置位时无此头（不以空值占位）。该头只发下游，不向上游转发。
+- 置位条件二选一：① `stream_options` 注入分支（恒经 `to_vec` 重序列化，与配置开关无关，
+  无条件置位，见 `src/handler/llm/rewrite.rs`）；② `NORMALIZE_JSON_WHITESPACE=1` 且请求体可解析为
+  JSON（紧凑化重序列化）。纯脱敏子串替换（字节级，未重序列化）与原文透传不置位。
+- 非流两处响应与 SSE 流响应均按同一 `normalized_out` 置位（见 `src/handler/llm/nonstream.rs`、
+  `src/handler/llm/pump.rs::build_sse_response`）。
+
+## 8. 遗留决策记录
+
+本节锁定四项遗留决策，后续 change 不得静默漂移（见 `contract-docs` spec）。
+
+### 8.1 NonDialog 透传（F1，与 P0 联动）
+
+- 非对话路径（`Protocol::NonDialog`）字节透传：hop 头过滤后原文转发，不做用量记录、审计判定与
+  凭据/PII 还原，与原仓直通语义一致（细节见 §7.6）。
+- 每次透传记 `GatewayMetrics.nondialog_passthrough`（流量验证用）；若该臂承载对话体需补
+  还原/审计/用量，另立任务跟进，不扩张本 change 范围。
+
+### 8.2 调试落盘缺失（F2）
+
+- 本仓无请求四件落盘：`CREDENTIAL_PROXY_DEBUG_DIR` 二进制不读取（见 §7.4）。
+- 排障代替指引：结构化日志 + `AUDIT_POLICY_FILE` 审计面；恢复落盘需新 change 交付，
+  且落盘即涉密、须配套脱敏方案。
+
+### 8.3 Go 未闭环清单（F3，`veil-hardening 5.x` 承接）
+
+- 存量 Go `get` 客户端对接指引见 §5；以下三项验证未闭环，由 `veil-hardening` 第 5 节承接：
+  `5.1` 存量 Go 直连全链路验证、`5.2` 三因子齐全/缺失两场景验证、`5.3` 阻断流终止验证
+  （收到终止帧且无重试挂起）。
+
+### 8.4 入口与审批语义（F4）
+
+- `VEIL_ENTRY_MODE` 三态：`full`（默认）/ `credential-only` / `llm-only`（另接受
+  `credential-proxy-only` / `llm-proxy-only` 别名，非法值拒启动）。
+- 非 `full` 入口下 `approve_hash_change` 降级为阻断（返回鉴权失败，不执行哈希变更，
+  见 `src/service/credential.rs::approve_hash_change`）。
+- Matrix `_ask` 返回 `None` 即 rejected 并清理；孤儿 pending 由 `60s` 清扫任务回收。
+- `AUTO_APPROVE` 三态：`true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批（见 §2）。

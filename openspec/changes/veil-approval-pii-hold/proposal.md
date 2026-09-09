@@ -27,6 +27,6 @@
 
 ## Impact
 
-- **新增文件**：`openspec/changes/veil-approval-pii-hold/` 下 proposal/design/specs/tasks；apply 阶段可能改 `src/service/audit_hold.rs`、`src/handler.rs` 流泵、`src/service/sse.rs`/`redaction.rs`（A 案）或仅改 README 威胁模型（B 案）。
+- **新增文件**：`openspec/changes/veil-approval-pii-hold/` 下 proposal/design/specs/tasks；apply 阶段可能改 `src/service/audit_hold.rs`、`src/handler/llm/pump.rs` 流泵、`src/service/sse.rs`/`redaction.rs`（A 案）或仅改 README 威胁模型（B 案）（勘误：原文 `src/handler.rs`，路径已拆分，语义不变）。
 - **影响系统**：流式审批阻塞语义、PII 分片泄漏面、usage 大盘可比性、审计对抗性。
 - **依赖**：Matrix `ask` 超时口径（`AUDIT_TIMEOUT` 默认 90s，禁 110-130s）、`AUDIT_HOLD_MAX_BYTES` 1MB 上限。

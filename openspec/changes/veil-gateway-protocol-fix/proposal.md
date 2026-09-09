@@ -22,12 +22,12 @@
 ## Non-Goals（显式）
 
 - 不改测试门限与新增 e2e 矩阵（见 `veil-test-parity-close`）。
-- 不做 `handler/llm.rs` 二次拆分与锁选型变更（见 `veil-arch-hygiene-round3`）。
+- 不做 `handler/llm/mod.rs` 二次拆分与锁选型变更（见 `veil-arch-hygiene-round3`）（勘误：原文 `handler/llm.rs`，路径已拆分，语义不变）。
 - 不改 `approve` pending 不断链 BREAKING（README §6.4 已声明，维持）。
 - 不提交 commit。
 
 ## Impact
 
 - **新增文件**：`openspec/changes/veil-gateway-protocol-fix/` 下 proposal/design/specs/tasks。
-- **影响系统**：`src/service/block_inject.rs`、`src/service/sse.rs`、`src/service/redaction.rs`、`src/service/llm_gateway.rs`、`src/handler/llm.rs` 泵尾；严格 SDK 兼容性提升，宽松客户端无感知。
+- **影响系统**：`src/service/block_inject.rs`、`src/service/sse.rs`、`src/service/redaction.rs`、`src/service/llm_gateway/mod.rs`、`src/handler/llm/pump.rs` 泵尾；严格 SDK 兼容性提升，宽松客户端无感知（勘误：原文 `llm_gateway.rs`/`handler/llm.rs`，路径已拆分，语义不变）。
 - **依赖**：无新依赖；conformance 20/20 回归 + 新增合规单测。

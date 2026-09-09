@@ -10,18 +10,12 @@ use {
             audit_hold::{AuditHold, RequestKeepalive},
             block_inject,
             credential_vault::CredentialVault,
+            json_walk::strip_bom,
             llm_gateway::{self, GatewayMetrics, Protocol},
-            metrics::MetricsStore,
+            metrics::{ChatRecord, MetricsStore},
             pii::PiiDetector,
             redaction::{BoundaryHold, Scope, marker_cross_spans},
-            sse::{
-                Speed,
-                SseParser,
-                classify_residue,
-                is_done_payload,
-                set_truncated,
-                strip_sse_bom,
-            },
+            sse::{Speed, SseParser, classify_residue, is_done_payload, set_truncated},
         },
     },
     axum::{
@@ -90,6 +84,9 @@ pub fn spawn_stream_pump(
             normalized_out: _,
             pii_boundary_chars,
         } = ctx;
+        // P0-4.1：泵入口钳位非法配置（0→默认+warn，超 8MB→截断+warn），
+        // 永不导致未定义行为。
+        let (hold_max, pii_boundary_chars) = clamp_pump_limits(hold_max, pii_boundary_chars);
         let mut boundary = BoundaryHold::new(pii_boundary_chars);
         let boundary_spans = |window: &str, seam: usize| {
             let cred_map = resp_vault.snapshot_p2t();
@@ -143,9 +140,18 @@ pub fn spawn_stream_pump(
         // 终端去重（§2.6 流式等价）：每协议恰一终止帧，多余 `[DONE]/message_stop/completed` 丢弃。
         let mut terminal_sent = false;
         let mut stream_usage: Option<llm_gateway::Usage> = None;
+        // C13 模型分桶：跟踪上游回显 `model`（首见为准，缺失归
+        // `unknown_model`），随 `record_chat` 落快照。
+        let mut stream_model: Option<String> = None;
         // Responses 终端去重旗：上游 `failed` 直接透传、`incomplete`/`error`
         // 合成为单个 `response.failed`，恒恰其一。
         let mut responses_failed_sent = false;
+        // P0-3.1/TSS-03：未完成 tool 分片缓冲（hold-until-complete）：审计开启时
+        // chat/anthropic 非终止 tool 事件帧先缓冲不转发，`done`/stop 到达才放行；
+        // 流截断时丢弃并记 `truncated_tool_dropped`（对标 Python
+        // `tool_calls_pending_events`）。条目为（分桶槽号组，帧前缀，边界输入），
+        // 缓冲点在边界 hold 上游，重放时缝合时序不变，保到达序。
+        let mut pending_tool_frames: Vec<(Vec<u32>, String, String)> = Vec::new();
         while let Ok(chunk) = upstream.chunk().await {
             let bytes = match chunk {
                 Some(b) => b,
@@ -154,7 +160,18 @@ pub fn spawn_stream_pump(
             if bytes.is_empty() {
                 continue;
             }
-            for ev in parser.push_bytes(&bytes) {
+            // C11：超长行尾部字节排入 metrics；截断事件打 warn 标记审计可见。
+            let events = parser.push_bytes(&bytes);
+            let line_dropped = parser.take_truncated_line_dropped_bytes();
+            if line_dropped > 0 {
+                metrics.record_truncated_line_dropped_bytes(line_dropped);
+            }
+            for ev in events {
+                if ev.truncated {
+                    tracing::warn!(
+                        "SSE 超长行已截断（16KB），头部分发审计，尾部 {line_dropped} 字节已计数丢弃"
+                    );
+                }
                 if ev.is_comment_only {
                     let _ = pump_tx
                         .send(format!(":{}\n\n", ev.comments.join("\n:")))
@@ -163,10 +180,15 @@ pub fn spawn_stream_pump(
                 }
                 if !ev.data.is_empty()
                     && !is_done_payload(&ev.data)
-                    && let Ok(v) = serde_json::from_str::<Value>(strip_sse_bom(&ev.data))
+                    && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
                 {
                     if let Some(id) = llm_gateway::extract_conv_id(&v) {
                         conv_id = Some(id);
+                    }
+                    if stream_model.is_none()
+                        && let Some(m) = v.get("model").and_then(|m| m.as_str())
+                    {
+                        stream_model = Some(m.to_string());
                     }
                     llm_gateway::accumulate_usage(
                         &mut stream_usage,
@@ -203,7 +225,7 @@ pub fn spawn_stream_pump(
                     }
                     if !ev.data.is_empty()
                         && !is_done_payload(&ev.data)
-                        && let Ok(v) = serde_json::from_str::<Value>(strip_sse_bom(&ev.data))
+                        && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
                         && (!extract_tool_fragments(protocol, &v).is_empty()
                             || AuditHold::is_complete_event(&v))
                     {
@@ -252,7 +274,7 @@ pub fn spawn_stream_pump(
                     }
                 }
                 if !ev.data.is_empty() && !is_done_payload(&ev.data) {
-                    if let Ok(v) = serde_json::from_str::<Value>(strip_sse_bom(&ev.data)) {
+                    if let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data)) {
                         // 终端后不再透出任何数据帧：恰一终止帧且其后无内容。
                         if terminal_sent {
                             continue;
@@ -264,6 +286,38 @@ pub fn spawn_stream_pump(
                         if rejected_sticky && is_tool_event {
                             continue;
                         }
+                        // P0-3.1：完成事件先放行此前缓冲的残缺分片（到达序重放进
+                        // 边界 hold，保证缝合时序），再处理本帧；全局完成全放行，
+                        // 按槽完成只放行对应槽（他槽残缺继续缓冲）。
+                        let audit_hold_on = !matches!(audit_mode, AuditMode::Off)
+                            && matches!(protocol, Protocol::Chat | Protocol::Anthropic);
+                        if audit_hold_on {
+                            let slot: Option<Option<u32>> = if AuditHold::is_complete_event(&v) {
+                                Some(None)
+                            } else if AuditHold::is_index_complete_event(&v) {
+                                outer_event_index(protocol, &v).map(Some)
+                            } else {
+                                None
+                            };
+                            if let Some(slot) = slot {
+                                for (b_prefix, b_data) in
+                                    take_pending_tool_inputs(&mut pending_tool_frames, slot)
+                                {
+                                    let (op, od) = boundary.push(b_prefix, b_data, boundary_spans);
+                                    if !od.is_empty() || !boundary.has_held() {
+                                        agg.push_str(&op);
+                                        agg.push_str(&format!("data: {od}\n\n"));
+                                    }
+                                }
+                            }
+                        }
+                        // P0-3.1：未完成 tool 分片缓冲不转发（hold-until-complete）；
+                        // 本帧槽号组取自各分片桶号（到达序 flush 时保序）。
+                        let buffer_tool_frame = audit_hold_on
+                            && is_tool_event
+                            && !AuditHold::is_complete_event(&v)
+                            && !AuditHold::is_index_complete_event(&v);
+                        let tool_buckets: Vec<u32> = frags.iter().map(|f| f.0).collect();
                         let mut reject_reason: Option<String> = None;
                         if minor {
                             // 次要事件透传且审计声明放行：不进 hold、不审计。
@@ -372,6 +426,8 @@ pub fn spawn_stream_pump(
                             terminal_sent = true;
                             agg.clear();
                             boundary.clear();
+                            // P0-3.1：阻断丢弃缓冲（阻断非截断，不记截断计数）。
+                            pending_tool_frames.clear();
                             if !block_injected {
                                 block_injected = true;
                                 for f in block_inject::ensure_event_lines(match protocol {
@@ -425,6 +481,13 @@ pub fn spawn_stream_pump(
                         if event_terminal {
                             terminal_sent = true;
                         }
+                        // P0-3.1：未完成 tool 分片不进边界 hold、不进 `agg`
+                        // （hold-until-complete），直接缓冲还原后输入；完成帧走
+                        // 正常透传（此前缓冲已在本帧前重放进边界 hold）。
+                        if buffer_tool_frame {
+                            pending_tool_frames.push((tool_buckets, prefix, restored_data));
+                            continue;
+                        }
                         let (out_prefix, out_data) =
                             boundary.push(prefix, restored_data, boundary_spans);
                         if !out_data.is_empty() || !boundary.has_held() {
@@ -461,13 +524,9 @@ pub fn spawn_stream_pump(
                         }
                     }
                 } else if ev.data.is_empty() {
-                    // 空心跳帧：原样透出，不参与终端计数。
-                    let prefix = ev
-                        .event_type
-                        .as_ref()
-                        .map(|t| format!("event: {t}\n"))
-                        .unwrap_or_default();
-                    agg.push_str(&format!("{prefix}data: {}\n\n", ev.data));
+                    // L17：空 `data:` 心跳帧丢弃不透传（不计数、不参与终端判定；
+                    // 真空流保持 open-ended，见 C8）。
+                    continue;
                 } else {
                     // `[DONE]`（含 BOM 前缀）：恰一终止帧，多余去重。
                     // 滞留帧先于终止帧放行（保序：滞留内容属于终止前的数据）。
@@ -498,6 +557,48 @@ pub fn spawn_stream_pump(
             if terminated {
                 break;
             }
+        }
+        // P0-3.1/TSS-03：截断丢弃未完成 tool 分片（对标 Python `_synthesize_truncation`
+        // TSS-03 分支）：缓冲帧永不透传下游，记 `truncated_tool_dropped` 并 warn；
+        // 置 `terminal_sent` 跳过空流二次合成（open-ended，以已透传块收尾）。
+        if !pending_tool_frames.is_empty() {
+            let dropped = pending_tool_frames.len() as u64;
+            pending_tool_frames.clear();
+            metrics.record_truncated_tool_dropped(dropped);
+            tracing::warn!("LLM 截断丢弃残缺 tool 分片: {dropped} 帧");
+            // P0-3.2：截断合成（responses 出 failed，chat/anthropic open-ended
+            // 空实现）；与 C8 空流合成联动：此处已置 `terminal_sent`，下游空流
+            // 守门不再二次合成，恒恰一终止语义。
+            let tid = conv_id.clone().unwrap_or_else(|| {
+                llm_gateway::resolve_conv_id(
+                    None,
+                    &serde_json::Value::Null,
+                    Some(&metrics),
+                    "truncated",
+                )
+                .0
+            });
+            for f in block_inject::ensure_event_lines(block_inject::synthesize_truncation(
+                protocol, &tid,
+            )) {
+                metrics.add_sse_event();
+                forwarded += 1;
+                any_frame_sent = true;
+                if pump_tx.send(f).await.is_err() {
+                    break;
+                }
+            }
+            terminal_sent = true;
+            let _ = crate::service::sse::set_truncated(
+                &mut meta,
+                protocol,
+                if protocol == Protocol::Responses {
+                    crate::service::sse::TruncatedMode::SynthesizedFailed
+                } else {
+                    crate::service::sse::TruncatedMode::OpenEnded
+                },
+                Some(&metrics),
+            );
         }
         if let Some((fp, fd)) = boundary.flush() {
             agg.push_str(&fp);
@@ -534,7 +635,6 @@ pub fn spawn_stream_pump(
         // D4：空流合成守门以终端/任意帧状态位为准（残余 `send` 即记位），
         // 不依赖 `forwarded` 计数器；真空流（三位全假）仍合成三协议恰一终端帧。
         if should_synthesize_empty_stream(terminal_sent, any_frame_sent, block_injected) {
-            block_injected = true;
             let proto_name = protocol_header_value(protocol);
             let tid = conv_id.clone().unwrap_or_else(|| {
                 llm_gateway::resolve_conv_id(
@@ -545,34 +645,50 @@ pub fn spawn_stream_pump(
                 )
                 .0
             });
-            for f in block_inject::ensure_event_lines(block_inject::empty_stream_frames(
+            // C8 open-ended：真空流 chat/anthropic 为空帧集（不伪造成功终止，
+            // 仅记 open-ended 可观测，不置 block_injected）；Responses 合成 failed。
+            // 与 P0-3.2 截断合成共用 `terminal_sent` 守门：此处仅真空（终端未发、
+            // 无帧、无阻断）才进入，恒恰一语义不变。
+            let frames = block_inject::ensure_event_lines(block_inject::empty_stream_frames(
                 proto_name, &tid,
-            )) {
-                let _ = pump_tx.send(f).await;
+            ));
+            if frames.is_empty() {
+                let _ = set_truncated(
+                    &mut meta,
+                    protocol,
+                    crate::service::sse::TruncatedMode::OpenEnded,
+                    Some(&metrics),
+                );
+            } else {
+                block_injected = true;
+                for f in frames {
+                    let _ = pump_tx.send(f).await;
+                }
+                let _ = set_truncated(
+                    &mut meta,
+                    protocol,
+                    if protocol == Protocol::Responses {
+                        crate::service::sse::TruncatedMode::SynthesizedFailed
+                    } else {
+                        crate::service::sse::TruncatedMode::OpenEnded
+                    },
+                    Some(&metrics),
+                );
+                block_inject::mark_terminal(&mut meta);
             }
-            let _ = set_truncated(
-                &mut meta,
-                protocol,
-                if protocol == Protocol::Responses {
-                    crate::service::sse::TruncatedMode::SynthesizedFailed
-                } else {
-                    crate::service::sse::TruncatedMode::OpenEnded
-                },
-                Some(&metrics),
-            );
-            block_inject::mark_terminal(&mut meta);
             terminated = true;
         }
         let _ = terminated;
         _gate.store(false, std::sync::atomic::Ordering::Relaxed);
-        admin_metrics.record_chat(
+        admin_metrics.record_chat(ChatRecord {
             protocol,
-            req_start.elapsed().as_millis() as u64,
-            stream_usage.as_ref(),
-            meta.truncated_mode.as_ref().map(|m| m.as_str()),
-            sqlite_precise,
-            now_secs(),
-        );
+            model: stream_model.as_deref().unwrap_or(""),
+            latency_ms: req_start.elapsed().as_millis() as u64,
+            usage: stream_usage.as_ref(),
+            truncated_mode: meta.truncated_mode.as_ref().map(|m| m.as_str()),
+            is_precise: sqlite_precise,
+            ts_secs: now_secs(),
+        });
         admin_metrics.record_aux_counts(protocol, now_secs(), 0, 0, u64::from(audit_blocked));
         PumpOutcome {
             forwarded,
@@ -645,6 +761,44 @@ fn is_terminal_event(protocol: crate::service::llm_gateway::Protocol, v: &Value)
 /// 外层事件序号（§2.5/§2.4）：anthropic 取事件级 `index`
 /// （`content_block_start/delta.index`），responses 取 `output_index`；
 /// 缺失返回 None（调用方跳过按槽清理，不误清）。
+/// TSS-03 缓冲取出（P0-3.1）：按到达序取出与 `slot` 相交的缓冲输入；
+/// `slot` 为 `None` 时全取（全局完成），否则只取含该槽号的帧（按槽完成）。
+/// 取出的是边界 hold 上游输入（还原/脱敏后、边界缝合前），调用方须按序
+/// 重放进 `BoundaryHold::push` 再转发，保证缝合状态机时序不变。
+fn take_pending_tool_inputs(
+    pending: &mut Vec<(Vec<u32>, String, String)>,
+    slot: Option<u32>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut kept = Vec::new();
+    for (buckets, prefix, data) in std::mem::take(pending) {
+        if slot.is_none_or(|s| buckets.contains(&s)) {
+            out.push((prefix, data));
+        } else {
+            kept.push((buckets, prefix, data));
+        }
+    }
+    *pending = kept;
+    out
+}
+
+/// 泵入口限值钳位（P0-4.1）：`hold_max == 0 → 1MB 默认并 warn`，超
+/// `AUDIT_SUBLIMIT_CEILING` 截断至上限并 warn；
+/// `pii_boundary_chars == 0` 为响应侧关闭直通信号（`StreamPumpCtx` 调用方契约，
+/// 见字段注释与 `handler::llm` 接线），保留不钳位。
+pub(crate) fn clamp_pump_limits(hold_max: usize, pii_boundary_chars: usize) -> (usize, usize) {
+    let hold_max = if hold_max == 0 {
+        tracing::warn!("hold_max 非法 ({hold_max})，已回退 1MB 默认");
+        crate::config::AUDIT_HOLD_MAX_BYTES_DEFAULT as usize
+    } else if hold_max > crate::config::AUDIT_SUBLIMIT_CEILING_BYTES {
+        tracing::warn!("hold_max 超限 ({hold_max})，已截断至 8MB 上限");
+        crate::config::AUDIT_SUBLIMIT_CEILING_BYTES
+    } else {
+        hold_max
+    };
+    (hold_max, pii_boundary_chars)
+}
+
 fn outer_event_index(protocol: crate::service::llm_gateway::Protocol, v: &Value) -> Option<u32> {
     use crate::service::llm_gateway::Protocol as P;
     let n = match protocol {
@@ -682,16 +836,12 @@ fn is_minor_event(protocol: crate::service::llm_gateway::Protocol, v: &Value) ->
         }
         P::Responses => {
             let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            [
-                "reasoning",
-                "mcp",
-                "file_search",
-                "web_search",
-                "code_interpreter",
-                "image_gen",
-            ]
-            .iter()
-            .any(|k| t.contains(k))
+            // C10：`file_search/web_search` 计 tool（与非流一致），不再列为
+            // 次要事件；其余检索外围（reasoning/mcp/code_interpreter/image_gen）
+            // 仍透传不审计。
+            ["reasoning", "mcp", "code_interpreter", "image_gen"]
+                .iter()
+                .any(|k| t.contains(k))
         }
         P::Chat => v
             .get("choices")
@@ -827,8 +977,8 @@ fn extract_tool_fragments(
                     blocks.push(b);
                 }
             }
-            // §2.4 外层序号优先：`content_block_start/delta.index` 为事件级序号，
-            // 内层 `content_block/delta.index` 仅作回退，缺失再回退枚举下标。
+            // §2.4/P0-2.2：分桶复用共享 `anthropic_bucket_index`
+            // （外层事件序号优先，内层回退，与非流单实现）。
             let outer_index = v.get("index").and_then(|x| x.as_u64()).map(|n| n as u32);
             if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
                 blocks.extend(arr.iter());
@@ -841,9 +991,7 @@ fn extract_tool_fragments(
                 }
             }
             for (i, b) in blocks.iter().enumerate() {
-                let idx = outer_index
-                    .or_else(|| b.get("index").and_then(|x| x.as_u64()).map(|n| n as u32))
-                    .unwrap_or(i as u32);
+                let idx = llm_gateway::anthropic_bucket_index(outer_index, b, i as u32);
                 if let Some(fc) = b.get("function_call").and_then(|x| x.as_object()) {
                     let name = fc
                         .get("name")
@@ -976,15 +1124,47 @@ fn extract_tool_fragments(
                 }
                 return out;
             }
+            // C10 检索事件计 tool（与非流一致）：名按类型派生，参按
+            // queries 回退；中间态同样建槽审计，误报优于漏审。
+            if let Some(rname) = llm_gateway::retrieval_tool_name(ev_type) {
+                let idx = v
+                    .get("output_index")
+                    .or_else(|| v.get("index"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                let id = v
+                    .get("item_id")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| v.get("id").and_then(|x| x.as_str()))
+                    .map(|s| s.to_string());
+                let name = v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(rname.to_string()));
+                let mut args = v
+                    .as_object()
+                    .map(llm_gateway::retrieval_args)
+                    .unwrap_or_default();
+                if args.is_empty()
+                    && let Some(d) = v.get("delta").and_then(|x| x.as_str())
+                {
+                    args = d.to_string();
+                }
+                out.push((idx, id, name, args));
+                return out;
+            }
             if ev_type.contains("output_text") {
                 return out;
             }
             if ev_type == "response.output_item.done"
                 && let Some(item) = v.get("item")
-                && item.get("type").and_then(|x| x.as_str()) == Some("function_call")
+                && let Some(type_str) = item.get("type").and_then(|x| x.as_str())
+                && (type_str == "function_call"
+                    || llm_gateway::retrieval_tool_name(type_str).is_some())
             {
                 let idx = v.get("output_index").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                let args = item
+                let mut args = item
                     .get("arguments")
                     .map(|a| {
                         if let Some(s) = a.as_str() {
@@ -994,10 +1174,16 @@ fn extract_tool_fragments(
                         }
                     })
                     .unwrap_or_default();
+                if args.is_empty()
+                    && let Some(obj) = item.as_object()
+                {
+                    args = llm_gateway::retrieval_args(obj);
+                }
                 let name = item
                     .get("name")
                     .and_then(|x| x.as_str())
-                    .map(|s| s.to_string());
+                    .map(|s| s.to_string())
+                    .or_else(|| llm_gateway::retrieval_tool_name(type_str).map(|s| s.to_string()));
                 let id = item
                     .get("id")
                     .and_then(|x| x.as_str())
@@ -1008,11 +1194,119 @@ fn extract_tool_fragments(
                 }
                 return out;
             }
+            if ev_type == "response.output_item.added"
+                && let Some(item) = v.get("item")
+            {
+                // C9 起始事件建槽（与非流同形）：`added` 携带 function_call
+                // 名/id（尚无 arguments），产出空参数分片经既有
+                // `push_responses_fragment` 建槽，复用按槽缓冲；
+                // C10 检索起始同样建槽（名按类型派生）；非 tool 形态直返。
+                let type_str = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                let is_tool = type_str.contains("function_call")
+                    || type_str.contains("custom_tool_call")
+                    || type_str.contains("tool")
+                    || llm_gateway::retrieval_tool_name(type_str).is_some()
+                    || item.get("name").is_some();
+                if !is_tool {
+                    return out;
+                }
+                let idx = v.get("output_index").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let id = item
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| item.get("call_id").and_then(|x| x.as_str()))
+                    .map(|s| s.to_string());
+                let name = item
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| llm_gateway::retrieval_tool_name(type_str).map(|s| s.to_string()));
+                out.push((idx, id, name, String::new()));
+                return out;
+            }
             if v.get("item").is_some() {
                 return out;
             }
             if let Some(output) = v.get("output").and_then(|o| o.as_array()) {
+                // C9：复用非流 `custom_obj_to_call` 取字段优先级
+                //（`id/call_id/tool_call_id`、`name/tool_name/function.name`、
+                // `arguments/input/args`），流/非流同调用同结论。
+                let custom_parts =
+                    |obj: &serde_json::Map<String, Value>| -> (Option<String>, Option<String>, String) {
+                        let cid = obj
+                            .get("id")
+                            .or_else(|| obj.get("call_id"))
+                            .or_else(|| obj.get("tool_call_id"))
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string());
+                        let cname = obj
+                            .get("name")
+                            .or_else(|| obj.get("tool_name"))
+                            .and_then(|x| x.as_str())
+                            .or_else(|| {
+                                obj.get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|x| x.as_str())
+                            })
+                            .map(|s| s.to_string());
+                        let cargs = obj
+                            .get("arguments")
+                            .or_else(|| obj.get("input"))
+                            .or_else(|| obj.get("args"))
+                            .map(|a| {
+                                if let Some(s) = a.as_str() {
+                                    s.to_string()
+                                } else if a.is_null() {
+                                    String::new()
+                                } else {
+                                    a.to_string()
+                                }
+                            })
+                            .unwrap_or_default();
+                        (cid, cname, cargs)
+                    };
                 for (i, item) in output.iter().enumerate() {
+                    // 非流同形 `is_tool` 前置门：非 tool 项直接跳过，不得建槽。
+                    let item_type = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                    let is_tool = item_type.contains("function_call")
+                        || item_type.contains("custom_tool_call")
+                        || item_type.contains("tool")
+                        || llm_gateway::retrieval_tool_name(item_type).is_some()
+                        || item.get("name").is_some()
+                        || item.get("arguments").is_some()
+                        || item.get("input").is_some();
+                    if !is_tool {
+                        continue;
+                    }
+                    // C10 检索调用直建分片（与非流同形：名派生+queries 回退）。
+                    if let Some(obj) = item.as_object()
+                        && let Some(rname) = llm_gateway::retrieval_tool_name(item_type)
+                    {
+                        let cid = obj
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .or_else(|| obj.get("call_id").and_then(|x| x.as_str()))
+                            .map(|s| s.to_string());
+                        let cname = obj
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| Some(rname.to_string()));
+                        out.push((i as u32, cid, cname, llm_gateway::retrieval_args(obj)));
+                        continue;
+                    }
+                    if let Some(obj) = item.as_object() {
+                        if let Some(Value::Object(inner)) = obj.get("custom_tool_call") {
+                            let (cid, cname, cargs) = custom_parts(inner);
+                            out.push((i as u32, cid, cname, cargs));
+                            continue;
+                        }
+                        let (cid, cname, cargs) = custom_parts(obj);
+                        if cname.is_some() || !cargs.is_empty() || cid.is_some() {
+                            out.push((i as u32, cid, cname, cargs));
+                            continue;
+                        }
+                    }
                     let args = item
                         .get("arguments")
                         .map(|a| {
@@ -1166,6 +1460,185 @@ mod tests {
             P::Responses,
             &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
         ));
+    }
+
+    #[test]
+    fn responses_added_builds_slot_so_truncation_stays_auditable() {
+        // C9 起始截断漏审回归：仅 `added` 到达（`.done` 前截断）时槽须已建，
+        // 名/id 保留至审计三元组；非 tool 起始不建槽。
+        use crate::service::llm_gateway::Protocol as P;
+        let added = serde_json::json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"call-9","name":"run"}});
+        let frags = extract_tool_fragments(P::Responses, &added);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].0, 2);
+        assert_eq!(frags[0].1.as_deref(), Some("call-9"));
+        assert_eq!(frags[0].2.as_deref(), Some("run"));
+        assert!(frags[0].3.is_empty());
+        // 复用既有按槽缓冲建槽：空参分片入槽后，即使零参数到达完成点，
+        // 审计仍可见起始名（截断前可审计，不断链漏审）。
+        let mut hold = AuditHold::new(1_048_576);
+        for (idx, id, name, args) in &frags {
+            let key = AuditHold::responses_key(id.as_deref(), *idx);
+            hold.push_responses_fragment(&key, *idx, None, id.as_deref(), name.as_deref(), args);
+            hold.mark_responses_done(&key, None);
+        }
+        let triples = hold.tool_triples();
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].0, 2);
+        assert_eq!(triples[0].1, "run");
+        let msg = serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","content":[]}});
+        assert!(extract_tool_fragments(P::Responses, &msg).is_empty());
+    }
+
+    #[test]
+    fn responses_custom_tool_call_stream_matches_nonstream() {
+        // C9 流式 custom 覆盖：同调用在流/非流须同结论（名/参/id 一致）。
+        use crate::service::llm_gateway::{Protocol as P, extract_tool_calls};
+        let nested = serde_json::json!({"output":[{"type":"custom_tool_call","custom_tool_call":{"name":"ct","arguments":"{}"}}]});
+        let frags = extract_tool_fragments(P::Responses, &nested);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].2.as_deref(), Some("ct"));
+        assert_eq!(frags[0].3, "{}");
+        let calls = extract_tool_calls(P::Responses, &nested);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name.as_deref(), frags[0].2.as_deref());
+        assert_eq!(calls[0].args, frags[0].3);
+        // 裸回退形态（`tool_name`+`input` 别名）双向同解。
+        let bare =
+            serde_json::json!({"output":[{"type":"tool","tool_name":"grep","input":{"p":1}}]});
+        let frags2 = extract_tool_fragments(P::Responses, &bare);
+        assert_eq!(frags2.len(), 1);
+        assert_eq!(frags2[0].2.as_deref(), Some("grep"));
+        assert_eq!(frags2[0].3, r#"{"p":1}"#);
+        let calls2 = extract_tool_calls(P::Responses, &bare);
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].name.as_deref(), Some("grep"));
+        assert_eq!(calls2[0].args, r#"{"p":1}"#);
+        // 纯消息项双向皆不建槽。
+        let msg = serde_json::json!({"output":[{"type":"message","id":"m1","content":[]}]});
+        assert!(extract_tool_fragments(P::Responses, &msg).is_empty());
+        assert!(extract_tool_calls(P::Responses, &msg).is_empty());
+    }
+
+    #[test]
+    fn retrieval_calls_reach_identical_verdicts_across_modes() {
+        // C10 同调用同结论：同一检索调用经流/非流须得同一审计结论。
+        use crate::{
+            config::AuditMode,
+            service::{
+                audit::{AuditPolicy, evaluate},
+                llm_gateway::{Protocol as P, extract_tool_calls},
+            },
+        };
+        let policy = AuditPolicy::default_policy();
+        let nonstream = serde_json::json!({"output":[{"type":"file_search_call","id":"fs1","queries":["rm -rf /"]}]});
+        let calls = extract_tool_calls(P::Responses, &nonstream);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name.as_deref(), Some("file_search"));
+        assert!(calls[0].args.contains("rm -rf /"));
+        let stream = serde_json::json!({"type":"response.file_search_call.completed","output_index":0,"item_id":"fs1","queries":["rm -rf /"]});
+        let frags = extract_tool_fragments(P::Responses, &stream);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].2.as_deref(), Some("file_search"));
+        assert!(frags[0].3.contains("rm -rf /"));
+        assert!(
+            !is_minor_event(P::Responses, &stream),
+            "检索事件不再列为次要"
+        );
+        let v_stream = evaluate(
+            AuditMode::Block,
+            frags[0].2.as_deref().unwrap_or(""),
+            &frags[0].3,
+            &policy,
+        );
+        let v_nonstream = evaluate(
+            AuditMode::Block,
+            calls[0].name.as_deref().unwrap_or(""),
+            &calls[0].args,
+            &policy,
+        );
+        assert!(
+            matches!(v_stream, crate::service::audit::AuditVerdict::Block { .. }),
+            "流式危险检索须阻断"
+        );
+        assert!(
+            matches!(
+                v_nonstream,
+                crate::service::audit::AuditVerdict::Block { .. }
+            ),
+            "非流危险检索须阻断"
+        );
+        // 良性检索双向同放行；检索外围仍透传不审计。
+        let benign_ns = serde_json::json!({"output":[{"type":"web_search_call","id":"w1","queries":["hello"]}]});
+        let benign_calls = extract_tool_calls(P::Responses, &benign_ns);
+        assert_eq!(benign_calls[0].name.as_deref(), Some("web_search"));
+        let benign_s = serde_json::json!({"type":"response.web_search_call.completed","output_index":0,"item_id":"w1","queries":["hello"]});
+        let benign_frags = extract_tool_fragments(P::Responses, &benign_s);
+        assert_eq!(benign_frags[0].2.as_deref(), Some("web_search"));
+        assert!(matches!(
+            evaluate(AuditMode::Block, "web_search", &benign_frags[0].3, &policy),
+            crate::service::audit::AuditVerdict::Allow
+        ));
+        assert!(is_minor_event(
+            P::Responses,
+            &serde_json::json!({"type":"response.reasoning.delta"})
+        ));
+    }
+
+    #[test]
+    fn stream_interleaved_outer_index_matches_nonstream_slot() {
+        // P0-2.3 回归：流式分桶与非流同槽（外层 0/1 胜过内层 3/5）。
+        use crate::service::llm_gateway::{Protocol as P, extract_tool_calls};
+        let start0 = serde_json::json!({"index":0,"content_block":{"type":"tool_use","index":3,"id":"a0","name":"run","input":{}}});
+        let frags = extract_tool_fragments(P::Anthropic, &start0);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].0, 0, "流式外层 0 须胜过内层 3");
+        let calls = extract_tool_calls(P::Anthropic, &start0);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].index, frags[0].0, "流/非流同槽");
+        let d1 = serde_json::json!({"index":1,"delta":{"type":"input_json_delta","index":5,"partial_json":"{\"y\":"}});
+        let frags1 = extract_tool_fragments(P::Anthropic, &d1);
+        assert_eq!(frags1.len(), 1);
+        assert_eq!(frags1[0].0, 1, "流式外层 1 须胜过内层 5");
+        let calls1 = extract_tool_calls(P::Anthropic, &d1);
+        assert_eq!(calls1.len(), 1);
+        assert_eq!(calls1[0].index, frags1[0].0, "流/非流同槽");
+    }
+
+    #[test]
+    fn pump_entry_clamps_hold_limits() {
+        // P0-4.1：0→1MB 默认，超 8MB→截断；pii 0（关闭直通）保留。
+        use crate::config::{AUDIT_HOLD_MAX_BYTES_DEFAULT, AUDIT_SUBLIMIT_CEILING_BYTES};
+        assert_eq!(
+            clamp_pump_limits(0, 64),
+            (AUDIT_HOLD_MAX_BYTES_DEFAULT as usize, 64)
+        );
+        assert_eq!(clamp_pump_limits(1_048_576, 64), (1_048_576, 64));
+        assert_eq!(
+            clamp_pump_limits(16 * 1024 * 1024, 64),
+            (AUDIT_SUBLIMIT_CEILING_BYTES, 64)
+        );
+        assert_eq!(
+            clamp_pump_limits(1_048_576, 0),
+            (1_048_576, 0),
+            "pii 0 为关闭直通信号，须保留"
+        );
+    }
+
+    #[test]
+    fn pending_tool_buffer_drains_by_slot_preserving_order() {
+        // P0-3.1：缓冲按槽取出保到达序；全局完成全取，按槽完成只取对应槽。
+        let mut pending: Vec<(Vec<u32>, String, String)> = vec![
+            (vec![0], "e0".to_string(), "d0".to_string()),
+            (vec![1], "e1".to_string(), "d1".to_string()),
+            (vec![0, 1], "e2".to_string(), "d2".to_string()),
+        ];
+        let slot0 = take_pending_tool_inputs(&mut pending, Some(0));
+        assert_eq!(slot0.len(), 2, "含槽 0 的两帧须取出");
+        assert_eq!(pending.len(), 1, "纯槽 1 帧须保留");
+        let rest = take_pending_tool_inputs(&mut pending, None);
+        assert_eq!(rest.len(), 1, "全局完成取空剩余");
+        assert!(pending.is_empty());
     }
 
     #[test]

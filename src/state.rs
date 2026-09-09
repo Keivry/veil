@@ -97,6 +97,49 @@ impl AppState {
     }
 }
 
+/// A1 依赖倒置：`AppState` 实现服务层读态 trait，本文件是 `service -> state`
+/// 反向边的唯一承载点（`service` 内业务代码不再命名 `AppState`）。
+impl crate::service::credential::AppStateParts for AppState {
+    fn config(&self) -> &Arc<crate::config::Config> { &self.config }
+
+    fn sqlite_ok_flag(&self) -> bool { self.sqlite_ok.load(Ordering::SeqCst) }
+
+    fn sqlite_error_text(&self) -> Option<String> {
+        match self.sqlite_error.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        }
+    }
+
+    fn registry(&self) -> &Arc<tokio::sync::RwLock<CallerRegistry>> { &self.registry }
+
+    fn registry_path(&self) -> &std::path::PathBuf { &self.registry_path }
+
+    fn keepass(&self) -> &Arc<dyn KeePassBackend> { &self.keepass }
+
+    fn pending(&self) -> &Arc<crate::approval::PendingApprovals> { &self.pending }
+
+    fn approval(&self) -> &Arc<crate::service::matrix::MatrixApproval> { &self.approval }
+
+    fn http_client(&self) -> &Arc<reqwest::Client> { &self.http_client }
+
+    fn vault(&self) -> &Arc<crate::service::credential_vault::CredentialVault> { &self.vault }
+
+    fn credential_hits(&self) -> &Arc<tokio::sync::Mutex<crate::service::RateTable>> {
+        &self.credential_hits
+    }
+
+    fn register_hits(&self) -> &Arc<tokio::sync::Mutex<crate::service::RateTable>> {
+        &self.register_hits
+    }
+
+    fn gateway_metrics(&self) -> &Arc<crate::service::llm_gateway::GatewayMetrics> {
+        &self.gateway_metrics
+    }
+
+    fn admin_state(&self) -> &Arc<crate::service::admin::AdminState> { &self.admin }
+}
+
 pub fn build_http_client(config: &Config) -> reqwest::Client {
     use std::time::Duration;
     reqwest::Client::builder()

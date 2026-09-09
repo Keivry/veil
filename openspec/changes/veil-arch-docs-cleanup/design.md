@@ -19,7 +19,7 @@
 
 ### D1：handler 按入口拆分，状态码集中注释
 
-**决策**：`src/handler.rs` → `src/handler/mod.rs`（ re-export ）+ `credential.rs`（`credential/registrations/register/revoke/emergency/approve`）+ `llm.rs`（`llm_proxy/request_rewrite/serve_nonstream/spawn_stream_pump`）；`router.rs` 不变；`error.rs` 头部加状态码表注释（`Pending→202/Auth→403/Unauthorized→401/RateLimited→429/PayloadTooLarge→413/Unavailable→503/NotFound→404/BadRequest→400`）。（注：截至 `bcc6c4e` 已为目录形态 `src/handler/{mod,credential,llm}.rs`，本条为历史决策存档。）
+**决策**：`src/handler/mod.rs`（勘误：原文 `src/handler.rs`，路径已拆分，语义不变）→ `src/handler/mod.rs`（ re-export ）+ `credential.rs`（`credential/registrations/register/revoke/emergency/approve`）+ `llm/mod.rs`（`llm_proxy/request_rewrite/serve_nonstream/spawn_stream_pump`）；`router.rs` 不变；`error.rs` 头部加状态码表注释（`Pending→202/Auth→403/Unauthorized→401/RateLimited→429/PayloadTooLarge→413/Unavailable→503/NotFound→404/BadRequest→400`）。（注：截至 `bcc6c4e` 已为目录形态 `src/handler/{mod,credential,llm}.rs`，本条为历史决策存档。）
 
 **理由**：凭据与 LLM 错误域正交，混居导致单测必须全量 `AppState`。按入口拆后各模块可独立单测。
 

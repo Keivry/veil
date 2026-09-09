@@ -1,5 +1,4 @@
 use {
-    crate::approval::{ApprovalGateway, PendingRecord},
     serde_json::Value,
     std::{
         collections::HashMap,
@@ -10,23 +9,9 @@ use {
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoldVerdict {
-    Approved,
-    Rejected,
-}
-
-/// 经审批网关判定：`Approved`→放行，`Blocked`→拒绝，`Pending`→None（暂缓，收齐 done 后再审）。
-pub fn decide_via_gateway(
-    gateway: &dyn ApprovalGateway,
-    record: &PendingRecord,
-) -> Option<HoldVerdict> {
-    match gateway.request_approval(record) {
-        crate::approval::ApprovalOutcome::Approved => Some(HoldVerdict::Approved),
-        crate::approval::ApprovalOutcome::Blocked => Some(HoldVerdict::Rejected),
-        crate::approval::ApprovalOutcome::Pending => None,
-    }
-}
+/// A1：`HoldVerdict`/`decide_via_gateway` 归属 `audit.rs`，此处重导出保持
+/// `crate::service::audit_hold::{HoldVerdict, decide_via_gateway}` 路径编译。
+pub use super::audit::{HoldVerdict, decide_via_gateway};
 
 #[derive(Debug, Default)]
 struct ResponsesSlot {
@@ -51,6 +36,8 @@ impl ResponsesSlot {
     }
 }
 
+/// R5 职责声明：本结构只累积（tool 参数分片/字节预算/完成判定），不合成
+/// 任何响应帧/体；帧合成归 `block_inject`，两边不交叉。
 #[derive(Debug, Default)]
 pub struct AuditHold {
     args_by_index: HashMap<u32, String>,
@@ -357,7 +344,10 @@ impl Drop for RequestKeepalive {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::approval::NoopApproval};
+    use {
+        super::*,
+        crate::approval::{ApprovalGateway, NoopApproval, PendingRecord},
+    };
 
     #[test]
     fn responses_three_fragments_ordered_single_flush_no_audit_during_delta() {

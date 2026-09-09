@@ -39,6 +39,45 @@ fn synth_id(index: u32, present: Option<&str>) -> (String, bool) {
     }
 }
 
+/// 检索调用名派生（C10）：`file_search_call`→`file_search`、
+/// `web_search_call`→`web_search`（对齐 Python `allow` 名单口径）；
+/// 非检索类型返回 `None`。事件类型串（含 `response.` 前缀）与条目类型同解。
+pub fn retrieval_tool_name(type_str: &str) -> Option<&'static str> {
+    if type_str.contains("file_search") {
+        Some("file_search")
+    } else if type_str.contains("web_search") {
+        Some("web_search")
+    } else {
+        None
+    }
+}
+
+/// 检索参数归一（C10）：`arguments/input/args` 优先，`queries/query`
+/// 回退序列化；全缺失返回空串（建槽不断链）。有意排除 `results`
+/// （检索结果体量大，进 hold 有炸槽风险，审计只看查询）。
+pub fn retrieval_args(obj: &serde_json::Map<String, Value>) -> String {
+    for key in ["arguments", "input", "args"] {
+        if let Some(v) = obj.get(key) {
+            match v {
+                Value::String(s) => return s.clone(),
+                Value::Null => continue,
+                other => return serde_json::to_string(other).unwrap_or_default(),
+            }
+        }
+    }
+    for key in ["queries", "query"] {
+        if let Some(v) = obj.get(key)
+            && !v.is_null()
+        {
+            match v {
+                Value::String(s) => return s.clone(),
+                other => return serde_json::to_string(other).unwrap_or_default(),
+            }
+        }
+    }
+    String::new()
+}
+
 fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Option<ToolCall> {
     let id_raw = obj
         .get("id")
@@ -61,8 +100,11 @@ fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Optio
         .or_else(|| obj.get("args"));
     let (id, id_synth) = synth_id(index, id_raw);
     let args = normalize_tool_args(args_raw);
-    if name.is_none() && args.is_empty() && !id_synth {
-        tracing::warn!("tool 三元组缺失（id/name/args 全空），暂缓审计放行");
+    // L16：空增量（id 缺失合成 + 无名 + 无参，创槽心跳）只 warn 不建条目，
+    // 与 anthropic 空跳过同条件；有真实 id 的待名槽仍保留锚定。
+    if name.is_none() && args.is_empty() && id_synth {
+        tracing::warn!("tool 三元组缺失（id/name/args 全空），跳过建条目不断链");
+        return None;
     }
     Some(ToolCall {
         index,
@@ -73,9 +115,22 @@ fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Optio
     })
 }
 
-/// 非流/流 tool 调用提取：外层 `index` 语义与 `handler::extract_tool_fragments`
-/// 双实现对齐（chat 取 call.index/枚举下标、legacy 取 choice 序号；anthropic
-/// 内层→外层→枚举回退；responses 取 output_index/index），双实现须同改。
+/// Anthropic 分桶唯一实现（P0-2.2）：外层事件 `index` > 内层块 `index` >
+/// 枚举下标；流式（`handler::llm::pump`）与非流共用，单优先级单实现。
+pub fn anthropic_bucket_index(outer: Option<u32>, block: &Value, fallback: u32) -> u32 {
+    outer
+        .or_else(|| {
+            block
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+        })
+        .unwrap_or(fallback)
+}
+
+/// 非流/流 tool 调用提取：外层 `index` 语义经 [`anthropic_bucket_index`]
+/// 与流式分桶单实现对齐（chat 取 call.index/枚举下标、legacy 取 choice 序号；
+/// anthropic 外层→内层→枚举回退；responses 取 output_index/index）。
 pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> {
     let mut out = Vec::new();
     match protocol {
@@ -175,22 +230,13 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     blocks.push(msg);
                 }
             }
-            // §2.4：按外层事件 `index` 分桶（官方 `content_block_start.index` /
-            // `content_block_delta.index` 在事件顶层，内层 `content_block` /
-            // `delta` 常无 index）；内层 index 优先、外层回退、缺失才用枚举下标。
+            // §2.4：分桶经共享 [`anthropic_bucket_index`]（外层优先，见上）。
             let outer_index: Option<u32> = payload
                 .get("index")
                 .and_then(|x| x.as_u64())
                 .map(|n| n as u32);
-            let bucket_index = |b: &Value, fallback: u32| -> u32 {
-                b.get("index")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .or(outer_index)
-                    .unwrap_or(fallback)
-            };
             for (i, b) in blocks.iter().enumerate() {
-                let bucket = bucket_index(b, i as u32);
+                let bucket = anthropic_bucket_index(outer_index, b, i as u32);
                 let is_tool = b.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
                     t.contains("tool_use") || t.contains("function") || t.contains("custom")
                 }) || b.get("name").is_some()
@@ -322,22 +368,30 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
             }
             if ev_type == "response.output_item.done"
                 && let Some(item) = payload.get("item")
-                && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+                && let Some(type_str) = item.get("type").and_then(|v| v.as_str())
+                && (type_str == "function_call" || retrieval_tool_name(type_str).is_some())
             {
                 let idx = payload
                     .get("output_index")
                     .and_then(|x| x.as_u64())
                     .map(|n| n as u32)
                     .unwrap_or(0);
-                let args = match item.get("arguments") {
+                let mut args = match item.get("arguments") {
                     Some(Value::String(s)) => s.clone(),
                     Some(other) => serde_json::to_string(other).unwrap_or_default(),
                     None => String::new(),
                 };
+                // C10：检索完成项参按 queries 回退（与流式分片同结论）。
+                if args.is_empty()
+                    && let Some(obj) = item.as_object()
+                {
+                    args = retrieval_args(obj);
+                }
                 let name = item
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(|s| s.to_string())
+                    .or_else(|| retrieval_tool_name(type_str).map(|s| s.to_string()));
                 let id_raw = item
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -354,6 +408,45 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                 }
                 return out;
             }
+            if ev_type == "response.output_item.added"
+                && let Some(item) = payload.get("item")
+            {
+                // C9 起始事件建槽：`added` 携带 function_call 名/id（尚无
+                // arguments），建槽保留名/id 供后续 delta 累积与截断前审计；
+                // C10 检索起始同样建槽（名按类型派生）；非 tool 形态仍直返。
+                let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let is_tool = type_str.contains("function_call")
+                    || type_str.contains("custom_tool_call")
+                    || type_str.contains("tool")
+                    || retrieval_tool_name(type_str).is_some()
+                    || item.get("name").is_some();
+                if !is_tool {
+                    return out;
+                }
+                let idx = payload
+                    .get("output_index")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(0);
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| retrieval_tool_name(type_str).map(|s| s.to_string()));
+                let id_raw = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
+                let (id, id_synth) = synth_id(idx, id_raw);
+                out.push(ToolCall {
+                    index: idx,
+                    id,
+                    name,
+                    args: String::new(),
+                    id_synth,
+                });
+                return out;
+            }
             if payload.get("item").is_some() {
                 return out;
             }
@@ -368,10 +461,38 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                         t.contains("function_call")
                             || t.contains("custom_tool_call")
                             || t.contains("tool")
+                            || retrieval_tool_name(t).is_some()
                     }) || item.get("name").is_some()
                         || item.get("arguments").is_some()
                         || item.get("input").is_some();
                     if !is_tool {
+                        continue;
+                    }
+                    // C10 检索调用直建条目：名缺失时按类型派生，参按
+                    // queries 回退；与流式分片同结论（误报优于漏审）。
+                    if let Some(obj) = item.as_object()
+                        && let Some(rname) = obj
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .and_then(retrieval_tool_name)
+                    {
+                        let id_raw = obj
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| obj.get("call_id").and_then(|v| v.as_str()));
+                        let name = obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| Some(rname.to_string()));
+                        let (id, id_synth) = synth_id(bucket, id_raw);
+                        out.push(ToolCall {
+                            index: bucket,
+                            id,
+                            name,
+                            args: retrieval_args(obj),
+                            id_synth,
+                        });
                         continue;
                     }
                     if let Some(obj) = item.as_object()
@@ -472,6 +593,54 @@ pub fn resolve_conv_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t5_null_tool_fragment_skipped_without_entry() {
+        let v = serde_json::json!({"choices":[{"delta":{"tool_calls":[null]}}]});
+        let calls = extract_tool_calls(Protocol::Chat, &v);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].name.is_none(), "空增量无名");
+        assert!(calls[0].args.is_empty(), "空增量无参");
+        let empty_custom = serde_json::json!({"choices":[{"message":{"custom_tool_call":{}}}]});
+        assert!(extract_tool_calls(Protocol::Chat, &empty_custom).is_empty());
+        let null_items =
+            serde_json::json!({"choices":[{"message":{"custom_tool_call":[null, 42]}}]});
+        assert!(extract_tool_calls(Protocol::Chat, &null_items).is_empty());
+    }
+
+    #[test]
+    fn t5_missing_index_falls_back_without_panic() {
+        let v = serde_json::json!({"content_block":{"type":"tool_use","id":"a1","name":"bash","input":{}}});
+        assert_eq!(anthropic_bucket_index(None, &v["content_block"], 7), 7);
+        assert_eq!(
+            anthropic_bucket_index(None, &serde_json::json!({"index": 4}), 7),
+            4
+        );
+        assert_eq!(
+            anthropic_bucket_index(Some(3), &serde_json::json!({"index": 9}), 7),
+            3,
+            "外层 index 优先"
+        );
+        let chat =
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"function":{"name":"run"}}]}}]});
+        let calls = extract_tool_calls(Protocol::Chat, &chat);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].index, 0);
+    }
+
+    #[test]
+    fn t5_multi_index_grouping_keeps_slots_separate() {
+        let v = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"c0","function":{"name":"a","arguments":"{}"}},
+            {"index":2,"id":"c2","function":{"name":"b","arguments":"{}"}}
+        ]}}]});
+        let calls = extract_tool_calls(Protocol::Chat, &v);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].index, 0);
+        assert_eq!(calls[1].index, 2);
+        assert_eq!(calls[0].name.as_deref(), Some("a"));
+        assert_eq!(calls[1].name.as_deref(), Some("b"));
+    }
 
     #[test]
     fn fix3_missing_id_synthesizes_call_stable_id() {
@@ -575,6 +744,61 @@ mod tests {
         let inner = serde_json::json!({"content":[{"type":"tool_use","index":7,"id":"z","name":"q","input":{}}]});
         let ci = extract_tool_calls(Protocol::Anthropic, &inner);
         assert_eq!(ci[0].index, 7);
+    }
+
+    #[test]
+    fn anthropic_outer_index_wins_over_conflicting_inner() {
+        // P0-2.3 回归：外层 0/1 + 内层 3/5 交错时以外层分桶（与流式同槽）。
+        let start0 = serde_json::json!({"index":0,"content_block":{"type":"tool_use","index":3,"id":"a0","name":"run","input":{}}});
+        let c0 = extract_tool_calls(Protocol::Anthropic, &start0);
+        assert_eq!(c0.len(), 1);
+        assert_eq!(c0[0].index, 0, "外层 0 须胜过内层 3");
+        let d1 = serde_json::json!({"index":1,"delta":{"type":"input_json_delta","index":5,"partial_json":"{\"y\":"}});
+        let c1 = extract_tool_calls(Protocol::Anthropic, &d1);
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0].index, 1, "外层 1 须胜过内层 5");
+        assert_eq!(c1[0].args, "{\"y\":");
+        // 共享分桶函数直断言：三级回退（外层 > 内层 > 下标）。
+        let blk = serde_json::json!({"index":3});
+        assert_eq!(anthropic_bucket_index(Some(0), &blk, 9), 0);
+        assert_eq!(anthropic_bucket_index(None, &blk, 9), 3);
+        assert_eq!(anthropic_bucket_index(None, &serde_json::json!({}), 9), 9);
+    }
+
+    #[test]
+    fn responses_added_creates_slot_preserving_name_id() {
+        // C9 起始事件建槽：`added` 无 arguments 仍须产出空参调用保留名/id。
+        let added = serde_json::json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"call-9","name":"run"}});
+        let calls = extract_tool_calls(Protocol::Responses, &added);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].index, 2);
+        assert_eq!(calls[0].id, "call-9");
+        assert!(!calls[0].id_synth);
+        assert_eq!(calls[0].name.as_deref(), Some("run"));
+        assert!(calls[0].args.is_empty());
+        // 非 tool 形态 `added`（纯消息项）仍直返，不建槽。
+        let msg = serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","content":[]}});
+        assert!(extract_tool_calls(Protocol::Responses, &msg).is_empty());
+        // 无名无 id 的裸 `added` 合成稳定 id，不断链。
+        let bare = serde_json::json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call"}});
+        let bare_calls = extract_tool_calls(Protocol::Responses, &bare);
+        assert_eq!(bare_calls.len(), 1);
+        assert!(bare_calls[0].id_synth);
+    }
+
+    #[test]
+    fn empty_custom_heartbeat_builds_no_entry() {
+        // L16：空心跳（无 id/name/args）只 warn 不建条目；对照组非空仍建槽。
+        let empty = serde_json::json!({"choices": [{"delta": {"custom_tool_call": {}}}]});
+        assert!(
+            extract_tool_calls(Protocol::Chat, &empty).is_empty(),
+            "空 custom_tool_call 不得建条目"
+        );
+        let named =
+            serde_json::json!({"choices": [{"delta": {"custom_tool_call": {"name": "run"}}}]});
+        let calls = extract_tool_calls(Protocol::Chat, &named);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name.as_deref(), Some("run"));
     }
 
     #[test]

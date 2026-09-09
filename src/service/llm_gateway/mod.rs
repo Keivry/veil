@@ -22,7 +22,13 @@ pub mod protocol;
 pub mod tool;
 pub mod usage;
 
+/// 上游重试退避三档（毫秒）：500/1000/2000，总等待 3.5s，远小于
+/// `HTTP_TIMEOUT_SECS`（默认 30s）转发超时；硬编码理由：重试预算须锁定在
+/// 超时预算一个数量级以下，固定档位防雪崩放大，不开放配置（调大任一档都可能
+/// 拖过整体超时，改值须同步复核 `retry_delay` 单测与超时预算）。
 pub const RETRY_DELAYS_MS: [u64; 3] = [500, 1000, 2000];
+/// 最多重试 3 次（`0..=3` 含初次共 4 次请求）；硬编码理由同上，与退避档位
+/// 一一对应，超限下标回退末档 2000ms（见 `retry_delay`）。
 pub const MAX_RETRY_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Default)]
@@ -32,6 +38,12 @@ pub struct GatewayMetrics {
     hop_filtered: Mutex<HashMap<String, u64>>,
     conv_missing: Mutex<HashMap<String, u64>>,
     sse_events: AtomicU64,
+    /// P0-3.1/TSS-03：截断丢弃的残缺 tool 分片帧数。
+    truncated_tool_dropped: AtomicU64,
+    /// C11：超长 SSE 行截断丢弃的尾部字节数。
+    truncated_line_dropped_bytes: AtomicU64,
+    /// P0-4.2/F1：NonDialog 非对话臂透传次数（流量验证用）。
+    nondialog_passthrough: AtomicU64,
 }
 
 impl GatewayMetrics {
@@ -92,6 +104,31 @@ impl GatewayMetrics {
             .lock()
             .map(|g| g.get(reason).copied().unwrap_or(0))
             .unwrap_or(0)
+    }
+
+    pub fn record_truncated_tool_dropped(&self, n: u64) {
+        self.truncated_tool_dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn truncated_tool_dropped_count(&self) -> u64 {
+        self.truncated_tool_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn record_truncated_line_dropped_bytes(&self, n: u64) {
+        self.truncated_line_dropped_bytes
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn truncated_line_dropped_bytes_count(&self) -> u64 {
+        self.truncated_line_dropped_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn record_nondialog_passthrough(&self) {
+        self.nondialog_passthrough.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn nondialog_passthrough_count(&self) -> u64 {
+        self.nondialog_passthrough.load(Ordering::Relaxed)
     }
 }
 
@@ -204,11 +241,14 @@ pub use {
     },
     tool::{
         ToolCall,
+        anthropic_bucket_index,
         archive_unknown_id,
         extract_conv_id,
         extract_tool_calls,
         normalize_tool_args,
         resolve_conv_id,
+        retrieval_args,
+        retrieval_tool_name,
     },
     usage::{Usage, accumulate_usage, extract_usage_nonstream, extract_usage_stream},
 };
@@ -419,6 +459,25 @@ mod tests {
             start.elapsed()
         );
         server.abort();
+    }
+
+    #[test]
+    fn truncated_tool_dropped_counter_accumulates() {
+        // P0-3.1：截断丢弃计数可查询（泵内截断路径经此计数）。
+        let m = GatewayMetrics::default();
+        assert_eq!(m.truncated_tool_dropped_count(), 0);
+        m.record_truncated_tool_dropped(2);
+        m.record_truncated_tool_dropped(1);
+        assert_eq!(m.truncated_tool_dropped_count(), 3);
+    }
+
+    #[test]
+    fn nondialog_passthrough_counter_accumulates() {
+        // P0-4.2：NonDialog 透传计数可查询（非流臂经此计数）。
+        let m = GatewayMetrics::default();
+        assert_eq!(m.nondialog_passthrough_count(), 0);
+        m.record_nondialog_passthrough();
+        assert_eq!(m.nondialog_passthrough_count(), 1);
     }
 
     #[test]

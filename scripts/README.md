@@ -4,3 +4,7 @@
   `/home/keivry/项目/Python/credential-proxy/.venv/bin/python scripts/api_conformance.py`
 - SDK pin：`openai==3.5.0`、`anthropic==1.1.0`（与原仓 `.venv` 锁定版本一致）。
 - mock 上游监听 `:0` 随机端口；veil 二进制固定 `127.0.0.1:8877`。
+- `check_doc_paths.py` — 文档源码路径校验（`veil-docs-contract-fix` 1.3）：扫描 `README.md` +
+  `openspec/**/*.md` + `scripts/*.md` 的 `src/...rs` 引用并断言存在，缺失即非零退出；
+  勘误注内旧路径与 `<!-- doc-paths-ignore -->` 行自动跳过。门禁调用：
+  `python3 scripts/check_doc_paths.py`（仓库根目录执行，无额外依赖）。

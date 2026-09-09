@@ -6,7 +6,7 @@
 
 ### Requirement: 网关入口文件按职责拆分且行为一致
 
-系统 SHALL 将 `handler/llm.rs` 按三单元拆分、`llm_gateway.rs` 按协议拆模块，conformance SHALL 全绿，限值常量 SHALL 归属 `config.rs`。
+系统 SHALL 将 `handler/llm/mod.rs` 按三单元拆分（勘误：原文 `handler/llm.rs` 单文件，拆分已落地，语义不变）、`llm_gateway/mod.rs` 按协议拆模块（勘误：原文 `llm_gateway.rs` 单文件，拆分已落地，语义不变），conformance SHALL 全绿，限值常量 SHALL 归属 `config.rs`。
 
 #### Scenario: 拆分后行为一致
 

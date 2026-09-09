@@ -28,6 +28,6 @@ Rust 重构双 change 自测与第三方审查发现 P0 级安全/兼容断裂�
 
 ## Impact
 
-- 影响 `src/handler.rs`（吊销 IP）、`src/config.rs`（env 别名/采样收敛）、`src/service/block_inject.rs`（终止帧）、`src/service/llm_gateway.rs`（usage/tool/conv）、`src/service/mod.rs`（Go 兼容）、`README.md`、`scripts/api_conformance.py`。
+- 影响 `src/handler/mod.rs`（吊销 IP）、`src/config.rs`（env 别名/采样收敛）、`src/service/block_inject.rs`（终止帧）、`src/service/llm_gateway/mod.rs`（usage/tool/conv）、`src/service/mod.rs`（Go 兼容）、`README.md`、`scripts/api_conformance.py`（勘误：原文 `src/handler.rs`/`src/service/llm_gateway.rs`，路径已拆分，语义不变）。
 - **BREAKING**：Chat 尾帧去 `event:`、缺 `entry/field` 由静默忽略改为 400（需 Go 侧同步，见 go-interop spec）。
 - 不碰 `openspec/changes/rust-rewrite-veil/*` 与 `veil-hardening/*` 原文件；KeePass 真后端另立 change。

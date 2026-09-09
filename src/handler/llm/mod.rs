@@ -4,9 +4,8 @@
 
 use {
     crate::{
-        config::resolve_upstream_with_ingress,
         service::{
-            llm_gateway::{self, GatewayMetrics, Protocol, resolve_protocol},
+            llm_gateway::{self, GatewayMetrics, Protocol, resolve_protocol, resolve_upstream},
             redaction::Scope,
         },
         state::AppState,
@@ -138,7 +137,7 @@ async fn gateway_serve(
                 }
             })
         });
-    let upstream_base = match resolve_upstream_with_ingress(&state.config, ingress_port) {
+    let upstream_base = match resolve_upstream(&state.config, ingress_port) {
         Some(u) => u,
         None => {
             return (
@@ -188,6 +187,7 @@ async fn gateway_serve(
             req_start,
             audit_mode,
             audit_policy_file: audit_policy_file.clone(),
+            pending: state.pending.clone(),
         };
         return match serve_nonstream(
             client,
@@ -301,6 +301,7 @@ async fn gateway_serve(
             req_start,
             audit_mode,
             audit_policy_file: audit_policy_file.clone(),
+            pending: state.pending.clone(),
         };
         match serve_nonstream(
             client,
@@ -388,6 +389,7 @@ mod gateway_units_tests {
             req_start: Instant::now(),
             audit_mode: AuditMode::Off,
             audit_policy_file: None,
+            pending: Arc::new(PendingApprovals::default()),
         }
     }
 
@@ -541,6 +543,36 @@ mod gateway_units_tests {
     }
 
     #[tokio::test]
+    async fn rewrite_injection_declares_normalization_without_config_flag() {
+        // L15：注入分支恒重序列化，声明不跟随配置开关。
+        let config = test_config(&[]);
+        assert!(!config.normalize_json_whitespace);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw = br#"{"model":"m","stream":true,"messages":[]}"#;
+        let out = request_rewrite(
+            raw.to_vec(),
+            Protocol::Chat,
+            &config,
+            scope,
+            vault,
+            detector,
+        )
+        .await;
+        assert!(out.stream_flag);
+        assert!(
+            out.normalized_out,
+            "stream 注入已重序列化，须声明 normalized"
+        );
+        let v: Value = serde_json::from_slice(&out.body).expect("改写后仍为合法 JSON");
+        assert_eq!(
+            v.get("stream_options")
+                .and_then(|o| o.get("include_usage"))
+                .and_then(|b| b.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn nonstream_forward_success_returns_verbatim() {
         let up_body = br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
         let (url, server) = loopback_server(200, "application/json", up_body).await;
@@ -579,6 +611,345 @@ mod gateway_units_tests {
             "响应体须原样返回上游内容"
         );
         assert_eq!(admin.ring_len(), 1, "非流成功须记一条 record_chat 快照");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nonstream_error_status_traverses_post_processing() {
+        // P0-1.1 回归：502/401 JSON 体走完整后处理（用量记录 + 状态保留），
+        // 不再早返原始字节跳过用量/审计/还原。
+        for status in [502u16, 401u16] {
+            let up_body = br#"{"id":"e1","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#.to_vec();
+            let (url, server) = loopback_server(status, "application/json", up_body).await;
+            let client = reqwest::Client::new();
+            let (scope, vault, detector) = fresh_arcs();
+            let admin = Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            )));
+            let mut ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
+            ctx.admin_metrics = admin.clone();
+            let outcome = serve_nonstream(
+                &client,
+                reqwest::Method::POST,
+                &url,
+                HeaderMap::new(),
+                br#"{"model":"m","messages":[]}"#.to_vec(),
+                ctx,
+            )
+            .await;
+            let resp = match outcome {
+                NonstreamOutcome::Responded(r) => r,
+                NonstreamOutcome::Stream(_) => panic!("{status} JSON 体不得转流泵"),
+            };
+            assert_eq!(resp.status().as_u16(), status, "错误状态码须保留");
+            let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .expect("响应体须可读");
+            let text = String::from_utf8_lossy(&body);
+            assert!(text.contains("hi"), "{status} 响应正文须透出: {text}");
+            assert_eq!(
+                admin.ring_len(),
+                1,
+                "{status} JSON 体须记一条 record_chat 用量快照"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn nonstream_error_non_json_passthrough_without_swallowing() {
+        // P0-1.1 显式豁免：非 JSON 的 502 体无用量可提，原样透传不转空体。
+        let up_body = b"upstream exploded".to_vec();
+        let (url, server) = loopback_server(502, "text/plain", up_body).await;
+        let client = reqwest::Client::new();
+        let (scope, vault, detector) = fresh_arcs();
+        let ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        let resp = match outcome {
+            NonstreamOutcome::Responded(r) => r,
+            NonstreamOutcome::Stream(_) => panic!("非 JSON 错误体不得转流泵"),
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        assert_eq!(
+            body.as_ref(),
+            b"upstream exploded",
+            "非 JSON 错误体须原文透传"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nonstream_broken_restore_falls_back_to_upstream() {
+        // P0-1.2 回归：还原把含引号明文写回 JSON 串内致破裂时，回退上游原文并 warn。
+        let (scope, vault, detector) = fresh_arcs();
+        let plain = "ab\"cd-ef";
+        let token = vault.register(plain).expect("测试凭据须注册成功");
+        let up_body = format!(
+            "{{\"id\":\"x\",\"choices\":[{{\"message\":{{\"content\":\"{token}\"}}}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&up_body).is_ok(),
+            "上游原文须为合法 JSON"
+        );
+        let (url, server) =
+            loopback_server(200, "application/json", up_body.clone().into_bytes()).await;
+        let client = reqwest::Client::new();
+        let ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        let resp = match outcome {
+            NonstreamOutcome::Responded(r) => r,
+            NonstreamOutcome::Stream(_) => panic!("JSON 上游不得转流泵"),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        assert_eq!(body.as_ref(), up_body.as_bytes(), "破裂还原须回退上游原文");
+        assert!(
+            serde_json::from_slice::<Value>(&body).is_ok(),
+            "回退后下游须收到合法 JSON"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nonstream_partial_tokens_stripped_at_exit() {
+        // P0-1.3 回归：凭据/PII 残缺前缀不得透出下游（含响应侧关闭旁路）。
+        let scope = Arc::new(Scope::with_opts(false, false));
+        let vault = Arc::new(CredentialVault::new());
+        let detector = Arc::new(PiiDetector::new());
+        let up_body = br#"{"id":"x","choices":[{"message":{"content":"a __VG_CRED_00 b __PII_3_ab c"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
+        let (url, server) = loopback_server(200, "application/json", up_body).await;
+        let client = reqwest::Client::new();
+        let ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        let resp = match outcome {
+            NonstreamOutcome::Responded(r) => r,
+            NonstreamOutcome::Stream(_) => panic!("JSON 上游不得转流泵"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("__VG_CRED_00"), "凭据残缺须剥离: {text}");
+        assert!(!text.contains("__PII_3_ab"), "PII 残缺须剥离: {text}");
+        assert!(
+            text.contains("a ") && text.contains(" c"),
+            "正常文本须保留: {text}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nonstream_approve_records_pending_and_passes_through() {
+        // P0-1.4 spec 场景：非流 NeedApproval 记 pending + 透传上游（仅 deny 阻断）。
+        let up_body = br#"{"id":"a1","choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
+        let (url, server) = loopback_server(200, "application/json", up_body).await;
+        let client = reqwest::Client::new();
+        let (scope, vault, detector) = fresh_arcs();
+        let mut ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
+        ctx.audit_mode = AuditMode::Approve;
+        let pending = ctx.pending.clone();
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            ctx,
+        )
+        .await;
+        let resp = match outcome {
+            NonstreamOutcome::Responded(r) => r,
+            NonstreamOutcome::Stream(_) => panic!("JSON 上游不得转流泵"),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("rm -rf /"), "approve 须透传上游响应: {text}");
+        assert!(
+            !text.contains("[blocked:"),
+            "approve 不得合成阻断体: {text}"
+        );
+        assert_eq!(pending.len(), 1, "approve 命中须有 pending 建单");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tss03_truncated_tool_fragments_never_reach_downstream() {
+        // P0-3.3 E2E：chat 流中途截断（无 finish、无 DONE），残缺 tool 不到下游，
+        // 记 `truncated_tool_dropped`，不伪造成功终止（open-ended）。
+        let sse = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-t1","function":{"name":"get_weather","arguments":"{\"city\":\""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"BJ\"}"}}]}}]}
+
+"#
+        .to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let metrics = Arc::new(GatewayMetrics::default());
+        let ctx = StreamPumpCtx {
+            protocol: Protocol::Chat,
+            scope,
+            vault,
+            detector,
+            audit_mode: AuditMode::Block,
+            audit_policy_file: None,
+            approval_whitelist: Vec::new(),
+            hold_max: 1_048_576,
+            pii_boundary_chars: 64,
+            gateway_metrics: metrics.clone(),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            init_conv: None,
+            normalized_out: false,
+        };
+        let (outcome, frames) = collect_pump(upstream, ctx).await;
+        assert!(!outcome.block_injected, "截断丢弃非阻断，不得注阻断帧");
+        let joined = frames.join("");
+        assert!(
+            !joined.contains("get_weather"),
+            "残缺工具名得到下游: {joined}"
+        );
+        assert!(
+            !joined.contains("call-t1"),
+            "残缺调用 id 得到下游: {joined}"
+        );
+        assert!(!joined.contains("city"), "残缺参数得到下游: {joined}");
+        assert!(!joined.contains("[DONE]"), "截断不得伪造成功终止: {joined}");
+        assert_eq!(
+            metrics.truncated_tool_dropped_count(),
+            2,
+            "两帧残缺分片须计数"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tss03_completed_tool_stream_flushes_buffered_fragments() {
+        // P0-3.3 E2E 对照：完整 tool 流（partial + finish + DONE）须放行缓冲分片，
+        // 下游可重组完整调用，不记截断丢弃。
+        let sse = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-t2","function":{"name":"get_weather","arguments":"{\"city\":\""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"BJ\"}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#
+        .to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let metrics = Arc::new(GatewayMetrics::default());
+        let ctx = StreamPumpCtx {
+            protocol: Protocol::Chat,
+            scope,
+            vault,
+            detector,
+            audit_mode: AuditMode::Block,
+            audit_policy_file: None,
+            approval_whitelist: Vec::new(),
+            hold_max: 1_048_576,
+            pii_boundary_chars: 64,
+            gateway_metrics: metrics.clone(),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            init_conv: None,
+            normalized_out: false,
+        };
+        let (outcome, frames) = collect_pump(upstream, ctx).await;
+        assert!(!outcome.block_injected, "良性工具调用不得阻断");
+        let joined = frames.join("");
+        assert!(joined.contains("get_weather"), "完整调用须放行: {joined}");
+        assert!(joined.contains("city"), "缓冲参数须放行: {joined}");
+        assert_eq!(
+            frames.iter().filter(|f| f.contains("data: [DONE]")).count(),
+            1,
+            "完整流恰一终止帧"
+        );
+        assert_eq!(
+            metrics.truncated_tool_dropped_count(),
+            0,
+            "完整流不得记截断丢弃"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nondialog_arm_passes_through_with_count() {
+        // P0-4.2：NonDialog 臂字节透传 + 计数，不做还原。
+        let up_body = b"plain-nondialog-bytes".to_vec();
+        let (url, server) = loopback_server(200, "text/plain", up_body).await;
+        let client = reqwest::Client::new();
+        let (scope, vault, detector) = fresh_arcs();
+        let metrics = Arc::new(GatewayMetrics::default());
+        let mut ctx = nonstream_ctx(Protocol::NonDialog, scope, vault, detector);
+        ctx.gateway_metrics = metrics.clone();
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::GET,
+            &url,
+            HeaderMap::new(),
+            Vec::new(),
+            ctx,
+        )
+        .await;
+        let resp = match outcome {
+            NonstreamOutcome::Responded(r) => r,
+            NonstreamOutcome::Stream(_) => panic!("纯文本上游不得转流泵"),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("响应体须可读");
+        assert_eq!(
+            body.as_ref(),
+            b"plain-nondialog-bytes",
+            "非对话体须字节透传"
+        );
+        assert_eq!(metrics.nondialog_passthrough_count(), 1, "透传须计数");
         server.abort();
     }
 
@@ -742,6 +1113,73 @@ mod gateway_units_tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn vacuum_stream_chat_stays_open_ended_without_fabricated_terminal() {
+        // C8 真空流 E2E：chat 零字节零残余时不合成 delta+stop+[DONE]，
+        // 下游仅见连接关闭（open-ended），Hermes 靠缺失 finish_reason 走 stub。
+        let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (outcome, frames) =
+            collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+        let joined = frames.join("");
+        assert!(!outcome.block_injected, "真空 open-ended 不得注阻断帧");
+        assert!(!joined.contains("[DONE]"), "不得伪造成功终止: {joined}");
+        assert!(
+            !joined.contains("empty-stream"),
+            "不得合成空流兜底: {joined}"
+        );
+        assert!(!outcome.terminal_injected, "无帧发出时不得标记终端已注入");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vacuum_stream_responses_still_synthesizes_failed() {
+        // C8 真空流 E2E 对照：responses 零字节时仍合成 failed 终端（失败语义）。
+        let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (outcome, frames) = collect_pump(
+            upstream,
+            pump_ctx(Protocol::Responses, scope, vault, detector),
+        )
+        .await;
+        let joined = frames.join("");
+        assert!(outcome.block_injected, "responses 真空流须合成 failed 终端");
+        assert!(
+            joined.contains("response.failed"),
+            "须含 failed 终端: {joined}"
+        );
+        assert!(
+            !joined.contains("response.completed"),
+            "不得伪造完成: {joined}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_data_heartbeat_frames_dropped_not_forwarded() {
+        // L17：纯空 `data:` 心跳（`event:` 独占帧 / 空 data 帧）不得透传；
+        // chat 无终端合成（open-ended，与 C8 真空语义一致：空帧不计入
+        // `any_frame_sent`）。注：裸 `data:\n\n` 由解析器直接过滤，
+        // 本分支覆盖带 `event:` 的空帧形态。
+        let up_body = b"event: ping\n\nevent: message\ndata:\n\n".to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", up_body).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (outcome, frames) =
+            collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+        let joined = frames.join("");
+        assert!(!joined.contains("data:"), "空心跳帧不得透传: {joined}");
+        assert!(!outcome.block_injected, "空帧流不得注阻断帧");
+        assert!(!outcome.terminal_injected, "无帧发出时不得标记终端已注入");
+        assert!(!joined.contains("[DONE]"), "不得伪造成功终止: {joined}");
+        server.abort();
+    }
+
     #[test]
     fn empty_stream_synthesis_gate_truth_table() {
         assert!(should_synthesize_empty_stream(false, false, false));
@@ -834,28 +1272,6 @@ mod gateway_units_tests {
                 "sig-bytes-123".to_string(),
                 "eHh4".to_string()
             ]
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn stream_pump_empty_stream_injects_block_and_marks_terminal() {
-        let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
-        let client = reqwest::Client::new();
-        let upstream = client.get(&url).send().await.expect("回环上游须可达");
-        let (scope, vault, detector) = fresh_arcs();
-        let (outcome, frames) =
-            collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
-        assert!(outcome.block_injected, "空流须注入阻断帧");
-        assert!(
-            outcome.terminal_injected,
-            "阻断注入后 terminal_injected 须为真"
-        );
-        let joined = frames.join("");
-        assert!(joined.contains("empty-stream"), "下游须收到阻断事件");
-        assert!(
-            frames.iter().any(|f| f.contains("data: [DONE]")),
-            "阻断事件后恒有终止帧"
         );
         server.abort();
     }

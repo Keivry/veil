@@ -1,0 +1,516 @@
+//! 请求级 PII token 容器：注册/还原/序号空洞复用/LRU 淘汰。
+
+use {
+    super::detector::{
+        PII_MAX_ENTRIES,
+        PII_TOKEN_PREFIX,
+        cred_token_shape_re,
+        pii_loose_re,
+        pii_token_re,
+    },
+    rand::{rand_core::TryRngCore as _, rngs::OsRng},
+    std::{
+        collections::{HashMap, HashSet, VecDeque},
+        sync::Mutex,
+    },
+};
+
+/// 构造 `__PII_<seq>_<rand8>__` token。
+pub fn make_pii_token(seq: usize, rand8: &str) -> String {
+    format!("{PII_TOKEN_PREFIX}{seq}_{rand8}__")
+}
+
+/// 生成 8 位十六进制随机段（`OsRng::try_fill_bytes`，CSPRNG）。
+pub fn gen_rand8() -> Result<String, &'static str> {
+    let mut buf = [0u8; 4];
+    OsRng
+        .try_fill_bytes(&mut buf)
+        .map_err(|_| "CSPRNG 熵源不可用")?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+pub(crate) fn parse_pii_seq(token: &str) -> Option<usize> {
+    let rest = token.strip_prefix(PII_TOKEN_PREFIX)?;
+    let (seq, _) = rest.split_once('_')?;
+    seq.parse().ok()
+}
+
+/// 请求级 PII token 容器（对标 `GlobalPiiTokens` 的请求隔离形态）。
+///
+/// - `pii_*`：请求期映射，可还原；`resp_*`：响应期映射，不可还原、原样保留；
+/// - 同值复用同一 token；空洞跳过稳态下标；并发注册经 `Mutex` 原子执行；
+/// - PII 还原只查本 Scope，MUST NOT 触达全局凭据映射。
+#[derive(Debug, Default)]
+pub struct PiiScope {
+    inner: Mutex<ScopeInner>,
+    malformed: Mutex<HashMap<String, u64>>,
+}
+
+#[derive(Debug, Default)]
+struct ScopeInner {
+    pii_p2t: HashMap<String, String>,
+    pii_t2p: HashMap<String, String>,
+    resp_p2t: HashMap<String, String>,
+    resp_t2p: HashMap<String, String>,
+    pii_order: VecDeque<String>,
+    resp_order: VecDeque<String>,
+}
+
+/// PII 值注册拒绝：值命中内部 token 形态或含保留前缀。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiiReject(&'static str);
+
+impl std::fmt::Display for PiiReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) }
+}
+
+impl PiiScope {
+    /// 新建空 Scope（每请求一个，请求结束即销毁）。
+    pub fn new() -> Self { Self::default() }
+
+    /// 空洞跳过：收集两表已用 seq，取最小空缺（稳态下标）。
+    pub fn next_available_index(&self) -> usize {
+        let inner = self.inner.lock().expect("PII scope 锁无毒");
+        next_hole(&used_seqs(&inner))
+    }
+
+    /// 注册 PII 值并返回 token。同值复用；`response_side=true` 进响应表
+    /// （不进请求还原表）；token 形态值拒绝注册。
+    pub fn register(&self, value: &str, response_side: bool) -> Result<String, PiiReject> {
+        if value.is_empty() {
+            return Ok(value.to_string());
+        }
+        if pii_token_re().is_match(value)
+            || value.contains(PII_TOKEN_PREFIX)
+            || value.contains(crate::service::credential_vault::TOKEN_PREFIX)
+            || cred_token_shape_re().is_match(value)
+        {
+            return Err(PiiReject(
+                "PII 值不能匹配内部 token 格式或以 token 前缀开头",
+            ));
+        }
+        let mut inner = self.inner.lock().expect("PII scope 锁无毒");
+        if response_side {
+            if let Some(tok) = inner.resp_p2t.get(value).cloned() {
+                touch_order(&mut inner.resp_order, value);
+                return Ok(tok);
+            }
+        } else if let Some(tok) = inner.pii_p2t.get(value).cloned() {
+            touch_order(&mut inner.pii_order, value);
+            return Ok(tok);
+        }
+        let seq = next_hole(&used_seqs(&inner));
+        let rand8 = gen_rand8().map_err(|_| PiiReject("CSPRNG 熵源不可用"))?;
+        let token = make_pii_token(seq, &rand8);
+        if response_side {
+            if inner.resp_p2t.len() >= PII_MAX_ENTRIES
+                && let Some(oldest) = inner.resp_order.pop_front()
+                && let Some(old_tok) = inner.resp_p2t.remove(&oldest)
+            {
+                inner.resp_t2p.remove(&old_tok);
+            }
+            inner.resp_order.push_back(value.to_string());
+            inner.resp_p2t.insert(value.to_string(), token.clone());
+            inner.resp_t2p.insert(token.clone(), value.to_string());
+        } else {
+            if inner.pii_p2t.len() >= PII_MAX_ENTRIES
+                && let Some(oldest) = inner.pii_order.pop_front()
+                && let Some(old_tok) = inner.pii_p2t.remove(&oldest)
+            {
+                inner.pii_t2p.remove(&old_tok);
+            }
+            inner.pii_order.push_back(value.to_string());
+            inner.pii_p2t.insert(value.to_string(), token.clone());
+            inner.pii_t2p.insert(token.clone(), value.to_string());
+        }
+        Ok(token)
+    }
+
+    /// 还原请求期注册 token；响应期/未注册/格式不符原样保留。
+    /// 只查本 Scope，绝不触达全局凭据映射。
+    /// 残留宽松形态补扫审计（聚合计数，落盘限流由调用方负责）。
+    pub fn restore(&self, text: &str) -> String { self.restore_with_fuzzy(text, false) }
+
+    /// 宽松还原：`fuzzy=false` 与 [`PiiScope::restore`] 一致；`fuzzy=true`
+    /// （`PII_FUZZY_RESTORE`）时残留宽松形态按序号回查请求表，截断/改写后的
+    /// token 仍可还原；响应表与未知序号一律原样保留。
+    pub fn restore_with_fuzzy(&self, text: &str, fuzzy: bool) -> String {
+        let restored = self.restore_exact(text);
+        if !fuzzy {
+            return restored;
+        }
+        let inner = self.inner.lock().expect("PII scope 锁无毒");
+        if inner.pii_t2p.is_empty() {
+            return restored;
+        }
+        let known: HashSet<String> = inner
+            .pii_t2p
+            .keys()
+            .chain(inner.resp_t2p.keys())
+            .cloned()
+            .collect();
+        let seq_map: HashMap<usize, String> = inner
+            .pii_t2p
+            .iter()
+            .filter_map(|(tok, plain)| parse_pii_seq(tok).map(|s| (s, plain.clone())))
+            .collect();
+        drop(inner);
+        if seq_map.is_empty() {
+            return restored;
+        }
+        pii_loose_re()
+            .replace_all(&restored, |caps: &regex::Captures| {
+                let tok = &caps[0];
+                if known.contains(tok) {
+                    return tok.to_string();
+                }
+                parse_pii_seq(tok)
+                    .and_then(|s| seq_map.get(&s).cloned())
+                    .unwrap_or_else(|| tok.to_string())
+            })
+            .into_owned()
+    }
+
+    /// 精确还原本体（`restore`/`restore_with_fuzzy` 共用）。
+    fn restore_exact(&self, text: &str) -> String {
+        if text.is_empty() {
+            return text.to_string();
+        }
+        let restored = {
+            let inner = self.inner.lock().expect("PII scope 锁无毒");
+            if inner.pii_t2p.is_empty() && inner.resp_t2p.is_empty() {
+                return text.to_string();
+            }
+            pii_token_re()
+                .replace_all(text, |caps: &regex::Captures| {
+                    let tok = &caps[0];
+                    if let Some(plain) = inner.pii_t2p.get(tok) {
+                        plain.clone()
+                    } else {
+                        // 响应期 token 原样保留；未知形态同样保留并补扫审计。
+                        tok.to_string()
+                    }
+                })
+                .into_owned()
+        };
+        let known: HashSet<String> = self
+            .inner
+            .lock()
+            .map(|g| g.pii_t2p.keys().chain(g.resp_t2p.keys()).cloned().collect())
+            .unwrap_or_default();
+        for m in pii_loose_re().find_iter(&restored) {
+            let tok = m.as_str();
+            if !known.contains(tok) {
+                self.count_malformed(tok);
+            }
+        }
+        restored
+    }
+
+    /// 是否持有该请求 token（跨请求还原隔离断言用）。
+    pub fn contains_request_token(&self, token: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.pii_t2p.contains_key(token))
+            .unwrap_or(false)
+    }
+
+    /// 记录宽松形态审计计数（同类聚合，调用方限流落盘）。
+    pub fn count_malformed(&self, token: &str) -> String {
+        let cat = if regex::Regex::new(r"^__PII_\d+_[0-9a-fA-F]{8}__$")
+            .expect("形态正则恒合法")
+            .is_match(token)
+        {
+            "unregistered"
+        } else {
+            "malformed"
+        };
+        let mut counts = self.malformed.lock().expect("计数锁无毒");
+        let c = counts.entry(cat.to_string()).or_insert(0);
+        *c += 1;
+        cat.to_string()
+    }
+}
+
+fn used_seqs(inner: &ScopeInner) -> HashSet<usize> {
+    inner
+        .pii_t2p
+        .keys()
+        .chain(inner.resp_t2p.keys())
+        .filter_map(|t| parse_pii_seq(t))
+        .collect()
+}
+
+fn next_hole(used: &HashSet<usize>) -> usize {
+    let mut nxt = 1;
+    while used.contains(&nxt) {
+        nxt += 1;
+    }
+    nxt
+}
+
+fn touch_order(order: &mut VecDeque<String>, value: &str) {
+    if let Some(pos) = order.iter().position(|v| v == value) {
+        order.remove(pos);
+    }
+    order.push_back(value.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_value_reuse_and_gap_skip_stable_index() {
+        let scope = PiiScope::new();
+        let t1 = scope.register("13812345678", false).unwrap();
+        let t2 = scope.register("13812345678", false).unwrap();
+        assert_eq!(t1, t2, "同值必须复用同一 token");
+        assert!(pii_token_re().is_match(&t1));
+        // token 形态值拒绝注册。
+        assert!(scope.register(&t1, false).is_err());
+        assert!(scope.register("__PII_1_ab", false).is_err());
+        // 响应期注册可用但请求还原表不含。
+        let rt = scope.register("new-resp-value-001", true).unwrap();
+        assert_ne!(rt, t1);
+        let restored = scope.restore(&format!("{t1} {rt}"));
+        assert!(restored.contains("13812345678"));
+        assert!(restored.contains(&rt), "响应期 token 原样保留不还原");
+        // 空洞跳过：直接构造空洞断言 next_available_index。
+        assert_eq!(scope.next_available_index(), 3);
+    }
+
+    #[test]
+    fn concurrent_register_no_index_conflict() {
+        use std::sync::Arc;
+        let scope = Arc::new(PiiScope::new());
+        let handles: Vec<_> = (0..32)
+            .map(|i| {
+                let s = scope.clone();
+                std::thread::spawn(move || s.register(&format!("并发值-{i:03}"), false).unwrap())
+            })
+            .collect();
+        let mut toks: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        toks.sort();
+        toks.dedup();
+        assert_eq!(toks.len(), 32, "并发注册不得串扰或冲突");
+        let mut seqs: Vec<usize> = toks.iter().filter_map(|t| parse_pii_seq(t)).collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rand8_shape_and_unpredictable_length() {
+        for _ in 0..10 {
+            let r = gen_rand8().unwrap();
+            assert_eq!(r.len(), 8);
+            assert!(r.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert_eq!(r, r.to_ascii_lowercase());
+        }
+    }
+
+    #[test]
+    fn loose_shape_audit_class_and_unknown_passthrough() {
+        let scope = PiiScope::new();
+        // 完整形态但未注册：归类 unregistered。
+        assert_eq!(scope.count_malformed("__PII_9_ab12cd34__"), "unregistered");
+        // 残缺/非法形态：归类 malformed。
+        assert_eq!(scope.count_malformed("__PII_x__"), "malformed");
+        assert_eq!(scope.count_malformed("__PII_1_ab"), "malformed");
+        // 未知完整 token 还原时原样透传（不伪造明文）。
+        let out = scope.restore("回拨 __PII_9_ab12cd34__ 结束");
+        assert_eq!(
+            out, "回拨 __PII_9_ab12cd34__ 结束",
+            "未知 token 须透传: {out}"
+        );
+        // 已注册 token 仍精确还原，不受未知形态干扰。
+        let tok = scope.register("13812345678", false).unwrap();
+        let out = scope.restore(&format!("回拨 {tok} 与 __PII_9_ab12cd34__"));
+        assert!(out.contains("13812345678"), "{out}");
+        assert!(out.contains("__PII_9_ab12cd34__"), "{out}");
+    }
+
+    #[test]
+    fn request_table_capacity_split_lru_eviction() {
+        // 分表声明：请求/响应单表 1000，与凭据 5000 不在同一容量口径。
+        assert_eq!(PII_MAX_ENTRIES, 1000);
+        assert_eq!(crate::service::credential_vault::MAX_TOKEN_ENTRIES, 5000);
+        assert_ne!(
+            PII_MAX_ENTRIES,
+            crate::service::credential_vault::MAX_TOKEN_ENTRIES
+        );
+        let scope = PiiScope::new();
+        let first = scope.register("13812340000", false).unwrap();
+        let mut last_tok = String::new();
+        for i in 1..=(PII_MAX_ENTRIES as u32 + 4) {
+            last_tok = scope.register(&format!("139{:08}", i), false).unwrap();
+        }
+        // 最久未用被淘汰，新值驻留；淘汰腾出的序号被复用（空洞跳过）。
+        assert!(
+            !scope.contains_request_token(&first),
+            "最久条目须被 LRU 淘汰"
+        );
+        let newest = format!("139{:08}", PII_MAX_ENTRIES as u32 + 4);
+        assert!(scope.contains_request_token(&last_tok));
+        assert_eq!(
+            scope.register(&newest, false).unwrap(),
+            last_tok,
+            "最新条目须驻留复用同一 token"
+        );
+        // 响应表独立：响应侧注册不进请求还原表（分表隔离）。
+        let rt = scope.register("新增响应值-001", true).unwrap();
+        assert!(!scope.contains_request_token(&rt));
+        let restored = scope.restore(&format!("回 {rt}"));
+        assert!(restored.contains(&rt), "响应 token 原样保留: {restored}");
+    }
+
+    #[test]
+    fn fuzzy_case_insensitive_restore() {
+        let scope = PiiScope::new();
+        let token = scope.register("13812345678", false).unwrap();
+        let seq: usize = token
+            .strip_prefix("__PII_")
+            .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
+            .flatten()
+            .unwrap();
+        // 大写变体同样按序号回查（IGNORECASE 口径）。
+        let upper = format!("__PII_{seq}_ZZZZABCD__");
+        assert!(pii_loose_re().is_match(&upper), "宽松形态须忽略大小写");
+        let restored = scope.restore_with_fuzzy(&format!("回拨 {upper}"), true);
+        assert!(restored.contains("13812345678"), "{restored}");
+    }
+}
+
+/// T7 vault 回补：空洞跳过/rand8 不可枚举/100 并发 gather/同值复用。
+#[cfg(test)]
+mod vault_parity_tests {
+    use {
+        super::{PII_MAX_ENTRIES, PiiScope, gen_rand8, parse_pii_seq, pii_token_re},
+        std::sync::Arc,
+    };
+
+    fn rand8_of(token: &str) -> &str {
+        let rest = token.strip_prefix("__PII_").expect("须为 PII token");
+        rest.split('_')
+            .nth(1)
+            .expect("须含 rand8 段")
+            .trim_end_matches('_')
+    }
+
+    #[test]
+    fn t7_same_value_reuses_token_both_tables() {
+        let scope = PiiScope::new();
+        let a = scope.register("13812345678", false).unwrap();
+        assert_eq!(scope.register("13812345678", false).unwrap(), a);
+        let r = scope.register("resp-value-001", true).unwrap();
+        assert_eq!(scope.register("resp-value-001", true).unwrap(), r);
+        // 请求/响应表隔离：同值跨表 token 不同。
+        let cross = scope.register("13812345678", true).unwrap();
+        assert_ne!(cross, a);
+    }
+
+    #[test]
+    fn t7_hole_reused_after_eviction() {
+        let scope = PiiScope::new();
+        assert_eq!(PII_MAX_ENTRIES, 1000, "请求/响应单表容量分表锁定");
+        for i in 0..PII_MAX_ENTRIES {
+            scope.register(&format!("hole-val-{i:04}"), false).unwrap();
+        }
+        assert_eq!(scope.next_available_index(), PII_MAX_ENTRIES + 1);
+        scope.register("hole-val-overflow", false).unwrap();
+        assert_eq!(scope.next_available_index(), 1, "淘汰最旧后空洞 1 须可复用");
+        let reused = scope.register("hole-val-new", false).unwrap();
+        assert_eq!(parse_pii_seq(&reused), Some(1), "新值须跳回空洞 1");
+    }
+
+    #[test]
+    fn t7_write_pii_does_not_evict_resp_table() {
+        let scope = PiiScope::new();
+        let rt = scope.register("resp-keep-001", true).unwrap();
+        for i in 0..PII_MAX_ENTRIES {
+            scope.register(&format!("pii-fill-{i:04}"), false).unwrap();
+        }
+        scope.register("pii-overflow-001", false).unwrap();
+        assert!(
+            scope.restore(&rt).contains(&rt),
+            "写请求表不得淘汰响应表，响应 token 须原样保留"
+        );
+    }
+
+    #[test]
+    fn t7_rand8_unenumerable_shape_and_entropy() {
+        let scope = PiiScope::new();
+        let mut tokens = Vec::new();
+        for i in 0..10 {
+            let tok = scope.register(&format!("13800000{i:03}"), false).unwrap();
+            assert!(pii_token_re().is_match(&tok), "{tok}");
+            tokens.push(tok);
+        }
+        assert_eq!(
+            tokens
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            10
+        );
+        let rand8s: Vec<&str> = tokens.iter().map(|t| rand8_of(t)).collect();
+        assert!(rand8s.iter().all(|r| r.len() == 8));
+        assert!(
+            rand8s
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        );
+        for _ in 0..10 {
+            assert_eq!(gen_rand8().unwrap().len(), 8);
+        }
+    }
+
+    #[test]
+    fn t7_response_side_token_not_restored() {
+        let scope = PiiScope::new();
+        let rt = scope.register("13900000001", true).unwrap();
+        assert_eq!(scope.restore(&rt), rt);
+        let qt = scope.register("13900000002", false).unwrap();
+        assert_eq!(scope.restore(&qt), "13900000002");
+    }
+
+    #[tokio::test]
+    async fn t7_100_way_join_set_no_conflict() {
+        let scope = Arc::new(PiiScope::new());
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..100 {
+            let s = scope.clone();
+            set.spawn(async move { s.register(&format!("join-val-{i:03}"), false).unwrap() });
+        }
+        let mut toks = Vec::new();
+        while let Some(r) = set.join_next().await {
+            toks.push(r.expect("任务须成功"));
+        }
+        toks.sort();
+        toks.dedup();
+        assert_eq!(toks.len(), 100, "100 并发注册不得冲突");
+        let mut seqs: Vec<usize> = toks.iter().filter_map(|t| parse_pii_seq(t)).collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=100).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn t7_concurrent_duplicate_reuse_single_token() {
+        let scope = Arc::new(PiiScope::new());
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let s = scope.clone();
+            set.spawn(async move { s.register("13812345678", false).unwrap() });
+        }
+        let mut toks = Vec::new();
+        while let Some(r) = set.join_next().await {
+            toks.push(r.expect("任务须成功"));
+        }
+        toks.sort();
+        toks.dedup();
+        assert_eq!(toks.len(), 1, "同值并发须复用同一 token");
+        assert_eq!(scope.next_available_index(), 2);
+    }
+}

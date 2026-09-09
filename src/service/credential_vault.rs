@@ -432,4 +432,43 @@ mod tests {
             "从未触达的次冷条目须先逐出"
         );
     }
+
+    /// T12 并发回补：100 路注册隔离 + 同值复用（tokio JoinSet）。
+    #[tokio::test]
+    async fn t12_100_way_register_isolation_no_conflict() {
+        use std::sync::Arc;
+        let vault = Arc::new(CredentialVault::new());
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..100 {
+            let v = vault.clone();
+            set.spawn(async move { v.register(&format!("join-secret-{i:03}")).unwrap() });
+        }
+        let mut toks = Vec::new();
+        while let Some(r) = set.join_next().await {
+            toks.push(r.expect("任务须成功"));
+        }
+        toks.sort();
+        toks.dedup();
+        assert_eq!(toks.len(), 100, "100 并发注册不得冲突");
+        assert_eq!(vault.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn t12_concurrent_duplicate_reuse_single_token() {
+        use std::sync::Arc;
+        let vault = Arc::new(CredentialVault::new());
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let v = vault.clone();
+            set.spawn(async move { v.register("shared-secret-xyz").unwrap() });
+        }
+        let mut toks = Vec::new();
+        while let Some(r) = set.join_next().await {
+            toks.push(r.expect("任务须成功"));
+        }
+        toks.sort();
+        toks.dedup();
+        assert_eq!(toks.len(), 1, "同值并发须复用同一 token");
+        assert_eq!(vault.len(), 1);
+    }
 }
