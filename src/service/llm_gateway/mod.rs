@@ -178,6 +178,10 @@ pub fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(RETRY_DELAYS_MS.get(attempt).copied().unwrap_or(2000))
 }
 
+// 缺省回退告警每进程至多一次（热路径去噪；取端口升序选择语义仍每次确定性计算）。
+static DEFAULT_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn resolve_upstream(config: &Config, local_port: Option<u16>) -> Option<String> {
     if let Some(port) = local_port
         && let Some(u) = config.llm_upstreams.get(&port)
@@ -194,8 +198,10 @@ pub fn resolve_upstream(config: &Config, local_port: Option<u16>) -> Option<Stri
         .first()
         .and_then(|p| config.llm_upstreams.get(p))
         .cloned();
-    if let Some(ref u) = chosen {
-        tracing::warn!(upstream = %u, "未配置缺省上游，按端口升序回退首个 LLM_<port>");
+    if let Some(ref u) = chosen
+        && !DEFAULT_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(upstream = %u, "未配置缺省上游，按端口升序回退首个 LLM_<port>（本进程仅提示一次）");
     }
     chosen
 }
