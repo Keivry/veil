@@ -148,16 +148,16 @@ impl GatewayMetrics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmptyAction {
-    StreamInjectThen502,
     NonStreamTo502,
     Passthrough502_401,
     NonDialogExempt,
     PassthroughOk,
 }
 
+/// 空体分类（非流路径唯一入口）。流式空流策略唯一归
+/// `should_synthesize_empty_stream`（`handler::llm::pump`），两策略不得并存。
 pub fn classify_empty(
     is_chat: bool,
-    is_stream: bool,
     body_len: usize,
     is_json: bool,
     upstream_status: u16,
@@ -167,12 +167,6 @@ pub fn classify_empty(
     }
     if upstream_status == 502 || upstream_status == 401 {
         return EmptyAction::Passthrough502_401;
-    }
-    if is_stream {
-        if body_len == 0 {
-            return EmptyAction::StreamInjectThen502;
-        }
-        return EmptyAction::PassthroughOk;
     }
     if body_len == 0 || !is_json {
         return EmptyAction::NonStreamTo502;
@@ -193,7 +187,17 @@ pub fn resolve_upstream(config: &Config, local_port: Option<u16>) -> Option<Stri
     if let Some(u) = config.llm_default_upstream.clone() {
         return Some(u);
     }
-    config.llm_upstreams.values().next().cloned()
+    // 缺省回退按端口升序取首个（确定性，不依赖 HashMap 迭代序），并 warn 便于迁移。
+    let mut ports: Vec<u16> = config.llm_upstreams.keys().copied().collect();
+    ports.sort_unstable();
+    let chosen = ports
+        .first()
+        .and_then(|p| config.llm_upstreams.get(p))
+        .cloned();
+    if let Some(ref u) = chosen {
+        tracing::warn!(upstream = %u, "未配置缺省上游，按端口升序回退首个 LLM_<port>");
+    }
+    chosen
 }
 
 pub async fn fetch_upstream_with_retry(
@@ -274,30 +278,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_body_502_four_branches() {
+    fn empty_body_502_three_branches() {
+        // D3：is_stream 分支已删；流式空流唯一策略见 should_synthesize_empty_stream。
         assert_eq!(
-            classify_empty(true, true, 0, false, 200),
-            EmptyAction::StreamInjectThen502
-        );
-        assert_eq!(
-            classify_empty(true, false, 0, false, 200),
+            classify_empty(true, 0, false, 200),
             EmptyAction::NonStreamTo502
         );
         assert_eq!(
-            classify_empty(true, false, 10, false, 200),
+            classify_empty(true, 10, false, 200),
             EmptyAction::NonStreamTo502
         );
         assert_eq!(
-            classify_empty(true, false, 10, true, 502),
+            classify_empty(true, 10, true, 502),
             EmptyAction::Passthrough502_401
         );
         assert_eq!(
-            classify_empty(true, true, 5, true, 401),
+            classify_empty(true, 5, true, 401),
             EmptyAction::Passthrough502_401
         );
         assert_eq!(
-            classify_empty(false, false, 0, false, 200),
+            classify_empty(false, 0, false, 200),
             EmptyAction::NonDialogExempt
+        );
+        assert_eq!(
+            classify_empty(true, 10, true, 200),
+            EmptyAction::PassthroughOk
         );
     }
 
@@ -334,6 +339,44 @@ mod tests {
             Some("https://up-b.example.com")
         );
         assert!(resolve_upstream(&cfg, Some(9999)).is_some());
+    }
+
+    #[test]
+    fn resolve_upstream_default_fallback_picks_lowest_port_deterministically() {
+        use std::collections::HashMap;
+        let env = HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://m.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+            (
+                "LLM_8879".to_string(),
+                "https://up-high.example.com".to_string(),
+            ),
+            (
+                "LLM_8878".to_string(),
+                "https://up-low.example.com".to_string(),
+            ),
+        ]);
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(
+            resolve_upstream(&cfg, None).as_deref(),
+            Some("https://up-low.example.com"),
+            "双端口缺省须取最小端口"
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                resolve_upstream(&cfg, None).as_deref(),
+                Some("https://up-low.example.com"),
+                "重复运行须一致（端口升序最小，不依赖 HashMap 迭代序）"
+            );
+        }
     }
 
     #[test]

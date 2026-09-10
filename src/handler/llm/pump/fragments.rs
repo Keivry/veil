@@ -704,7 +704,7 @@ mod fragments_tests {
         use crate::{
             config::AuditMode,
             service::{
-                audit::{AuditPolicy, evaluate},
+                audit::{AuditPolicy, evaluate_with_whitelist, test_whitelist},
                 llm_gateway::{Protocol as P, extract_tool_calls},
             },
         };
@@ -723,17 +723,19 @@ mod fragments_tests {
             !is_minor_event(P::Responses, &stream),
             "检索事件不再列为次要"
         );
-        let v_stream = evaluate(
+        let v_stream = evaluate_with_whitelist(
             AuditMode::Block,
             frags[0].2.as_deref().unwrap_or(""),
             &frags[0].3,
             &policy,
+            test_whitelist(),
         );
-        let v_nonstream = evaluate(
+        let v_nonstream = evaluate_with_whitelist(
             AuditMode::Block,
             calls[0].name.as_deref().unwrap_or(""),
             &calls[0].args,
             &policy,
+            test_whitelist(),
         );
         assert!(
             matches!(v_stream, crate::service::audit::AuditVerdict::Block { .. }),
@@ -754,7 +756,13 @@ mod fragments_tests {
         let benign_frags = extract_tool_fragments(P::Responses, &benign_s);
         assert_eq!(benign_frags[0].2.as_deref(), Some("web_search"));
         assert!(matches!(
-            evaluate(AuditMode::Block, "web_search", &benign_frags[0].3, &policy),
+            evaluate_with_whitelist(
+                AuditMode::Block,
+                "web_search",
+                &benign_frags[0].3,
+                &policy,
+                test_whitelist()
+            ),
             crate::service::audit::AuditVerdict::Allow
         ));
         assert!(is_minor_event(

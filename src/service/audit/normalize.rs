@@ -325,18 +325,24 @@ mod normalize_tests {
     #[test]
     fn t5_dotdot_evasion_still_blocked() {
         use {
-            super::super::{AuditVerdict, evaluate, touches_sensitive_path},
+            super::super::{
+                AuditVerdict,
+                evaluate_with_whitelist,
+                test_whitelist,
+                touches_sensitive_path,
+            },
             crate::config::AuditMode,
         };
         assert!(touches_sensitive_path("edit /etc/../etc/passwd", &policy()));
         assert!(!touches_sensitive_path("write /var/log/app.log", &policy()));
         assert!(touches_sensitive_path("write /etc/./shadow", &policy()));
         assert!(matches!(
-            evaluate(
+            evaluate_with_whitelist(
                 AuditMode::Block,
                 "edit",
                 "edit /etc/../etc/shadow",
-                &policy()
+                &policy(),
+                test_whitelist()
             ),
             AuditVerdict::Block { .. }
         ));

@@ -77,9 +77,9 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 - compose 三映射宿主机入口区分：三条映射（宿主机 `PORT_887x` → 容器 `8877`）只是宿主机入口区分；
   `LLM_8878`/`LLM_8879` 按入口宿主机端口选择上游，`LLM_UPSTREAM` 为缺省上游。宿主机端口可经
   `PORT_8877/8878/8879` 覆盖，回环绑定不变。
-- 选路上游缺省唯一生效：`resolve_upstream(None)` 恒返回 `LLM_UPSTREAM` 缺省上游（未设则取首个
-  `LLM_<port>`），不按端口猜测；`LLM_8878`/`LLM_8879` 仅在携带入口宿主机端口上下文时生效。
-  当前行为由 `resolve_upstream` 单测锁定。
+- 选路上游缺省唯一生效：`resolve_upstream(None)` 恒返回 `LLM_UPSTREAM` 缺省上游（未设则取端口升序
+  首个 `LLM_<port>` 并 warn，序确定不依赖 `HashMap` 迭代），不按端口猜测；`LLM_8878`/`LLM_8879`
+  仅在携带入口宿主机端口上下文时生效。当前行为由 `resolve_upstream` 单测锁定。
 
 ### 管理控制台说明（`admin.html` 范围）
 
@@ -240,7 +240,7 @@ get revoke --name "check-mail"
 
 ## 6. 行为变更（BREAKING）与迁移
 
-下述五处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
+下述六处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
 按迁移步骤调整后可回到预期行为，无静默变严或明文落盘增量。
 
 ### 6.1 脱敏总开关默认开启（原仓默认关闭）
@@ -298,6 +298,17 @@ get revoke --name "check-mail"
 - 影响：检索调用审计量可能上升（误报优于漏审）；监控检索审计量突变属预期。
 - 迁移：无配置项需改；依赖旧一方漏审口径的告警阈值请按新口径重估。
 
+### 6.6 回环免 token 未迁移（ENV=dev / ALLOW_LOOPBACK_NO_TOKEN）
+
+- 变更：原仓 `ENV=dev` + `ALLOW_LOOPBACK_NO_TOKEN` 允许回环来源免管理 token；
+  本仓**未实现**该逃生口：二进制不读取这两个变量，回环来源与外部来源同等鉴权
+  （`X-Admin-Token` / Cookie / 仅 SSE 回退 query；无 token 恒 401）。
+- 影响：旧 dev 环境依赖回环免 token 的脚本会收到 401；生产面不回环豁免，
+  fail-closed 语义不变（`veil-full-parity-fix` spec 允许「恢复或 BREAKING 声明」二选一，
+  本仓选择声明）。
+- 迁移：dev 环境显式补 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`；
+  如需恢复回环免 token 语义，须新 change 交付并撤回本条 BREAKING。
+
 ## 7. 传输与兼容声明
 
 ### 7.1 逐跳（HOP）头集
@@ -335,18 +346,37 @@ Responses 取数顶层优先：非流按顶层 `usage` → `response.usage` → 
 
 迁移：依赖旧 `sum` 口径的告警阈值请按 `max` 重估；缓存与分桶列为新增列，旧查询不受影响。
 
-显式 false 即放弃流式用量，按 key 合并保留不覆写：请求自带
+Chat 显式 false 即放弃流式用量，按 key 合并保留不覆写：Chat 请求自带
 `stream_options={"include_usage":false}` 时转发体保留 `false`，不覆写为 `true`
 （按 key 合并语义，见 `src/service/llm_gateway/protocol.rs` 与
 `src/handler/llm/rewrite.rs`）；此时流式无 usage 帧，metrics 空 usage 桶为预期而非异常。
+Responses **不注入** `stream_options`（官方规范仅接受 `include_obfuscation`，无
+`include_usage`；决策依据与回退条款见 change `veil-llm-proto-closeout` 的 design.md D1/R1），其流式用量一律经
+`response.completed.response.usage` 三级回退记录，用户自带键逐字节保留。
+
+Chat 无 `[DONE]` 收尾处理：上游以非 null `finish_reason` 结束后断流、从未发 `data: [DONE]`
+时，网关置 `truncated_mode=open_ended` 并记 warn 与指标，**不合成** `[DONE]` 或任何终端帧
+（见 `src/handler/llm/pump/spawn.rs`）。
+
+Responses 断序容忍：流中 `sequence_number` 不连续（跳号/回退）时帧原样透传、不 panic、
+不丢帧，终端恰一，不因断序升级为错误日志（见 `src/handler/llm/pump/event.rs::extract_responses_seq`）。
+
+Responses `error` 事件统一为失败终端：流中 `type:"error"` 合成恰一 `response.failed`，
+不出现 `response.completed`、无重复终端（见 `src/handler/llm/pump/spawn.rs`）。
 
 空 usage 桶排查指引：观测到某模型空 usage 桶时，先查请求是否显式 `false`
 （转发体保留原值即用户放弃流式用量），再判上游异常或采样缺失，不得直接按故障报修。
 
-非 502/401 错误 JSON 后处理声明（E6/D4）：非流上游回非 502/401 错误状态的 JSON 体
-（如 400 `truncation:disabled`）仍进完整后处理链（用量记录＋审计判定＋还原），
-下游状态码与正文保留、非字节等价为有意行为；仅非 JSON 的 502/401 错误体豁免透传
-（见 `src/handler/llm/nonstream.rs` 尾部分支）。
+凭据占位符说明注入门控口径：`__VG_CRED_` 门控要求序号 `\d{6,}`（生产 token 恒 6 位），
+窄于 vault 还原侧 `\d{4,}`（兼容历史 4-5 位幻觉形）；4-5 位形态不触发说明注入属**有意保守**
+（注入宜漏不宜误，还原侧仍按宽松口径处理，见 `src/service/llm_gateway/placeholder.rs`）。
+
+非流阻断与错误状态声明（E4/E6/D4，`veil-nonstream-audit-align`）：非流上游为 **2xx**
+且审计命中 `Block` 时，下游恒收 `200 + nonstream_block_body`（与流式恒 200 闭合对称）；
+非 502/401 错误状态的 JSON 体（如 400 `truncation:disabled`）仍进完整后处理链
+（用量记录＋审计判定＋还原），审计照记（`audit_blocks` 列 + warn 日志），但下游
+**不合成阻断体**、状态码与正文保留、非字节等价为有意行为；仅非 JSON 的 502/401
+错误体豁免透传（见 `src/handler/llm/nonstream.rs`）。
 
 ### 7.3 请求隔离声明
 
@@ -363,6 +393,7 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 | `CREDENTIAL_MASTER_PASSWORD` | 二进制不读取 | 主密码口令改走 TPM 解封（`startup_tpm_in`） |
 | `CREDENTIAL_PORT` | 二进制不读取 | 宿主机端口改用 `PORT_8877/8878/8879`（仅改映射） |
 | `CREDENTIAL_PROXY_DEBUG_DIR` | 二进制不读取，无四件落盘 | 如需请求落盘排障，用结构化日志 + `AUDIT_POLICY_FILE` 审计面代替；恢复落盘需新 change 交付（落盘即涉密，需配套脱敏） |
+| `ENV` / `ALLOW_LOOPBACK_NO_TOKEN` | 二进制不读取（回环免 token 未迁移，见 §6.6） | dev 环境显式配置 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`；恢复回环免 token 需新 change 交付 |
 
 沿用旧名部署会静默不生效（环境变量全表之外的一律忽略），迁移时必须改名。
 
@@ -388,8 +419,8 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 
 - 下游响应头 `x-veil-normalized: json-whitespace` 当且仅当转发前请求体被重序列化为紧凑 JSON
   时置位；未置位时无此头（不以空值占位）。该头只发下游，不向上游转发。
-- 置位条件三选一：① `stream_options` 注入分支（恒经 `to_vec` 重序列化，与配置开关无关，
-  无条件置位，见 `src/handler/llm/rewrite.rs`）；② `NORMALIZE_JSON_WHITESPACE=1` 且请求体可解析为
+- 置位条件三选一：① Chat `stream_options` 注入分支（恒经 `to_vec` 重序列化，与配置开关无关，
+  无条件置位，见 `src/handler/llm/rewrite.rs`；Responses 不注入，故不因此置位）；② `NORMALIZE_JSON_WHITESPACE=1` 且请求体可解析为
   JSON（紧凑化重序列化）；③ 占位符说明注入分支（经 `to_string` 紧凑重序列化，见 D1 方案 A）。
   纯脱敏子串替换（字节级，未重序列化）与原文透传不置位，即使替换前后字节长度变化。
 - 非流两处响应与 SSE 流响应均按同一 `normalized_out` 置位（见 `src/handler/llm/nonstream.rs`、
@@ -397,7 +428,7 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 
 ## 8. 遗留决策记录
 
-本节锁定四项遗留决策，后续 change 不得静默漂移（见 `contract-docs` spec）。
+本节锁定遗留决策与口径，后续 change 不得静默漂移（见 `contract-docs` spec）。
 
 ### 8.1 NonDialog 透传（F1，与 P0 联动）
 
@@ -431,3 +462,23 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
 - 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 20 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。
+
+### 8.6 空流三协议语义与原仓差异（`stream-protocol-parity`）
+
+- 行为：Chat/Anthropic 真空流（零字节零残余）保持 open-ended——不合成任何终止帧，仅置
+  `truncated_mode=open_ended`；Responses 真空流合成恰一 `response.failed` 终端（失败语义，
+  不伪造完成）。实现见 `src/service/block_inject/frames.rs::empty_stream_frames` 与
+  `src/handler/llm/pump/spawn.rs` 空流合成守门；三协议对照由单测
+  `vacuum_stream_three_protocol_e2e_comparison` 锁定。
+- 与原仓差异：原仓 Python `_ensure_nonempty_stream`（`_llm.py:2633`）对三协议均注入最小可解析
+  事件，目的为避免下游 Hermes 侧 `JSONDecodeError` 空体。本仓有意不加终止帧，依据
+  `stream-protocol-parity` spec「no fabricated success termination」。
+- 风险：若下游 Hermes 未对空流做 stub 保护，Chat/Anthropic 真空流将表现为客户端解析错误或
+  空等。缓解：Responses 仍合成 `response.failed`；Chat/Anthropic 依赖下游 stub。
+- 下游依赖证据：**待人工确认**（open item，owner：下游集成）。本仓仅有间接声明——
+  `openspec/specs/stream-protocol-parity/spec.md` 与归档 change
+  `2026-09-09-veil-llm-protocol-parity` 断言「Hermes stub protection still applies」，
+  以及 `src/handler/llm/stream_tests.rs` 注释「Hermes 靠缺失 finish_reason 走 stub」；
+  仓内**无** Hermes 侧源码/配置可独立佐证，故不满足「证实存在」，按未证实处置。
+- 升级路径：若人工确认 Hermes 无 stub 保护，则另立 change 评估「Chat/Anthropic 空流补终止帧」
+  路线，实施前须修订 `stream-protocol-parity` spec（本 change 不改该 spec 的 SHALL 文本）。

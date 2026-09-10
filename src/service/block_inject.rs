@@ -19,7 +19,7 @@ use crate::{
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, crate::service::audit::test_whitelist};
 
     #[test]
     fn chat_block_ends_with_exactly_one_bare_done() {
@@ -151,7 +151,6 @@ mod tests {
                 .filter(|f| !is_done_frame(f))
                 .all(|f| f.lines().any(|l| l.starts_with("event:")))
         );
-        assert!(has_chat_terminal(&norm));
         let empty_norm = dedupe_terminal_frames(vec![], "chat");
         assert_eq!(count_done(&empty_norm), 1);
     }
@@ -235,8 +234,6 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("response.completed"));
         assert!(!out[0].contains("response.failed"));
-        assert!(should_discard_after_terminal(true));
-        assert!(!should_discard_after_terminal(false));
     }
 
     #[test]
@@ -254,6 +251,7 @@ mod tests {
             AuditMode::Block,
             &policy,
             "r1",
+            test_whitelist(),
             &pending,
         )
         .expect("危险调用须阻断");
@@ -267,6 +265,7 @@ mod tests {
                 AuditMode::Block,
                 &policy,
                 "r1",
+                test_whitelist(),
                 &pending
             )
             .is_none()
@@ -278,6 +277,7 @@ mod tests {
                 AuditMode::Off,
                 &policy,
                 "r1",
+                test_whitelist(),
                 &pending
             )
             .is_none()
@@ -289,6 +289,7 @@ mod tests {
             AuditMode::Block,
             &policy,
             "r1",
+            test_whitelist(),
             &pending,
         )
         .expect("anthropic 危险须阻断");
@@ -300,6 +301,7 @@ mod tests {
             AuditMode::Block,
             &policy,
             "r1",
+            test_whitelist(),
             &pending,
         )
         .expect("responses 危险须阻断");
@@ -313,6 +315,7 @@ mod tests {
             AuditMode::Approve,
             &policy,
             "r1",
+            test_whitelist(),
             &pending,
         );
         assert!(need.is_none(), "approve 命中须透传上游，不得合成阻断体");
@@ -424,14 +427,44 @@ mod tests {
     #[test]
     fn blocked_placeholder_does_not_retrigger_audit() {
         use {
-            super::super::audit::{AuditPolicy, AuditVerdict, evaluate},
+            super::super::audit::{AuditPolicy, AuditVerdict, evaluate_with_whitelist},
             crate::config::AuditMode,
         };
         let policy = AuditPolicy::default_policy();
-        let verdict = evaluate(AuditMode::Block, "blocked", "{}", &policy);
+        let verdict =
+            evaluate_with_whitelist(AuditMode::Block, "blocked", "{}", &policy, test_whitelist());
         assert!(
             matches!(verdict, AuditVerdict::Allow),
             "占位名 blocked + 空 input 须放行，否则下游二次调用被拦死循环"
+        );
+    }
+
+    #[test]
+    fn approve_empty_whitelist_direct_call_downgrades_to_block() {
+        // T4.2/D2：approve + 空白名单直调 → Block 降级（与流式同口径）。
+        // 生产不可达：启动门禁拒绝 approve 空白名单（`src/config/env_parse.rs:307-310`），
+        // 本用例锁定降级语义本身。
+        use {
+            super::super::{audit::AuditPolicy, llm_gateway::Protocol},
+            crate::config::AuditMode,
+        };
+        let policy = AuditPolicy::default_policy();
+        let pending = PendingApprovals::default();
+        let chat = serde_json::json!({"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}]});
+        let blocked = evaluate_nonstream(
+            Protocol::Chat,
+            &chat,
+            AuditMode::Approve,
+            &policy,
+            "wl-empty",
+            &[],
+            &pending,
+        )
+        .expect("approve 空白名单须降级 Block 合成阻断体");
+        assert!(blocked.to_string().contains("[blocked:"));
+        assert!(
+            pending.get("nonstream-wl-empty-exec").is_none(),
+            "降级 block 不得建 pending"
         );
     }
 
@@ -464,6 +497,7 @@ mod tests {
                 AuditMode::Off,
                 &policy,
                 "c1",
+                test_whitelist(),
                 &pending
             )
             .is_none(),
@@ -478,6 +512,7 @@ mod tests {
                 AuditMode::Off,
                 &policy,
                 "m1",
+                test_whitelist(),
                 &pending
             )
             .is_none()

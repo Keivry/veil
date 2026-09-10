@@ -196,7 +196,7 @@ pub async fn handle_credential(
     )
     .await?;
 
-    let effective = match decision {
+    match decision {
         None => {
             return approval_dual_mode(
                 state,
@@ -224,9 +224,8 @@ pub async fn handle_credential(
             )
             .await;
         }
-        Some(_) => AutoApprove::Allow,
-    };
-    let _ = effective;
+        Some(_) => {}
+    }
 
     query_keepass(state, &entry, field.as_deref(), use_token).await
 }

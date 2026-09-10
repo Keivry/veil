@@ -73,6 +73,7 @@ fn nonstream_ctx(
         req_start: std::time::Instant::now(),
         audit_mode: AuditMode::Off,
         audit_policy_file: None,
+        approval_whitelist: Vec::new(),
         pending: Arc::new(PendingApprovals::default()),
     }
 }
@@ -425,13 +426,15 @@ async fn nonstream_partial_tokens_stripped_at_exit() {
 
 #[tokio::test]
 async fn nonstream_approve_records_pending_and_passes_through() {
-    // P0-1.4 spec 场景：非流 NeedApproval 记 pending + 透传上游（仅 deny 阻断）。
+    // P0-1.4 spec 场景 + T1/T4.1：approve 非空白名单 → NeedApproval 记 pending
+    // 且透传上游（仅 block 降级/deny 才合成阻断体）。
     let up_body = br#"{"id":"a1","choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
     let (url, server) = loopback_server(200, "application/json", up_body).await;
     let client = reqwest::Client::new();
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
     ctx.audit_mode = AuditMode::Approve;
+    ctx.approval_whitelist = vec!["@admin:example.com".to_string()];
     let pending = ctx.pending.clone();
     let outcome = serve_nonstream(
         &client,

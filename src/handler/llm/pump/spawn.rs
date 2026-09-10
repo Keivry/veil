@@ -6,6 +6,7 @@ use {
         PumpOutcome,
         StreamPumpCtx,
         event::{
+            chat_finish_reason_seen,
             extract_responses_seq,
             is_minor_event,
             is_terminal_event,
@@ -120,6 +121,8 @@ pub fn spawn_stream_pump(
         let mut audit_blocked = false;
         // 终端去重（§2.6 流式等价）：每协议恰一终止帧，多余 `[DONE]/message_stop/completed` 丢弃。
         let mut terminal_sent = false;
+        // B3/P2-2：Chat 已见非 null `finish_reason`（soft-terminal）但流末缺 `[DONE]`。
+        let mut saw_finish_reason = false;
         let mut stream_usage: Option<llm_gateway::Usage> = None;
         // C13 模型分桶：跟踪上游回显 `model`（首见为准，缺失归
         // `unknown_model`），随 `record_chat` 落快照。
@@ -170,6 +173,9 @@ pub fn spawn_stream_pump(
                     && !is_done_payload(&ev.data)
                     && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
                 {
+                    if protocol == Protocol::Chat && chat_finish_reason_seen(&v) {
+                        saw_finish_reason = true;
+                    }
                     if let Some(id) = llm_gateway::extract_conv_id(&v) {
                         if stream_first_id.is_none() {
                             stream_first_id = Some(id.clone());
@@ -651,6 +657,24 @@ pub fn spawn_stream_pump(
         }
         let _ = terminated;
         _gate.store(false, std::sync::atomic::Ordering::Relaxed);
+        // B3/P2-2：Chat 已见非 null `finish_reason` 却未收到 `[DONE]`（上游异常收尾）：
+        // 置 open-ended 可观测（warn + 指标），不合成任何终端帧（真空/截断守门已覆盖，
+        // 此处仅补齐「有帧但无 DONE」缺口）。
+        if protocol == Protocol::Chat
+            && !terminal_sent
+            && saw_finish_reason
+            && meta.truncated_mode.is_none()
+        {
+            let _ = set_truncated(
+                &mut meta,
+                protocol,
+                crate::service::sse::TruncatedMode::OpenEnded,
+                Some(&metrics),
+            );
+            tracing::warn!(
+                "Chat 流已见 finish_reason 但缺 [DONE]，按 open-ended 收尾（不合成终端）"
+            );
+        }
         admin_metrics.record_chat(ChatRecord {
             protocol,
             model: stream_model.as_deref().unwrap_or(""),

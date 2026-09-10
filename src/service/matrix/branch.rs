@@ -4,8 +4,6 @@ use std::path::Path;
 
 /// 凭据审批超时（秒），与审计分表，固定 300s。
 pub const CREDENTIAL_TIMEOUT_SECS: u64 = 300;
-/// 审计审批超时（秒）。
-pub const AUDIT_TIMEOUT_SECS: u64 = 90;
 /// 孤儿 pending 清扫阈值（秒）。
 pub const ORPHAN_SWEEP_SECS: u64 = 60;
 

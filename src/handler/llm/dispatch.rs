@@ -149,6 +149,7 @@ pub(crate) async fn gateway_serve(
             req_start,
             audit_mode,
             audit_policy_file: audit_policy_file.clone(),
+            approval_whitelist: approval_whitelist.clone(),
             pending: state.pending.clone(),
         };
         return match serve_nonstream(
@@ -267,6 +268,7 @@ pub(crate) async fn gateway_serve(
             req_start,
             audit_mode,
             audit_policy_file: audit_policy_file.clone(),
+            approval_whitelist: approval_whitelist.clone(),
             pending: state.pending.clone(),
         };
         match serve_nonstream(

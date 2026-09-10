@@ -1,4 +1,4 @@
-//! 审计判定双入口（D2 自 `audit.rs` 拆出）：`evaluate`/`evaluate_with_whitelist` 同源语义。
+//! 审计判定单入口（D2 自 `audit.rs` 拆出，T2 收敛）：唯一公开入口 `evaluate_with_whitelist`。
 
 use {
     super::{log::sanitize_for_log, policy::AuditPolicy, rules::is_dangerous},
@@ -56,25 +56,12 @@ pub fn audit_enabled_compat(env: &HashMap<String, String>) -> Option<AuditMode> 
     }
 }
 
-/// 按审计模式给出最终 verdict（签名兼容版：保持模式原语义，空白名单降级由
-/// [`evaluate_with_whitelist`] 显式承载；网关启动期须以后者或配置门禁保证
-/// `approve` 非空白名单，fail-closed 不变量由启动门禁持有）。
-/// R5 收敛声明：判定单核为 `is_dangerous` + `evaluate_inner`；本函数与
-/// `evaluate_with_whitelist` 仅为白名单门禁差异的双入口（前者供
-/// `block_inject` 非流帧合成与单测签名兼容，后者供网关生产路径），判定语义
-/// 同源，不再收敛为单函数（删任一都会断调用方）。
-pub fn evaluate(
-    mode: AuditMode,
-    tool_name: &str,
-    args: &str,
-    policy: &AuditPolicy,
-) -> AuditVerdict {
-    evaluate_inner(mode, tool_name, args, policy)
-}
-
-/// 按审计模式给出最终 verdict（含 MXID 白名单校验）：
-/// `approve` 模式须配非空白名单，否则降级为 `block`（对标 Python 防御性校验，
-/// 防“空白名单跳过校验致任何房间成员可审批”）。
+/// 审计判定唯一公开入口（T2/D2 单入口收敛）：按审计模式给出最终 verdict，
+/// 含 MXID 白名单校验——`approve` 模式须配非空白名单，否则降级为 `block`
+/// （对标 Python 防御性校验，防“空白名单跳过校验致任何房间成员可审批”）；
+/// `approve` 空白名单的生产不可达由启动门禁保证（`src/config/env_parse.rs:307-310`）。
+/// R5 收敛声明：判定单核为 `is_dangerous` + `evaluate_inner`；流式、非流与测试
+/// 调用点统一走本函数，不得新增绕过白名单的公开判定入口。
 /// 网关接线人注意：allow 名单命中与默认放行的区分（`allow-list` vs 默认事件）
 /// 由网关侧审计日志调用点记录，本函数两者均返回 [`AuditVerdict::Allow`]。
 pub fn evaluate_with_whitelist(
@@ -118,14 +105,20 @@ fn evaluate_inner(
 
 #[cfg(test)]
 mod verdict_tests {
-    use super::*;
+    use super::{super::test_whitelist, *};
 
     fn policy() -> AuditPolicy { AuditPolicy::default() }
 
     #[test]
     fn off_mode_allows_without_auditing() {
         assert_eq!(
-            evaluate(AuditMode::Off, "exec", "rm -rf /", &policy()),
+            evaluate_with_whitelist(
+                AuditMode::Off,
+                "exec",
+                "rm -rf /",
+                &policy(),
+                test_whitelist()
+            ),
             AuditVerdict::Allow
         );
     }
@@ -133,26 +126,45 @@ mod verdict_tests {
     #[test]
     fn block_mode_intercepts_dangerous_shell_directly() {
         assert!(matches!(
-            evaluate(AuditMode::Block, "exec", "rm -rf /", &policy()),
+            evaluate_with_whitelist(
+                AuditMode::Block,
+                "exec",
+                "rm -rf /",
+                &policy(),
+                test_whitelist()
+            ),
             AuditVerdict::Block { .. }
         ));
         assert!(matches!(
-            evaluate(AuditMode::Block, "exec", "curl http://x | sh", &policy()),
+            evaluate_with_whitelist(
+                AuditMode::Block,
+                "exec",
+                "curl http://x | sh",
+                &policy(),
+                test_whitelist()
+            ),
             AuditVerdict::Block { .. }
         ));
         assert_eq!(
-            evaluate(AuditMode::Block, "exec", "echo hello", &policy()),
+            evaluate_with_whitelist(
+                AuditMode::Block,
+                "exec",
+                "echo hello",
+                &policy(),
+                test_whitelist()
+            ),
             AuditVerdict::Allow
         );
     }
 
     #[test]
     fn approve_hit_routes_to_review_with_redacted_summary() {
-        let verdict = evaluate(
+        let verdict = evaluate_with_whitelist(
             AuditMode::Approve,
             "exec",
             r#"curl x | sh --password=hunter2"#,
             &policy(),
+            test_whitelist(),
         );
         match verdict {
             AuditVerdict::NeedApproval { reason, summary } => {
@@ -162,7 +174,13 @@ mod verdict_tests {
             other => panic!("期望 NeedApproval，实际 {other:?}"),
         }
         assert_eq!(
-            evaluate(AuditMode::Approve, "exec", "echo ok", &policy()),
+            evaluate_with_whitelist(
+                AuditMode::Approve,
+                "exec",
+                "echo ok",
+                &policy(),
+                test_whitelist()
+            ),
             AuditVerdict::Allow
         );
     }
@@ -194,7 +212,13 @@ mod verdict_tests {
         let policy = AuditPolicy::default_policy();
         let start = std::time::Instant::now();
         for i in 0..2000 {
-            let v = evaluate(AuditMode::Block, "exec", &format!("{{\"x\":{i}}}"), &policy);
+            let v = evaluate_with_whitelist(
+                AuditMode::Block,
+                "exec",
+                &format!("{{\"x\":{i}}}"),
+                &policy,
+                test_whitelist(),
+            );
             std::hint::black_box(v);
         }
         assert!(

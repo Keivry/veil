@@ -13,8 +13,6 @@ use {
 
 pub fn mark_terminal(meta: &mut StreamMeta) { meta.terminal_injected = true; }
 
-pub fn has_chat_terminal(frames: &[String]) -> bool { frames.iter().any(|f| is_done_frame(f)) }
-
 pub fn normalize_chat_done(frames: Vec<String>) -> Vec<String> {
     let mut kept: Vec<String> = frames.into_iter().filter(|f| !is_done_frame(f)).collect();
     kept = ensure_event_lines(kept);
@@ -57,8 +55,6 @@ pub fn dedupe_terminal_frames(frames: Vec<String>, protocol: &str) -> Vec<String
         }
     }
 }
-
-pub fn should_discard_after_terminal(terminated: bool) -> bool { terminated }
 
 /// 协议级终端计数（D6 帧级）：chat 数 `[DONE]` 帧、anthropic 数 `message_stop`、
 /// responses 数 `completed/failed`；恰一约束的计数口径。

@@ -24,7 +24,7 @@ use {
     std::{sync::Arc, time::Instant},
 };
 
-fn fresh_arcs() -> (Arc<Scope>, Arc<CredentialVault>, Arc<PiiDetector>) {
+pub(super) fn fresh_arcs() -> (Arc<Scope>, Arc<CredentialVault>, Arc<PiiDetector>) {
     (
         Arc::new(Scope::new()),
         Arc::new(CredentialVault::new()),
@@ -32,7 +32,7 @@ fn fresh_arcs() -> (Arc<Scope>, Arc<CredentialVault>, Arc<PiiDetector>) {
     )
 }
 
-fn pump_ctx(
+pub(super) fn pump_ctx(
     protocol: Protocol,
     scope: Arc<Scope>,
     vault: Arc<CredentialVault>,
@@ -61,7 +61,7 @@ fn pump_ctx(
 }
 
 /// 回环上游：固定状态码/内容类型/体，供流泵回放单测（无外网依赖）。
-async fn loopback_server(
+pub(super) async fn loopback_server(
     status: u16,
     content_type: &str,
     body: Vec<u8>,
@@ -103,7 +103,7 @@ async fn loopback_server(
     (url, handle)
 }
 
-async fn collect_pump(
+pub(super) async fn collect_pump(
     upstream: reqwest::Response,
     ctx: StreamPumpCtx,
 ) -> (PumpOutcome, Vec<String>) {

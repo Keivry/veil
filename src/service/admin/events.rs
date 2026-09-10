@@ -81,31 +81,6 @@ pub fn load_admin_token_file(data_dir: &std::path::Path) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// 回环免 token 放行判定（对标原仓）：仅 `ENV=dev` 且回环远端时豁免鉴权，
-/// 生产回环同样鉴权（Docker/反代下回环不可靠，fail-closed）。
-/// 完整 bypass 接线（`ALLOW_LOOPBACK_NO_TOKEN` 门 + 鉴权前判定）归网关入口，
-/// 本函数只提供纯判定供接线与单测。
-/// D4：仅单测使用，降级为测试可见（生产无读取方）。
-#[cfg(test)]
-pub fn loopback_grace(env_is_dev: bool, remote: &str) -> bool {
-    if !env_is_dev {
-        return false;
-    }
-    let r = remote.trim().trim_start_matches('[').trim_end_matches(']');
-    r == "127.0.0.1" || r == "::1" || r == "::ffff:127.0.0.1"
-}
-
-/// 可观测性总开关：`OBSERVABILITY_DISABLE=1` 时管理面显式禁用（过渡逃生开关，
-/// 对标原仓；网关入口据此拒绝注册 admin 路由并告警）。
-/// D4：仅单测使用，降级为测试可见（生产无读取方）。
-#[cfg(test)]
-pub fn observability_disabled(env: &HashMap<String, String>) -> bool {
-    matches!(
-        env.get("OBSERVABILITY_DISABLE").map(|v| v.trim()),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
 /// 事件查询默认上限。
 pub const EVENT_DEFAULT_LIMIT: usize = 100;
 
@@ -704,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_token_file_isolation_and_loopback_grace() {
+    fn admin_token_file_isolation() {
         let dir = std::env::temp_dir().join(format!("veil-admin-token-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(load_admin_token_file(&dir), None);
@@ -714,17 +689,6 @@ mod tests {
             Some("file-token-abc")
         );
         std::fs::remove_dir_all(&dir).ok();
-        // 回环免 token 仅 dev + 回环。
-        assert!(loopback_grace(true, "127.0.0.1"));
-        assert!(loopback_grace(true, "::1"));
-        assert!(!loopback_grace(false, "127.0.0.1"));
-        assert!(!loopback_grace(true, "192.168.1.10"));
-        assert!(!loopback_grace(true, "unknown"));
-        // 总开关。
-        let env: HashMap<String, String> =
-            HashMap::from([("OBSERVABILITY_DISABLE".to_string(), "1".to_string())]);
-        assert!(observability_disabled(&env));
-        assert!(!observability_disabled(&HashMap::new()));
     }
 
     #[test]

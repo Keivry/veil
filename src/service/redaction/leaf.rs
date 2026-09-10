@@ -14,9 +14,11 @@ pub const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
 /// 归一化声明头值（同上）。
 pub const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
 
+// D1.8：以下三辅助生产零引用（生产走 `Config` 同名成员），`#[cfg(test)]` 收编。
 /// 占位符说明注入开关（与 `Config::is_falsy` 同口径）：`0/false/no/off` 关闭，
 /// 其余（含空）启用。网关实际以 `Config::parse_placeholder_prompt` 为准，
 /// 本函数仅供单测对账，两者语义一致。
+#[cfg(test)]
 pub fn placeholder_prompt_enabled(raw: &str) -> bool {
     !matches!(
         raw.trim().to_lowercase().as_str(),
@@ -24,8 +26,10 @@ pub fn placeholder_prompt_enabled(raw: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn normalize_flag_enabled(raw: Option<&str>) -> bool { matches!(raw.map(str::trim), Some("1")) }
 
+#[cfg(test)]
 pub fn select_request_bytes<'a>(
     original: &'a [u8],
     normalized: &'a [u8],

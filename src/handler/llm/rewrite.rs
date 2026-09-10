@@ -487,10 +487,11 @@ mod rewrite_unit_tests {
     }
 
     #[tokio::test]
-    async fn rewrite_t3_responses_true_injection_integration() {
+    async fn rewrite_t3_responses_no_injection_bytes_preserved() {
+        // B1（决策 b）：Responses stream:true 不注入 stream_options，非脱敏路径字节等价。
         let config = test_config(&[]);
         let (scope, vault, detector) = fresh_arcs();
-        let raw = br#"{"model":"m","input":"hi __PII_2_cd34ab12__"}"#;
+        let raw = br#"{"model":"m","stream":true,"input":"hi"}"#;
         let out = request_rewrite(
             raw.to_vec(),
             Protocol::Responses,
@@ -500,9 +501,39 @@ mod rewrite_unit_tests {
             detector,
         )
         .await;
+        assert!(out.stream_flag, "stream 意图仍须识别");
+        assert_eq!(out.body, raw, "Responses 不得注入，字节须等价");
+        assert!(!out.normalized_out, "未重序列化不得声明 normalized");
         let v: serde_json::Value = serde_json::from_slice(&out.body).expect("合法 JSON");
-        assert!(v["input"].as_str().unwrap().contains("hi"));
-        assert_ne!(v["input"].as_str().unwrap(), "hi __PII_2_cd34ab12__");
+        assert!(
+            v.get("stream_options").is_none(),
+            "Responses 不得出现 stream_options"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_t3_responses_user_stream_options_preserved() {
+        // B1（决策 b）：Responses 用户自带 stream_options 须逐字节保留，不合并/替换。
+        let config = test_config(&[]);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw = br#"{"model":"m","stream":true,"stream_options":{"include_obfuscation":false},"input":"hi"}"#;
+        let out = request_rewrite(
+            raw.to_vec(),
+            Protocol::Responses,
+            &config,
+            scope,
+            vault,
+            detector,
+        )
+        .await;
+        assert_eq!(
+            out.body, raw,
+            "用户自带 stream_options 须逐字节保留，不注入 include_usage"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.body).expect("合法 JSON");
+        assert_eq!(v["stream_options"]["include_obfuscation"], false);
+        assert!(v["stream_options"].get("include_usage").is_none());
+        assert!(!out.normalized_out);
     }
 
     #[tokio::test]

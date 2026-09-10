@@ -71,14 +71,8 @@ struct VaultInner {
 }
 
 impl CredentialVault {
-    /// 新建空 vault（单测与每进程单例均经此构造）。
+    /// 新建空 vault（单测与生产状态构造均经此）。
     pub fn new() -> Self { Self::default() }
-
-    /// 进程级全局单例（热路径复用）。
-    pub fn global() -> &'static Self {
-        static GLOBAL: OnceLock<CredentialVault> = OnceLock::new();
-        GLOBAL.get_or_init(CredentialVault::new)
-    }
 
     /// 注册凭据明文，返回 token。已存在则复用并提升 LRU；
     /// 过短直接透传原值；命中 token 形态/前缀则拒绝。
@@ -114,24 +108,6 @@ impl CredentialVault {
     /// 当前映射条数（可观测/断言用）。
     pub fn len(&self) -> usize { self.inner.read().map(|g| g.pwd_to_token.len()).unwrap_or(0) }
 
-    /// 映射版本（序号 + 条数）：快照缓存键，写入即变化。
-    pub fn version(&self) -> (u64, usize) {
-        self.inner
-            .read()
-            .map(|g| (g.seq, g.pwd_to_token.len()))
-            .unwrap_or_default()
-    }
-
-    /// 只读快照：拷贝映射并预编译脱敏/还原正则，网关热路径复用以避免逐次重编。
-    pub fn snapshot(&self) -> VaultSnapshot {
-        let guard = self.inner.read().expect("凭据 vault 锁无毒");
-        VaultSnapshot::from_maps(
-            guard.pwd_to_token.clone(),
-            guard.token_to_pwd.clone(),
-            (guard.seq, guard.pwd_to_token.len()),
-        )
-    }
-
     /// 映射是否为空。
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
@@ -149,21 +125,6 @@ impl CredentialVault {
             .read()
             .map(|g| g.token_to_pwd.clone())
             .unwrap_or_default()
-    }
-
-    /// 是否持有该 token（幻觉判定用）。
-    pub fn contains_token(&self, token: &str) -> bool {
-        self.inner
-            .read()
-            .map(|g| g.token_to_pwd.contains_key(token))
-            .unwrap_or(false)
-    }
-
-    /// 用 token 替换文本中的凭据明文。按明文长度降序单次替换，
-    /// 防短值先替换切断长值。
-    pub fn redact(&self, text: &str) -> String {
-        let map = self.snapshot_p2t();
-        redact_with_map(text, &map)
     }
 
     /// 将 token 还原为凭据明文。
@@ -202,85 +163,6 @@ impl CredentialVault {
             })
             .into_owned()
     }
-}
-
-/// 只读快照：映射拷贝 + 预编译正则，多次脱敏/还原复用同一编译结果。
-#[derive(Debug, Clone, Default)]
-pub struct VaultSnapshot {
-    version: (u64, usize),
-    redact_re: Option<regex::Regex>,
-    redact_map: HashMap<String, String>,
-    restore_re: Option<regex::Regex>,
-    restore_map: HashMap<String, String>,
-}
-
-impl VaultSnapshot {
-    fn from_maps(
-        p2t: HashMap<String, String>,
-        t2p: HashMap<String, String>,
-        version: (u64, usize),
-    ) -> Self {
-        Self {
-            version,
-            redact_re: compile_union(p2t.keys()),
-            redact_map: p2t,
-            restore_re: compile_union(t2p.keys()),
-            restore_map: t2p,
-        }
-    }
-
-    /// 快照版本：与来源 vault 的 [`CredentialVault::version`] 同口径，命中即复用。
-    pub fn version(&self) -> (u64, usize) { self.version }
-
-    /// 快照是否为空。
-    pub fn is_empty(&self) -> bool { self.redact_map.is_empty() }
-
-    /// 快照内映射条数。
-    pub fn len(&self) -> usize { self.redact_map.len() }
-
-    /// 用快照内已注册映射脱敏（只读，不写全局）。
-    pub fn redact(&self, text: &str) -> String {
-        match &self.redact_re {
-            None => text.to_string(),
-            Some(re) => re
-                .replace_all(text, |caps: &regex::Captures| {
-                    self.redact_map
-                        .get(&caps[0])
-                        .cloned()
-                        .unwrap_or_else(|| caps[0].to_string())
-                })
-                .into_owned(),
-        }
-    }
-
-    /// 用快照内映射还原 token（只读，不写全局）。
-    pub fn restore(&self, text: &str) -> String {
-        match &self.restore_re {
-            None => text.to_string(),
-            Some(re) => re
-                .replace_all(text, |caps: &regex::Captures| {
-                    self.restore_map
-                        .get(&caps[0])
-                        .cloned()
-                        .unwrap_or_else(|| caps[0].to_string())
-                })
-                .into_owned(),
-        }
-    }
-}
-
-fn compile_union<'a>(keys: impl Iterator<Item = &'a String>) -> Option<regex::Regex> {
-    let mut items: Vec<&String> = keys.collect();
-    if items.is_empty() {
-        return None;
-    }
-    items.sort_by_key(|k| std::cmp::Reverse(k.len()));
-    let pat = items
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect::<Vec<_>>()
-        .join("|");
-    regex::Regex::new(&pat).ok()
 }
 
 fn touch(order: &mut VecDeque<String>, value: &str) {
@@ -359,7 +241,7 @@ mod tests {
         let vault = CredentialVault::new();
         vault.register("abcd-1234-long").unwrap();
         vault.register("abcd").unwrap();
-        let out = vault.redact("值 abcd-1234-long 结束");
+        let out = redact_with_map("值 abcd-1234-long 结束", &vault.snapshot_p2t());
         assert!(!out.contains("abcd-1234-long"));
         assert!(out.contains("__VG_CRED_"));
     }
@@ -383,25 +265,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_readonly_passthrough_with_stable_version() {
+    fn snapshot_maps_and_redact_with_map_reflect_registrations() {
+        // D1.3：只读快照语义改走生产等价路径（`snapshot_p2t`/`snapshot_t2p` +
+        // `redact_with_map`/`restore`）；旧 `VaultSnapshot` 类型（生产零引用）已删。
         let vault = CredentialVault::new();
         let token = vault.register("快照秘密-abc456").unwrap();
-        let snap = vault.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert!(!snap.is_empty());
-        let v1 = vault.version();
-        assert_eq!(snap.version(), v1);
-        let again = vault.snapshot();
-        assert_eq!(again.version(), v1);
-        let out = snap.redact("正文含 快照秘密-abc456 结尾");
+        let p2t = vault.snapshot_p2t();
+        assert_eq!(p2t.len(), 1);
+        let out = redact_with_map("正文含 快照秘密-abc456 结尾", &p2t);
         assert_eq!(out, format!("正文含 {token} 结尾"));
-        assert_eq!(snap.restore(&out), "正文含 快照秘密-abc456 结尾");
+        assert_eq!(vault.restore(&out), "正文含 快照秘密-abc456 结尾");
         assert_eq!(vault.len(), 1);
         let fresh = vault.register("另一秘密-def000").unwrap();
-        assert_ne!(vault.version(), v1);
-        let snap2 = vault.snapshot();
-        assert_eq!(snap2.len(), 2);
-        assert!(snap2.redact("另一秘密-def000").contains(&fresh));
+        let p2t2 = vault.snapshot_p2t();
+        assert_eq!(p2t2.len(), 2);
+        assert!(redact_with_map("另一秘密-def000", &p2t2).contains(&fresh));
     }
 
     #[test]

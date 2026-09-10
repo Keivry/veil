@@ -22,3 +22,11 @@ pub mod rules;
 pub mod verdict;
 
 pub use {hold::*, log::*, normalize::*, policy::*, rules::*, verdict::*};
+
+/// 单测专用：非空审批白名单（T2/D2 调用点统一口径；空白名单降级用例显式传 `&[]`，
+/// 生产不可达由启动门禁保证，见 `src/config/env_parse.rs:307-310`）。
+#[cfg(test)]
+pub(crate) fn test_whitelist() -> &'static [String] {
+    static TEST_WHITELIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    TEST_WHITELIST.get_or_init(|| vec!["@admin:example.com".to_string()])
+}

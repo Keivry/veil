@@ -109,21 +109,23 @@ pub fn is_stream_body(body: &Value) -> bool {
 }
 
 pub fn should_inject_stream_options(protocol: Protocol, body: &Value) -> bool {
-    match protocol {
-        Protocol::Chat | Protocol::Responses => {
-            if !is_stream_body(body) {
-                return false;
-            }
-            match body.as_object().and_then(|m| m.get("stream_options")) {
-                // 键内合并语义（对齐 Python setdefault）：整键缺失或
-                // `include_usage` 缺失即需注入，保留用户自带其他键。
-                None => true,
-                Some(Value::Object(opts)) => opts.get("include_usage").is_none(),
-                // 非对象形态视为缺失，由 inject 整体替换 + warn。
-                Some(_) => true,
-            }
-        }
-        Protocol::Anthropic | Protocol::NonDialog => false,
+    // P1-1（决策 b）：官方 Responses `stream_options` 仅接受 `include_obfuscation`，
+    // 无 `include_usage`，故注入收窄为仅 `Protocol::Chat`。Responses 流式用量经
+    // `response.completed.response.usage` 携带，由 `extract_usage_stream` 三级回退
+    // 闭环（见 `usage.rs`），不依赖请求注入；用户自带 `stream_options` 原样保留。
+    if protocol != Protocol::Chat {
+        return false;
+    }
+    if !is_stream_body(body) {
+        return false;
+    }
+    match body.as_object().and_then(|m| m.get("stream_options")) {
+        // 键内合并语义（对齐 Python setdefault）：整键缺失或
+        // `include_usage` 缺失即需注入，保留用户自带其他键。
+        None => true,
+        Some(Value::Object(opts)) => opts.get("include_usage").is_none(),
+        // 非对象形态视为缺失，由 inject 整体替换 + warn。
+        Some(_) => true,
     }
 }
 
@@ -210,16 +212,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_options_injected_only_for_chat_and_responses() {
+    fn stream_options_injected_only_for_chat() {
         let chat_stream = serde_json::json!({"model":"m","stream":true});
         let resp_stream = serde_json::json!({"model":"m","stream":true});
         let anth_stream = serde_json::json!({"model":"m","stream":true});
         let chat_nostream = serde_json::json!({"model":"m"});
         assert!(should_inject_stream_options(Protocol::Chat, &chat_stream));
-        assert!(should_inject_stream_options(
-            Protocol::Responses,
-            &resp_stream
-        ));
+        assert!(
+            !should_inject_stream_options(Protocol::Responses, &resp_stream),
+            "Responses 不得注入规范外 include_usage（P1-1 决策 b）"
+        );
         assert!(!should_inject_stream_options(
             Protocol::Anthropic,
             &anth_stream

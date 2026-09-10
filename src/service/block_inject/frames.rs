@@ -13,7 +13,7 @@ use {
         approval::{PendingApprovals, PendingRecord},
         config::AuditMode,
         service::{
-            audit::{AuditPolicy, AuditVerdict, evaluate},
+            audit::{AuditPolicy, AuditVerdict, evaluate_with_whitelist},
             llm_gateway::{Protocol as GatewayProtocol, extract_tool_calls},
             metrics::normalize_model,
         },
@@ -230,21 +230,24 @@ pub fn nonstream_block_body(
     }
 }
 
-/// 非流 tool 提取 + 审计（§2.3/P0-1.4）：提取三协议 tool 调用
+/// 非流 tool 提取 + 审计（§2.3/P0-1.4，T1/P2-1）：提取三协议 tool 调用
 /// （chat `tool_calls`、anthropic `tool_use`、responses `function_call`）
-/// 并逐条 `audit::evaluate`；仅 `Block` 返回 `Some(阻断体)`（fail-closed），
+/// 并逐条 `audit::evaluate_with_whitelist`（与流式同口径白名单入口）；
+/// 仅 `Block` 返回 `Some(阻断体)`（fail-closed），
 /// `NeedApproval` 记 pending 后返回 `None` 走上游透传（与流式 B 案 `README 6.4`
 /// 一致：不断链、不合成阻断帧）；全放行返回 `None`。
 /// R5 职责声明：本模块只合成帧/体（阻断体/截断帧/空流帧），不累积字节；
 /// 字节累积归 `audit_hold::AuditHold`（只累积、不合成帧），两边不交叉。
-/// handler 接线说明：`Some(body)` 直接替代上游响应返回（E4 状态码统一恒 200，
-/// 与流式恒 200 闭合对称，不再沿用上游码），`None` 走正常还原透传。
+/// handler 接线说明：`Some(body)` 是否替代上游响应由调用方按上游状态码裁决
+/// （T3/D3：仅上游 2xx 合成 200 阻断体；错误状态保留上游状态与正文并照记审计，
+/// 见 `src/handler/llm/nonstream.rs`），`None` 走正常还原透传。
 pub fn evaluate_nonstream(
     protocol: GatewayProtocol,
     body: &Value,
     mode: AuditMode,
     policy: &AuditPolicy,
     conv_id: &str,
+    approval_whitelist: &[String],
     pending: &PendingApprovals,
 ) -> Option<Value> {
     if matches!(mode, AuditMode::Off) {
@@ -253,7 +256,7 @@ pub fn evaluate_nonstream(
     let mut blocked_reason: Option<String> = None;
     for call in extract_tool_calls(protocol, body) {
         let name = call.name.as_deref().unwrap_or("");
-        match evaluate(mode, name, &call.args, policy) {
+        match evaluate_with_whitelist(mode, name, &call.args, policy, approval_whitelist) {
             AuditVerdict::Allow => {}
             AuditVerdict::Block { reason } => {
                 blocked_reason = Some(reason);

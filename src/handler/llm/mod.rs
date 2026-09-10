@@ -20,6 +20,8 @@ pub mod rewrite;
 #[cfg(test)]
 mod gateway_tests;
 #[cfg(test)]
+mod proto_closeout_tests;
+#[cfg(test)]
 mod stream_tests;
 
 /// 限值常量归属 `config.rs`（D1 下沉），此处原位转发防外部引用断裂。

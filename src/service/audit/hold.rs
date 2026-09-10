@@ -287,12 +287,6 @@ impl AuditHold {
     pub fn accumulated(&self, index: u32) -> Option<&str> {
         self.args_by_index.get(&index).map(|s| s.as_str())
     }
-
-    /// hold 期间新危险调用是否拒绝（预留：流泵未接线——当前泵路径不调用本
-    /// 函数，危险调用按 pending 建单语义处理；接线见网关 change）。
-    pub fn reject_new_dangerous_during_hold(&self, is_dangerous: bool) -> bool {
-        self.held() && is_dangerous
-    }
 }
 
 #[derive(Debug)]
@@ -506,13 +500,6 @@ mod audit_hold_tests {
     }
 
     #[test]
-    fn new_dangerous_calls_rejected_during_hold() {
-        let hold = AuditHold::new(1024);
-        assert!(hold.reject_new_dangerous_during_hold(true));
-        assert!(!hold.reject_new_dangerous_during_hold(false));
-    }
-
-    #[test]
     fn verdict_reuses_approval_trait_stub() {
         let gw = NoopApproval;
         let rec = PendingRecord::new("k", "audit_hold");
@@ -563,6 +550,34 @@ mod audit_hold_tests {
         assert!(!AuditHold::is_complete_event(
             &serde_json::json!({"item": {"id": "x"}, "type": "other"})
         ));
+    }
+
+    #[test]
+    fn message_delta_after_slot_stop_does_not_duplicate_audit() {
+        // B5.1：`message_delta` 非按槽完成事件，仅 `content_block_stop`/`item_done`
+        // 触发槽清理（`is_index_complete_event`）；同帧到达不得重复审计/清理。
+        let mut hold = AuditHold::new(1024);
+        assert_eq!(
+            hold.push_fragment(0, Some("c1"), Some("exec"), "{\"command\":\"rm -rf /\"}"),
+            HoldVerdict::Approved
+        );
+        let stop0 = serde_json::json!({"type":"content_block_stop","index":0});
+        assert!(AuditHold::is_index_complete_event(&stop0));
+        assert_eq!(hold.tool_triples().len(), 1, "槽完成须恰可审计一次");
+        hold.clear_index(0);
+        let md = serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}});
+        assert!(
+            !AuditHold::is_index_complete_event(&md),
+            "message_delta 非按槽清理事件"
+        );
+        assert!(
+            !AuditHold::is_complete_event(&md),
+            "message_delta 非全局完成事件"
+        );
+        assert!(
+            hold.tool_triples().is_empty(),
+            "message_delta 不得重复审计/清理"
+        );
     }
 
     #[tokio::test]

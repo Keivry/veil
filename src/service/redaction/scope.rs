@@ -244,7 +244,10 @@ pub fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
 
 #[cfg(test)]
 mod scope_tests {
-    use {super::*, crate::service::pii::apply_spans};
+    use {
+        super::*,
+        crate::service::{credential_vault::redact_with_map, pii::apply_spans},
+    };
 
     fn vault_with_secret(secret: &str) -> CredentialVault {
         let v = CredentialVault::new();
@@ -457,7 +460,7 @@ mod scope_tests {
         let vault = CredentialVault::new();
         vault.register("my-secret-001").expect("注册恒成功");
         let scope = Scope::new();
-        let masked = vault.redact("密码 my-secret-001 结束");
+        let masked = redact_with_map("密码 my-secret-001 结束", &vault.snapshot_p2t());
         assert!(!masked.contains("my-secret-001"), "{masked}");
         let (restored, spans) = scope.restore_response_with_spans(&vault, &masked);
         assert_eq!(restored, "密码 my-secret-001 结束");

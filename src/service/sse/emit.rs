@@ -12,6 +12,10 @@ pub enum Speed {
     Fast,
 }
 
+/// Fast 径攒批阈值（字节）：攒至标点边界或该阈值即吐出（T4）。
+/// 硬编码理由：经验值平衡首字延迟与 SSE 帧数，调整须同步复核续跑测试。
+pub const FAST_EMIT_THRESHOLD_BYTES: usize = 4096;
+
 pub fn is_punct_boundary(text: &str) -> bool {
     text.chars().last().is_some_and(|c| {
         matches!(
@@ -33,7 +37,7 @@ pub fn select_emit(buffer: &mut String, speed: Speed) -> Option<String> {
         Speed::Fast => {
             if buffer.is_empty() {
                 None
-            } else if is_punct_boundary(buffer) || buffer.len() >= 4096 {
+            } else if is_punct_boundary(buffer) || buffer.len() >= FAST_EMIT_THRESHOLD_BYTES {
                 Some(std::mem::take(buffer))
             } else {
                 None

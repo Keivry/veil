@@ -14,9 +14,15 @@ use {
     std::time::{Duration, Instant},
     veil::{
         config::AuditMode,
-        service::audit::{AuditPolicy, AuditVerdict, evaluate},
+        service::audit::{AuditPolicy, AuditVerdict, evaluate_with_whitelist},
     },
 };
+
+/// T2/D2：测试统一以非空白名单提供；空白名单降级语义由 verdict 单测锁定。
+fn test_whitelist() -> &'static [String] {
+    static TEST_WHITELIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    TEST_WHITELIST.get_or_init(|| vec!["@admin:example.com".to_string()])
+}
 
 fn policy() -> AuditPolicy { AuditPolicy::default_policy() }
 
@@ -30,7 +36,13 @@ fn assert_bounded(elapsed: Duration, bound: Duration, case: &str) {
 #[test]
 fn small_benign_allow_fast() {
     let start = Instant::now();
-    let verdict = evaluate(AuditMode::Block, "exec", "echo hello", &policy());
+    let verdict = evaluate_with_whitelist(
+        AuditMode::Block,
+        "exec",
+        "echo hello",
+        &policy(),
+        test_whitelist(),
+    );
     let elapsed = start.elapsed();
     assert_eq!(verdict, AuditVerdict::Allow);
     assert_bounded(elapsed, Duration::from_secs(1), "small_benign");
@@ -41,7 +53,8 @@ fn large_benign_1mb_bounded() {
     let body = "echo ok\n".repeat(128 * 1024);
     assert!(body.len() >= 1024 * 1024, "实际 {}", body.len());
     let start = Instant::now();
-    let verdict = evaluate(AuditMode::Block, "exec", &body, &policy());
+    let verdict =
+        evaluate_with_whitelist(AuditMode::Block, "exec", &body, &policy(), test_whitelist());
     let elapsed = start.elapsed();
     assert_eq!(verdict, AuditVerdict::Allow);
     assert_bounded(elapsed, Duration::from_secs(5), "large_benign_1mb");
@@ -52,7 +65,8 @@ fn large_dangerous_tail_blocked() {
     let mut body = "echo ok\n".repeat(128 * 1024);
     body.push_str("; rm -rf /");
     let start = Instant::now();
-    let verdict = evaluate(AuditMode::Block, "exec", &body, &policy());
+    let verdict =
+        evaluate_with_whitelist(AuditMode::Block, "exec", &body, &policy(), test_whitelist());
     let elapsed = start.elapsed();
     assert!(matches!(verdict, AuditVerdict::Block { .. }), "{verdict:?}");
     assert_bounded(elapsed, Duration::from_secs(5), "large_dangerous_tail");
@@ -61,7 +75,8 @@ fn large_dangerous_tail_blocked() {
 #[test]
 fn empty_body_allow() {
     let start = Instant::now();
-    let verdict = evaluate(AuditMode::Block, "exec", "", &policy());
+    let verdict =
+        evaluate_with_whitelist(AuditMode::Block, "exec", "", &policy(), test_whitelist());
     let elapsed = start.elapsed();
     assert_eq!(verdict, AuditVerdict::Allow);
     assert_bounded(elapsed, Duration::from_secs(1), "empty_body");
@@ -72,7 +87,8 @@ fn near_8mb_ceiling_bounded() {
     // 8MB 上限附近体（8MiB - 1KiB），只锚数量级不卡墙钟。
     let body = "x".repeat(8 * 1024 * 1024 - 1024);
     let start = Instant::now();
-    let verdict = evaluate(AuditMode::Block, "exec", &body, &policy());
+    let verdict =
+        evaluate_with_whitelist(AuditMode::Block, "exec", &body, &policy(), test_whitelist());
     let elapsed = start.elapsed();
     assert_eq!(verdict, AuditVerdict::Allow);
     assert_bounded(elapsed, Duration::from_secs(15), "near_8mb_ceiling");
@@ -81,7 +97,13 @@ fn near_8mb_ceiling_bounded() {
 #[test]
 fn approve_dangerous_verdict_shape() {
     let start = Instant::now();
-    let verdict = evaluate(AuditMode::Approve, "exec", "rm -rf /", &policy());
+    let verdict = evaluate_with_whitelist(
+        AuditMode::Approve,
+        "exec",
+        "rm -rf /",
+        &policy(),
+        test_whitelist(),
+    );
     let elapsed = start.elapsed();
     match verdict {
         AuditVerdict::NeedApproval { reason, summary } => {

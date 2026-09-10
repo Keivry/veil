@@ -186,6 +186,18 @@ pub(super) fn extract_responses_seq(v: &Value) -> Option<u64> {
     })
 }
 
+/// B3/P2-2：Chat 是否出现非 null `finish_reason`（soft-terminal 信号）。
+/// 上游以 `finish_reason` 收尾却不发 `[DONE]` 时据此置 open-ended 可观测。
+pub(super) fn chat_finish_reason_seen(v: &Value) -> bool {
+    v.get("choices")
+        .and_then(|c| c.as_array())
+        .is_some_and(|choices| {
+            choices
+                .iter()
+                .any(|ch| ch.get("finish_reason").is_some_and(|r| !r.is_null()))
+        })
+}
+
 pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
     use crate::service::llm_gateway::Protocol as P;
     match protocol {

@@ -268,12 +268,12 @@ impl ApprovalGateway for MatrixApproval {
 #[cfg(test)]
 mod approval_tests {
     use super::{
-        super::{AUDIT_TIMEOUT_SECS, MatrixBot, TextCommand},
+        super::{MatrixBot, TextCommand},
         *,
     };
 
     fn approval() -> MatrixApproval {
-        MatrixApproval::new(vec!["@admin:example.com".to_string()], AUDIT_TIMEOUT_SECS)
+        MatrixApproval::new(vec!["@admin:example.com".to_string()], 90)
     }
 
     #[tokio::test]
@@ -326,7 +326,6 @@ mod approval_tests {
     #[test]
     fn timeout_credential_300s_audit_90s() {
         assert_eq!(CREDENTIAL_TIMEOUT_SECS, 300);
-        assert_eq!(AUDIT_TIMEOUT_SECS, 90);
         let gw = approval();
         assert_eq!(gw.audit_timeout(), Duration::from_secs(90));
         assert_eq!(gw.credential_timeout(), Duration::from_secs(300));

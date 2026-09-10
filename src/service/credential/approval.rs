@@ -7,7 +7,7 @@
 use {
     super::{super::matrix, AppStateParts, vault_ops::query_keepass},
     crate::{
-        approval::{ApprovalGateway as _, NoopApproval, PendingRecord},
+        approval::PendingRecord,
         error::{Result, VeilError},
     },
     std::time::Duration,
@@ -29,8 +29,6 @@ fn approval_event_id(key: &str, reason: &str) -> String {
 
 async fn submit_pending(state: &impl AppStateParts, key: &str, reason: &str) -> String {
     let record = PendingRecord::new(key, reason);
-    let gateway = NoopApproval;
-    let _ = gateway.request_approval(&record);
     state.pending().insert(record);
     let event_id = approval_event_id(key, reason);
     let branch = matrix::MatrixBranch::from_reason(reason);
