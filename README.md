@@ -476,9 +476,10 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 风险：若下游 Hermes 未对空流做 stub 保护，Chat/Anthropic 真空流将表现为客户端解析错误或
   空等。缓解：Responses 仍合成 `response.failed`；Chat/Anthropic 依赖下游 stub。
 - 下游依赖证据：**待人工确认**（open item，owner：下游集成）。本仓仅有间接声明——
-  `openspec/specs/stream-protocol-parity/spec.md` 与归档 change
-  `2026-09-09-veil-llm-protocol-parity` 断言「Hermes stub protection still applies」，
+  归档 change `2026-09-09-veil-llm-protocol-parity` 断言「Hermes stub protection still applies」，
   以及 `src/handler/llm/stream_tests.rs` 注释「Hermes 靠缺失 finish_reason 走 stub」；
+  `openspec/specs/stream-protocol-parity/spec.md` 已（经 `veil-residual-followup`）去保证化——
+  不再将 stub 保护列为仓内保证，明确其为外部依赖并指向本 open item。
   仓内**无** Hermes 侧源码/配置可独立佐证，故不满足「证实存在」，按未证实处置。
 - 升级路径：若人工确认 Hermes 无 stub 保护，则另立 change 评估「Chat/Anthropic 空流补终止帧」
-  路线，实施前须修订 `stream-protocol-parity` spec（本 change 不改该 spec 的 SHALL 文本）。
+  路线，实施前须再次修订 `stream-protocol-parity` spec。
