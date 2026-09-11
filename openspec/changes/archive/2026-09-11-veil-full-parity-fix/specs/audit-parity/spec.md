@@ -6,7 +6,7 @@
 
 ### Requirement: 策略引擎补名单与预检
 
-审计 SHALL 支持 `allow/deny` 名单、`internal_suffixes`、host 提取、`audit_precheck`、evaluate 内 MXID 白名单校验、旧 `AUDIT_ENABLED` 兼容；策略文件 SHALL 兼容原仓全量形态（allow/deny/dangerous 可覆盖）。
+审计 SHALL 支持 `allow/deny` 名单、`internal_suffixes`、host 提取、`audit_precheck`、evaluate 内 MXID 白名单校验、旧 `AUDIT_ENABLED` 兼容（触发条件：`AUDIT_MODE` 缺失或空白；真值集合 `1/true/yes/on`，trim + 大小写不敏感，映射 `block`；接线点：`Config::load_from` 缺失回退分支调用 `audit_enabled_compat`，口径见 change `veil-config-legacy-compat`）；策略文件 SHALL 兼容原仓全量形态（allow/deny/dangerous 可覆盖）。
 
 #### Scenario: allow 名单放行
 

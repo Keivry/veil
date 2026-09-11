@@ -23,7 +23,7 @@
 
 ## 4. 审计 parity（P1）
 
-- [x] 4.1 allow/deny 名单 + internal_suffixes + host 提取 + precheck + MXID + AUDIT_ENABLED 兼容 + 策略全形态，验证：allow 放行、内网不判外传
+- [x] 4.1 allow/deny 名单 + internal_suffixes + host 提取 + precheck + MXID + AUDIT_ENABLED 兼容 + 策略全形态，验证：allow 放行、内网不判外传；`AUDIT_ENABLED` 回退接线证据：`Config::load_from`（`src/config/env_parse.rs`）在 `AUDIT_MODE` 缺失/空白时调用 `audit_enabled_compat`（`src/service/audit/verdict.rs`），真值 `1/true/yes/on` → `block`（change `veil-config-legacy-compat`）
 - [x] 4.2 日志口径对齐（先脱敏后截断 + 异常占位符），验证：强化层异常零明文
 - [x] 4.3 hold 判定清理 + decide 落实，验证：增量未收齐不放行
 
