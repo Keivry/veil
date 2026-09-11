@@ -46,11 +46,11 @@ _ARCHIVED_HARDENING_REF = "veil-hardening 归档后其 change-local admin-rateli
 # 但不算失败。其余悬空引用（含 README.md 全部引用）一律 FAIL。
 PENDING_REFS: dict[tuple[str, str], str] = {
     (
-        "openspec/changes/veil-config-legacy-compat/tasks.md",
+        "openspec/changes/archive/2026-09-11-veil-config-legacy-compat/tasks.md",
         "openspec/changes/veil-full-parity-fix/specs/audit-parity/spec.md",
     ): _ARCHIVED_HISTORY,
     (
-        "openspec/changes/veil-docs-contract-sync/tasks.md",
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-sync/tasks.md",
         "openspec/changes/veil-arch-docs-cleanup/specs/arch-docs-cleanup/spec.md",
     ): "归档兜底路径（canonical arch-docs-cleanup 在位）；历史记录，其他 change 目录禁改",
     (
@@ -66,11 +66,11 @@ PENDING_REFS: dict[tuple[str, str], str] = {
         "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
     ): _ARCHIVED_HARDENING_REF,
     (
-        "openspec/changes/veil-docs-contract-sync/design.md",
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-sync/design.md",
         "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
     ): _ARCHIVED_HARDENING_REF,
     (
-        "openspec/changes/veil-docs-contract-sync/tasks.md",
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-sync/tasks.md",
         "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
     ): _ARCHIVED_HARDENING_REF,
     (

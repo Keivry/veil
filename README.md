@@ -567,6 +567,6 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   不伪造内容/usage/成功（Anthropic `error` 本身即终端，其后不注入 `message_stop`）。
 - 口径变更声明：本条替换旧「Chat/Anthropic 真空流保持 open-ended」口径；既有
   `stream-protocol-parity` spec 的空流条款待随本 change 归档时同步修订，
-  行为真相源以 `openspec/changes/veil-llm-protocol-hardening/specs/llm-protocol-hardening/spec.md`（未归档，待该 change 归档后晋升 canonical）为准。
+  行为真相源以 `openspec/specs/llm-protocol-hardening/spec.md`（canonical，该 change 已归档）为准。
 - 风险：Anthropic 严格 SDK 若要求 `message_delta` 才认流闭合，最小信封可能被拒收；
   以 spec「真空流最小终止」Scenario 为准，实测需要时另立 change 补帧。
