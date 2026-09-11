@@ -205,3 +205,76 @@ async fn t1_2_empty_window_snapshot_shape_ok() {
     assert!(body["points"].as_array().unwrap().is_empty());
     handle.abort();
 }
+
+#[tokio::test]
+async fn legacy_range_four_tiers_map_and_points_equivalent() {
+    // T4/D4：旧 `range=1h/24h/7d/30d` 四档映射 five_min/hourly/daily/daily，
+    // 逐档 deprecated 标注 + 与同窗新口径 points 逐点等价；未知 range 维持 400。
+    let (app, state) = test_app();
+    let ts = now_secs();
+    let u1 = usage(10, 5, 15);
+    let u2 = usage(4, 2, 6);
+    state.admin_state().metrics.record_chat(ChatRecord {
+        protocol: Protocol::Chat,
+        model: "legacy-m",
+        latency_ms: 12,
+        usage: Some(&u1),
+        truncated_mode: None,
+        is_precise: true,
+        ts_secs: ts,
+    });
+    state.admin_state().metrics.record_chat(ChatRecord {
+        protocol: Protocol::Responses,
+        model: "legacy-m",
+        latency_ms: 20,
+        usage: Some(&u2),
+        truncated_mode: None,
+        is_precise: true,
+        ts_secs: ts,
+    });
+    state.admin_state().metrics.flush().await.unwrap();
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+
+    let point_key = |v: &serde_json::Value| {
+        (
+            v["window"].as_str().unwrap_or("").to_string(),
+            v["protocol"].as_str().unwrap_or("").to_string(),
+        )
+    };
+    for (range, granularity) in [
+        ("1h", "five_min"),
+        ("24h", "hourly"),
+        ("7d", "daily"),
+        ("30d", "daily"),
+    ] {
+        let (status, legacy) =
+            get_json(&client, &base, &format!("/_admin/series?range={range}")).await;
+        assert_eq!(status, 200, "{range}: {legacy}");
+        assert_eq!(legacy["granularity"], granularity, "{range} 映射粒度");
+        assert!(
+            legacy.get("deprecated").is_some(),
+            "{range} 须弃用标注: {legacy}"
+        );
+        assert_eq!(legacy["compat"]["range"], range, "{range} compat 回显");
+        let (status, fresh) = get_json(
+            &client,
+            &base,
+            &format!("/_admin/series?granularity={granularity}"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let mut legacy_points = legacy["points"].as_array().unwrap().clone();
+        let mut fresh_points = fresh["points"].as_array().unwrap().clone();
+        legacy_points.sort_by_key(point_key);
+        fresh_points.sort_by_key(point_key);
+        assert_eq!(
+            legacy_points, fresh_points,
+            "{range} 与 {granularity} 同窗 points 须逐点等价"
+        );
+    }
+    // 未知 range 维持既有 400 口径。
+    let (status, _) = get_json(&client, &base, "/_admin/series?range=90d").await;
+    assert_eq!(status, 400, "未知 range 须维持既有报错口径");
+    handle.abort();
+}

@@ -61,9 +61,23 @@ impl Scope {
         detector: &PiiDetector,
         text: &str,
     ) -> String {
-        let cred_map = vault.snapshot_p2t();
+        self.redact_request_with_report(vault, detector, text)
+            .await
+            .0
+    }
+
+    /// 请求侧脱敏（H1/D3 报告变体）：返回 `(脱敏文本, 是否经 loads→walk→dumps 重序列化)`。
+    /// 重序列化判定 = 有替换命中（含自定义预扫）且输入为可 walk 的 JSON 容器；
+    /// 非 JSON 字节级替换与原文透传返回 `false`（对齐 README §7.7 置位口径）。
+    pub async fn redact_request_with_report(
+        &self,
+        vault: &CredentialVault,
+        detector: &PiiDetector,
+        text: &str,
+    ) -> (String, bool) {
+        let cred_map = vault.p2t_snapshot();
         // 自定义正则先在原文上预扫并注册（值→token 快照供叶回调复用）。
-        let custom_snapshot = prescan_custom(detector, &self.pii, text, &cred_map).await;
+        let custom_snapshot = prescan_custom(detector, &self.pii, text, cred_map.map()).await;
         let replaced = std::cell::Cell::new(false);
         let mut leaf = |s: String| {
             let r = redact_leaf(&self.pii, detector, &cred_map, &custom_snapshot, s.clone());
@@ -74,9 +88,9 @@ impl Scope {
         };
         let out = json_walk::process_text(text, &mut leaf, json_walk::DEPTH_LIMIT);
         if replaced.get() || !custom_snapshot.is_empty() {
-            strip_partials(&out)
+            (strip_partials(&out), is_json_container(text))
         } else {
-            strip_partials(text)
+            (strip_partials(text), false)
         }
     }
 
@@ -87,8 +101,8 @@ impl Scope {
         detector: &PiiDetector,
         text: &str,
     ) -> String {
-        let cred_map = vault.snapshot_p2t();
-        let custom_snapshot = prescan_custom(detector, &self.pii, text, &cred_map).await;
+        let cred_map = vault.p2t_snapshot();
+        let custom_snapshot = prescan_custom(detector, &self.pii, text, cred_map.map()).await;
         let redacted = redact_leaf(
             &self.pii,
             detector,
@@ -106,7 +120,7 @@ impl Scope {
     /// [`Scope::restore_response_with_spans`]（生产调用方均经该入口）；
     /// 可见性收敛为模块内，单测同文件可达。
     fn restore_response(&self, vault: &CredentialVault, text: &str) -> String {
-        let step1 = vault.restore(text);
+        let step1 = restore_cred_tokens(vault, text);
         let step2 = self.pii.restore_with_fuzzy(&step1, self.fuzzy_restore);
         let step3 = vault.strip_hallucinated(&step2);
         strip_partials(&step3)
@@ -170,6 +184,36 @@ impl Scope {
         (restored, dedup)
     }
 
+    /// 响应还原（JSON 字符串上下文变体，H2/D1）：与
+    /// [`Scope::restore_response_with_spans`] 同还原语义（PII/凭据/幻觉/残缺），
+    /// 写回明文按 RFC 8259 转义（`"`→`\"`、`\`→`\\`、控制字符转义），
+    /// 保证「还原前可解析」的 JSON 帧「还原后仍可解析」；返回的 span 为
+    /// 转义后文本中的还原明文区间（供
+    /// [`Scope::redact_response_new_pii_with_skip`] 跳过二次掩码）。
+    /// 非 JSON 帧（plain 分支）MUST NOT 走本入口（保持字节级原样还原）。
+    pub fn restore_response_with_spans_json(
+        &self,
+        vault: &CredentialVault,
+        text: &str,
+    ) -> (String, Vec<(usize, usize)>) {
+        let (restored, spans) = self.restore_response_with_spans(vault, text);
+        if spans.is_empty() {
+            return (restored, spans);
+        }
+        let mut out = String::with_capacity(restored.len());
+        let mut escaped_spans: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        let mut cursor = 0usize;
+        for (s, e) in spans {
+            out.push_str(&restored[cursor..s]);
+            let start = out.len();
+            out.push_str(&json_escape_plain(&restored[s..e]));
+            escaped_spans.push((start, out.len()));
+            cursor = e;
+        }
+        out.push_str(&restored[cursor..]);
+        (out, escaped_spans)
+    }
+
     /// 响应侧新检出：响应中出现的新 PII 注册进响应表（不进请求还原表），
     /// 以新占位符呈现，不还原为明文。
     /// `PII_RESPONSE_SIDE=0` 时直接返回原文（响应侧脱敏关闭）。
@@ -182,12 +226,41 @@ impl Scope {
         if !self.response_side {
             return text.to_string();
         }
-        let cred_map = vault.snapshot_p2t();
-        let custom_snapshot = prescan_custom_response(detector, &self.pii, text, &cred_map).await;
-        let mut leaf =
-            |s: String| redact_leaf_response(&self.pii, detector, &cred_map, &custom_snapshot, s);
+        self.redact_response_new_pii_tracked(vault, detector, text)
+            .await
+            .0
+    }
+
+    /// 响应侧新检出追踪内核（H1/D2，对齐请求侧 FIX-5 `replaced` Cell）：
+    /// 返回 `(输出, 是否发生替换)`；全程零替换且无自定义预扫命中时返回原文
+    /// （跳过 `json_walk::process_text` 的 `jdumps` 重排，逐字节透传）。
+    async fn redact_response_new_pii_tracked(
+        &self,
+        vault: &CredentialVault,
+        detector: &PiiDetector,
+        text: &str,
+    ) -> (String, bool) {
+        if !self.response_side {
+            return (text.to_string(), false);
+        }
+        let cred_map = vault.p2t_snapshot();
+        let custom_snapshot =
+            prescan_custom_response(detector, &self.pii, text, cred_map.map()).await;
+        let replaced = std::cell::Cell::new(false);
+        let mut leaf = |s: String| {
+            let r =
+                redact_leaf_response(&self.pii, detector, &cred_map, &custom_snapshot, s.clone());
+            if r != s {
+                replaced.set(true);
+            }
+            r
+        };
         let out = json_walk::process_text(text, &mut leaf, json_walk::DEPTH_LIMIT);
-        strip_partials(&out)
+        if replaced.get() || !custom_snapshot.is_empty() {
+            (strip_partials(&out), true)
+        } else {
+            (strip_partials(text), false)
+        }
     }
 
     /// 响应侧新检出（跳过还原区间，§2.2）：
@@ -214,6 +287,7 @@ impl Scope {
             return self.redact_response_new_pii(vault, detector, text).await;
         }
         spans.sort_unstable();
+        let replaced = std::cell::Cell::new(false);
         let mut out = String::with_capacity(text.len());
         let mut cursor = 0;
         for (s, e) in spans {
@@ -221,25 +295,81 @@ impl Scope {
                 continue;
             }
             if s > cursor {
-                out.push_str(
-                    &self
-                        .redact_response_new_pii(vault, detector, &text[cursor..s])
-                        .await,
-                );
+                let (seg, seg_replaced) = self
+                    .redact_response_new_pii_tracked(vault, detector, &text[cursor..s])
+                    .await;
+                if seg_replaced {
+                    replaced.set(true);
+                }
+                out.push_str(&seg);
             }
             // 跳过段原样保留：还原出的请求明文不得二次掩码。
             out.push_str(&text[s..e]);
             cursor = e.max(cursor);
         }
         if cursor < text.len() {
-            out.push_str(
-                &self
-                    .redact_response_new_pii(vault, detector, &text[cursor..])
-                    .await,
-            );
+            let (seg, seg_replaced) = self
+                .redact_response_new_pii_tracked(vault, detector, &text[cursor..])
+                .await;
+            if seg_replaced {
+                replaced.set(true);
+            }
+            out.push_str(&seg);
         }
-        strip_partials(&out)
+        if replaced.get() {
+            strip_partials(&out)
+        } else {
+            strip_partials(text)
+        }
     }
+}
+
+/// 凭据 token 逐 token 直查重建（B2/D2）：仅对 `scan_token_forms` 命中的完整形态
+/// 调 `CredentialVault::restore_one`，未注册形态原样保留；与全量 alternation
+/// 替换逐字节等价（还原只做 token→明文，不重序列化）。
+fn restore_cred_tokens(vault: &CredentialVault, text: &str) -> String {
+    let forms = scan_token_forms(text);
+    if forms.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end, token) in forms {
+        out.push_str(&text[cursor..start]);
+        match vault.restore_one(&token) {
+            Some(plain) => out.push_str(&plain),
+            None => out.push_str(&token),
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// `json_walk::process_text` 是否会对该输入走 `loads→walk→dumps`
+/// （长度未超限、BOM 剥离 trim 后以 `{`/`[` 开头且可解析为 object/array）。
+fn is_json_container(text: &str) -> bool {
+    if text.len() > json_walk::SCAN_INPUT_LIMIT {
+        return false;
+    }
+    let stripped = json_walk::strip_bom(text).trim_start();
+    if !(stripped.starts_with('{') || stripped.starts_with('[')) {
+        return false;
+    }
+    matches!(
+        json_walk::jloads(json_walk::strip_bom(text)),
+        Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_))
+    )
+}
+
+/// RFC 8259 字符串上下文转义（JSON 帧还原写回用）：`"`/`\`/控制字符转义。
+/// 复用 `serde_json` 的字符串序列化实现，保证与 JSON 解析器严格互逆。
+fn json_escape_plain(s: &str) -> String {
+    let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""));
+    quoted
+        .strip_prefix('"')
+        .and_then(|q| q.strip_suffix('"'))
+        .map_or_else(|| s.to_string(), str::to_string)
 }
 
 /// 全出口残缺清理：凭据 + PII 两套半截形态统一入口。
@@ -256,399 +386,5 @@ pub fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
 }
 
 #[cfg(test)]
-mod scope_tests {
-    use {
-        super::*,
-        crate::service::{credential_vault::redact_with_map, pii::apply_spans},
-    };
-
-    fn vault_with_secret(secret: &str) -> CredentialVault {
-        let v = CredentialVault::new();
-        v.register(secret).unwrap();
-        v
-    }
-
-    #[tokio::test]
-    async fn request_redact_response_restore() {
-        let vault = vault_with_secret("my-secret-001");
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        let req = r#"{"pwd":"my-secret-001","phone":"13812345678"}"#;
-        let redacted = scope.redact_request(&vault, &detector, req).await;
-        assert!(!redacted.contains("my-secret-001"), "{redacted}");
-        assert!(!redacted.contains("13812345678"), "{redacted}");
-        assert!(redacted.contains("__VG_CRED_"), "{redacted}");
-        assert!(redacted.contains("__PII_"), "{redacted}");
-        // JSON 语义等价：仍可解析，键名层级不变。
-        let v: serde_json::Value = serde_json::from_str(&redacted).unwrap();
-        assert!(v.get("pwd").is_some() && v.get("phone").is_some());
-        let restored = scope.restore_response(&vault, &redacted);
-        assert!(restored.contains("my-secret-001"), "{restored}");
-        assert!(restored.contains("13812345678"), "{restored}");
-    }
-
-    #[tokio::test]
-    async fn response_new_pii_not_restored() {
-        let vault = CredentialVault::new();
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        // 请求期未注册的新 PII：响应侧以新占位符呈现。
-        let resp = scope
-            .redact_response_new_pii(&vault, &detector, r#"{"ip":"8.8.8.8"}"#)
-            .await;
-        assert!(!resp.contains("8.8.8.8"), "{resp}");
-        assert!(resp.contains("__PII_"), "{resp}");
-        // 请求还原表不含该 token：restore 原样保留。
-        let again = scope.restore_response(&vault, &resp);
-        assert!(again.contains("__PII_"), "{again}");
-    }
-
-    #[tokio::test]
-    async fn same_secret_reuse_single_register_rebuild_consistent() {
-        let vault = vault_with_secret("cache-secret-xyz");
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        let req = r#"{"a":"cache-secret-xyz","b":"cache-secret-xyz"}"#;
-        let once = scope.redact_request(&vault, &detector, req).await;
-        let twice = scope.redact_request(&vault, &detector, req).await;
-        assert_eq!(once, twice, "同秘密重复脱敏须复用一致");
-        assert_eq!(vault.len(), 1, "同一秘密只注册一次");
-        // 重建一致：还原后结构与原文一致。
-        let rebuilt = scope.restore_response(&vault, &once);
-        let v_orig: serde_json::Value = serde_json::from_str(req).unwrap();
-        let v_back: serde_json::Value = serde_json::from_str(&rebuilt).unwrap();
-        assert_eq!(v_orig, v_back);
-    }
-
-    #[tokio::test]
-    async fn cross_request_pii_not_restorable() {
-        let vault = CredentialVault::new();
-        let detector = PiiDetector::new();
-        let a = Scope::new();
-        let b = Scope::new();
-        let redacted = a
-            .redact_request(&vault, &detector, "电话 13812345678")
-            .await;
-        assert!(redacted.contains("__PII_"));
-        // B 持有 A 的占位符：还原失败并原样保留。
-        let restored_by_b = b.restore_response(&vault, &redacted);
-        assert!(restored_by_b.contains("__PII_"), "{restored_by_b}");
-        assert!(!restored_by_b.contains("13812345678"));
-    }
-
-    #[tokio::test]
-    async fn nested_tool_calls_roundtrip() {
-        let vault = CredentialVault::new();
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        let req = r#"{"tool_calls":[{"name":"login","arguments":"{\"user\":\"admin\",\"key\":\"p@ss\\\"quote\",\"code\":\"\\u0031\"}"}]}"#;
-        let redacted = scope.redact_request(&vault, &detector, req).await;
-        // 无 PII/凭据命中时结构原样（roundtrip 保证可解析）。
-        let v: serde_json::Value = serde_json::from_str(&redacted).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(v["tool_calls"][0]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["key"], "p@ss\"quote");
-        assert_eq!(args["code"], "1");
-    }
-
-    #[tokio::test]
-    async fn nonstream_and_stream_tail_partials_cleaned() {
-        let vault = CredentialVault::new();
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        // 残缺前缀在出口被清理，不泄漏半截占位符。
-        let dirty = "正文 __VG_CRED_000 与 __PII_2_ab 结尾";
-        let cleaned = scope.redact_request_plain(&vault, &detector, dirty).await;
-        assert!(!cleaned.contains("__VG_CRED_000"), "{cleaned}");
-        assert!(!cleaned.contains("__PII_2_ab"), "{cleaned}");
-        let restored = scope.restore_response(&vault, "ok __VG_CRED_12");
-        assert!(!restored.contains("__VG_CRED_12"), "{restored}");
-    }
-
-    #[tokio::test]
-    async fn response_side_disabled_passes_through() {
-        let vault = CredentialVault::new();
-        let detector = PiiDetector::new();
-        let scope = Scope::with_opts(false, false);
-        let resp = scope
-            .redact_response_new_pii(&vault, &detector, r#"{"ip":"8.8.8.8"}"#)
-            .await;
-        assert!(resp.contains("8.8.8.8"), "{resp}");
-        assert!(!resp.contains("__PII_"), "{resp}");
-        let open = Scope::with_opts(true, false);
-        let masked = open
-            .redact_response_new_pii(&vault, &detector, r#"{"ip":"8.8.8.8"}"#)
-            .await;
-        assert!(!masked.contains("8.8.8.8"), "{masked}");
-    }
-
-    #[test]
-    fn fuzzy_restore_by_sequence_lookup() {
-        let vault = CredentialVault::new();
-        let plain = "13812345678";
-        let exact = Scope::with_opts(true, false);
-        let token = exact.pii_scope().register(plain, false).unwrap();
-        let seq: usize = token
-            .strip_prefix("__PII_")
-            .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
-            .flatten()
-            .expect("token 恒带序号");
-        let fuzzy_tok = format!("__PII_{seq}_zzzz__");
-        // 精确模式保留宽松形态。
-        assert!(
-            exact
-                .restore_response(&vault, &format!("回拨 {fuzzy_tok}"))
-                .contains(&fuzzy_tok)
-        );
-        // 宽松模式按序号还原明文。
-        let scope2 = Scope::with_opts(true, true);
-        let token2 = scope2.pii_scope().register(plain, false).unwrap();
-        let seq2: usize = token2
-            .strip_prefix("__PII_")
-            .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
-            .flatten()
-            .unwrap();
-        let restored = scope2.restore_response(&vault, &format!("回拨 __PII_{seq2}_zzzz__"));
-        assert!(restored.contains(plain), "{restored}");
-        assert!(!restored.contains("__PII_"), "{restored}");
-    }
-
-    #[test]
-    fn strip_partial_and_token_fn_semantics() {
-        let vault = CredentialVault::new();
-        assert_eq!(strip_partials("a __VG_CRED_00 b"), "a  b");
-        assert_eq!(strip_partials("a __PII_3_ab b"), "a  b");
-        assert_eq!(strip_token_forms(&vault, "x __VG_CRED_123456__ y"), "x  y");
-        // PII 完整形态保留（响应期新 token 语义）。
-        assert!(strip_token_forms(&vault, "x __PII_1_ab12cd34__ y").contains("__PII_1_ab12cd34__"));
-    }
-
-    #[tokio::test]
-    async fn multiline_faithful_roundtrip_bytes_identical() {
-        let vault = vault_with_secret("my-secret-001");
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        let req = "第一行 电话 13812345678 📞\n第二行 密钥 my-secret-001 ✅\n第三行 纯文本无敏感";
-        let redacted = scope.redact_request_plain(&vault, &detector, req).await;
-        assert!(!redacted.contains("13812345678"), "{redacted}");
-        assert!(!redacted.contains("my-secret-001"), "{redacted}");
-        assert!(redacted.contains("第三行 纯文本无敏感"), "{redacted}");
-        let restored = scope.restore_response(&vault, &redacted);
-        assert_eq!(restored, req, "往返须字节一致");
-    }
-
-    #[tokio::test]
-    async fn restore_spans_skip_prevents_remask() {
-        let vault = CredentialVault::new();
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        let redacted = scope
-            .redact_request(&vault, &detector, r#"{"phone":"13812345678"}"#)
-            .await;
-        assert!(redacted.contains("__PII_"), "{redacted}");
-        let (restored, spans) = scope.restore_response_with_spans(&vault, &redacted);
-        assert!(restored.contains("13812345678"), "{restored}");
-        assert!(!spans.is_empty());
-        assert!(
-            spans
-                .iter()
-                .any(|(s, e)| &restored[*s..*e] == "13812345678"),
-            "{spans:?}"
-        );
-        // 带 skip：还原明文保持明文。
-        let kept = scope
-            .redact_response_new_pii_with_skip(&vault, &detector, &restored, &spans)
-            .await;
-        assert!(kept.contains("13812345678"), "{kept}");
-        // 对照（不带 skip）：同一明文被套上响应 token，证明 skip 生效。
-        let masked = scope
-            .redact_response_new_pii(&vault, &detector, &restored)
-            .await;
-        assert!(!masked.contains("13812345678"), "{masked}");
-        assert!(masked.contains("__PII_"), "{masked}");
-    }
-
-    #[test]
-    fn credential_restore_spans_cover_plaintext() {
-        let vault = CredentialVault::new();
-        vault.register("my-secret-001").expect("注册恒成功");
-        let scope = Scope::new();
-        let masked = redact_with_map("密码 my-secret-001 结束", &vault.snapshot_p2t());
-        assert!(!masked.contains("my-secret-001"), "{masked}");
-        let (restored, spans) = scope.restore_response_with_spans(&vault, &masked);
-        assert_eq!(restored, "密码 my-secret-001 结束");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(&restored[spans[0].0..spans[0].1], "my-secret-001");
-        // 未知 token 不产生 span。
-        let (unchanged, empty) = scope.restore_response_with_spans(&vault, "纯文本无 token");
-        assert_eq!(unchanged, "纯文本无 token");
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn per_token_lookup_does_not_snapshot_full_vault() {
-        let vault = CredentialVault::new();
-        let secret = "complexity-secret-001";
-        let token = vault.register(secret).unwrap();
-        let scope = Scope::new();
-        let text = format!("{token} {token} {token}");
-        let before = vault.snapshot_calls();
-        let (restored, spans) = scope.restore_response_with_spans(&vault, &text);
-        assert_eq!(restored, format!("{secret} {secret} {secret}"));
-        assert_eq!(spans.len(), 3);
-        // 全量 restore 恰一次快照；逐 token 回查零快照（旧路径每 token +1）。
-        assert_eq!(
-            vault.snapshot_calls() - before,
-            1,
-            "逐 token 回查不得触发全表克隆（复杂度 O(K×N)→O(K+N)）"
-        );
-    }
-
-    #[test]
-    fn span_apply_dedup_semantics() {
-        let out = apply_spans(
-            "hello world",
-            &[(6, 11, "W".to_string()), (6, 11, "W".to_string())],
-            true,
-        );
-        assert_eq!(out, "hello W");
-    }
-
-    #[test]
-    fn restore_idempotent_unknown_passthrough() {
-        let vault = vault_with_secret("my-secret-001");
-        let scope = Scope::new();
-        let tok = scope.pii_scope().register("13812345678", false).unwrap();
-        let mixed = format!("回拨 {tok} 与 __PII_9_ab12cd34__ 及 my-secret-001");
-        let once = scope.restore_response(&vault, &mixed);
-        assert!(once.contains("13812345678"), "{once}");
-        assert!(once.contains("__PII_9_ab12cd34__"), "{once}");
-        assert!(once.contains("my-secret-001"), "明文直通不改写: {once}");
-        let twice = scope.restore_response(&vault, &once);
-        assert_eq!(twice, once, "二次还原须与一次一致");
-    }
-
-    #[tokio::test]
-    async fn dict_5000_no_combined_regex_blowup_time_anchor() {
-        let detector = PiiDetector::new();
-        let dict: Vec<(String, String)> = (0..5000)
-            .map(|i| (format!("合成姓名{i:05}号"), "name".to_string()))
-            .collect();
-        detector.load_dict(&dict);
-        let vault = CredentialVault::new();
-        let scope = Scope::new();
-        let text = "正文含 合成姓名01234号 ok 与其余文字混合".to_string();
-        let start = std::time::Instant::now();
-        let out = scope.redact_request(&vault, &detector, &text).await;
-        let elapsed = start.elapsed();
-        assert!(!out.contains("合成姓名01234号"), "{out}");
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "5000 字典单次扫描须远低于宽松上界（防 13.8ms 爆炸回归），实测 {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn incremental_scan_time_anchor_loose_bound() {
-        let vault = vault_with_secret("anchor-secret-007");
-        let detector = PiiDetector::new();
-        let scope = Scope::new();
-        let start = std::time::Instant::now();
-        for i in 0..100 {
-            let text = format!("{{\"k{i}\":\"v{i} anchor-secret-007 13812345678\"}}");
-            let out = scope.redact_request(&vault, &detector, &text).await;
-            assert!(!out.contains("anchor-secret-007"), "{out}");
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(30),
-            "100 次增量扫描须远低于宽松上界，实测 {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn scope_request_isolation_concurrent_invisible() {
-        let detector = std::sync::Arc::new(PiiDetector::new());
-        let mut handles = Vec::new();
-        for i in 0..4 {
-            let d = std::sync::Arc::clone(&detector);
-            handles.push(tokio::spawn(async move {
-                let vault = CredentialVault::new();
-                let secret = format!("隔离密钥-{i:02}");
-                vault.register(&secret).unwrap();
-                let scope = Scope::new();
-                let text = format!("{{\"s\":\"{secret}\"}}");
-                scope.redact_request(&vault, &d, &text).await
-            }));
-        }
-        let mut outs = Vec::new();
-        for h in handles {
-            outs.push(h.await.expect("隔离任务不得失败"));
-        }
-        for (i, out) in outs.iter().enumerate() {
-            for j in 0..4 {
-                assert!(
-                    !out.contains(&format!("隔离密钥-{j:02}")),
-                    "scope{i} 不得透出任何明文密钥（含自身注册前形态）: {out}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn t12_scope_registration_isolated_across_tasks() {
-        let vault = std::sync::Arc::new(CredentialVault::new());
-        let detector = std::sync::Arc::new(PiiDetector::new());
-        let a = tokio::spawn({
-            let (vault, detector) = (vault.clone(), detector.clone());
-            async move {
-                let scope = Scope::new();
-                scope
-                    .redact_request(&vault, &detector, "号码 13800138000 结束")
-                    .await
-            }
-        });
-        let b = tokio::spawn({
-            let (vault, detector) = (vault.clone(), detector.clone());
-            async move {
-                let scope = Scope::new();
-                scope
-                    .redact_request(&vault, &detector, "号码 13800138000 结束")
-                    .await
-            }
-        });
-        let (out_a, out_b) = tokio::join!(a, b);
-        let (out_a, out_b) = (out_a.expect("任务 A 须成功"), out_b.expect("任务 B 须成功"));
-        assert!(out_a.contains("__PII_"), "A 须脱敏");
-        assert!(out_b.contains("__PII_"), "B 须脱敏");
-        assert_ne!(out_a, out_b, "独立 Scope 的 rand8 须不同（请求隔离）");
-    }
-
-    #[test]
-    fn t12_restore_only_own_scope_tokens() {
-        let vault = CredentialVault::new();
-        let scope_a = Scope::new();
-        let scope_b = Scope::new();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("单线程运行时须可用");
-        let out_a = rt.block_on(scope_a.redact_request(
-            &vault,
-            &PiiDetector::new(),
-            "号码 13800138000 结束",
-        ));
-        let out_b = rt.block_on(scope_b.redact_request(
-            &vault,
-            &PiiDetector::new(),
-            "号码 13800138000 结束",
-        ));
-        assert_ne!(out_a, out_b);
-        assert!(scope_a.restore_response(&vault, &out_b).contains("__PII_"));
-        assert!(scope_b.restore_response(&vault, &out_a).contains("__PII_"));
-        assert!(
-            scope_a
-                .restore_response(&vault, &out_a)
-                .contains("13800138000")
-        );
-    }
-}
+#[path = "scope_tests.rs"]
+mod scope_tests;

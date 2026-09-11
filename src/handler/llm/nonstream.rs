@@ -108,10 +108,14 @@ pub async fn serve_nonstream(
                 resp_headers.insert(n, val);
             }
         }
+        // M1/D4：解码与剥头配对——tower-http 仅在实际解压成功后移除
+        // `content-encoding`；该头仍在 ⇒ 未解压（不支持编码/别名/多值），
+        // 保留编码头与压缩字节供下游自解，不得剥头造成「无编码头 + 压缩字节」。
+        let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
         llm_gateway::filter_hop_headers_counted(
             &mut resp_headers,
             "downstream",
-            llm_gateway::DECODE_ENABLED,
+            decode_enabled,
             Some(&ctx.gateway_metrics),
         );
         for (k, v) in resp_headers.iter() {

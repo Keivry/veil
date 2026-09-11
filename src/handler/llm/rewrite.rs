@@ -43,14 +43,18 @@ pub async fn request_rewrite(
     let mut normalized_out = false;
     let mut body_bytes = body_bytes;
     let mut redacted_text = original_text.clone();
+    let mut redacted_reserialized = false;
     if llm_gateway::should_inject_placeholders(
         true,
         config.redaction_enabled,
         !body_bytes.is_empty(),
     ) {
-        redacted_text = scope
-            .redact_request(&vault, &detector, &original_text)
+        // H1/D3：报告「是否经 loads→walk→dumps 重序列化」，据此诚实置位声明头。
+        let (text, reserialized) = scope
+            .redact_request_with_report(&vault, &detector, &original_text)
             .await;
+        redacted_text = text;
+        redacted_reserialized = reserialized;
     }
     let need_inject = body_value
         .as_ref()
@@ -64,6 +68,7 @@ pub async fn request_rewrite(
         normalized_out = normalized;
     } else if redacted_text != original_text && original_valid {
         body_bytes = redacted_text.into_bytes();
+        normalized_out = redacted_reserialized;
     } else if config.normalize_json_whitespace
         && let Some(v) = body_value.as_ref()
     {
@@ -334,8 +339,32 @@ mod rewrite_unit_tests {
 
     #[tokio::test]
     async fn rewrite_pure_redaction_byte_replace_keeps_normalized_false_e13() {
-        // E13/D2 锁定：纯脱敏字节替换（未重序列化）即使长度变化也不置位；
+        // E13/D2 + H1/D3 锁定：非 JSON 纯文本的字节级替换（未重序列化）不置位；
         // 关闭占位符注入以隔离纯替换分支。
+        let config = test_config(&[("PII_PLACEHOLDER_PROMPT", "0")]);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw = b"call 13812345678 now".to_vec();
+        let out =
+            request_rewrite(raw.clone(), Protocol::Chat, &config, scope, vault, detector).await;
+        assert!(
+            !out.normalized_out,
+            "非 JSON 字节替换不得置位 normalized_out"
+        );
+        assert_ne!(
+            out.body.len(),
+            raw.len(),
+            "脱敏替换前后长度须不同（否则本用例无回归价值）"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.body).contains("__PII_"),
+            "须已发生脱敏替换"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_json_redaction_declares_normalized() {
+        // H1/D3：JSON 容器脱敏经 loads→walk→dumps 重序列化，须置位
+        // `normalized_out`（handler 据此输出 `x-veil-normalized: json-whitespace`）。
         let config = test_config(&[("PII_PLACEHOLDER_PROMPT", "0")]);
         let (scope, vault, detector) = fresh_arcs();
         let raw = br#"{"model":"m","messages":[{"role":"user","content":"call 13812345678"}]}"#;
@@ -348,15 +377,12 @@ mod rewrite_unit_tests {
             detector,
         )
         .await;
-        assert!(!out.normalized_out, "纯字节替换不得置位 normalized_out");
-        assert_ne!(
-            out.body.len(),
-            raw.len(),
-            "脱敏替换前后长度须不同（否则本用例无回归价值）"
-        );
+        assert!(out.normalized_out, "JSON 脱敏重序列化须置位");
+        let text = String::from_utf8_lossy(&out.body).into_owned();
+        assert!(text.contains("__PII_"), "须已脱敏: {text}");
         assert!(
-            String::from_utf8_lossy(&out.body).contains("__PII_"),
-            "须已发生脱敏替换"
+            text.find("\"model\"") < text.find("\"messages\""),
+            "重序列化键序须保持: {text}"
         );
     }
 

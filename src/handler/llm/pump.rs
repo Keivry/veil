@@ -24,6 +24,11 @@ pub mod fragments;
 pub mod spawn;
 pub mod toolbuf;
 
+pub mod decide;
+
+#[cfg(test)]
+mod spawn_tests;
+
 /// 2.3 `stream_pump` 字节泵的上下文：全 `Arc`，`spawn` 闭包全 `Arc move`。
 pub struct StreamPumpCtx {
     pub protocol: Protocol,

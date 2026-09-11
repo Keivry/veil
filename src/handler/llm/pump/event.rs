@@ -131,17 +131,33 @@ pub(super) fn responses_failed_incomplete(
     }
 }
 
-/// P4/D4：`type:"error"` 事件的上游文案提取：`error.message`（对象形态）优先，
-/// 其次顶层 `message`（官方 error 事件形态）；缺失返回 `None`
-/// （合成帧回退既有 `{"id","status"}` 形态，不带 error 字段）。
-pub(super) fn responses_error_message(data: &str) -> Option<String> {
+/// D5：`type:"error"` 事件的上游 error 诊断提取：`error` 对象内存在的
+/// `code`/`type`/`param`/`message` 字段原样保留（缺失 `message` 时回退顶层
+/// `message`）；无 `message` 或 `error` 非对象返回 `None`
+/// （合成帧回退既有 `{"id","status"}` 形态，不带 error 字段、无空字段噪声）。
+pub(super) fn responses_error_object(data: &str) -> Option<Value> {
     let v = serde_json::from_str::<Value>(strip_bom(data)).ok()?;
-    v.get("error")
-        .and_then(|e| e.get("message"))
+    let mut obj = serde_json::Map::new();
+    if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+        for key in ["type", "code", "param", "message"] {
+            if let Some(val) = err.get(key).filter(|x| !x.is_null()) {
+                obj.insert(key.to_string(), val.clone());
+            }
+        }
+    }
+    if !obj.contains_key("message")
+        && let Some(msg) = v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+    {
+        obj.insert("message".to_string(), Value::String(msg.to_string()));
+    }
+    let has_message = obj
+        .get("message")
         .and_then(|m| m.as_str())
-        .or_else(|| v.get("message").and_then(|m| m.as_str()))
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .is_some_and(|s| !s.is_empty());
+    has_message.then_some(Value::Object(obj))
 }
 
 /// E9 合成截断帧 conv 取值：优先流内首见 `id`，其次泵内最新 `conv_id`，
@@ -209,6 +225,22 @@ pub(super) fn chat_finish_reason_seen(v: &Value) -> bool {
                 .iter()
                 .any(|ch| ch.get("finish_reason").is_some_and(|r| !r.is_null()))
         })
+}
+
+/// M3/D6：Anthropic opaque 帧（`thinking`/`signature`/`redacted` 载体）——
+/// 签名/密文完整性优先，响应侧须跳过新 PII 扫描（`redact_response_new_pii*`）
+/// 与 `json_aware_line` 重序列化，仅做字节级还原后透传。
+pub(super) fn is_anthropic_opaque_event(v: &Value) -> bool {
+    let opaque =
+        |t: &str| t.contains("thinking") || t.contains("signature") || t.contains("redacted");
+    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    if opaque(t) {
+        return true;
+    }
+    v.get("delta")
+        .and_then(|d| d.get("type"))
+        .and_then(|x| x.as_str())
+        .is_some_and(opaque)
 }
 
 pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
@@ -413,6 +445,43 @@ mod event_tests {
             P::NonDialog,
             &serde_json::json!({"refusal":"no"})
         ));
+    }
+
+    #[test]
+    fn responses_error_no_message_fallback() {
+        use crate::service::block_inject;
+        // D5：error 对象无 message 或 error 非对象 ⇒ 提取 None，合成帧回退
+        // 既有 `{"id","status"}` 形态（无 panic、无空体、无 error 字段）。
+        for raw in [
+            r#"{"type":"error","error":{"code":"x"}}"#,
+            r#"{"type":"error","error":"oops"}"#,
+            r#"{"type":"error"}"#,
+        ] {
+            assert!(responses_error_object(raw).is_none(), "须回退: {raw}");
+        }
+        let frame = block_inject::responses_failed_frame("r1", None);
+        assert!(frame.contains("\"status\":\"failed\""));
+        assert!(!frame.contains("\"error\""), "回退形态不得带 error 字段");
+        // 顶层 message 回退 + 仅 message 无空字段噪声。
+        let obj = responses_error_object(r#"{"type":"error","message":"boom"}"#).expect("顶层回退");
+        assert_eq!(obj["message"], "boom");
+        let obj = responses_error_object(r#"{"type":"error","error":{"message":"only"}}"#).unwrap();
+        assert!(
+            obj.get("code").is_none() && obj.get("param").is_none() && obj.get("type").is_none()
+        );
+        // 完整诊断字段全保留。
+        let obj = responses_error_object(
+            r#"{"type":"error","error":{"type":"err","code":"c","param":"p","message":"m"}}"#,
+        )
+        .unwrap();
+        for (k, v) in [
+            ("type", "err"),
+            ("code", "c"),
+            ("param", "p"),
+            ("message", "m"),
+        ] {
+            assert_eq!(obj[k], v);
+        }
     }
 
     #[test]

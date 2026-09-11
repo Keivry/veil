@@ -11,9 +11,32 @@ use {
     rand::{rand_core::TryRngCore as _, rngs::OsRng},
     std::{
         collections::{HashMap, HashSet, VecDeque},
-        sync::Mutex,
+        sync::{Mutex, MutexGuard, OnceLock, PoisonError},
     },
 };
+
+/// 锁中毒恢复（B3/D3）：`PoisonError::into_inner` 返回可用守卫，首次 warn。
+fn warn_poison_once() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("PII scope 锁中毒，已 PoisonError::into_inner 恢复（首次告警）");
+    }
+}
+
+fn recover_mutex<T>(lock: std::sync::LockResult<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
+    lock.unwrap_or_else(|e: PoisonError<_>| {
+        warn_poison_once();
+        e.into_inner()
+    })
+}
+
+/// 宽松形态分类正则（字面量提升 `OnceLock`，消除每调用编译与 `.expect`）。
+fn malformed_shape_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^__PII_\d+_[0-9a-fA-F]{8}__$").expect("PII 形态正则恒合法")
+    })
+}
 
 /// 构造 `__PII_<seq>_<rand8>__` token。
 pub fn make_pii_token(seq: usize, rand8: &str) -> String {
@@ -120,7 +143,7 @@ impl PiiScope {
     /// 分配本身走 [`ScopeInner::alloc_seq`] 游标，不做全量重建）。
     #[cfg(test)]
     fn next_available_index(&self) -> usize {
-        let inner = self.inner.lock().expect("PII scope 锁无毒");
+        let inner = recover_mutex(self.inner.lock());
         let mut seq = 1;
         while inner.used_seqs.contains(&seq) {
             seq += 1;
@@ -143,7 +166,7 @@ impl PiiScope {
                 "PII 值不能匹配内部 token 格式或以 token 前缀开头",
             ));
         }
-        let mut inner = self.inner.lock().expect("PII scope 锁无毒");
+        let mut inner = recover_mutex(self.inner.lock());
         if response_side {
             if let Some(tok) = inner.resp_p2t.get(value).cloned() {
                 touch_order(&mut inner.resp_order, value);
@@ -197,7 +220,7 @@ impl PiiScope {
         if !fuzzy {
             return restored;
         }
-        let inner = self.inner.lock().expect("PII scope 锁无毒");
+        let inner = recover_mutex(self.inner.lock());
         if inner.pii_t2p.is_empty() {
             return restored;
         }
@@ -235,7 +258,7 @@ impl PiiScope {
             return text.to_string();
         }
         let restored = {
-            let inner = self.inner.lock().expect("PII scope 锁无毒");
+            let inner = recover_mutex(self.inner.lock());
             if inner.pii_t2p.is_empty() && inner.resp_t2p.is_empty() {
                 return text.to_string();
             }
@@ -251,11 +274,15 @@ impl PiiScope {
                 })
                 .into_owned()
         };
-        let known: HashSet<String> = self
-            .inner
-            .lock()
-            .map(|g| g.pii_t2p.keys().chain(g.resp_t2p.keys()).cloned().collect())
-            .unwrap_or_default();
+        let known: HashSet<String> = {
+            let inner = recover_mutex(self.inner.lock());
+            inner
+                .pii_t2p
+                .keys()
+                .chain(inner.resp_t2p.keys())
+                .cloned()
+                .collect()
+        };
         for m in pii_loose_re().find_iter(&restored) {
             let tok = m.as_str();
             if !known.contains(tok) {
@@ -266,24 +293,22 @@ impl PiiScope {
     }
 
     /// 是否持有该请求 token（跨请求还原隔离断言用）。
-    pub fn contains_request_token(&self, token: &str) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.pii_t2p.contains_key(token))
-            .unwrap_or(false)
+    /// 中毒恢复后返回真实结果，不得静默降级为「不包含」（B3/D3）。
+    /// 仅测试口径（D1/hygiene-round5）：生产零调用，`#[cfg(test)]` 收编，
+    /// 对齐 [`PiiScope::next_available_index`] 的既有处置，release 构建不含该符号。
+    #[cfg(test)]
+    fn contains_request_token(&self, token: &str) -> bool {
+        recover_mutex(self.inner.lock()).pii_t2p.contains_key(token)
     }
 
     /// 记录宽松形态审计计数（同类聚合，调用方限流落盘）。
     pub fn count_malformed(&self, token: &str) -> String {
-        let cat = if regex::Regex::new(r"^__PII_\d+_[0-9a-fA-F]{8}__$")
-            .expect("形态正则恒合法")
-            .is_match(token)
-        {
+        let cat = if malformed_shape_re().is_match(token) {
             "unregistered"
         } else {
             "malformed"
         };
-        let mut counts = self.malformed.lock().expect("计数锁无毒");
+        let mut counts = recover_mutex(self.malformed.lock());
         let c = counts.entry(cat.to_string()).or_insert(0);
         *c += 1;
         cat.to_string()
@@ -300,6 +325,18 @@ fn touch_order(order: &mut VecDeque<String>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_len_under_800_or_split() {
+        // 红线看护（口径=文件总行，含测试与注释，见 hygiene-round4 模板）：
+        // 超 800 即失败，须按模板拆分，不得只改数字放行。
+        const SELF_SRC: &str = include_str!("scope.rs");
+        let lines = SELF_SRC.lines().count();
+        assert!(
+            lines <= 800,
+            "scope.rs {lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+        );
+    }
 
     #[test]
     fn same_value_reuse_and_gap_skip_stable_index() {
@@ -433,7 +470,7 @@ mod tests {
         for i in 0..K {
             scope.register(&format!("f5-linear-{i:04}"), false).unwrap();
         }
-        let inner = scope.inner.lock().expect("PII scope 锁无毒");
+        let inner = recover_mutex(scope.inner.lock());
         assert_eq!(
             inner.scan_steps, K,
             "顺序分配每注册恰探测一次候选（实际 {}）；旧全量重建为 O(K^2)",
@@ -454,7 +491,7 @@ mod tests {
         assert!(!scope.contains_request_token(&first), "最旧条目须被淘汰");
         let reused = scope.register("f5-reused", false).unwrap();
         assert_eq!(parse_pii_seq(&reused), Some(first_seq), "空洞须被复用");
-        let inner = scope.inner.lock().expect("PII scope 锁无毒");
+        let inner = recover_mutex(scope.inner.lock());
         let all: Vec<usize> = inner
             .pii_t2p
             .keys()
@@ -498,6 +535,33 @@ mod tests {
         assert!(pii_loose_re().is_match(&upper), "宽松形态须忽略大小写");
         let restored = scope.restore_with_fuzzy(&format!("回拨 {upper}"), true);
         assert!(restored.contains("13812345678"), "{restored}");
+    }
+
+    /// B3/D3：锁中毒后隔离判定返回真实值、计数正常、注册/还原无 panic。
+    #[test]
+    fn pii_poison_recovery() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let scope = PiiScope::new();
+        let tok = scope.register("13812345678", false).unwrap();
+        for poison in 0..2 {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                if poison == 0 {
+                    let _guard = scope.inner.lock().unwrap();
+                    panic!("注入 inner 锁中毒");
+                }
+                let _guard = scope.malformed.lock().unwrap();
+                panic!("注入 malformed 锁中毒");
+            }));
+        }
+        assert!(
+            scope.contains_request_token(&tok),
+            "中毒后隔离判定须返回真实结果（不得静默 false）"
+        );
+        assert_eq!(scope.count_malformed("__PII_9_ab12cd34__"), "unregistered");
+        assert_eq!(scope.count_malformed("__PII_x__"), "malformed");
+        let tok2 = scope.register("13900000001", false).unwrap();
+        assert!(scope.contains_request_token(&tok2));
+        assert!(scope.restore(&tok2).contains("13900000001"));
     }
 }
 

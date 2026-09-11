@@ -289,10 +289,22 @@ mod tests {
 
     #[test]
     fn data_line_level_json_aware_restore() {
-        let out = json_aware_line("{\"a\": \"v1\"}", |s| s.replace("v1", "v2"));
-        assert!(out.contains("v2"));
+        // H1/D2：JSON 合法即逐字节透传（不再二次序列化/叶变换）；非 JSON 走闭包。
+        let raw = "{\"a\": \"v1\"}";
+        let out = json_aware_line(raw, |s| s.replace("v1", "v2"));
+        assert_eq!(out, raw, "合法 JSON 须返回输入字节");
         let plain = json_aware_line("plain token", |s| s.to_uppercase());
         assert_eq!(plain, "PLAIN TOKEN");
+    }
+
+    #[test]
+    fn json_aware_line_no_second_pass() {
+        // H1/D2：已处理帧再入 `json_aware_line` 输出与输入字节一致
+        //（不再触发第二次 `dumps`，数字/键序/空白零改写）。
+        let processed = r#"{"z":1e3,"a":"已脱敏 __PII_1_ab12cd34__"}"#;
+        assert_eq!(json_aware_line(processed, |s| s), processed);
+        let array = r#"[1e3,{"b":2,"a":1}]"#;
+        assert_eq!(json_aware_line(array, |s| s), array);
     }
 
     #[test]
@@ -336,9 +348,10 @@ mod tests {
         // JSON 残余保留还原（断连半帧不断链）。
         let kept = classify_residue("data: {\"a\": 1").expect("半帧残余须保留");
         assert!(kept.contains("\"a\""));
-        // BOM+JSON 正常解析，不当残余转发。
-        let out = json_aware_line("\u{feff}{\"a\": \"v1\"}", |s| s.replace("v1", "v2"));
-        assert!(out.contains("v2"));
+        // BOM+JSON 正常解析，不当残余转发；H1/D2：合法 JSON 字节透传（含 BOM 输入）。
+        let raw = "\u{feff}{\"a\": \"v1\"}";
+        let out = json_aware_line(raw, |s| s.replace("v1", "v2"));
+        assert_eq!(out, raw, "合法 JSON 须返回输入字节");
         // 残余 DONE 经 parser 直接丢弃，不 data: 转发。
         let mut q = SseParser::new();
         let _ = q.push_bytes("\u{feff}[DONE]".as_bytes());

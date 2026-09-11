@@ -19,6 +19,14 @@ pub const HOP_HEADERS: [&str; 8] = [
 /// `gzip/brotli/deflate` 三开关（见 handler 网关路径），对外统一 `identity`。
 pub const DECODE_ENABLED: bool = true;
 
+/// M1/D4 解码配对判定（下游响应方向）：reqwest/tower-http 仅在实际解压成功后
+/// 移除响应 `content-encoding`；该头仍存在 ⇒ 上游用了网关不支持的编码
+/// （如未启用 feature 的 zstd）、别名（`x-gzip`）或多值编码，未解压——
+/// 此时 MUST NOT 剥头透传压缩字节（否则下游收「无编码头 + 压缩字节」）。
+pub fn downstream_decode_enabled(response_headers: &HeaderMap) -> bool {
+    DECODE_ENABLED && !response_headers.contains_key("content-encoding")
+}
+
 /// 兼容旧单参调用：默认按响应方向计数（`dir="downstream"`），解码配对按 [`DECODE_ENABLED`]。
 pub fn filter_hop_headers(headers: &mut HeaderMap) {
     filter_hop_headers_counted(headers, "downstream", DECODE_ENABLED, None);
@@ -142,6 +150,64 @@ mod tests {
         assert_eq!(n2, 1);
         assert_eq!(m.hop_filtered_count("upstream"), 0);
         assert_eq!(m.hop_filtered_count("downstream"), 1);
+    }
+
+    #[test]
+    fn hop_decode_pairing_zstd() {
+        // M1/D4：未启用 zstd feature 时上游仍回 `content-encoding: zstd` ⇒
+        // tower-http 未解压，配对判定为 false，编码头与压缩字节保留供下游自解
+        //（不得出现「无编码头 + 压缩字节」）。
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut resp = HeaderMap::new();
+        resp.insert("content-encoding", HeaderValue::from_static("zstd"));
+        resp.insert("content-length", HeaderValue::from_static("64"));
+        assert!(!downstream_decode_enabled(&resp), "未解压须禁用剥头");
+        let m = GatewayMetrics::default();
+        let mut copied = resp.clone();
+        let removed = filter_hop_headers_counted(
+            &mut copied,
+            "downstream",
+            downstream_decode_enabled(&resp),
+            Some(&m),
+        );
+        assert_eq!(removed, 0);
+        assert!(
+            copied.get("content-encoding").is_some(),
+            "不得无声明剥头（下游须可自解）"
+        );
+        assert!(copied.get("content-length").is_some(), "长度头须保留");
+        // 已解压（tower-http 已移除编码头）⇒ 配对开启，对外 identity 无需再剥。
+        let mut decoded = HeaderMap::new();
+        decoded.insert("x-real", HeaderValue::from_static("keep"));
+        let decoded_flag = downstream_decode_enabled(&decoded);
+        assert!(decoded_flag);
+        let removed2 =
+            filter_hop_headers_counted(&mut decoded, "downstream", decoded_flag, Some(&m));
+        assert_eq!(removed2, 0);
+        assert!(decoded.get("x-real").is_some());
+    }
+
+    #[test]
+    fn hop_encoding_multivalue_alias() {
+        // M1 spec「内容编码解码配对」三 Scenario：别名（x-gzip）、多值、大小写变体
+        // 均不匹配 tower-http 精确解码条件 ⇒ 未解压，编码头与压缩字节须保留。
+        use axum::http::{HeaderMap, HeaderValue};
+        let m = GatewayMetrics::default();
+        for enc in ["x-gzip", "gzip, br", "GZIP"] {
+            let mut h = HeaderMap::new();
+            h.insert("content-encoding", HeaderValue::from_static(enc));
+            h.insert("content-length", HeaderValue::from_static("32"));
+            let flag = downstream_decode_enabled(&h);
+            assert!(!flag, "{enc} 未解压须配对关闭");
+            let removed = filter_hop_headers_counted(&mut h, "downstream", flag, Some(&m));
+            assert_eq!(removed, 0, "{enc} 不得剥头");
+            assert!(h.get("content-encoding").is_some(), "{enc} 编码头须保留");
+            assert!(h.get("content-length").is_some(), "{enc} 长度头须保留");
+        }
+        // 支持集单值经 tower-http 解码后编码头已移除 ⇒ 对外统一 identity。
+        let mut decoded = HeaderMap::new();
+        decoded.insert("x-real", HeaderValue::from_static("keep"));
+        assert!(downstream_decode_enabled(&decoded));
     }
 
     #[test]

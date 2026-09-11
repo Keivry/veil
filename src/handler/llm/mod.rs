@@ -22,6 +22,8 @@ mod gateway_tests;
 #[cfg(test)]
 mod proto_closeout_tests;
 #[cfg(test)]
+mod stream_fidelity_tests;
+#[cfg(test)]
 mod stream_tests;
 
 /// 限值常量归属 `config.rs`（D1 下沉），此处原位转发防外部引用断裂。
@@ -30,12 +32,15 @@ pub use crate::config::{AUDIT_SUBLIMIT_CEILING_BYTES, GATEWAY_BODY_LIMIT_BYTES};
 /// 审计/扫描类体长归属判定（spec 8MB 上限的回归锚点，不接请求路径）。
 pub fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SUBLIMIT_CEILING_BYTES }
 
-/// 上游转发头：剥 `host`/`content-length`/`content-encoding` 后做 hop 头过滤并计数。
+/// 上游转发头：剥 `host`/`content-length`/`content-encoding` 与下游
+/// `accept-encoding`（M1/D4：reqwest 仅在其请求头缺席时注入网关支持集
+/// `gzip/br/deflate`，从而保证上游只回可解码编码），再做 hop 头过滤并计数。
 pub fn forward_headers(incoming: &HeaderMap, metrics: &GatewayMetrics) -> HeaderMap {
     let mut fwd = incoming.clone();
     fwd.remove(header::HOST);
     fwd.remove(header::CONTENT_LENGTH);
     fwd.remove(header::CONTENT_ENCODING);
+    fwd.remove(header::ACCEPT_ENCODING);
     llm_gateway::filter_hop_headers_counted(
         &mut fwd,
         "upstream",

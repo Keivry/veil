@@ -88,6 +88,8 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 
 - `GET /_admin/` 返回 JSON 索引占位（六路由表与就绪说明），为终态形态；独立 `admin.html` 静态页为 Non-Goal，
   本仓不交付（见 `observability-admin` spec），如需静态控制台由新 change 交付。
+- `GET /_admin`（无尾斜杠）与 `GET /_admin/` 注册为同一索引 handler，均返回 200 JSON 索引
+  （`src/router.rs` 双路由注册）；`/_admin/{*rest}` 未知子路径仍 404。
 - 管理面鉴权：请求头 `X-Admin-Token`（对应环境变量 `OBSERVABILITY_ADMIN_TOKEN`）优先，
   其次 `__Host-admin_token` Cookie，最后仅 SSE 回退可用 `?access_token`；非 SSE 接口以 query 传 token 恒 401。
 
@@ -171,6 +173,8 @@ curl -fsS http://127.0.0.1:8877/credential \
 ## 3. 限流规则
 
 - 通用 admin 接口按源 IP 限流 `10/min`，超限返回 `429` 并携带 `Retry-After` 头（头名大小写不敏感， wire 形态为小写 `retry-after`）。
+- `/_admin/health` 豁免通用 `10/min` 限流（存活探针高频；豁免集为
+  `src/service/admin/ratelimit.rs::admin_rate_exempt_paths()` 唯一项），health 请求不占通用限流桶。
 - `/_admin/events/stream` 按 IP 限制并发 `5`，超限拒绝新连接而不影响已建连接；
   保活 `60s` ping，`5min` 服务端强制重连。
 - `10/min` 为速率维度、`5`/IP 为并发维度，两者正交且均为有意设计。
@@ -213,6 +217,24 @@ done
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
 | 审批超时 | `AUDIT_TIMEOUT` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
 | 凭据审批超时 | `300`s | — | 与审计 `AUDIT_TIMEOUT` 分表 |
+
+### 4.1 内部常量附录（未列即内部实现细节）
+
+附录为可审计登记，不构成外部契约；未列出的常量均属内部实现细节，变更不视为 BREAKING。
+
+| 符号 | 取值 | 来源 |
+|:-----|:-----|:-----|
+| `CREDENTIAL_RATE_WINDOW_SECS` | `2` | `src/config/env_parse.rs` |
+| `REGISTER_RATE_WINDOW_SECS` | `1` | `src/config/env_parse.rs` |
+| `PENDING_TTL_SECS` | `60` | `src/approval.rs` |
+| `OLD_HASH_GRACE_SECS` | `3600` | `src/registry.rs` |
+| `RateTable::MAX_ENTRIES` | `4096` | `src/service/credential/ratelimit.rs` |
+| `RateTable::SWEEP_LEN` | `1000` | `src/service/credential/ratelimit.rs` |
+| `RateTable::SWEEP_SECS` | `60` | `src/service/credential/ratelimit.rs` |
+| `LINE_LIMIT_BYTES` | `16KiB` | `src/config/env_parse.rs` |
+| `EVENT_IDLE_TIMEOUT` | `30s` | `src/config/env_parse.rs` |
+| `KEEPALIVE_INTERVAL` | `10s` | `src/config/env_parse.rs` |
+| `RING_CAP` | `10000` | `src/service/metrics/aggregate.rs` |
 
 ## 5. Go 客户端对接指引
 
@@ -352,9 +374,17 @@ get revoke --name "check-mail"
 每次剥离记 `hop_filtered_total{dir}` 并打 `tracing::debug`（`header`/`dir` 字段）。与原仓差异：原仓显式剥 7 项 HOP
 （`host`/`transfer-encoding`/`content-length`/`content-encoding`/`connection`/`keep-alive`/`te`，`_sse.py:19-28`）；
 本仓为 RFC 9110 §7.6.1 全集 8 项 + `Connection` 头内列名的动态项
-（`src/service/llm_gateway/hop.rs:7-16` 的 `HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用），
-其中 `host` 由 `forward_headers` 单独剥（`src/handler/llm/mod.rs:34-46`）；
+（`src/service/llm_gateway/hop.rs::HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用），
+解码配对开关见同文件 `src/service/llm_gateway/hop.rs::DECODE_ENABLED`，
+其中 `host` 由 `src/handler/llm/mod.rs::forward_headers` 单独剥；
 A5/D9 互引：编码剥离即对外统一 `identity`，见同文件 `filter_hop_headers_counted` 内联注释与单测 `gzip_stripped_as_identity_a5`）。
+
+解码配对补充（M1/D4）：转发上游前 `src/handler/llm/mod.rs::forward_headers` 剥离下游
+`accept-encoding`，由 reqwest 注入网关支持集（`gzip`/`br`/`deflate`）；`content-encoding`
+仅在 reqwest 实际解压后（tower-http 已连同 `content-length` 移除）才对外 `identity`。
+上游若仍回网关不支持编码（如未启用 feature 的 `zstd`）、别名（`x-gzip`）或多值编码，
+该头与 `content-length` 保留供下游自解（`src/service/llm_gateway/hop.rs::downstream_decode_enabled`），
+不得出现「无编码头 + 压缩字节」；支持集内的编码解码与剥头由同一判定配对。
 
 ### 7.2 usage 口径
 
@@ -398,6 +428,11 @@ Responses 断序容忍：流中 `sequence_number` 不连续（跳号/回退）�
 Responses `error` 事件统一为失败终端：流中 `type:"error"` 合成恰一 `response.failed`，
 不出现 `response.completed`、无重复终端（见 `src/handler/llm/pump/spawn.rs`）。
 
+Responses 失败帧诊断字段（M2/D5，lossy 边界）：合成 `response.failed.response.error`
+保留上游 error 对象中存在的 `type`/`code`/`param`/`message` 四字段（缺失 `message`
+或 error 非对象时回退既有 `{"id","status"}` 形态）；error 对象中这四字段之外的其余
+字段不保留，属已声明 lossy 范围，下游诊断依赖须以本清单为准。
+
 空 usage 桶排查指引：观测到某模型空 usage 桶时，先查请求是否显式 `false`
 （转发体保留原值即用户放弃流式用量），再判上游异常或采样缺失，不得直接按故障报修。
 
@@ -418,8 +453,9 @@ Responses `error` 事件统一为失败终端：流中 `type:"error"` 合成恰�
 PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁，跨请求不互见）；
 凭据 `vault` 与 PII `detector` 为进程单例只读复用（还原不断链）。与原仓差异：
 原仓 PII 全局复用（跨请求同明文同 token，prompt-cache 友好但可关联），本仓隐私更严，
-代价是跨请求 prompt-cache 命中率下降，属有意权衡（命中率差异本地不测量：命中率是上游 provider
-侧计费指标，网关侧不可见真值，且请求隔离是隐私硬要求；`TODO(metrics)` 以此为 wont-measure 闭环，见 §8 与 `src/service/metrics.rs` 模块文档）。
+代价是跨请求 prompt-cache 命中率下降，属有意权衡：命中率差异本地不测量（wont-measure）——
+命中率是上游 provider 侧计费指标，网关侧不可见真值，且请求隔离是隐私硬要求
+（见 `src/service/metrics.rs` 模块文档）。
 
 ### 7.4 遗留变量兼容表
 
@@ -459,7 +495,15 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 置位条件三选一：① Chat `stream_options` 注入分支（恒经 `to_vec` 重序列化，与配置开关无关，
   无条件置位，见 `src/handler/llm/rewrite.rs`；Responses 不注入，故不因此置位）；② `NORMALIZE_JSON_WHITESPACE=1` 且请求体可解析为
   JSON（紧凑化重序列化）；③ 占位符说明注入分支（经 `to_string` 紧凑重序列化，见 D1 方案 A）。
-  纯脱敏子串替换（字节级，未重序列化）与原文透传不置位，即使替换前后字节长度变化。
+  纯脱敏替换与原文透传口径：JSON 容器内的脱敏替换经 `json_walk` loads→walk→dumps
+  紧凑重序列化（`scope.rs::redact_request`），重序列化即置位 `x-veil-normalized`
+  （change `veil-gateway-fidelity-fix`（H1）已落地：`normalized_out` 随实际重序列化置位，不再有缺口）；原文透传（零替换）
+  与非 JSON 字节级替换不置位。
+- 响应侧字节保真与已知偏离（H1）：响应帧零替换/零命中时逐字节透传，不触发
+  `loads→walk→dumps`，键序、数字表示（如 `1e3`）与空白均不改写；必须重序列化
+  （响应侧新 PII 掩码）时对象键序保持原序（`serde_json` `preserve_order`），
+  但数字表示与空白仍可能被 `serde_json` 规整（已知偏离，如 `1e3` → `1000.0`），
+  下游做字节级比对须以此为准。
 - 非流两处响应与 SSE 流响应均按同一 `normalized_out` 置位（见 `src/handler/llm/nonstream.rs`、
   `src/handler/llm/pump/event.rs::build_sse_response`，经 `pump.rs` 与 `handler/llm/mod.rs` 重导出亦可用；D9 互引见 `arch-docs-cleanup` spec（canonical，自 `veil-arch-docs-cleanup` 归档晋升）。
 
@@ -499,6 +543,13 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
 - 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 20 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。
+  **已纳入 gate 步骤**（`veil-test-coverage-fill` T3）：`bash scripts/gate.sh` 第 6 步执行真 SDK 一致性
+  （20 项 = 11 常规 + 3 阻断 + 5 取用 + 1 无库 503），与 fmt/clippy/test/文档路径/文件大小五步串联，任一失败整体非零退出。
+  前置条件：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
+  可用 `VEIL_CONFORMANCE_PYTHON` 覆盖）与 SDK pin `openai==3.5.0`/`anthropic==1.1.0` + `pykeepass`；
+  无 TPM 硬件时脚本内建 `VEIL_ALLOW_MOCK_TPM=1` 回退（仅开发/CI，生产接 TPM 2.0 硬件）。
+  跳过语义：缺前置条件默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1` 为显式跳过
+  （打印跳过理由与文档位置），不出现无输出的静默跳过。
 
 ### 8.6 空流三协议语义与原仓差异（P2，`veil-llm-protocol-hardening`）
 

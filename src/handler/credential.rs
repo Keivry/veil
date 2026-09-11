@@ -244,7 +244,17 @@ pub async fn register_caller_handler(
     let view =
         service::register_caller_extended(&state, &params, source.as_deref().unwrap_or("unknown"))
             .await?;
-    Ok(Json(json!({ "ok": true, "registration": view })))
+    // D8.3 Go 加性超集：既有 `ok`/`registration` 不删，顶层同步 Go 形态字段
+    //（`name`/`script_path`/`script_hash`/`entries`/`allow_mode`）供直接解析。
+    Ok(Json(json!({
+        "ok": true,
+        "registration": view.clone(),
+        "name": view.name,
+        "script_path": view.script_path,
+        "script_hash": view.script_hash,
+        "entries": view.entries,
+        "allow_mode": view.allow_mode,
+    })))
 }
 
 #[derive(Debug, Clone, Deserialize)]

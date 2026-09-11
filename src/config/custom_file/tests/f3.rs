@@ -98,7 +98,7 @@ fn pii_dict_file_alias_equivalent_hits_and_redaction() {
         let out = crate::service::redaction::redact_leaf(
             &scope,
             &d,
-            &HashMap::new(),
+            &crate::service::credential_vault::P2tSnapshot::empty(),
             &HashMap::new(),
             "联系 张三 或 李四".to_string(),
         );

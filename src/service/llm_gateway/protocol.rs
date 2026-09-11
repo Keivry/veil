@@ -21,6 +21,12 @@ impl Protocol {
     }
 }
 
+// 新增协议检查清单（D6/hygiene-round5）：新增第 4 协议时，除本表外还须同步：
+// `usage.rs`（用量提取/缓存列）、`tool.rs`（工具调用判定）、`sse/meta.rs`（截断模式）、
+// `block_inject/frames.rs`（终止帧合成）、`placeholder.rs`（说明注入/schema 判定）、
+// `handler/llm/mod.rs::protocol_header_value`（下游协议头）、`rewrite.rs`（请求改写）、
+// `block_inject.rs`（阻断体）。本清单为最低覆盖，新增协议 change 仍须全量
+// grep `Protocol::` 复查（见 design D6）。
 const STRICT_TAILS: [(&str, Protocol); 3] = [
     ("chat/completions", Protocol::Chat),
     ("v1/messages", Protocol::Anthropic),

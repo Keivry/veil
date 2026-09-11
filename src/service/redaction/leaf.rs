@@ -2,7 +2,7 @@
 
 use {
     super::super::{
-        credential_vault::redact_with_map,
+        credential_vault::P2tSnapshot,
         pii::{PiiDetector, PiiScope, apply_spans, arbitrate, credential_spans, protected_spans},
     },
     std::collections::HashMap,
@@ -90,18 +90,18 @@ pub(crate) async fn prescan_custom_response(
 pub(crate) fn redact_leaf(
     scope: &PiiScope,
     detector: &PiiDetector,
-    cred_map: &HashMap<String, String>,
+    cred_map: &P2tSnapshot,
     custom_snapshot: &HashMap<String, String>,
     text: String,
 ) -> String {
-    // 1) 凭据替换（长度降序单次）。
-    let after_cred = redact_with_map(&text, cred_map);
+    // 1) 凭据替换（长度降序单次；快照内预编译正则）。
+    let after_cred = cred_map.redact(&text);
     // 2) 内置 + 字典同步扫描（凭据优先已在扫描内跳过）。
-    let mut hits = detector.scan_spans_sync(&after_cred, cred_map);
+    let mut hits = detector.scan_spans_sync(&after_cred, cred_map.map());
     // 3) 自定义快照值在叶内定位（逐值全出现点，边界由加载期 lookaround 保证，
     //    此处做区间保护：与凭据/占位符/已命中重叠则跳过）。
     let protected = protected_spans(&after_cred);
-    let cred_spans = credential_spans(&after_cred, cred_map);
+    let cred_spans = credential_spans(&after_cred, cred_map.map());
     let mut extra = Vec::new();
     let mut keys: Vec<&String> = custom_snapshot.keys().collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
@@ -147,14 +147,14 @@ pub(crate) fn redact_leaf(
 pub(crate) fn redact_leaf_response(
     scope: &PiiScope,
     detector: &PiiDetector,
-    cred_map: &HashMap<String, String>,
+    cred_map: &P2tSnapshot,
     custom_snapshot: &HashMap<String, String>,
     text: String,
 ) -> String {
-    let after_cred = redact_with_map(&text, cred_map);
-    let mut hits = detector.scan_spans_sync(&after_cred, cred_map);
+    let after_cred = cred_map.redact(&text);
+    let mut hits = detector.scan_spans_sync(&after_cred, cred_map.map());
     let protected = protected_spans(&after_cred);
-    let cred_spans = credential_spans(&after_cred, cred_map);
+    let cred_spans = credential_spans(&after_cred, cred_map.map());
     let mut keys: Vec<&String> = custom_snapshot.keys().collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
     for value in keys {

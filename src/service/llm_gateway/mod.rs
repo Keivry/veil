@@ -245,7 +245,13 @@ pub async fn fetch_upstream_with_retry(
 }
 
 pub use {
-    hop::{DECODE_ENABLED, HOP_HEADERS, filter_hop_headers, filter_hop_headers_counted},
+    hop::{
+        DECODE_ENABLED,
+        HOP_HEADERS,
+        downstream_decode_enabled,
+        filter_hop_headers,
+        filter_hop_headers_counted,
+    },
     placeholder::{
         has_placeholder_tokens,
         inject_placeholder_prompt,

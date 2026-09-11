@@ -51,6 +51,8 @@ pub trait AppStateParts {
     fn sqlite_error_text(&self) -> Option<String>;
     fn registry(&self) -> &Arc<tokio::sync::RwLock<CallerRegistry>>;
     fn registry_path(&self) -> &PathBuf;
+    /// 写路径全序点（B1/D1）：仅三条低频管理写路径经此串行化落盘，读路径不经过。
+    fn registry_save_lock(&self) -> &Arc<tokio::sync::Mutex<()>>;
     fn keepass(&self) -> &Arc<dyn KeePassBackend>;
     fn pending(&self) -> &Arc<PendingApprovals>;
     fn approval(&self) -> &Arc<matrix::MatrixApproval>;
@@ -137,6 +139,15 @@ pub struct RegistrationView {
     pub description: String,
     #[serde(default)]
     pub allow_mode: Option<AutoApprove>,
+    /// Go 加性兼容（D8.3）：与 `caller_path` 同值，只增不改。
+    #[serde(default)]
+    pub script_path: String,
+    /// Go 加性兼容（D8.3）：注册脚本哈希（`expected_hash` 回显）。
+    #[serde(default)]
+    pub script_hash: String,
+    /// Go 加性兼容（D8.3）：条目→字段授权映射回显。
+    #[serde(default)]
+    pub entries: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub(crate) fn registration_view(entry: &CallerEntry) -> RegistrationView {
@@ -148,6 +159,9 @@ pub(crate) fn registration_view(entry: &CallerEntry) -> RegistrationView {
         name: entry.name.clone(),
         description: entry.description.clone(),
         allow_mode: entry.allow_mode.or(entry.auto_approve),
+        script_path: entry.caller_path.clone(),
+        script_hash: entry.expected_hash.clone(),
+        entries: entry.entries.clone(),
     }
 }
 

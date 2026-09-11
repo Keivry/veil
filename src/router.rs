@@ -485,6 +485,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_redaction_declares_normalized_header_e2e() {
+        // H1/D3 E2E：JSON 请求体脱敏重序列化 → 下游响应含 `x-veil-normalized`;
+        // 上游收到脱敏体（键序保持，不含原文）。
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (upstream, uhandle) = mock_upstream_echo(seen.clone()).await;
+        let app = test_app(&[
+            ("LLM_UPSTREAM", upstream.as_str()),
+            ("PII_PLACEHOLDER_PROMPT", "0"),
+        ]);
+        let (base, handle) = serve_and_client(app).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"call 13812345678"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-veil-normalized")
+                .and_then(|v| v.to_str().ok()),
+            Some("json-whitespace"),
+            "JSON 脱敏重序列化须声明"
+        );
+        let forwarded = String::from_utf8_lossy(&seen.lock().unwrap().clone()).into_owned();
+        assert!(
+            forwarded.contains("__PII_"),
+            "上游须收到脱敏体: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("13812345678"),
+            "不得外泄原文: {forwarded}"
+        );
+        handle.abort();
+        uhandle.abort();
+    }
+
+    #[tokio::test]
+    async fn register_caller_go_shape_superset() {
+        // GO/D8.3：Go 形态请求（`name/script_path/script_hash/entries/allow_mode`）
+        // 注册成功；响应提供加性超集（顶层 + `registration` 内可解析），
+        // 既有字段不删、重名 409 语义不变。
+        let (base, handle) = serve_and_client(test_app(&[])).await;
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "name": "check-mail",
+            "script_path": "/srv/go-shape.sh",
+            "script_hash": "gohash-shape-1",
+            "entries": {"网易": ["授权码"]},
+            "allow_mode": "true",
+        });
+        let resp = client
+            .post(format!("{base}/register-caller"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["registration"]["caller_path"], "/srv/go-shape.sh");
+        assert!(
+            v["registration"]["status"].as_str().is_some(),
+            "既有 status 字段须保留: {v}"
+        );
+        for ptr in [
+            "/name",
+            "/script_path",
+            "/script_hash",
+            "/entries",
+            "/allow_mode",
+        ] {
+            assert!(v.pointer(ptr).is_some(), "顶层缺 {ptr}: {v}");
+            assert!(
+                v.pointer(&format!("/registration{ptr}")).is_some(),
+                "registration 缺 {ptr}: {v}"
+            );
+        }
+        assert_eq!(v["script_path"], "/srv/go-shape.sh");
+        assert_eq!(v["script_hash"], "gohash-shape-1");
+        assert_eq!(v["entries"]["网易"][0], "授权码");
+        assert_eq!(v["allow_mode"], "true");
+        let dup = client
+            .post(format!("{base}/register-caller"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dup.status().as_u16(), 409, "重名 409 语义不变");
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn non_stream_observation_persisted_and_queryable() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (upstream, uhandle) = mock_upstream_echo(seen.clone()).await;

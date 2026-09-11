@@ -1,0 +1,166 @@
+//! Python 旧格式注册表迁移（B6/D6 自 `registry.rs` 拆出）。
+//! 仅测试口径（D2/hygiene-round5）：模块级 `#[cfg(test)]` gating
+//! （见 `registry.rs`），生产零引用；`load_from` 为生产唯一加载入口。
+
+use {
+    super::{
+        entry::CallerEntry,
+        store::{CallerRegistry, RegistryFile, bind_script_sha256, integrity_of},
+    },
+    crate::{
+        error::{Result, VeilError},
+        fs_perm::ensure_0600,
+    },
+    std::{collections::BTreeMap, path::Path},
+};
+
+impl CallerRegistry {
+    /// Python `caller_registry.json` 迁移（`version/callers/allowed_entries` 形态）。
+    /// 成功后旧文件保留 `.bak` 备份；新格式文件直接走 [`CallerRegistry::load_from`]。
+    /// 仅测试口径（见模块文档）：生产零调用，测试与 `.bak` 语义保持原样。
+    fn migrate_python_registry(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read(path).map_err(|e| VeilError::Storage {
+            message: format!("注册表读取失败: {}: {e}", path.display()),
+        })?;
+        // 先试新格式；失败再试 Python 旧形态。
+        if let Ok(file) = serde_json::from_slice::<RegistryFile>(&raw) {
+            match integrity_of(&file.entries) {
+                Ok(sha) if sha == file.sha256 => {
+                    return Ok(Self {
+                        entries: file.entries,
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let old: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| VeilError::Storage {
+                message: format!("注册表解析失败（新旧格式均不匹配）: {e}"),
+            })?;
+        // Python 形态判定：含 `callers` 数组即视为旧格式。
+        let Some(callers) = old.get("callers").and_then(|v| v.as_array()) else {
+            return Err(VeilError::Storage {
+                message: "注册表解析失败（新旧格式均不匹配）".to_string(),
+            });
+        };
+        tracing::warn!(
+            "检测到 Python 旧格式注册表（含 {} 条），迁移为当前格式并保留 .bak",
+            callers.len()
+        );
+        let mut entries = BTreeMap::new();
+        for c in callers {
+            let caller_path = c
+                .get("script_path")
+                .or_else(|| c.get("caller_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let expected_hash = c
+                .get("script_hash")
+                .or_else(|| c.get("caller_hash"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if caller_path.is_empty() || expected_hash.is_empty() {
+                continue;
+            }
+            // 旧条目 allowed_entries：`{"entry": ["field", ...]}` 或字符串数组。
+            let mut entry_map = BTreeMap::new();
+            if let Some(allowed) = c.get("allowed_entries").and_then(|v| v.as_object()) {
+                for (k, v) in allowed {
+                    let fields: Vec<String> = match v {
+                        serde_json::Value::Array(arr) => arr
+                            .iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect(),
+                        serde_json::Value::String(s) => vec![s.clone()],
+                        _ => Vec::new(),
+                    };
+                    entry_map.insert(k.clone(), fields);
+                }
+            }
+            entries.insert(
+                caller_path.clone(),
+                CallerEntry {
+                    caller_path: caller_path.clone(),
+                    expected_hash: expected_hash.clone(),
+                    script_sha256: bind_script_sha256(&caller_path, &expected_hash),
+                    enabled: c.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                    revoked: false,
+                    auto_approve: None,
+                    name: c
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    description: String::new(),
+                    entries: entry_map,
+                    allow_mode: None,
+                    old_hash: c
+                        .get("script_hash_old")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    old_hash_expires_at: None,
+                },
+            );
+        }
+        let migrated = Self { entries };
+        // 旧文件备份 .bak（fail-closed：备份失败则拒绝覆盖写新格式）。
+        let bak = path.with_extension("json.bak");
+        std::fs::copy(path, &bak).map_err(|e| VeilError::Storage {
+            message: format!("旧注册表备份失败（拒绝迁移覆盖）: {e}"),
+        })?;
+        ensure_0600(&bak);
+        migrated.save_to(path)?;
+        Ok(migrated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::registry::CallerRegistry;
+
+    #[test]
+    fn legacy_python_format_migration_keeps_bak() {
+        let dir = std::env::temp_dir().join(format!(
+            "veil-reg-mig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller_registry.json");
+        let old = serde_json::json!({
+            "version": 1,
+            "callers": [
+                {
+                    "script_path": "/s/old.sh",
+                    "script_hash": "hold1",
+                    "name": "old-job",
+                    "enabled": true,
+                    "allowed_entries": {"网易": ["授权码"]}
+                }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        let migrated = CallerRegistry::migrate_python_registry(&path).unwrap();
+        assert_eq!(migrated.len(), 1);
+        let e = migrated.lookup_by_path("/s/old.sh").unwrap();
+        assert_eq!(e.expected_hash, "hold1");
+        assert!(e.enabled);
+        assert!(e.check_entry_allowed("网易", Some("授权码")));
+        assert!(path.with_extension("json.bak").exists(), "旧文件须留 .bak");
+        // 迁移后新格式可直接加载。
+        let reloaded = CallerRegistry::load_from(&path).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

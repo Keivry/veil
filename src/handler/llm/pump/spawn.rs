@@ -5,14 +5,16 @@ use {
         super::protocol_header_value,
         PumpOutcome,
         StreamPumpCtx,
+        decide::{self, ResponsesAction, StickyAction},
         event::{
             chat_finish_reason_seen,
             extract_responses_seq,
+            is_anthropic_opaque_event,
             is_minor_event,
             is_terminal_event,
             now_secs,
             outer_event_index,
-            responses_error_message,
+            responses_error_object,
             responses_failed_incomplete,
             responses_synth_conv_id,
             should_synthesize_empty_stream,
@@ -28,7 +30,7 @@ use {
             audit::{self, AuditHold, AuditPolicy, RequestKeepalive},
             block_inject,
             json_walk::strip_bom,
-            llm_gateway::{self, Protocol},
+            llm_gateway::{self, GatewayMetrics, Protocol},
             metrics::ChatRecord,
             redaction::{BoundaryHold, marker_cross_spans},
             sse::{Speed, SseParser, classify_residue, is_done_payload, set_truncated},
@@ -37,6 +39,22 @@ use {
     serde_json::Value,
     std::sync::Arc,
 };
+
+/// H2/D1 兜底回退：还原后帧 `jloads` 校验（BOM 感知）；失败时回退**还原前占位符帧**
+/// （fail-closed，token 形态保留、不破帧），记 warn + `restore_fallback` 计数，
+/// 对齐非流 `retry_stripped` 回退语义（`nonstream.rs::retry_stripped`）。
+pub(crate) fn guard_restored_frame(
+    restored: String,
+    placeholder_frame: &str,
+    metrics: &GatewayMetrics,
+) -> String {
+    if serde_json::from_str::<Value>(strip_bom(&restored)).is_ok() {
+        return restored;
+    }
+    tracing::warn!("流式还原后 JSON 校验失败，已回退还原前占位符帧（fail-closed）");
+    metrics.record_restore_fallback();
+    placeholder_frame.to_string()
+}
 
 /// 2.3 `spawn_stream_pump`：把上游字节流泵为下游 SSE 帧流，保证终止闭合；
 /// 阻断或合成终止时注入终止标记。`upstream` 所有权移入 task，不解析业务语义之外的状态。
@@ -69,9 +87,9 @@ pub fn spawn_stream_pump(
         let (hold_max, pii_boundary_chars) = clamp_pump_limits(hold_max, pii_boundary_chars);
         let mut boundary = BoundaryHold::new(pii_boundary_chars);
         let boundary_spans = |window: &str, seam: usize| {
-            let cred_map = resp_vault.snapshot_p2t();
+            let cred_map = resp_vault.p2t_snapshot();
             let mut spans: Vec<(usize, usize)> = resp_detector
-                .scan_spans_sync(window, &cred_map)
+                .scan_spans_sync(window, cred_map.map())
                 .into_iter()
                 .map(|(_, _, s, e)| (s, e))
                 .collect();
@@ -197,65 +215,82 @@ pub fn spawn_stream_pump(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if rejected_sticky {
-                    if is_done_payload(&ev.data) {
-                        continue;
-                    }
-                    if !ev.data.is_empty() {
-                        let terminal = sticky_terminal_event(protocol, &ev.data, &metrics);
-                        if terminal {
-                            continue;
-                        }
-                    }
-                    if !ev.data.is_empty()
-                        && !is_done_payload(&ev.data)
-                        && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
-                        && (!extract_tool_fragments(protocol, &v).is_empty()
-                            || AuditHold::is_complete_event(&v))
+                    // 纯函数决策；短路求值与 metrics 副作用留调用点：
+                    // 仅非空非 DONE 才解析/记 terminal_fallback（原语义不变）。
+                    let data_empty = ev.data.is_empty();
+                    let is_done = is_done_payload(&ev.data);
+                    let is_terminal = !data_empty
+                        && !is_done
+                        && sticky_terminal_event(protocol, &ev.data, &metrics);
+                    let is_tool_or_complete = !data_empty
+                        && !is_done
+                        && serde_json::from_str::<Value>(strip_bom(&ev.data)).is_ok_and(|v| {
+                            !extract_tool_fragments(protocol, &v).is_empty()
+                                || AuditHold::is_complete_event(&v)
+                        });
+                    if decide::sticky_suppress_action(
+                        rejected_sticky,
+                        data_empty,
+                        is_done,
+                        is_terminal,
+                        is_tool_or_complete,
+                    ) == StickyAction::Drop
                     {
                         continue;
                     }
                 }
                 if protocol == Protocol::Responses && !ev.data.is_empty() {
-                    // N1：分支首行守卫——已发任意终端（如 `response.completed`）后，
-                    // 后续 `error`/`incomplete`/`failed` 帧一律忽略，不得在其后合成
-                    // `response.failed`（先于 `responses_failed_sent` 判定，保证恒恰一终端）。
-                    if terminal_sent {
-                        continue;
-                    }
-                    let (is_failed, _, is_error) = responses_failed_incomplete(&ev.data, &metrics);
-                    if is_error {
-                        // P4/D4：`error` 仅合成单帧 `response.failed`（`response.error.message`
-                        // 携带上游 error 文案），不注入 `output_index` 序列；`incomplete`
-                        // 不在此列——原样透传并作为唯一终端（保留 `incomplete_details`，
-                        // 由 `is_terminal_event` 置位）。
-                        responses_failed_sent = true;
-                        terminal_sent = true;
-                        let fid = responses_synth_conv_id(
-                            stream_first_id.as_deref(),
-                            conv_id.as_deref(),
-                            &metrics,
-                        );
-                        let err_msg = responses_error_message(&ev.data);
-                        for f in block_inject::ensure_event_lines(vec![
-                            block_inject::responses_failed_frame(&fid, err_msg.as_deref()),
-                        ]) {
-                            metrics.add_sse_event();
-                            forwarded += 1;
-                            any_frame_sent = true;
-                            if pump_tx.send(f).await.is_err() {
-                                break;
+                    // N1 守卫（T1/D1）：决策交纯函数 `responses_control_action`；
+                    // 已发终端时保持原语义不解析（terminal_fallback 计数不漂移）。
+                    let (is_failed, is_error) = if terminal_sent {
+                        (false, false)
+                    } else {
+                        let (f, _, e) = responses_failed_incomplete(&ev.data, &metrics);
+                        (f, e)
+                    };
+                    match decide::responses_control_action(
+                        terminal_sent,
+                        responses_failed_sent,
+                        is_error,
+                        is_failed,
+                    ) {
+                        ResponsesAction::Ignore => continue,
+                        ResponsesAction::SynthesizeFailed => {
+                            // P4/D4：`error` 仅合成单帧 `response.failed`
+                            //（`response.error.message` 携带上游 error 文案），不注入
+                            // `output_index` 序列；`incomplete` 不在此列——原样透传并作为
+                            // 唯一终端（保留 `incomplete_details`，由 `is_terminal_event` 置位）。
+                            responses_failed_sent = true;
+                            terminal_sent = true;
+                            let fid = responses_synth_conv_id(
+                                stream_first_id.as_deref(),
+                                conv_id.as_deref(),
+                                &metrics,
+                            );
+                            let err_obj = responses_error_object(&ev.data);
+                            for f in block_inject::ensure_event_lines(vec![
+                                block_inject::responses_failed_frame(&fid, err_obj.as_ref()),
+                            ]) {
+                                metrics.add_sse_event();
+                                forwarded += 1;
+                                any_frame_sent = true;
+                                if pump_tx.send(f).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
-                        block_inject::mark_terminal(&mut meta);
-                        terminated = true;
-                        continue;
-                    }
-                    if is_failed {
-                        if responses_failed_sent {
+                            block_inject::mark_terminal(&mut meta);
                             terminated = true;
                             continue;
                         }
-                        responses_failed_sent = true;
+                        ResponsesAction::DuplicateFailed => {
+                            terminated = true;
+                            continue;
+                        }
+                        ResponsesAction::Passthrough => {
+                            if is_failed {
+                                responses_failed_sent = true;
+                            }
+                        }
                     }
                 }
                 if !ev.data.is_empty() && !is_done_payload(&ev.data) {
@@ -277,13 +312,12 @@ pub fn spawn_stream_pump(
                         let audit_hold_on = !matches!(audit_mode, AuditMode::Off)
                             && matches!(protocol, Protocol::Chat | Protocol::Anthropic);
                         if audit_hold_on {
-                            let slot: Option<Option<u32>> = if AuditHold::is_complete_event(&v) {
-                                Some(None)
-                            } else if AuditHold::is_index_complete_event(&v) {
-                                outer_event_index(protocol, &v).map(Some)
-                            } else {
-                                None
-                            };
+                            let slot = decide::tool_replay_slot(
+                                protocol,
+                                &v,
+                                AuditHold::is_complete_event(&v),
+                                AuditHold::is_index_complete_event(&v),
+                            );
                             if let Some(slot) = slot {
                                 for (b_prefix, b_data) in
                                     take_pending_tool_inputs(&mut pending_tool_frames, slot)
@@ -298,10 +332,12 @@ pub fn spawn_stream_pump(
                         }
                         // P0-3.1：未完成 tool 分片缓冲不转发（hold-until-complete）；
                         // 本帧槽号组取自各分片桶号（到达序 flush 时保序）。
-                        let buffer_tool_frame = audit_hold_on
-                            && is_tool_event
-                            && !AuditHold::is_complete_event(&v)
-                            && !AuditHold::is_index_complete_event(&v);
+                        let buffer_tool_frame = decide::should_buffer_tool_frame(
+                            audit_hold_on,
+                            is_tool_event,
+                            AuditHold::is_complete_event(&v),
+                            AuditHold::is_index_complete_event(&v),
+                        );
                         let tool_buckets: Vec<u32> = frags.iter().map(|f| f.0).collect();
                         let mut reject_reason: Option<String> = None;
                         if minor {
@@ -447,17 +483,31 @@ pub fn spawn_stream_pump(
                         } else if AuditHold::is_complete_event(&v) && !approve_held {
                             hold.mark_completed();
                         }
-                        let (restored, spans) =
-                            resp_scope.restore_response_with_spans(&resp_vault, &ev.data);
-                        let scanned = resp_scope
-                            .redact_response_new_pii_with_skip(
-                                &resp_vault,
-                                &resp_detector,
-                                &restored,
-                                &spans,
-                            )
-                            .await;
-                        let restored_data = crate::service::sse::json_aware_line(&scanned, |s| s);
+                        let restored_data =
+                            if protocol == Protocol::Anthropic && is_anthropic_opaque_event(&v) {
+                                // M3/D6：opaque（signature/redacted/thinking）帧跳过响应侧
+                                // 新 PII 扫描与 `json_aware_line` 重序列化，仅做字节级还原
+                                //（JSON 转义变体保证不破帧）；审计 hold/次要判定维持现状。
+                                let (restored, _spans) = resp_scope
+                                    .restore_response_with_spans_json(&resp_vault, &ev.data);
+                                guard_restored_frame(restored, &ev.data, &metrics)
+                            } else {
+                                let (restored, spans) = resp_scope
+                                    .restore_response_with_spans_json(&resp_vault, &ev.data);
+                                let scanned = resp_scope
+                                    .redact_response_new_pii_with_skip(
+                                        &resp_vault,
+                                        &resp_detector,
+                                        &restored,
+                                        &spans,
+                                    )
+                                    .await;
+                                guard_restored_frame(
+                                    crate::service::sse::json_aware_line(&scanned, |s| s),
+                                    &ev.data,
+                                    &metrics,
+                                )
+                            };
                         let prefix = ev
                             .event_type
                             .as_ref()
@@ -479,7 +529,11 @@ pub fn spawn_stream_pump(
                             agg.push_str(&out_prefix);
                             agg.push_str(&format!("data: {out_data}\n\n"));
                         }
-                        if !minor && hold.held() && !out_data.is_empty() {
+                        if decide::should_suppress_held_output(
+                            minor,
+                            hold.held(),
+                            !out_data.is_empty(),
+                        ) {
                             continue;
                         }
                     } else {
@@ -622,11 +676,12 @@ pub fn spawn_stream_pump(
         // 尾帧此前已透传，不提前截断。`truncated_mode=open_ended` 观测保留
         //（如实描述上游截断形态，不新增枚举）。置于空流守门前：补发后
         // `terminal_sent` 已置位，守门自然跳过，恒恰一终端。
-        if protocol == Protocol::Chat
-            && !terminal_sent
-            && saw_finish_reason
-            && meta.truncated_mode.is_none()
-        {
+        if decide::should_backfill_chat_done(
+            protocol,
+            terminal_sent,
+            saw_finish_reason,
+            meta.truncated_mode.is_some(),
+        ) {
             if let Some((fp, fd)) = boundary.flush() {
                 agg.push_str(&fp);
                 agg.push_str(&format!("data: {fd}\n\n"));

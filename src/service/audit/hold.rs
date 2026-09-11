@@ -343,6 +343,18 @@ mod audit_hold_tests {
     use super::*;
 
     #[test]
+    fn file_len_under_800_or_split() {
+        // 红线看护（口径=文件总行，含测试与注释，见 hygiene-round4 模板）：
+        // 超 800 即失败，须按模板拆分，不得只改数字放行。
+        const SELF_SRC: &str = include_str!("hold.rs");
+        let lines = SELF_SRC.lines().count();
+        assert!(
+            lines <= 800,
+            "hold.rs {lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+        );
+    }
+
+    #[test]
     fn responses_three_fragments_ordered_single_flush_no_audit_during_delta() {
         let mut hold = AuditHold::new(1024);
         let key = AuditHold::responses_key(Some("item-7"), 1);

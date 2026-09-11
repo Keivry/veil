@@ -318,14 +318,12 @@ pub fn json_aware_line(line: &str, restore: impl Fn(String) -> String) -> String
     // §2.6：BOM 剥离后判 JSON（BOM+JSON 不得当残余转发）。
     let trimmed = json_walk::strip_bom(line).trim();
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && matches!(
-            v,
-            serde_json::Value::Object(_) | serde_json::Value::Array(_)
-        )
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
     {
-        let owned_restore = restore;
-        return json_walk::process_text(trimmed, &mut |s| owned_restore(s), json_walk::DEPTH_LIMIT);
+        // H1/D2：JSON 合法即返回输入（仅保留校验），不再二次 `loads→walk→dumps`。
+        // Leaf 还原/脱敏已由调用方（scope 层）先行完成；二次序列化会重排
+        // 键序/数字表示/空白（如 `1e3`→`1000.0`），与字节保真契约相悖。
+        return line.to_string();
     }
     restore(line.to_string())
 }

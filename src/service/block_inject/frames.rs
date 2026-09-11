@@ -68,13 +68,14 @@ pub fn responses_truncated_frames(response_id: &str) -> Vec<String> {
     responses_sequence(response_id, text, false)
 }
 
-/// P4/D4：`type:"error"` 单帧合成——`response.failed` 单帧携带上游 error 文案
-/// （`message` 为 `None` 时保持既有 `{"id","status"}` 形态，不带 error 字段）；
-/// 不注入 `output_index`/`output_item.*` 序列，不与已流出 item 冲突。
-pub fn responses_failed_frame(response_id: &str, message: Option<&str>) -> String {
+/// P4/D4 + D5：`type:"error"` 单帧合成——`response.failed` 单帧携带上游
+/// error 诊断对象（`code`/`type`/`param`/`message` 存在即保留；`None` 时保持
+/// 既有 `{"id","status"}` 形态，不带 error 字段）；不注入
+/// `output_index`/`output_item.*` 序列，不与已流出 item 冲突。
+pub fn responses_failed_frame(response_id: &str, error: Option<&Value>) -> String {
     let mut response = serde_json::json!({"id": response_id, "status": "failed"});
-    if let Some(msg) = message {
-        response["error"] = serde_json::json!({"message": msg});
+    if let Some(err) = error {
+        response["error"] = err.clone();
     }
     let payload = serde_json::json!({"type": "response.failed", "response": response});
     format!("event: response.failed\ndata: {payload}\n\n")
@@ -296,7 +297,10 @@ pub fn evaluate_nonstream(
 /// 返回帧由调用方经 `ensure_event_lines` 归一化后发送。
 pub fn synthesize_truncation(protocol: GatewayProtocol, conv_id: &str) -> Vec<String> {
     match protocol {
-        GatewayProtocol::Responses => vec![responses_failed_frame(conv_id, Some("truncated"))],
+        GatewayProtocol::Responses => vec![responses_failed_frame(
+            conv_id,
+            Some(&serde_json::json!({"message": "truncated"})),
+        )],
         GatewayProtocol::Chat | GatewayProtocol::Anthropic | GatewayProtocol::NonDialog => {
             vec![]
         }

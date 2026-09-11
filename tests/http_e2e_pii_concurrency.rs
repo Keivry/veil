@@ -19,6 +19,8 @@ static APP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const CONCURRENCY: usize = 100;
 
+const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
+
 fn phone(i: usize) -> String { format!("138{:08}", 1000 + i) }
 
 fn test_app(extra: &[(&str, &str)]) -> axum::Router {
@@ -115,37 +117,79 @@ async fn t3_1_pii_100_concurrent_restore_isolated_no_crosstalk() {
             .await
             .expect("单路须在 120s 内返回")
             .unwrap();
-            assert_eq!(resp.status().as_u16(), 200, "第 {i} 路须 200");
+            let status = resp.status().as_u16();
             let text = resp.text().await.unwrap();
-            (i, text)
+            (i, status, text)
         }));
     }
     let mut bodies = vec![String::new(); CONCURRENCY];
+    let mut statuses = [0u16; CONCURRENCY];
     for t in tasks {
-        let (i, text) = t.await.expect("并发任务须成功");
+        let (i, status, text) = t.await.expect("并发任务须成功");
         bodies[i] = text;
+        statuses[i] = status;
     }
 
-    // 本路还原：每路响应含本路号码（回声占位符经本路 scope 还原）。
+    // 请求级断言（每路 3 条，共 3×CONCURRENCY）：状态码 200、本路号码已还原、
+    // 本路占位符形态已全部还原为号码（合法 `__PII_<seq>_<8hex>__` token 归零；
+    // 说明提示中的字面 `__PII_*__` 不属合法形态，不误伤）。
+    let pii_token = regex::Regex::new(r"__PII_\d+_[0-9a-fA-F]{8}__").expect("正则恒合法");
+    let mut request_assertions = 0usize;
     for (i, body) in bodies.iter().enumerate() {
+        assert_eq!(statuses[i], 200, "第 {i} 路须 200");
+        request_assertions += 1;
         assert!(
             body.contains(&phone(i)),
             "第 {i} 路须还原本路号码 {}: {body}",
             phone(i)
         );
+        request_assertions += 1;
+        assert!(
+            !pii_token.is_match(body),
+            "第 {i} 路占位符须全部还原: {body}"
+        );
+        request_assertions += 1;
     }
-    // 全矩阵无串扰：任一路不得含他路号码。
+    assert_eq!(
+        request_assertions,
+        3 * CONCURRENCY,
+        "请求级断言数须 ≥3×CONCURRENCY=300"
+    );
+
+    // 全对串扰矩阵（100×99 显式计数）：任一路不得含他路号码，自环跳过。
+    let mut pair_checks = 0usize;
     for (i, body) in bodies.iter().enumerate() {
         for j in 0..CONCURRENCY {
-            if i != j {
-                assert!(
-                    !body.contains(&phone(j)),
-                    "第 {i} 路串扰他路号码 {}: {body}",
-                    phone(j)
-                );
+            if i == j {
+                continue;
             }
+            pair_checks += 1;
+            assert!(
+                !body.contains(&phone(j)),
+                "第 {i} 路串扰他路号码 {}: {body}",
+                phone(j)
+            );
         }
     }
+    assert_eq!(
+        pair_checks,
+        CONCURRENCY * (CONCURRENCY - 1),
+        "串扰矩阵须覆盖 100×99 全对"
+    );
+
+    // 用量计数：100 路并发全部计入，一进一出无遗漏。
+    let metrics = client
+        .get(format!("{base}/_admin/metrics"))
+        .header("X-Admin-Token", ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status().as_u16(), 200);
+    let metrics_body: serde_json::Value = metrics.json().await.unwrap();
+    assert_eq!(
+        metrics_body["requests"], 100,
+        "100 路并发须全部记录用量: {metrics_body}"
+    );
 
     uhandle.abort();
     handle.abort();

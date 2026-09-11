@@ -406,6 +406,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn three_factor_body_auth_fallback() {
+        // GO/D8：头缺失时回退读取 `body.auth.get_binary_hash`/`get_binary_secret`
+        //（Go 存量 `CredentialBody` 形态），按三因子语义放行；
+        // 仅缺 caller 字段时返回 403「body.auth.caller_hash/caller_path 必填」。
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        let go_body = CredentialBody {
+            secret: None,
+            auth: Some(AuthBlock {
+                caller_hash: Some("gohash-fallback".to_string()),
+                caller_path: Some("/s/go-fallback.sh".to_string()),
+                get_binary_hash: Some("gethash".to_string()),
+                get_binary_secret: Some("s3cr3t".to_string()),
+            }),
+            entry: Some("网易".to_string()),
+            field: Some("授权码".to_string()),
+            fields: None,
+            token: None,
+        };
+        let out = handle_credential(&state, &CredentialHeaders::new(None, None), &go_body)
+            .await
+            .unwrap();
+        assert!(credential_value(&out).starts_with("__VG_CRED_"));
+        let no_caller = CredentialBody {
+            secret: None,
+            auth: Some(AuthBlock {
+                caller_hash: None,
+                caller_path: None,
+                get_binary_hash: Some("gethash".to_string()),
+                get_binary_secret: Some("s3cr3t".to_string()),
+            }),
+            entry: Some("网易".to_string()),
+            field: Some("授权码".to_string()),
+            fields: None,
+            token: None,
+        };
+        let err = handle_credential(&state, &CredentialHeaders::new(None, None), &no_caller)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+        match err {
+            VeilError::Auth { message } => assert!(
+                message.contains("body.auth.caller_hash/caller_path 必填"),
+                "缺 caller 因子文案: {message}"
+            ),
+            other => panic!("须为鉴权拒绝: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn missing_entry_returns_400_with_hint() {
         let env = cred_env(&[]);
         let state = cred_state(&env);

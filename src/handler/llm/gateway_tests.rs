@@ -572,3 +572,27 @@ async fn nonstream_upstream_400_passthrough_without_swallowing_error() {
     );
     server.abort();
 }
+
+#[test]
+fn forward_headers_strips_accept_encoding() {
+    // M1/D4：下游 `accept-encoding`（含网关不支持编码与多值形态）须剥离，
+    // 由 reqwest 在上游请求头缺席时注入支持集（gzip/br/deflate）。
+    use axum::http::HeaderValue;
+    let metrics = GatewayMetrics::default();
+    let mut h = HeaderMap::new();
+    h.insert("accept-encoding", HeaderValue::from_static("zstd"));
+    h.insert("x-real", HeaderValue::from_static("keep"));
+    let fwd = super::forward_headers(&h, &metrics);
+    assert!(
+        fwd.get("accept-encoding").is_none(),
+        "下游 accept-encoding 须剥离"
+    );
+    assert!(fwd.get("x-real").is_some(), "业务头须保留");
+    let mut h2 = HeaderMap::new();
+    h2.insert("accept-encoding", HeaderValue::from_static("gzip, br"));
+    let fwd2 = super::forward_headers(&h2, &metrics);
+    assert!(
+        fwd2.get("accept-encoding").is_none(),
+        "支持集多值同样剥离（交由 reqwest 注入）"
+    );
+}

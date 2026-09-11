@@ -41,6 +41,8 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub registry: Arc<tokio::sync::RwLock<CallerRegistry>>,
     pub registry_path: PathBuf,
+    /// 写路径全序点（B1/D1）：序列化三条管理写路径的落盘次序，防旧快照覆盖新快照。
+    pub registry_save_lock: Arc<tokio::sync::Mutex<()>>,
     pub keepass: Arc<dyn KeePassBackend>,
     pub pending: Arc<PendingApprovals>,
     pub approval: Arc<crate::service::matrix::MatrixApproval>,
@@ -76,6 +78,7 @@ impl AppState {
             db_path: outcome.db_path,
             registry: Arc::new(tokio::sync::RwLock::new(registry)),
             registry_path,
+            registry_save_lock: Arc::new(tokio::sync::Mutex::new(())),
             keepass: Arc::new(MockKeePass::locked()),
             pending: Arc::new(PendingApprovals::default()),
             approval,
@@ -114,6 +117,8 @@ impl crate::service::credential::AppStateParts for AppState {
     fn registry(&self) -> &Arc<tokio::sync::RwLock<CallerRegistry>> { &self.registry }
 
     fn registry_path(&self) -> &std::path::PathBuf { &self.registry_path }
+
+    fn registry_save_lock(&self) -> &Arc<tokio::sync::Mutex<()>> { &self.registry_save_lock }
 
     fn keepass(&self) -> &Arc<dyn KeePassBackend> { &self.keepass }
 

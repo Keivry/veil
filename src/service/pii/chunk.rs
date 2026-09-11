@@ -107,12 +107,14 @@ pub fn protected_spans(text: &str) -> Vec<(usize, usize)> {
 
 /// PII 残缺形态，对标 `_PII_PARTIAL_TOKEN_RE`：
 /// `__PI` 后负向前瞻排除完整形态，使完整 token 不被误剥；
-/// 结尾覆盖行中残缺（后跟空白/标点/汉字等非单词字符同样剥离）。
+/// D7 收窄：确证残缺续段（`__PI` + 可选 `I` + 可选 `_数字_hex`）且后随边界
+/// （空白/标点/串尾）时剥离；后续为合法单词字符的正文（如 `__PIXEL`/`__PII_DATA`）
+/// 与无序号数字段的 hex-only 形态（如 `__PII_AB`）一律不剥离。
 fn pii_partial_re() -> &'static fancy_regex::Regex {
     static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         fancy_regex::Regex::new(
-            r"__PI(?!I_\d+_[0-9a-f]{8}__)(?:I(?:_(?:\d+_)?[0-9a-fA-F]*)?)?(?:_*$|(?=\s|[^\w]))",
+            r"__PI(?!I_\d+_[0-9a-f]{8}__)(?:I(?:_\d+(?:_[0-9a-fA-F]*)?)?)?(?:_*$|(?=\s|[^\w]))",
         )
         .expect("PII 残缺正则恒合法")
     })
