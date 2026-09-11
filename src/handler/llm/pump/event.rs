@@ -131,6 +131,19 @@ pub(super) fn responses_failed_incomplete(
     }
 }
 
+/// P4/D4：`type:"error"` 事件的上游文案提取：`error.message`（对象形态）优先，
+/// 其次顶层 `message`（官方 error 事件形态）；缺失返回 `None`
+/// （合成帧回退既有 `{"id","status"}` 形态，不带 error 字段）。
+pub(super) fn responses_error_message(data: &str) -> Option<String> {
+    let v = serde_json::from_str::<Value>(strip_bom(data)).ok()?;
+    v.get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| v.get("message").and_then(|m| m.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// E9 合成截断帧 conv 取值：优先流内首见 `id`，其次泵内最新 `conv_id`，
 /// 缺失才回退 `resolve_conv_id` 归档（记 `conv_missing`，不断链）。
 pub(super) fn responses_synth_conv_id(
@@ -149,19 +162,19 @@ pub(super) fn responses_synth_conv_id(
 }
 
 /// 流式终端事件判定（§2.6 去重用）：chat 以 `[DONE]` 为准（非 JSON 分支处理，
-/// 此处恒 false）；anthropic 仅 `message_stop`；responses 仅 `completed/failed`
-/// （`incomplete/error` 已提前映射为单个 `failed`）。
+/// 此处恒 false）；anthropic 为 `message_stop` 或 `error`（P2/D3：`error` 本身
+/// 即终端，其后不得注入 `message_stop`）；responses 为
+/// `completed/failed/incomplete`（`incomplete` P4 原样透传并作为唯一终端）。
 pub(super) fn is_terminal_event(protocol: Protocol, v: &Value) -> bool {
     use crate::service::llm_gateway::Protocol as P;
     match protocol {
         P::Anthropic => v
             .get("type")
             .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "message_stop"),
-        P::Responses => v
-            .get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "response.completed" || t == "response.failed"),
+            .is_some_and(|t| t == "message_stop" || t == "error"),
+        P::Responses => v.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+            t == "response.completed" || t == "response.failed" || t == "response.incomplete"
+        }),
         _ => false,
     }
 }

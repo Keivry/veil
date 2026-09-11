@@ -348,9 +348,9 @@ async fn stream_pump_residue_sent_skips_secondary_empty_stream_frame() {
 }
 
 #[tokio::test]
-async fn vacuum_stream_chat_stays_open_ended_without_fabricated_terminal() {
-    // C8 真空流 E2E：chat 零字节零残余时不合成 delta+stop+[DONE]，
-    // 下游仅见连接关闭（open-ended），Hermes 靠缺失 finish_reason 走 stub。
+async fn vacuum_stream_chat_synthesizes_single_done() {
+    // P2/D2：chat 零字节零残余时补恰一 `data: [DONE]`（不伪造内容/usage），
+    // 下游可解析收尾；终端标记落位。
     let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
@@ -358,13 +358,14 @@ async fn vacuum_stream_chat_stays_open_ended_without_fabricated_terminal() {
     let (outcome, frames) =
         collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
     let joined = frames.join("");
-    assert!(!outcome.block_injected, "真空 open-ended 不得注阻断帧");
-    assert!(!joined.contains("[DONE]"), "不得伪造成功终止: {joined}");
-    assert!(
-        !joined.contains("empty-stream"),
-        "不得合成空流兜底: {joined}"
+    assert_eq!(
+        frames.iter().filter(|f| f.contains("data: [DONE]")).count(),
+        1,
+        "真空流恰一 [DONE]: {joined}"
     );
-    assert!(!outcome.terminal_injected, "无帧发出时不得标记终端已注入");
+    assert!(!joined.contains("\"delta\""), "不得伪造内容帧: {joined}");
+    assert!(outcome.block_injected, "合成终端须置位 block_injected");
+    assert!(outcome.terminal_injected, "终端标记须落位");
     server.abort();
 }
 
@@ -395,10 +396,9 @@ async fn vacuum_stream_responses_still_synthesizes_failed() {
 
 #[tokio::test]
 async fn empty_data_heartbeat_frames_dropped_not_forwarded() {
-    // L17：纯空 `data:` 心跳（`event:` 独占帧 / 空 data 帧）不得透传；
-    // chat 无终端合成（open-ended，与 C8 真空语义一致：空帧不计入
-    // `any_frame_sent`）。注：裸 `data:\n\n` 由解析器直接过滤，
-    // 本分支覆盖带 `event:` 的空帧形态。
+    // L17 + P2：纯空 `data:` 心跳（`event:` 独占帧 / 空 data 帧）不得透传；
+    // 空帧不计入 `any_frame_sent`，chat 真空守门仍补恰一 `[DONE]` 收尾。
+    // 注：裸 `data:\n\n` 由解析器直接过滤，本分支覆盖带 `event:` 的空帧形态。
     let up_body = b"event: ping\n\nevent: message\ndata:\n\n".to_vec();
     let (url, server) = loopback_server(200, "text/event-stream", up_body).await;
     let client = reqwest::Client::new();
@@ -407,10 +407,17 @@ async fn empty_data_heartbeat_frames_dropped_not_forwarded() {
     let (outcome, frames) =
         collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
     let joined = frames.join("");
-    assert!(!joined.contains("data:"), "空心跳帧不得透传: {joined}");
-    assert!(!outcome.block_injected, "空帧流不得注阻断帧");
-    assert!(!outcome.terminal_injected, "无帧发出时不得标记终端已注入");
-    assert!(!joined.contains("[DONE]"), "不得伪造成功终止: {joined}");
+    assert!(
+        !joined.contains("event: ping") && !joined.contains("event: message"),
+        "空心跳帧不得透传: {joined}"
+    );
+    assert_eq!(
+        frames.iter().filter(|f| f.contains("data: [DONE]")).count(),
+        1,
+        "空心跳流仍走真空守门补 [DONE]: {joined}"
+    );
+    assert!(outcome.block_injected, "合成终端须置位 block_injected");
+    assert!(outcome.terminal_injected, "终端标记须落位");
     server.abort();
 }
 
@@ -442,8 +449,8 @@ async fn comment_only_heartbeat_does_not_gate_empty_synthesis_e11() {
 
 #[tokio::test]
 async fn pump_terminal_reuses_request_conv_e12() {
-    // E12/D7：泵内终端帧复用请求会话而非合成随机值。
-    let sse = b"data: {\"type\":\"response.incomplete\",\"response\":{}}\n\n".to_vec();
+    // E12/D7 + P4：泵内 `error` 合成单帧 failed 时复用请求会话而非合成随机值。
+    let sse = b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
@@ -512,35 +519,49 @@ async fn thinking_and_signature_opaque_passthrough_values_match() {
 }
 
 #[tokio::test]
-async fn responses_incomplete_and_error_merge_into_single_failed() {
-    let sse = b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r9\",\"status\":\"incomplete\"}}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
+async fn responses_incomplete_passthrough() {
+    // P4/D4：`response.incomplete` 原样透传（保留 `incomplete_details`）并作为唯一终端，
+    // 其后无数据帧、无合成 `response.failed`、不转换。
+    let sse = b"data: {\"type\":\"response.incomplete\",\"sequence_number\":4,\"response\":{\"id\":\"r9\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":5,\"delta\":\"late\"}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let (scope, vault, detector) = fresh_arcs();
-    let (outcome, frames) = collect_pump(
+    let (_outcome, frames) = collect_pump(
         upstream,
         pump_ctx(Protocol::Responses, scope, vault, detector),
     )
     .await;
     let joined = frames.join("");
     assert!(
-        joined.contains("response.failed"),
-        "incomplete/error 须映射为 failed"
+        joined.contains("\"status\":\"incomplete\""),
+        "incomplete 须原样透传: {joined}"
     );
     assert!(
-        !joined.contains("response.incomplete"),
-        "原始 incomplete 不得透出"
+        joined.contains("incomplete_details") && joined.contains("max_output_tokens"),
+        "incomplete_details 不得丢: {joined}"
+    );
+    assert!(
+        !joined.contains("response.failed"),
+        "不得合成 failed: {joined}"
+    );
+    assert!(!joined.contains("late"), "终端后数据帧不得透出: {joined}");
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f.contains("response.incomplete"))
+            .count(),
+        1,
+        "incomplete 恰一: {joined}"
     );
     assert_eq!(
         frames
             .iter()
-            .filter(|f| f.contains("response.failed"))
+            .filter(|f| f.contains("response.completed") || f.contains("response.failed"))
             .count(),
-        1,
-        "恒恰一个 failed 终止帧"
+        0,
+        "不得出现其他终端: {joined}"
     );
-    assert!(outcome.terminal_injected, "映射后 terminal 须落位");
     server.abort();
 }
 

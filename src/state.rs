@@ -155,13 +155,13 @@ pub fn build_http_client(config: &Config) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// sqlite 初始化结果：健康或内存-only 降级。
+/// sqlite 初始化结果：健康或内存-only 降级（降级由 `sqlite_ok=false` +
+/// `sqlite_error` 表达）。
 #[derive(Debug)]
 pub struct SqliteOutcome {
     pub sqlite_ok: bool,
     pub sqlite_error: Option<String>,
     pub db_path: PathBuf,
-    pub memory_only: bool,
 }
 
 /// 异步入口：阻塞工作下沉到 `spawn_blocking`，绝不在 async 上下文直调 rusqlite。
@@ -186,7 +186,6 @@ fn outcome_from_open_result(
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path,
-                memory_only: false,
             })
         }
         Err(err) => {
@@ -196,7 +195,6 @@ fn outcome_from_open_result(
                     sqlite_ok: false,
                     sqlite_error: Some(format!("ENOSPC ({err:#})")),
                     db_path,
-                    memory_only: true,
                 })
             } else {
                 Err(VeilError::Storage {
@@ -301,7 +299,7 @@ mod tests {
         drop(conn);
 
         let outcome = init_sqlite(&dir).await.unwrap();
-        assert!(outcome.sqlite_ok && !outcome.memory_only);
+        assert!(outcome.sqlite_ok);
 
         assert_eq!(file_mode(&dir.join(SQLITE_FILE_NAME)), 0o600);
         for suffix in ["-wal", "-shm"] {
@@ -327,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_full_degrades_to_memory_only_without_crash() {
+    fn disk_full_degrades_without_crash() {
         let full = anyhow::Error::from(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(13),
             Some("database or disk is full".to_string()),
@@ -335,7 +333,6 @@ mod tests {
         let outcome =
             outcome_from_open_result(PathBuf::from("/data/metrics.sqlite"), Err(full)).unwrap();
         assert!(!outcome.sqlite_ok);
-        assert!(outcome.memory_only);
         assert!(outcome.sqlite_error.as_deref().unwrap().contains("ENOSPC"));
     }
 
@@ -370,7 +367,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: dir.join("m.sqlite"),
-                memory_only: false,
             },
         );
         let again = state.clone();
@@ -410,7 +406,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
             },
         );
         let again = state.clone();

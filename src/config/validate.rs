@@ -13,7 +13,8 @@ use {
 };
 
 /// 原仓遗留变量名：二进制不读取，检出时启动期 warn 指引改名。
-pub const LEGACY_IGNORED_VARS: [(&str, &str); 3] = [
+/// 权威清单：README §7.4 须逐项锁步（集合相等由 `legacy_vars_readme_lockstep` 守卫）。
+pub const LEGACY_IGNORED_VARS: [(&str, &str); 6] = [
     (
         "CREDENTIAL_MASTER_PASSWORD",
         "主密码口令改走 TPM 解封（startup_tpm_in）",
@@ -25,6 +26,18 @@ pub const LEGACY_IGNORED_VARS: [(&str, &str); 3] = [
     (
         "CREDENTIAL_PROXY_DEBUG_DIR",
         "请求落盘排障改用结构化日志 + AUDIT_POLICY_FILE 审计面",
+    ),
+    (
+        "ENV",
+        "dev 环境显式配置 OBSERVABILITY_ADMIN_TOKEN 并携带 X-Admin-Token（回环免 token 未迁移，见 README §6.6）",
+    ),
+    (
+        "ALLOW_LOOPBACK_NO_TOKEN",
+        "回环免 token 未迁移：dev 环境显式配置 OBSERVABILITY_ADMIN_TOKEN 并携带 X-Admin-Token（见 README §6.6）",
+    ),
+    (
+        "CREDENTIAL_API_PORT",
+        "入口统一走 VEIL_ENTRY_MODE + 单端口 8877（见 README §8.4）",
     ),
 ];
 
@@ -44,7 +57,9 @@ pub(crate) fn is_falsy(v: &str) -> bool {
     )
 }
 
-fn is_truthy(v: &str) -> bool {
+/// 真值集合 `1/true/yes/on`（trim + 大小写不敏感），默认关闭开关与
+/// `AUDIT_ENABLED` 遗留回退共用同一口径，防两处集合漂移。
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(
         v.trim().to_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
@@ -264,7 +279,7 @@ fn is_valid_mxid(s: &str) -> bool {
 mod tests {
     use {
         super::*,
-        crate::config::env_parse::{Config, test_support::base_env},
+        crate::config::env_parse::{AuditMode, Config, test_support::base_env},
     };
 
     #[test]
@@ -309,6 +324,25 @@ mod tests {
     }
 
     #[test]
+    fn nonstream_max_bytes_default_override_and_invalid_reject() {
+        // F2 三例：缺省 8388608、覆盖生效、非法（非整数或 <1）拒启动（fail-closed）。
+        let cfg = Config::load_from(&base_env()).unwrap();
+        assert_eq!(cfg.nonstream_max_bytes, 8 * 1024 * 1024);
+        let mut env = base_env();
+        env.insert("NONSTREAM_MAX_BYTES".to_string(), "1024".to_string());
+        assert_eq!(Config::load_from(&env).unwrap().nonstream_max_bytes, 1024);
+        for raw in ["0", "-1", "abc", "1.5"] {
+            let mut env = base_env();
+            env.insert("NONSTREAM_MAX_BYTES".to_string(), raw.to_string());
+            let err = Config::load_from(&env).unwrap_err();
+            assert!(
+                err.to_string().contains("NONSTREAM_MAX_BYTES"),
+                "输入 {raw} 报错须指明变量名"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_whitelist_member_rejects_startup() {
         let mut env = base_env();
         env.insert("AUDIT_MODE".to_string(), "approve".to_string());
@@ -326,6 +360,52 @@ mod tests {
         env.insert("AUDIT_MODE".to_string(), "allow".to_string());
         let msg = Config::load_from(&env).unwrap_err().to_string();
         assert!(msg.contains("AUDIT_MODE") && msg.contains("off/block/approve"));
+    }
+
+    #[test]
+    fn audit_enabled_fallback_at_config_load() {
+        let fallback_block = |raw: &str| {
+            let mut env = base_env();
+            env.insert("AUDIT_ENABLED".to_string(), raw.to_string());
+            Config::load_from(&env).unwrap().audit_mode
+        };
+        assert_eq!(fallback_block("1"), AuditMode::Block);
+        assert_eq!(fallback_block("on"), AuditMode::Block);
+
+        let mut blank_mode = base_env();
+        blank_mode.insert("AUDIT_MODE".to_string(), "   ".to_string());
+        blank_mode.insert("AUDIT_ENABLED".to_string(), "yes".to_string());
+        assert_eq!(
+            Config::load_from(&blank_mode).unwrap().audit_mode,
+            AuditMode::Block
+        );
+
+        let mut explicit_off = base_env();
+        explicit_off.insert("AUDIT_MODE".to_string(), "off".to_string());
+        explicit_off.insert("AUDIT_ENABLED".to_string(), "1".to_string());
+        assert_eq!(
+            Config::load_from(&explicit_off).unwrap().audit_mode,
+            AuditMode::Off
+        );
+
+        let mut explicit_approve = base_env();
+        explicit_approve.insert("AUDIT_MODE".to_string(), "approve".to_string());
+        explicit_approve.insert(
+            "APPROVAL_WHITELIST".to_string(),
+            "@admin:example.com".to_string(),
+        );
+        explicit_approve.insert("AUDIT_ENABLED".to_string(), "1".to_string());
+        assert_eq!(
+            Config::load_from(&explicit_approve).unwrap().audit_mode,
+            AuditMode::Approve
+        );
+
+        let mut falsy = base_env();
+        falsy.insert("AUDIT_ENABLED".to_string(), "0".to_string());
+        assert_eq!(
+            Config::load_from(&falsy).unwrap().audit_mode,
+            AuditMode::Off
+        );
     }
 
     #[test]
@@ -431,5 +511,89 @@ mod tests {
         assert!(cfg.credential_secret.is_none());
         assert!(!cfg.llm_upstreams.contains_key(&9999));
         assert!(crate::service::llm_gateway::resolve_upstream(&cfg, Some(9999)).is_none());
+    }
+
+    #[test]
+    fn legacy_warn_covers_env_loopback_and_api_port() {
+        let mut env = base_env();
+        for var in ["ENV", "ALLOW_LOOPBACK_NO_TOKEN", "CREDENTIAL_API_PORT"] {
+            env.insert(var.to_string(), "set".to_string());
+        }
+        let detected = legacy_ignored_detected(&env);
+        for var in ["ENV", "ALLOW_LOOPBACK_NO_TOKEN", "CREDENTIAL_API_PORT"] {
+            assert!(detected.contains(&var), "{var} 非空须命中");
+        }
+        let blank = HashMap::from([
+            ("ENV".to_string(), "  ".to_string()),
+            ("ALLOW_LOOPBACK_NO_TOKEN".to_string(), String::new()),
+            ("CREDENTIAL_API_PORT".to_string(), "\t".to_string()),
+        ]);
+        assert!(legacy_ignored_detected(&blank).is_empty(), "空值不得命中");
+        let mut loaded = base_env();
+        loaded.insert("ENV".to_string(), "dev".to_string());
+        loaded.insert("ALLOW_LOOPBACK_NO_TOKEN".to_string(), "1".to_string());
+        loaded.insert("CREDENTIAL_API_PORT".to_string(), "9999".to_string());
+        let cfg = Config::load_from(&loaded).unwrap();
+        assert_eq!(cfg.audit_mode, AuditMode::Off);
+        assert_eq!(cfg.entry_mode, crate::config::EntryMode::Full);
+        assert!(!cfg.credential_block_wait);
+        assert!(!cfg.llm_upstreams.contains_key(&9999));
+    }
+
+    #[test]
+    fn legacy_ignored_vars_set_locked() {
+        let names: std::collections::BTreeSet<&str> =
+            LEGACY_IGNORED_VARS.iter().map(|(name, _)| *name).collect();
+        let want = std::collections::BTreeSet::from([
+            "CREDENTIAL_MASTER_PASSWORD",
+            "CREDENTIAL_PORT",
+            "CREDENTIAL_PROXY_DEBUG_DIR",
+            "ENV",
+            "ALLOW_LOOPBACK_NO_TOKEN",
+            "CREDENTIAL_API_PORT",
+        ]);
+        assert_eq!(
+            names, want,
+            "清单须恰为六项，增删须同步本测试与本 change spec"
+        );
+        assert_eq!(LEGACY_IGNORED_VARS.len(), 6, "不得重复项扩容");
+        for (name, hint) in LEGACY_IGNORED_VARS {
+            assert!(!hint.trim().is_empty(), "{name} hint 不得为空");
+        }
+    }
+
+    #[test]
+    fn legacy_vars_readme_lockstep() {
+        const README: &str = include_str!("../../README.md");
+        let section = README
+            .split("### 7.4 遗留变量兼容表")
+            .nth(1)
+            .expect("README 须含 §7.4 遗留变量兼容表");
+        let mut names: Vec<String> = Vec::new();
+        for line in section.lines().skip(1) {
+            if line.starts_with("### ") {
+                break;
+            }
+            let Some(row) = line.strip_prefix('|') else {
+                continue;
+            };
+            let cell = row.split('|').next().unwrap_or("").trim();
+            let name = cell.trim_matches('`').trim();
+            if name.is_empty() || name == "遗留变量" || name.chars().all(|c| c == ':' || c == '-')
+            {
+                continue;
+            }
+            names.push(name.to_string());
+        }
+        let readme_set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+        let list_set: std::collections::BTreeSet<String> = LEGACY_IGNORED_VARS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(
+            readme_set, list_set,
+            "README §7.4 与 LEGACY_IGNORED_VARS 名称集合须相等"
+        );
+        assert_eq!(names.len(), readme_set.len(), "README §7.4 不得重复变量行");
     }
 }

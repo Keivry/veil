@@ -12,6 +12,7 @@ use {
             is_terminal_event,
             now_secs,
             outer_event_index,
+            responses_error_message,
             responses_failed_incomplete,
             responses_synth_conv_id,
             should_synthesize_empty_stream,
@@ -24,8 +25,7 @@ use {
         approval::PendingRecord,
         config::AuditMode,
         service::{
-            audit::{self, AuditPolicy},
-            audit_hold::{AuditHold, RequestKeepalive},
+            audit::{self, AuditHold, AuditPolicy, RequestKeepalive},
             block_inject,
             json_walk::strip_bom,
             llm_gateway::{self, Protocol},
@@ -216,29 +216,37 @@ pub fn spawn_stream_pump(
                     }
                 }
                 if protocol == Protocol::Responses && !ev.data.is_empty() {
-                    let (is_failed, is_incomplete, is_error) =
-                        responses_failed_incomplete(&ev.data, &metrics);
-                    if is_incomplete || is_error {
-                        if !responses_failed_sent {
-                            responses_failed_sent = true;
-                            terminal_sent = true;
-                            let fid = responses_synth_conv_id(
-                                stream_first_id.as_deref(),
-                                conv_id.as_deref(),
-                                &metrics,
-                            );
-                            for f in block_inject::ensure_event_lines(
-                                block_inject::responses_truncated_frames(&fid),
-                            ) {
-                                metrics.add_sse_event();
-                                forwarded += 1;
-                                any_frame_sent = true;
-                                if pump_tx.send(f).await.is_err() {
-                                    break;
-                                }
+                    // N1：分支首行守卫——已发任意终端（如 `response.completed`）后，
+                    // 后续 `error`/`incomplete`/`failed` 帧一律忽略，不得在其后合成
+                    // `response.failed`（先于 `responses_failed_sent` 判定，保证恒恰一终端）。
+                    if terminal_sent {
+                        continue;
+                    }
+                    let (is_failed, _, is_error) = responses_failed_incomplete(&ev.data, &metrics);
+                    if is_error {
+                        // P4/D4：`error` 仅合成单帧 `response.failed`（`response.error.message`
+                        // 携带上游 error 文案），不注入 `output_index` 序列；`incomplete`
+                        // 不在此列——原样透传并作为唯一终端（保留 `incomplete_details`，
+                        // 由 `is_terminal_event` 置位）。
+                        responses_failed_sent = true;
+                        terminal_sent = true;
+                        let fid = responses_synth_conv_id(
+                            stream_first_id.as_deref(),
+                            conv_id.as_deref(),
+                            &metrics,
+                        );
+                        let err_msg = responses_error_message(&ev.data);
+                        for f in block_inject::ensure_event_lines(vec![
+                            block_inject::responses_failed_frame(&fid, err_msg.as_deref()),
+                        ]) {
+                            metrics.add_sse_event();
+                            forwarded += 1;
+                            any_frame_sent = true;
+                            if pump_tx.send(f).await.is_err() {
+                                break;
                             }
-                            block_inject::mark_terminal(&mut meta);
                         }
+                        block_inject::mark_terminal(&mut meta);
                         terminated = true;
                         continue;
                     }
@@ -310,7 +318,7 @@ pub fn spawn_stream_pump(
                                     frag.2.as_deref(),
                                     &frag.3,
                                 );
-                                if verdict == crate::service::audit_hold::HoldVerdict::Rejected {
+                                if verdict == crate::service::audit::HoldVerdict::Rejected {
                                     reject_reason = Some("audit-hold-overflow".to_string());
                                     break;
                                 }
@@ -325,7 +333,7 @@ pub fn spawn_stream_pump(
                                     frag.1.as_deref(),
                                     frag.2.as_deref(),
                                     &frag.3,
-                                ) == crate::service::audit_hold::HoldVerdict::Rejected
+                                ) == crate::service::audit::HoldVerdict::Rejected
                                 {
                                     reject_reason = Some("audit-hold-overflow".to_string());
                                     break;
@@ -609,6 +617,39 @@ pub fn spawn_stream_pump(
                 }
             }
         }
+        // P1/D2：Chat 已见非 null `finish_reason` 却未收到 `[DONE]`（上游异常收尾）：
+        // flush 边界后补发恰一 `data: [DONE]` 并置终端；`finish_reason` 后的 usage
+        // 尾帧此前已透传，不提前截断。`truncated_mode=open_ended` 观测保留
+        //（如实描述上游截断形态，不新增枚举）。置于空流守门前：补发后
+        // `terminal_sent` 已置位，守门自然跳过，恒恰一终端。
+        if protocol == Protocol::Chat
+            && !terminal_sent
+            && saw_finish_reason
+            && meta.truncated_mode.is_none()
+        {
+            if let Some((fp, fd)) = boundary.flush() {
+                agg.push_str(&fp);
+                agg.push_str(&format!("data: {fd}\n\n"));
+            }
+            agg.push_str(&block_inject::chat_done_frame());
+            if !agg.is_empty() {
+                metrics.add_sse_event();
+                forwarded += 1;
+                any_frame_sent = true;
+                let _ = pump_tx.send(std::mem::take(&mut agg)).await;
+            }
+            terminal_sent = true;
+            block_inject::mark_terminal(&mut meta);
+            let _ = set_truncated(
+                &mut meta,
+                protocol,
+                crate::service::sse::TruncatedMode::OpenEnded,
+                Some(&metrics),
+            );
+            tracing::warn!(
+                "Chat 流已见 finish_reason 但缺 [DONE]，已补发 [DONE] 收尾（open-ended 观测保留）"
+            );
+        }
         // D4：空流合成守门以终端/任意帧状态位为准（残余 `send` 即记位），
         // 不依赖 `forwarded` 计数器；真空流（三位全假）仍合成三协议恰一终端帧。
         if should_synthesize_empty_stream(terminal_sent, any_frame_sent, block_injected) {
@@ -657,24 +698,6 @@ pub fn spawn_stream_pump(
         }
         let _ = terminated;
         _gate.store(false, std::sync::atomic::Ordering::Relaxed);
-        // B3/P2-2：Chat 已见非 null `finish_reason` 却未收到 `[DONE]`（上游异常收尾）：
-        // 置 open-ended 可观测（warn + 指标），不合成任何终端帧（真空/截断守门已覆盖，
-        // 此处仅补齐「有帧但无 DONE」缺口）。
-        if protocol == Protocol::Chat
-            && !terminal_sent
-            && saw_finish_reason
-            && meta.truncated_mode.is_none()
-        {
-            let _ = set_truncated(
-                &mut meta,
-                protocol,
-                crate::service::sse::TruncatedMode::OpenEnded,
-                Some(&metrics),
-            );
-            tracing::warn!(
-                "Chat 流已见 finish_reason 但缺 [DONE]，按 open-ended 收尾（不合成终端）"
-            );
-        }
         admin_metrics.record_chat(ChatRecord {
             protocol,
             model: stream_model.as_deref().unwrap_or(""),

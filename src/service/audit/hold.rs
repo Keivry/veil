@@ -340,10 +340,7 @@ impl Drop for RequestKeepalive {
 /// D3 hold 单测（自 `audit_hold.rs` 随实现体并入，语义不变）。
 #[cfg(test)]
 mod audit_hold_tests {
-    use {
-        super::{super::verdict::decide_via_gateway, *},
-        crate::approval::{ApprovalGateway, NoopApproval, PendingRecord},
-    };
+    use super::*;
 
     #[test]
     fn responses_three_fragments_ordered_single_flush_no_audit_during_delta() {
@@ -497,48 +494,6 @@ mod audit_hold_tests {
         assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MIN, 110);
         assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MAX, 130);
         assert_eq!(crate::config::AUDIT_TIMEOUT_DEFAULT, 90);
-    }
-
-    #[test]
-    fn verdict_reuses_approval_trait_stub() {
-        let gw = NoopApproval;
-        let rec = PendingRecord::new("k", "audit_hold");
-        assert_eq!(decide_via_gateway(&gw, &rec), None);
-        struct BlockAll;
-        impl std::fmt::Debug for BlockAll {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("BlockAll")
-            }
-        }
-        impl ApprovalGateway for BlockAll {
-            fn request_approval(&self, _: &PendingRecord) -> crate::approval::ApprovalOutcome {
-                crate::approval::ApprovalOutcome::Blocked
-            }
-        }
-        assert_eq!(
-            decide_via_gateway(&BlockAll, &rec),
-            Some(HoldVerdict::Rejected)
-        );
-    }
-
-    #[test]
-    fn decide_enforces_block_and_approve_without_noop_stub() {
-        let rec = PendingRecord::new("k", "audit_hold");
-        struct AllowAll;
-        impl std::fmt::Debug for AllowAll {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("AllowAll")
-            }
-        }
-        impl ApprovalGateway for AllowAll {
-            fn request_approval(&self, _: &PendingRecord) -> crate::approval::ApprovalOutcome {
-                crate::approval::ApprovalOutcome::Approved
-            }
-        }
-        assert_eq!(
-            decide_via_gateway(&AllowAll, &rec),
-            Some(HoldVerdict::Approved)
-        );
     }
 
     #[test]

@@ -157,13 +157,19 @@ mod tests {
 
     #[test]
     fn synthesize_truncation_covers_all_protocols_without_fake_success() {
-        // P0-3.2：responses 合成 failed；chat/anthropic open-ended 空实现
-        // （不伪造成功终止）；与 C8 空流合成形态互斥可联动。
+        // P0-3.2 + P4/D4：responses 合成单帧 failed（`error.message="truncated"`，
+        // 不注入 output_index 全序列）；chat/anthropic open-ended 空实现
+        // （不伪造成功终止）。
         let failed =
             ensure_event_lines(synthesize_truncation(GatewayProtocol::Responses, "r-drop"));
-        assert!(!failed.is_empty());
+        assert_eq!(failed.len(), 1, "截断合成为单帧: {failed:?}");
         assert!(failed.join("").contains("response.failed"));
+        assert!(failed.join("").contains("\"message\":\"truncated\""));
         assert!(!failed.join("").contains("response.completed"));
+        assert!(
+            !failed.join("").contains("output_index"),
+            "不得注入 output_index 序列: {failed:?}"
+        );
         for proto in [GatewayProtocol::Chat, GatewayProtocol::Anthropic] {
             assert!(
                 synthesize_truncation(proto, "x").is_empty(),
@@ -205,23 +211,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_stream_frames_chat_single_done() {
+        // P2/D2：chat 真空流恰一帧且为 `data: [DONE]`。
+        let frames = empty_stream_frames("chat", "c-vacuum");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], "data: [DONE]\n\n");
+        assert_eq!(count_done(&frames), 1);
+    }
+
+    #[test]
     fn truncation_tss04_empty_stream_single_terminal_all_protocols() {
-        // C8 open-ended：真空流 chat/anthropic 为空帧集（不伪造成功终止）；
-        // Responses 仍合成 failed 且恰一终端。
+        // P2/D2/D3：真空流三协议均补终止帧且恰一终端（chat `[DONE]`、
+        // anthropic 最小 message_start+message_stop、responses failed）。
+        let chat = empty_stream_frames("chat", "c1");
+        assert_eq!(count_done(&chat), 1, "chat 真空流恰一 [DONE]");
+        let anth = empty_stream_frames("anthropic", "a1");
+        let joined_a = anth.join("");
         assert!(
-            empty_stream_frames("chat", "c1").is_empty(),
-            "chat 真空流须 open-ended，不合成终止"
+            joined_a.contains("message_start") && joined_a.contains("message_stop"),
+            "anthropic 须最小终止信封: {joined_a}"
         );
         assert!(
-            empty_stream_frames("anthropic", "c1").is_empty(),
-            "anthropic 真空流须 open-ended，不合成终止"
+            !joined_a.contains("content_block"),
+            "不得注入 content_block_*: {joined_a}"
         );
+        assert_eq!(terminal_count(&anth, "anthropic"), 1);
         assert_eq!(
             terminal_count(&empty_stream_frames("responses", "c1"), "responses"),
             1
         );
-        let chat_empty = dedupe_terminal_frames(vec![], "chat");
-        assert_eq!(count_done(&chat_empty), 1);
+        assert!(empty_stream_frames("passthrough", "x").is_empty());
     }
 
     #[test]
@@ -521,9 +540,12 @@ mod tests {
 
     #[test]
     fn done_fallback_audits_single_terminal_all_protocols() {
-        // C8：chat/anthropic 真空流 open-ended（空帧集）；responses 合成 failed。
-        assert!(empty_stream_frames("chat", "c1").is_empty());
-        assert!(empty_stream_frames("anthropic", "m1").is_empty());
+        // P2：三协议真空流均补终止帧；未知协议仍空实现。
+        assert_eq!(count_done(&empty_stream_frames("chat", "c1")), 1);
+        assert_eq!(
+            terminal_count(&empty_stream_frames("anthropic", "m1"), "anthropic"),
+            1
+        );
         let resp = empty_stream_frames("responses", "r1");
         assert_eq!(terminal_count(&resp, "responses"), 1);
         assert!(resp.join("").contains("response.failed"));

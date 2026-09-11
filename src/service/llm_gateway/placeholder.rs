@@ -172,21 +172,6 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
         }
         return injected;
     }
-    if protocol == Protocol::Anthropic {
-        let Some(map) = body.as_object_mut() else {
-            return false;
-        };
-        if let Some(sys) = map.get_mut("system") {
-            if matches!(sys, Value::String(_) | Value::Array(_)) {
-                append_prompt_text(sys, prompt);
-                return true;
-            }
-            tracing::warn!("Anthropic system 非法形态不注入，原体透传");
-            return false;
-        }
-        map.insert("system".to_string(), Value::String(prompt.to_string()));
-        return true;
-    }
     let key = "messages";
     let Some(map) = body.as_object_mut() else {
         return false;

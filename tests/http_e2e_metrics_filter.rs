@@ -64,7 +64,6 @@ fn test_app() -> (axum::Router, veil::state::AppState) {
             sqlite_ok: true,
             sqlite_error: None,
             db_path: db,
-            memory_only: true,
         },
     )
     .with_keepass(std::sync::Arc::new(veil::keepass::MockKeePass::unlocked()));

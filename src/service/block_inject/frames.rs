@@ -1,8 +1,8 @@
 //! 三协议阻断帧/体合成（H1.2 一切：帧合成）。
 //!
 //! - 流式帧：`chat/anthropic/responses_block_frames` + 截断/空流合成
-//!   （`synthesize_truncation`/`empty_stream_frames`，Responses 合成 failed， chat/anthropic
-//!   真空保持 open-ended 不伪造成功终止）。
+//!   （`synthesize_truncation`/`empty_stream_frames`：Responses 合成 failed 单帧/全序列，
+//!   Chat/Anthropic 真空补最小线级终止，不伪造内容/usage/成功语义）。
 //! - 非流体：`nonstream_block_body` 三协议 JSON 形态 + `evaluate_nonstream` tool 提取与审计（仅
 //!   `Block` 合成阻断体，`NeedApproval` 记 pending 透传）。
 //! - `ensure_event_lines` 归一化（Chat/`[DONE]` 豁免补 `event:` 行）。
@@ -60,9 +60,24 @@ pub fn responses_block_frames(response_id: &str) -> Vec<String> {
 
 /// Responses 截断全序列（D3）：与阻断同序列，尾帧改 `response.failed`
 /// （失败语义，不伪造完成），`terminal_count==1` 且不含 `completed`。
+/// P4/D4：本全序列**仅真空流**（`empty_stream_frames`）使用——含 `output_index`
+/// 的注入仅对无已流出 item 的零帧流安全；流中段 `error`/截断改单帧
+/// [`responses_failed_frame`]（避免重复 `output_index`）。
 pub fn responses_truncated_frames(response_id: &str) -> Vec<String> {
     let text = "[truncated]";
     responses_sequence(response_id, text, false)
+}
+
+/// P4/D4：`type:"error"` 单帧合成——`response.failed` 单帧携带上游 error 文案
+/// （`message` 为 `None` 时保持既有 `{"id","status"}` 形态，不带 error 字段）；
+/// 不注入 `output_index`/`output_item.*` 序列，不与已流出 item 冲突。
+pub fn responses_failed_frame(response_id: &str, message: Option<&str>) -> String {
+    let mut response = serde_json::json!({"id": response_id, "status": "failed"});
+    if let Some(msg) = message {
+        response["error"] = serde_json::json!({"message": msg});
+    }
+    let payload = serde_json::json!({"type": "response.failed", "response": response});
+    format!("event: response.failed\ndata: {payload}\n\n")
 }
 
 fn responses_sequence(response_id: &str, text: &str, completed: bool) -> Vec<String> {
@@ -237,7 +252,7 @@ pub fn nonstream_block_body(
 /// `NeedApproval` 记 pending 后返回 `None` 走上游透传（与流式 B 案 `README 6.4`
 /// 一致：不断链、不合成阻断帧）；全放行返回 `None`。
 /// R5 职责声明：本模块只合成帧/体（阻断体/截断帧/空流帧），不累积字节；
-/// 字节累积归 `audit_hold::AuditHold`（只累积、不合成帧），两边不交叉。
+/// 字节累积归 `service::audit::AuditHold`（只累积、不合成帧），两边不交叉。
 /// handler 接线说明：`Some(body)` 是否替代上游响应由调用方按上游状态码裁决
 /// （T3/D3：仅上游 2xx 合成 200 阻断体；错误状态保留上游状态与正文并照记审计，
 /// 见 `src/handler/llm/nonstream.rs`），`None` 走正常还原透传。
@@ -274,25 +289,57 @@ pub fn evaluate_nonstream(
 }
 
 /// 截断合成（P0-3.2/TSS-02，对标 Python `_synthesize_truncation`）：
-/// responses 合成截断文本 + `response.failed`（失败语义，不伪造完成）；
-/// chat/anthropic 不合成成功终止（open-ended，以已透传块收尾；残缺分片
-/// 由泵内 TSS-03 缓冲丢弃）。返回帧由调用方经 `ensure_event_lines` 归一化后发送。
+/// responses 合成单帧 `response.failed`（`response.error.message="truncated"`，
+/// 失败语义不伪造完成；P4/D4：不再注入 7 帧 `output_index` 序列——流中段可能
+/// 已流出 `output_index:0` 的 item，重复注入违反序号单调）；chat/anthropic
+/// 不合成成功终止（open-ended，以已透传块收尾；残缺分片由泵内 TSS-03 缓冲丢弃）。
+/// 返回帧由调用方经 `ensure_event_lines` 归一化后发送。
 pub fn synthesize_truncation(protocol: GatewayProtocol, conv_id: &str) -> Vec<String> {
     match protocol {
-        GatewayProtocol::Responses => responses_truncated_frames(conv_id),
+        GatewayProtocol::Responses => vec![responses_failed_frame(conv_id, Some("truncated"))],
         GatewayProtocol::Chat | GatewayProtocol::Anthropic | GatewayProtocol::NonDialog => {
             vec![]
         }
     }
 }
 
-/// 空流合成（C8 open-ended 回归，对标 Python `_synthesize_truncation`）：
-/// 真空流（零残余）chat/anthropic 保持 open-ended（空帧集，不伪造成功终止，
-/// 下游靠缺失 `finish_reason` 走 stub 路径）；Responses 仍合成 failed 终端
-/// （TSS04，失败语义不伪造完成）；未知协议空实现。
+/// 空流合成（P2/D2/D3，对标 Python `_synthesize_truncation`）：
+/// 真空流（零残余）三协议均补最小可解析终止——chat 恰一 `data: [DONE]`；
+/// anthropic 最小 `message_start`+`message_stop`（空 content、null stop_reason、
+/// usage 全 0，不含 `content_block_*`，不伪造成功）；responses 保持
+/// `response.failed` 全序列（失败语义不伪造完成）；未知协议空实现。
 pub fn empty_stream_frames(protocol: &str, conv_id: &str) -> Vec<String> {
     match protocol {
+        "chat" => vec![chat_done_frame()],
+        "anthropic" => anthropic_vacuum_frames(conv_id),
         "responses" => responses_truncated_frames(conv_id),
         _ => vec![],
     }
+}
+
+/// P2/D3：Anthropic 真空流最小终止信封——`message_start` 空 content、
+/// null `stop_reason`、usage 全 0，`model` 按既有回退口径置 `unknown_model`；
+/// 不注入 `content_block_*`、不声称语义 stop_reason。
+fn anthropic_vacuum_frames(conv_id: &str) -> Vec<String> {
+    let id = if conv_id.is_empty() {
+        "vacuum-0"
+    } else {
+        conv_id
+    };
+    let start = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": "unknown_model",
+            "content": [],
+            "stop_reason": null,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }
+    });
+    vec![
+        format!("event: message_start\ndata: {start}\n\n"),
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+    ]
 }

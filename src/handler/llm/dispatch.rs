@@ -37,10 +37,30 @@ fn payload_too_large(limit: usize) -> Response {
         .into_response()
 }
 
+/// spawn 包裹 + 立即 await 的语义容器（A3/D2）：
+/// 1) panic 兜底：spawn 任务内 panic 被隔离为 `JoinError`，统一转 500 （不穿透为下游连接中断）；
+/// 2) 断连续跑：任务所有权脱离 handler future，客户端断连致 handler 被 `drop`
+///    时任务仍续跑至完成（审计/用量落库完整）。
+///
+/// 正常路径与直接 await 等价，无并发收益。
+async fn spawn_contained<F>(fut: F) -> Response
+where
+    F: std::future::Future<Output = Response> + Send + 'static,
+{
+    match tokio::spawn(fut).await {
+        Ok(resp) => resp,
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":{"code":"E_INTERNAL","message":"内部错误"}})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn llm_proxy_handler(State(state): State<AppState>, req: Request) -> Response {
     let (mut parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
-    let outcome = tokio::spawn(async move {
+    spawn_contained(async move {
         // 通用 ingress JSON 检查点 10MB（spec `admin-ratelimit-contract` + design D4）：
         // 超限返回 413，MUST NOT 以 `unwrap_or_default` 静默为空体继续处理。
         let body_bytes = match axum::body::to_bytes(body, super::GATEWAY_BODY_LIMIT_BYTES).await {
@@ -49,15 +69,7 @@ pub async fn llm_proxy_handler(State(state): State<AppState>, req: Request) -> R
         };
         gateway_serve(&state, &mut parts, &path, body_bytes).await
     })
-    .await;
-    match outcome {
-        Ok(resp) => resp,
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":{"code":"E_INTERNAL","message":"内部错误"}})),
-        )
-            .into_response(),
-    }
+    .await
 }
 
 /// A1/D8 入口宿主机端口解析：`]` 存在时按方括号 IPv6 取 `]:` 后段端口
@@ -151,6 +163,7 @@ pub(crate) async fn gateway_serve(
             audit_policy_file: audit_policy_file.clone(),
             approval_whitelist: approval_whitelist.clone(),
             pending: state.pending.clone(),
+            nonstream_max_bytes: state.config.nonstream_max_bytes,
         };
         return match serve_nonstream(
             client,
@@ -270,6 +283,7 @@ pub(crate) async fn gateway_serve(
             audit_policy_file: audit_policy_file.clone(),
             approval_whitelist: approval_whitelist.clone(),
             pending: state.pending.clone(),
+            nonstream_max_bytes: state.config.nonstream_max_bytes,
         };
         match serve_nonstream(
             client,
@@ -348,6 +362,17 @@ mod entry_tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "E_PAYLOAD_TOO_LARGE");
+    }
+
+    #[tokio::test]
+    async fn panic_in_spawned_task_maps_to_500_not_connection_abort() {
+        let resp = super::spawn_contained(async { panic!("注入 panic") }).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "E_INTERNAL");
+        let ok = super::spawn_contained(async { (StatusCode::OK, "ok").into_response() }).await;
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -1,9 +1,8 @@
-//! 管理面限流：速率 10/min/IP + 豁免路径 + 429 响应。
+//! 管理面限流纯逻辑：速率 10/min/IP + 豁免路径（429 响应构造归
+//! `handler::admin::rate_limited`）。
 
 use {
     super::{super::credential::AppStateParts, state::AdminState},
-    axum::response::{IntoResponse, Response},
-    serde_json::json,
     std::{
         net::IpAddr,
         time::{Duration, Instant},
@@ -45,27 +44,11 @@ impl AdminState {
     }
 }
 
-/// 超限响应：429 + `Retry-After`（秒）+ 错误码 `E_RATE_LIMITED`（spec 锁定）。/// 头名小写
-/// `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）。
-pub(crate) fn rate_limited(retry_after: u64) -> Response {
-    let mut resp = (
-        axum::http::StatusCode::TOO_MANY_REQUESTS,
-        axum::Json(json!({"error": {"code": "E_RATE_LIMITED", "message": format!("请求过于频繁，请 {retry_after}s 后重试")}})),
-    )
-        .into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
-        resp.headers_mut().insert("retry-after", v);
-    }
-    resp
-}
-
-/// 通用限流门（速率维度）：通过则计数 +1；超限返回 `Retry-After` 秒数。
+/// 通用限流门（速率维度）：通过则计数 +1；超限返回 `Retry-After` 秒数
+/// （响应构造归 handler 层，本层不 import axum）。
 /// 与 SSE 并发计数相互独立（正交），本函数不触 `sse_count`。
-pub(crate) fn check_admin_rate(state: &impl AppStateParts, ip: IpAddr) -> Option<Response> {
-    match state.admin_state().check_rate(ip) {
-        Ok(()) => None,
-        Err(retry) => Some(rate_limited(retry)),
-    }
+pub(crate) fn check_admin_rate(state: &impl AppStateParts, ip: IpAddr) -> Option<u64> {
+    state.admin_state().check_rate(ip).err()
 }
 
 #[cfg(test)]
@@ -78,7 +61,7 @@ mod tests {
             },
             *,
         },
-        axum::http::StatusCode,
+        std::net::IpAddr,
     };
 
     #[test]
@@ -92,31 +75,6 @@ mod tests {
         assert!(retry >= 1);
         // 不同 IP 不受影响（不读代理头：伪造 XFF 无法逃逸——本函数只收直连 IP）。
         assert!(st.check_rate(IpAddr::from([10, 0, 0, 2])).is_ok());
-    }
-
-    #[tokio::test]
-    async fn rate_limited_returns_429_with_retry_after_and_code() {
-        let resp = rate_limited(42);
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok()),
-            Some("42")
-        );
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["error"]["code"], "E_RATE_LIMITED");
-        // SSE 并发拒绝固定 Retry-After: 60。
-        let sse_resp = rate_limited(60);
-        assert_eq!(sse_resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            sse_resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok()),
-            Some("60")
-        );
     }
 
     #[test]

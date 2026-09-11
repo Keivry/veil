@@ -66,8 +66,6 @@ impl MockKeePass {
         }
     }
 
-    pub fn set_unlocked(&self, value: bool) { self.unlocked.store(value, Ordering::SeqCst); }
-
     pub fn fetch_credential(&self, caller: &str) -> Result<String> {
         if !self.is_unlocked() {
             return Err(VeilError::Unavailable {
@@ -225,21 +223,6 @@ impl RealKeePass {
 
     fn is_cached(&self) -> bool { self.cache.lock().is_ok_and(|g| g.is_some()) }
 
-    /// 解锁探针：主口令提供器能给出非空口令即视为已解锁。
-    /// 与 [`RealKeePass::is_unlocked`] 的差异有意为之：快检只看文件存在（零副作用，
-    /// `/health` 高频调用安全），本探针会实际调用提供器（可能触发 TPM 解封，
-    /// 但 `tpm_password_provider` 自带缓存，重复调用不重复解封）。
-    /// 接线说明（给 handler 集成方）：`/health` 沿用 `is_unlocked` 快检；
-    /// 需要“口令级解锁”门禁的路径（如启动期预热）调用本探针。
-    pub fn is_unlocked_by_password(&self) -> bool {
-        if !self.db_path.is_file() {
-            return false;
-        }
-        (self.password_provider)()
-            .map(|pw| !pw.is_empty())
-            .unwrap_or(false)
-    }
-
     fn lookup_cached(&self, title: &str) -> Option<EntrySnapshot> {
         self.cache
             .lock()
@@ -252,7 +235,6 @@ impl RealKeePass {
 
 impl KeePassBackend for RealKeePass {
     /// 快检：库文件存在即视为配置就绪（`/health` 用，不触发解密、无副作用）。
-    /// 真正“已解锁”（主口令非空可用）见 [`RealKeePass::is_unlocked_by_password`]，
     /// 取用路径失败仍以 `fetch_entry` 的实时错误为准，本函数不做解锁承诺。
     fn is_unlocked(&self) -> bool { self.db_path.is_file() }
 
@@ -580,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn unlock_probe_detects_nonempty_password() {
+    fn unlock_quickcheck_keys_off_file_presence_only() {
         let dir = unique_temp_dir("probe");
         let db_path = dir.join("vault.kdbx");
         build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
@@ -588,19 +570,17 @@ mod tests {
             std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
         let ok = RealKeePass::new(db_path.clone(), None, ok_provider);
         assert!(ok.is_unlocked());
-        assert!(ok.is_unlocked_by_password());
+        // 快检不触提供器：空口令提供器同样视为库文件就绪（解锁承诺由取用路径承担）。
         let empty_provider: PasswordProvider =
             std::sync::Arc::new(|| Ok(Zeroizing::new(Vec::new())));
         let empty = RealKeePass::new(db_path, None, empty_provider);
         assert!(empty.is_unlocked());
-        assert!(!empty.is_unlocked_by_password());
         let absent = RealKeePass::new(
             dir.join("absent.kdbx"),
             None,
             std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec()))),
         );
         assert!(!absent.is_unlocked());
-        assert!(!absent.is_unlocked_by_password());
         std::fs::remove_dir_all(&dir).ok();
     }
 

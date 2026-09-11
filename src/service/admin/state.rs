@@ -144,7 +144,6 @@ pub(crate) mod test_support {
     use {
         super::AdminState,
         crate::service::metrics::{PiiSamplerConfig, PiiValueSampler},
-        axum::http::HeaderMap,
         std::net::IpAddr,
     };
 
@@ -163,17 +162,6 @@ pub(crate) mod test_support {
             db.clone(),
         );
         AdminState::new_for_test(db, sampler)
-    }
-
-    pub(crate) fn headers_with(token: Option<&str>, cookie: Option<&str>) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        if let Some(t) = token {
-            h.insert("x-admin-token", t.parse().unwrap());
-        }
-        if let Some(c) = cookie {
-            h.insert("cookie", format!("__Host-admin_token={c}").parse().unwrap());
-        }
-        h
     }
 }
 

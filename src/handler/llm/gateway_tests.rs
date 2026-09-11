@@ -75,6 +75,7 @@ fn nonstream_ctx(
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
         pending: Arc::new(PendingApprovals::default()),
+        nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
     }
 }
 

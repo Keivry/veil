@@ -1,7 +1,7 @@
 use {
     crate::{
-        handler,
-        service::{admin, credential::AppStateParts},
+        handler::{self, admin},
+        service::credential::AppStateParts,
         state::AppState,
     },
     axum::{
@@ -90,7 +90,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
             },
         )
         .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()));

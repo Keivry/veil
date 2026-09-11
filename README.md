@@ -2,7 +2,7 @@
 
 Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 LLM 脱敏反向代理（SSE 流式还原 + 输出审计）。
 
-本文档是部署与行为的唯一文档入口，阈值表与 `openspec/changes/veil-hardening/specs/` 契约同字；如有出入以 spec 为准。
+本文档是部署与行为的唯一文档入口，阈值表与 `openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md`（未归档，`veil-hardening` 5.1–5.3 完成后晋升 canonical）契约同字；如有出入以 spec 为准。
 
 ## 1. 部署方式
 
@@ -32,9 +32,10 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 认证 | `GET_BINARY_HASH` | 空 | 独立生效：置位时拒绝调用方冒用 get 自身哈希的直调（`caller_hash == GET_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `GET_BINARY_SECRET` 无联动 |
 | 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同 |
 | 认证 | `AUTO_APPROVE` | `true` | `true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批 |
-| 认证 | `CREDENTIAL_BLOCK_WAIT` | 关闭 | 凭据审批双模开关；`=1` 时 enrolled 篡改/未 enrolled 待审走 `300`s 阻塞等 reaction，默认 `202` 抛单（建单 + best-effort 发送即返回，接线见 `src/service/credential/approval.rs::approval_dual_mode`）；示例：`CREDENTIAL_BLOCK_WAIT=1` |
+| 认证 | `CREDENTIAL_BLOCK_WAIT` | 关闭 | 凭据审批双模开关；开启条件为真值集合 `1/true/yes/on`（trim + 大小写不敏感），enrolled 篡改/未 enrolled 待审走 `300`s 阻塞等 reaction，默认（未设/非真值）保持 `202` 抛单（建单 + best-effort 发送即返回，接线见 `src/service/credential/approval.rs::approval_dual_mode`）；默认模式客户端按 `E_PENDING` 对同一请求轮询重试（建议指数退避），阻塞模式无需轮询；示例：`CREDENTIAL_BLOCK_WAIT=1` |
 | 入口 | `VEIL_ENTRY_MODE` | `full` | `full` / `credential-only` / `llm-only` |
 | 入口 | `CALLER_REGISTRY_PATH` | `<DATA_DIR>/caller_registry.json` | 调用方注册表路径 |
+| 入口 | `OBSERVABILITY_DISABLE` | 空（启用） | 精确 `=1`（去空白）时 `/_admin*` 全 404，且与 token 有效性无关；其余值不触发；生产不推荐 |
 | 存储 | `DATA_DIR` | `/data` | sqlite、审计日志父目录；派生 `/data/tpm`（`seal.pub`+`seal.priv`）与 `/data/db`（`.kdbx`+`.key`） |
 | 存储 | `DB_DIR` / `TPM_DIR` | `<DATA_DIR>/db` / `<DATA_DIR>/tpm` | kdbx 库目录（扫描排序取末位 `.kdbx`，同名 `.key` 优先）与 TPM 密封目录 |
 | 存储 | `VEIL_KEEPASS_BACKEND` | `real` | `real` 真实 kdbx 后端；显式 `mock` 仅 CI 逃生（生产禁用） |
@@ -45,7 +46,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 脱敏 | `PII_DETECTION_HARDENING` | 关闭 | 严格边界复核，丢弃 ASCII 粘连与前导零 IPv4 |
 | 脱敏 | `PII_CUSTOM_RULES_FILE` / `PII_RULES_FILE` / `PII_CUSTOM_RULES` | 空 | 自定义正则文件（合并文件，可与分离文件叠加；优先级按列序）；格式 JSON / 极简 YAML（`.yaml`）/ TXT 名单；已配置但缺文件/不可读/解析失败/形态非法一律拒启动，空文件仅 warn（见 `examples/pii-custom.yaml`） |
 | 脱敏 | `PII_CUSTOM_PATTERNS_FILE` / `PII_CUSTOM_PATTERN_FILE` / `PII_CUSTOM_PATTERNS` | 空 | 同上（数组或 `{name: pattern}` 映射） |
-| 脱敏 | `PII_CUSTOM_DICT_FILE` / `PII_SENSITIVE_DICT_FILE` / `PII_SENSITIVE_NAMES_FILE` / `PII_CUSTOM_DICT` | 空 | 同上（字典形态；TXT 每行一名，`#` 注释忽略） |
+| 脱敏 | `PII_CUSTOM_DICT_FILE` / `PII_DICT_FILE` / `PII_SENSITIVE_DICT_FILE` / `PII_SENSITIVE_NAMES_FILE` / `PII_CUSTOM_DICT` | 空 | 同上（字典形态；TXT 每行一名，`#` 注释忽略）；各名等价加载，列序即优先级（`PII_DICT_FILE` 相对 Python 历史名优先，与原仓一致） |
 | 脱敏 | `PII_VALUE_SAMPLE_ENABLED` | 关闭 | 值级采样总开关 |
 | 脱敏 | `PII_VALUE_SAMPLE_PERSIST` | 开启 | 值级采样落盘 |
 | 脱敏 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 未设退化为 SHA256 |
@@ -54,6 +55,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 脱敏 | `PII_HOLD_MAX` | `64` | PII 保持上限（须 ≥1 正整数） |
 | 脱敏 | `NORMALIZE_JSON_WHITESPACE` | 关闭 | 仅 `"1"` 开启请求体空白归一 |
 | 审计 | `AUDIT_MODE` | `off` | `off` / `block` / `approve`；`approve` 必须配 `APPROVAL_WHITELIST` |
+| 审计 | `AUDIT_ENABLED` | 空 | 遗留回退：`AUDIT_MODE` 缺失/空白时真值 `1/true/yes/on`（trim + 大小写不敏感）→ `block`（fail-closed），显式 `AUDIT_MODE` 优先，缺省仍 `off` |
 | 审计 | `AUDIT_TIMEOUT` | `90`s | 禁止落在 `110`-`130`s 竞态区间，否则拒启动 |
 | 审计 | `AUDIT_HOLD_MAX_BYTES` | `1048576` | 审计 hold 上限字节（须 ≥1 正整数） |
 | 审计 | `AUDIT_POLICY_FILE` | 内建默认策略 | 审计策略文件路径 |
@@ -63,6 +65,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | LLM | `LLM_UPSTREAM` | 空 | 缺省上游 URL；`scripts/api_conformance.py` 将其指向 mock 上游 |
 | LLM | `LLM_<port>`（如 `LLM_8878`/`LLM_8879`） | 见 compose | 按宿主机入口端口选择上游 |
 | LLM | `HTTP_TIMEOUT_SECS` | `30` | 上游转发整体超时（秒） |
+| LLM | `NONSTREAM_MAX_BYTES` | `8388608` | 非流对话响应体上限（字节，须 ≥1 正整数，显式非法拒启动）；仅非错误（`status < 400`）响应严格超限 `502` + `response_too_large`，错误体按透传语义不改写（见 §4） |
 | LLM | `HTTP_POOL_MAX_IDLE_PER_HOST` | `16` | 每主机空闲连接上限 |
 | LLM | `HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | 空闲连接保活（秒） |
 | compose 专用 | `PORT_8877` / `PORT_8878` / `PORT_8879` | `8877/8878/8879` | 仅改宿主机映射端口，不改容器内监听；二进制直跑时忽略（只监听 `127.0.0.1:8877`） |
@@ -197,14 +200,15 @@ done
 
 ## 4. 阈值表
 
-下表与 `admin-ratelimit-contract` spec 同字；差异均为有意设计（不同检查点），超限行为统一为
-`429 + Retry-After`（限流）与 `413`（body 超限）。
+下表与 `openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md`（未归档，`veil-hardening` 5.1–5.3 完成后晋升）同字；差异均为有意设计（不同检查点），超限行为统一为
+`429 + Retry-After`（限流）、`413`（body 超限）与 `502`（非流对话响应超限）。
 
 | 维度 | 取值 | 超限行为 | 是否接入口 | 说明 |
 |:-----|:-----|:---------|:-----------|:-----|
 | 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 是 | 速率维度；按 TCP 远端地址计数，不采信代理头 |
 | SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 是 | 并发维度；与 `10/min` 正交；`60s` ping + `5min` 强制重连 |
 | 通用请求体上限 | `10MB` | `413` | 是（入口唯一 enforcement） | 通用 JSON 检查点 |
+| 非流对话响应上限 | `NONSTREAM_MAX_BYTES` 默认 `8MB` | `502` + `response_too_large` JSON 体 | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代 |
 | 审计类上限 | `8MB` | — | 否（纯 ceiling 锚点） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `AUDIT_HOLD_MAX_BYTES` 默认 1MB 均不得超过它）；与入口 `10MB` 属不同检查点、差异有意 |
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
 | 审批超时 | `AUDIT_TIMEOUT` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
@@ -212,7 +216,8 @@ done
 
 ## 5. Go 客户端对接指引
 
-存量 Go `get` 客户端无需修改即可对接：网关保持其所用路径与方法不变。
+存量 Go `get` 客户端无需修改即可对接：网关保持其所用路径与方法不变
+（凭据审批默认 `202` 的例外与 Go 处理结论见本节末条）。
 
 | 用途 | 方法与路径 | 鉴权 |
 |:-----|:-----------|:-----|
@@ -236,11 +241,21 @@ get revoke --name "check-mail"
 
 - 三因子字段：`X-Get-Binary-Hash` + `X-Get-Binary-Secret`（或 `body.secret`）+ `body.auth.caller_hash` /
   `caller_path`；齐全时按既有语义放行或进入审批，缺失时返回明确的鉴权失败（403），不会空响应或挂起。
+- 凭据审批 `202` 轮询语义：默认（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）待审请求返回
+  `202 + E_PENDING` 即已建单，客户端应对同一请求轮询重试（建议指数退避），批准后重试返回凭据、
+  拒绝后 `403`；`CREDENTIAL_BLOCK_WAIT=1` 时无需轮询（同请求阻塞等待，批准返回凭据、拒绝/超时 `403`）。
+- Go `202` 处理结论（只读核实 `get/internal/proxy.go::FetchCredential`，未改 Go）：Go 先整包
+  `json.Unmarshal` 再判 `status >= 400`；网关 `202` 体为 `{"error":{"code":"E_PENDING",...}}`
+  （`error` 为对象），而 Go `CredentialResponse.Error` 为 `string`，反序列化在状态判定前即失败并返回
+  「解析响应失败」——**判定：Go 存量客户端不可直接轮询该 `202`**（也拿不到 `E_PENDING`）。
+  承接建议：由新 change 让 Go 容忍 `202/E_PENDING`（解析 error 对象或按状态码分派后轮询），或部署侧
+  临时改 `CREDENTIAL_BLOCK_WAIT=1` 走同请求阻塞；与 `veil-hardening` 5.2 未勾项联动（该 change 文件不改）。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
 
 ## 6. 行为变更（BREAKING）与迁移
 
-下述六处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING。
+下述六处为相对原仓（Python `credential-proxy`）已发生的默认值与语义漂移，现显式为 BREAKING；
+§6.3 为容量分表基线确认（非 BREAKING）。
 按迁移步骤调整后可回到预期行为，无静默变严或明文落盘增量。
 
 ### 6.1 脱敏总开关默认开启（原仓默认关闭）
@@ -270,12 +285,14 @@ get revoke --name "check-mail"
   PII_VALUE_SAMPLE_HMAC_KEY="$(openssl rand -hex 32)"
   ```
 
-### 6.3 凭据淘汰 FIFO 改 LRU（含容量分表声明）
+### 6.3 容量分表确认（非 BREAKING）
 
-- 变更：凭据映射淘汰策略由 FIFO 改为 LRU（最久未用优先淘汰）；容量分表：
-  凭据表 `MAX_TOKEN_ENTRIES=5000`，PII 请求/响应单表 `PII_MAX_ENTRIES=1000`。
-- 影响：热点凭据驻留更久，冷凭据更快被淘汰；容量语义以本表为准。
-- 迁移：无配置项需改；如依赖旧 FIFO 逐出顺序做容量估算，请按上表容量重估。
+- 基线确认：原仓自 v0.9.6 起凭据与 PII 均已是真 LRU（`_token.py:231`、`:523-538`），
+  容量凭据 `MAX_TOKEN_ENTRIES=5000`（`_token.py:102`）/PII `PII_MAX_ENTRIES=1000`（`_token.py:141`）
+  与本仓一致，非行为漂移，故不计入 BREAKING。
+- 基线 commit（锁定）：`46f6ff665c869b02c154c10df431c638c2177fd9`（2026-09-07，bump version v0.9.47）。
+- 迁移：无配置项需改；容量分表（本仓 `MAX_TOKEN_ENTRIES=5000` / `PII_MAX_ENTRIES=1000`）与原仓一致，
+  仅作容量复核锚点，不主张默认值/行为变化。
 
 ### 6.4 流式审批挂起声明（原仓同步阻塞）
 
@@ -304,10 +321,23 @@ get revoke --name "check-mail"
   本仓**未实现**该逃生口：二进制不读取这两个变量，回环来源与外部来源同等鉴权
   （`X-Admin-Token` / Cookie / 仅 SSE 回退 query；无 token 恒 401）。
 - 影响：旧 dev 环境依赖回环免 token 的脚本会收到 401；生产面不回环豁免，
-  fail-closed 语义不变（`veil-full-parity-fix` spec 允许「恢复或 BREAKING 声明」二选一，
+  fail-closed 语义不变（`metrics-admin-parity` spec 允许「恢复或 BREAKING 声明」二选一，
   本仓选择声明）。
 - 迁移：dev 环境显式补 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`；
   如需恢复回环免 token 语义，须新 change 交付并撤回本条 BREAKING。
+
+### 6.7 凭据审批默认异步 `202`（原仓同步阻塞 `300`s）
+
+- 变更：`CREDENTIAL_BLOCK_WAIT` 未设或非真值时，enrolled 哈希篡改/未 enrolled 待审请求立即返回
+  `202` + `E_PENDING`（已建单 + best-effort 发送审批即返回），同一请求不阻塞；原仓 Python 为同一请求内
+  同步阻塞 `300`s（批准返回凭据、拒绝 `403`、超时 `408`，`_credential.py:26,433,455`）。
+- 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求
+  （建议指数退避），批准后重试返回凭据、拒绝后 `403`。
+- 迁移：恢复 Python 式同步阻塞请设 `CREDENTIAL_BLOCK_WAIT=1`（真值集合 `1/true/yes/on`）：
+  `300`s 内批准同请求返回凭据、拒绝 `403`、超时按拒绝返回 `403` 且不悬挂。
+- 影响：不识别 `202` 的旧客户端须补轮询；Go 存量 `get` 判定为**不可直接轮询**（错误体解析失败，
+  结论见 §5），与 `veil-hardening` 5.2 未勾项联动，Go 侧修复由新 change 承接（恢复旧默认须新 change
+  并撤回本条）。
 
 ## 7. 传输与兼容声明
 
@@ -319,8 +349,11 @@ get revoke --name "check-mail"
 外加 `Connection` 头内列名的动态项。解码开启时（默认）额外剥离
 `content-encoding`/`content-length`（已解码，对外统一 `identity`：如上游回
 `content-encoding: gzip`，下游响应无该头与 `content-length`），
-每次剥离记 `hop_filtered_total{dir}` 并打 `tracing::debug`（`header`/`dir` 字段）。与原仓差异：原仓 Python 侧仅透传常用头，
-本仓显式全集过滤（见 `src/service/llm_gateway/hop.rs:7` 的 `HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用；
+每次剥离记 `hop_filtered_total{dir}` 并打 `tracing::debug`（`header`/`dir` 字段）。与原仓差异：原仓显式剥 7 项 HOP
+（`host`/`transfer-encoding`/`content-length`/`content-encoding`/`connection`/`keep-alive`/`te`，`_sse.py:19-28`）；
+本仓为 RFC 9110 §7.6.1 全集 8 项 + `Connection` 头内列名的动态项
+（`src/service/llm_gateway/hop.rs:7-16` 的 `HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用），
+其中 `host` 由 `forward_headers` 单独剥（`src/handler/llm/mod.rs:34-46`）；
 A5/D9 互引：编码剥离即对外统一 `identity`，见同文件 `filter_hop_headers_counted` 内联注释与单测 `gzip_stripped_as_identity_a5`）。
 
 ### 7.2 usage 口径
@@ -355,8 +388,9 @@ Responses **不注入** `stream_options`（官方规范仅接受 `include_obfusc
 `response.completed.response.usage` 三级回退记录，用户自带键逐字节保留。
 
 Chat 无 `[DONE]` 收尾处理：上游以非 null `finish_reason` 结束后断流、从未发 `data: [DONE]`
-时，网关置 `truncated_mode=open_ended` 并记 warn 与指标，**不合成** `[DONE]` 或任何终端帧
-（见 `src/handler/llm/pump/spawn.rs`）。
+时，网关在流结束处补发恰一 `data: [DONE]` 并置终端（`finish_reason` 后到达的 usage
+尾帧照常透传不丢），同时保留 `truncated_mode=open_ended` 与 warn/指标观测
+（见 `src/handler/llm/pump/spawn.rs`）；上游已发 `[DONE]` 时不重复补发。
 
 Responses 断序容忍：流中 `sequence_number` 不连续（跳号/回退）时帧原样透传、不 panic、
 不丢帧，终端恰一，不因断序升级为错误日志（见 `src/handler/llm/pump/event.rs::extract_responses_seq`）。
@@ -371,12 +405,13 @@ Responses `error` 事件统一为失败终端：流中 `type:"error"` 合成恰�
 窄于 vault 还原侧 `\d{4,}`（兼容历史 4-5 位幻觉形）；4-5 位形态不触发说明注入属**有意保守**
 （注入宜漏不宜误，还原侧仍按宽松口径处理，见 `src/service/llm_gateway/placeholder.rs`）。
 
-非流阻断与错误状态声明（E4/E6/D4，`veil-nonstream-audit-align`）：非流上游为 **2xx**
-且审计命中 `Block` 时，下游恒收 `200 + nonstream_block_body`（与流式恒 200 闭合对称）；
-非 502/401 错误状态的 JSON 体（如 400 `truncation:disabled`）仍进完整后处理链
+非流阻断与错误状态声明（E4/E6/D4，`veil-nonstream-audit-align`；N2/D6，`veil-llm-protocol-hardening`）：
+非流上游为 **2xx** 且审计命中 `Block` 时，下游恒收 `200 + nonstream_block_body`（与流式恒 200 闭合对称）；
+错误状态的 JSON 体（如 400 `truncation:disabled`）仍进完整后处理链
 （用量记录＋审计判定＋还原），审计照记（`audit_blocks` 列 + warn 日志），但下游
-**不合成阻断体**、状态码与正文保留、非字节等价为有意行为；仅非 JSON 的 502/401
-错误体豁免透传（见 `src/handler/llm/nonstream.rs`）。
+**不合成阻断体**、状态码与正文保留、非字节等价为有意行为；`status>=400` 的非 JSON
+错误体（429 限流文案、500 HTML、404 说明，含空体）原样透传状态码与正文字节，
+不再合成 `502 E_EMPTY_BODY`（见 `src/handler/llm/nonstream.rs`）。
 
 ### 7.3 请求隔离声明
 
@@ -393,7 +428,9 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 | `CREDENTIAL_MASTER_PASSWORD` | 二进制不读取 | 主密码口令改走 TPM 解封（`startup_tpm_in`） |
 | `CREDENTIAL_PORT` | 二进制不读取 | 宿主机端口改用 `PORT_8877/8878/8879`（仅改映射） |
 | `CREDENTIAL_PROXY_DEBUG_DIR` | 二进制不读取，无四件落盘 | 如需请求落盘排障，用结构化日志 + `AUDIT_POLICY_FILE` 审计面代替；恢复落盘需新 change 交付（落盘即涉密，需配套脱敏） |
-| `ENV` / `ALLOW_LOOPBACK_NO_TOKEN` | 二进制不读取（回环免 token 未迁移，见 §6.6） | dev 环境显式配置 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`；恢复回环免 token 需新 change 交付 |
+| `ENV` | 二进制不读取（置位启动 warn） | dev 环境显式配置 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`（回环免 token 未迁移，见 §6.6） |
+| `ALLOW_LOOPBACK_NO_TOKEN` | 二进制不读取（置位启动 warn） | 回环免 token 未迁移：dev 环境显式配置 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`（见 §6.6） |
+| `CREDENTIAL_API_PORT` | 二进制不读取（置位启动 warn） | 入口统一走 `VEIL_ENTRY_MODE` + 单端口 `8877`（见 §8.4） |
 
 沿用旧名部署会静默不生效（环境变量全表之外的一律忽略），迁移时必须改名。
 
@@ -424,7 +461,7 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   JSON（紧凑化重序列化）；③ 占位符说明注入分支（经 `to_string` 紧凑重序列化，见 D1 方案 A）。
   纯脱敏子串替换（字节级，未重序列化）与原文透传不置位，即使替换前后字节长度变化。
 - 非流两处响应与 SSE 流响应均按同一 `normalized_out` 置位（见 `src/handler/llm/nonstream.rs`、
-  `src/handler/llm/pump/event.rs::build_sse_response`，经 `pump.rs` 与 `handler/llm/mod.rs` 重导出亦可用；D9 互引见 `arch-docs` spec）。
+  `src/handler/llm/pump/event.rs::build_sse_response`，经 `pump.rs` 与 `handler/llm/mod.rs` 重导出亦可用；D9 互引见 `arch-docs-cleanup` spec（canonical，自 `veil-arch-docs-cleanup` 归档晋升）。
 
 ## 8. 遗留决策记录
 
@@ -463,23 +500,22 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
 - 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 20 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。
 
-### 8.6 空流三协议语义与原仓差异（`stream-protocol-parity`）
+### 8.6 空流三协议语义与原仓差异（P2，`veil-llm-protocol-hardening`）
 
-- 行为：Chat/Anthropic 真空流（零字节零残余）保持 open-ended——不合成任何终止帧，仅置
-  `truncated_mode=open_ended`；Responses 真空流合成恰一 `response.failed` 终端（失败语义，
-  不伪造完成）。实现见 `src/service/block_inject/frames.rs::empty_stream_frames` 与
-  `src/handler/llm/pump/spawn.rs` 空流合成守门；三协议对照由单测
+- 行为：三协议真空流（零字节零残余）均补最小可解析终止——Chat 恰一 `data: [DONE]`
+  （传输层终止标记，不伪造 `finish_reason`/内容/usage）；Anthropic 最小
+  `message_start`+`message_stop`（空 content、null `stop_reason`、usage 全 0，不含
+  `content_block_*`，不声称语义 stop_reason）；Responses 保持恰一 `response.failed` 全序列
+  （失败语义，不伪造完成）。`truncated_mode` 口径保留：Chat/Anthropic 记 `open_ended`
+  （metrics 观测），Responses 记 `synthesized_failed`——`open_ended` 仅余观测口径，
+  不再代表「不发终止帧」。实现见 `src/service/block_inject/frames.rs::empty_stream_frames`
+  与 `src/handler/llm/pump/spawn.rs` 空流合成守门；三协议对照由单测
   `vacuum_stream_three_protocol_e2e_comparison` 锁定。
 - 与原仓差异：原仓 Python `_ensure_nonempty_stream`（`_llm.py:2633`）对三协议均注入最小可解析
-  事件，目的为避免下游 Hermes 侧 `JSONDecodeError` 空体。本仓有意不加终止帧，依据
-  `stream-protocol-parity` spec「no fabricated success termination」。
-- 风险：若下游 Hermes 未对空流做 stub 保护，Chat/Anthropic 真空流将表现为客户端解析错误或
-  空等。缓解：Responses 仍合成 `response.failed`；Chat/Anthropic 依赖下游 stub。
-- 下游依赖证据：**待人工确认**（open item，owner：下游集成）。本仓仅有间接声明——
-  归档 change `2026-09-09-veil-llm-protocol-parity` 断言「Hermes stub protection still applies」，
-  以及 `src/handler/llm/stream_tests.rs` 注释「Hermes 靠缺失 finish_reason 走 stub」；
-  `openspec/specs/stream-protocol-parity/spec.md` 已（经 `veil-residual-followup`）去保证化——
-  不再将 stub 保护列为仓内保证，明确其为外部依赖并指向本 open item。
-  仓内**无** Hermes 侧源码/配置可独立佐证，故不满足「证实存在」，按未证实处置。
-- 升级路径：若人工确认 Hermes 无 stub 保护，则另立 change 评估「Chat/Anthropic 空流补终止帧」
-  路线，实施前须再次修订 `stream-protocol-parity` spec。
+  事件以避免下游 `JSONDecodeError` 空体；本仓现按协议最小面补终止，语义面只补线级终止，
+  不伪造内容/usage/成功（Anthropic `error` 本身即终端，其后不注入 `message_stop`）。
+- 口径变更声明：本条替换旧「Chat/Anthropic 真空流保持 open-ended」口径；既有
+  `stream-protocol-parity` spec 的空流条款待随本 change 归档时同步修订，
+  行为真相源以 `openspec/changes/veil-llm-protocol-hardening/specs/llm-protocol-hardening/spec.md`（未归档，待该 change 归档后晋升 canonical）为准。
+- 风险：Anthropic 严格 SDK 若要求 `message_delta` 才认流闭合，最小信封可能被拒收；
+  以 spec「真空流最小终止」Scenario 为准，实测需要时另立 change 补帧。

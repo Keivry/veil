@@ -41,6 +41,76 @@ mod tests {
     }
 
     #[test]
+    fn crlf_split_across_chunks() {
+        // N3：块末孤立 `\r` 与下一块首字节 `\n` 合并为单个 CRLF 行终止，
+        // `event:` 与 `data:` 归属同一事件，不提前分发。
+        let mut p = SseParser::new();
+        assert!(
+            p.push_bytes(b"event: x\r").is_empty(),
+            "块末孤立 CR 不得提前分发"
+        );
+        let evs = p.push_bytes(b"\ndata: y\r\n\r\n");
+        assert_eq!(evs.len(), 1, "跨块 CRLF 恰一事件: {evs:?}");
+        assert_eq!(evs[0].event_type.as_deref(), Some("x"));
+        assert_eq!(evs[0].data, "y");
+    }
+
+    #[test]
+    fn parser_crlf_across_chunk_boundaries() {
+        // 块末 CR + 下一块首字节非 LF：按孤立 CR 终止，字段归属不变。
+        let mut p = SseParser::new();
+        assert!(p.push_bytes(b"data: z\r").is_empty());
+        let evs = p.push_bytes(b"data: w\r\n\r\n");
+        assert_eq!(evs.len(), 1, "两 data 行同属一事件: {evs:?}");
+        assert_eq!(evs[0].data, "z\nw");
+        // `data: z\r` + `\r` 跨块：孤立 CR 为行终止，空行照常分发。
+        let mut q = SseParser::new();
+        assert!(q.push_bytes(b"data: z\r").is_empty());
+        let evs_q = q.push_bytes(b"\r\n\r\n");
+        assert_eq!(evs_q.len(), 1, "跨块 CR/CRLF 组合恰一事件: {evs_q:?}");
+        assert_eq!(evs_q[0].data, "z");
+        // 连续 CRLF 跨块：吞掉的 LF 不得触发空行提前分发。
+        let mut r = SseParser::new();
+        assert!(r.push_bytes(b"data: a\r").is_empty());
+        assert!(r.push_bytes(b"\n").is_empty(), "被吞 LF 不得产生空行分发");
+        let evs_r = r.push_bytes(b"\r\n");
+        assert_eq!(evs_r.len(), 1, "块结束行仍照常分发: {evs_r:?}");
+        assert_eq!(evs_r[0].data, "a");
+        // 末尾 CR 后 EOF：无事件、无残余（与 LF 收尾语义一致，块未闭合）。
+        let mut t = SseParser::new();
+        assert!(t.push_bytes(b"data: e\r").is_empty());
+        assert!(t.residual_json_aware().is_empty());
+    }
+
+    #[test]
+    fn bare_data_line() {
+        // P11/D9：无冒号 `data` 行按空值字段处理：`data\ndata: x\n\n` → `data=="\nx"`。
+        let mut p = SseParser::new();
+        let evs = p.push_bytes(b"data\ndata: x\n\n");
+        assert_eq!(evs.len(), 1, "恰一事件: {evs:?}");
+        assert_eq!(evs[0].data, "\nx");
+    }
+
+    #[test]
+    fn parser_bare_data() {
+        // P11/D9 边界：裸 `data`、`data:` 空值、混合形态合并；其他无冒号行维持忽略。
+        let mut p = SseParser::new();
+        let evs = p.push_bytes(b"data\ndata:\ndata: x\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "\n\nx", "空值字段须参与 \\n 合并");
+        let mut q = SseParser::new();
+        assert!(
+            q.push_bytes(b"data\n\n").is_empty(),
+            "单裸 data 得空值 data 帧，无其他字段时按既有空帧语义丢弃"
+        );
+        let mut r = SseParser::new();
+        let evs_r = r.push_bytes(b"event\ndata: v\n\n");
+        assert_eq!(evs_r.len(), 1);
+        assert_eq!(evs_r[0].event_type, None, "无冒号 event 行仍忽略");
+        assert_eq!(evs_r[0].data, "v");
+    }
+
+    #[test]
     fn retry_all_digits_and_data_single_space_stripped() {
         let mut p = SseParser::new();
         let evs = p.push_bytes(b"retry: 3000\ndata:  hello\n\n");

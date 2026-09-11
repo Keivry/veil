@@ -54,6 +54,54 @@ struct ScopeInner {
     resp_t2p: HashMap<String, String>,
     pii_order: VecDeque<String>,
     resp_order: VecDeque<String>,
+    /// F5/D4 分配游标：下一个候选序号（1 起），与 `used_seqs` 配套均摊 O(1)。
+    next_seq: usize,
+    /// F5/D4 全部在用序号（请求/响应表共享序号空间；分配插入、淘汰移除）。
+    used_seqs: HashSet<usize>,
+    /// 分配探测步数（仅测试观测线性有界；生产零成本）。
+    #[cfg(test)]
+    scan_steps: usize,
+}
+
+impl ScopeInner {
+    /// F5/D4：游标 + 已用集分配。自游标起找首个未用序号，越顶回卷；
+    /// 全满时返回 `PII_MAX_ENTRIES + 1`（与旧 `next_hole` 全占语义一致，
+    /// 紧随的 LRU 淘汰会把空洞重新释放）。
+    fn alloc_seq(&mut self) -> usize {
+        let start = self.next_seq.max(1);
+        let mut seq = if start > PII_MAX_ENTRIES { 1 } else { start };
+        seq = self.find_free_from(seq);
+        if seq > PII_MAX_ENTRIES {
+            seq = self.find_free_from(1);
+        }
+        self.next_seq = if seq >= PII_MAX_ENTRIES { 1 } else { seq + 1 };
+        seq
+    }
+
+    fn find_free_from(&mut self, from: usize) -> usize {
+        let mut seq = from;
+        while seq <= PII_MAX_ENTRIES {
+            self.note_probe();
+            if !self.used_seqs.contains(&seq) {
+                return seq;
+            }
+            seq += 1;
+        }
+        PII_MAX_ENTRIES + 1
+    }
+
+    /// 回收淘汰条目的序号（空洞复用来源）。
+    fn release_seq(&mut self, token: &str) {
+        if let Some(seq) = parse_pii_seq(token) {
+            self.used_seqs.remove(&seq);
+        }
+    }
+
+    #[cfg(test)]
+    fn note_probe(&mut self) { self.scan_steps += 1; }
+
+    #[cfg(not(test))]
+    fn note_probe(&mut self) {}
 }
 
 /// PII 值注册拒绝：值命中内部 token 形态或含保留前缀。
@@ -68,10 +116,16 @@ impl PiiScope {
     /// 新建空 Scope（每请求一个，请求结束即销毁）。
     pub fn new() -> Self { Self::default() }
 
-    /// 空洞跳过：收集两表已用 seq，取最小空缺（稳态下标）。
-    pub fn next_available_index(&self) -> usize {
+    /// 空洞跳过：返回全序号空间最小空闲序号（仅测试口径；
+    /// 分配本身走 [`ScopeInner::alloc_seq`] 游标，不做全量重建）。
+    #[cfg(test)]
+    fn next_available_index(&self) -> usize {
         let inner = self.inner.lock().expect("PII scope 锁无毒");
-        next_hole(&used_seqs(&inner))
+        let mut seq = 1;
+        while inner.used_seqs.contains(&seq) {
+            seq += 1;
+        }
+        seq
     }
 
     /// 注册 PII 值并返回 token。同值复用；`response_side=true` 进响应表
@@ -99,7 +153,7 @@ impl PiiScope {
             touch_order(&mut inner.pii_order, value);
             return Ok(tok);
         }
-        let seq = next_hole(&used_seqs(&inner));
+        let seq = inner.alloc_seq();
         let rand8 = gen_rand8().map_err(|_| PiiReject("CSPRNG 熵源不可用"))?;
         let token = make_pii_token(seq, &rand8);
         if response_side {
@@ -108,7 +162,9 @@ impl PiiScope {
                 && let Some(old_tok) = inner.resp_p2t.remove(&oldest)
             {
                 inner.resp_t2p.remove(&old_tok);
+                inner.release_seq(&old_tok);
             }
+            inner.used_seqs.insert(seq);
             inner.resp_order.push_back(value.to_string());
             inner.resp_p2t.insert(value.to_string(), token.clone());
             inner.resp_t2p.insert(token.clone(), value.to_string());
@@ -118,7 +174,9 @@ impl PiiScope {
                 && let Some(old_tok) = inner.pii_p2t.remove(&oldest)
             {
                 inner.pii_t2p.remove(&old_tok);
+                inner.release_seq(&old_tok);
             }
+            inner.used_seqs.insert(seq);
             inner.pii_order.push_back(value.to_string());
             inner.pii_p2t.insert(value.to_string(), token.clone());
             inner.pii_t2p.insert(token.clone(), value.to_string());
@@ -230,23 +288,6 @@ impl PiiScope {
         *c += 1;
         cat.to_string()
     }
-}
-
-fn used_seqs(inner: &ScopeInner) -> HashSet<usize> {
-    inner
-        .pii_t2p
-        .keys()
-        .chain(inner.resp_t2p.keys())
-        .filter_map(|t| parse_pii_seq(t))
-        .collect()
-}
-
-fn next_hole(used: &HashSet<usize>) -> usize {
-    let mut nxt = 1;
-    while used.contains(&nxt) {
-        nxt += 1;
-    }
-    nxt
 }
 
 fn touch_order(order: &mut VecDeque<String>, value: &str) {
@@ -382,6 +423,65 @@ mod tests {
         scope.register("b4-val-0999", false).unwrap();
         assert!(!scope.contains_request_token(&a), "最久条目须被淘汰");
         assert_eq!(scope.next_available_index(), 1);
+    }
+
+    #[test]
+    fn f5_cursor_alloc_is_linear_no_full_rebuild() {
+        // F5/D4：K 次顺序注册探测步数线性（游标分配），不随每次注册全量重建。
+        let scope = PiiScope::new();
+        const K: usize = PII_MAX_ENTRIES;
+        for i in 0..K {
+            scope.register(&format!("f5-linear-{i:04}"), false).unwrap();
+        }
+        let inner = scope.inner.lock().expect("PII scope 锁无毒");
+        assert_eq!(
+            inner.scan_steps, K,
+            "顺序分配每注册恰探测一次候选（实际 {}）；旧全量重建为 O(K^2)",
+            inner.scan_steps
+        );
+    }
+
+    #[test]
+    fn f5_hole_reuse_after_eviction_no_conflict() {
+        // F5：淘汰释放的序号被后续注册复用，且不与在用序号冲突。
+        let scope = PiiScope::new();
+        let first = scope.register("f5-first", false).unwrap();
+        let first_seq = parse_pii_seq(&first).unwrap();
+        for i in 0..PII_MAX_ENTRIES - 1 {
+            scope.register(&format!("f5-fill-{i:04}"), false).unwrap();
+        }
+        scope.register("f5-overflow", false).unwrap();
+        assert!(!scope.contains_request_token(&first), "最旧条目须被淘汰");
+        let reused = scope.register("f5-reused", false).unwrap();
+        assert_eq!(parse_pii_seq(&reused), Some(first_seq), "空洞须被复用");
+        let inner = scope.inner.lock().expect("PII scope 锁无毒");
+        let all: Vec<usize> = inner
+            .pii_t2p
+            .keys()
+            .chain(inner.resp_t2p.keys())
+            .filter_map(|t| parse_pii_seq(t))
+            .collect();
+        let uniq: HashSet<usize> = all.iter().copied().collect();
+        assert_eq!(uniq.len(), all.len(), "两表在用序号不得重复");
+        assert_eq!(inner.used_seqs, uniq, "已用集须与表内容一致");
+    }
+
+    #[test]
+    fn f5_upper_bound_unique_and_in_range() {
+        // F5：单请求注册至 PII_MAX_ENTRIES，序号互不重复且落在 [1, PII_MAX_ENTRIES]。
+        let scope = PiiScope::new();
+        let mut seqs = Vec::new();
+        for i in 0..PII_MAX_ENTRIES {
+            let tok = scope.register(&format!("f5-bound-{i:04}"), false).unwrap();
+            seqs.push(parse_pii_seq(&tok).unwrap());
+        }
+        assert_eq!(seqs.len(), PII_MAX_ENTRIES);
+        let uniq: HashSet<usize> = seqs.iter().copied().collect();
+        assert_eq!(uniq.len(), PII_MAX_ENTRIES, "序号不得重复");
+        assert!(
+            seqs.iter().all(|s| (1..=PII_MAX_ENTRIES).contains(s)),
+            "序号须落在 [1, {PII_MAX_ENTRIES}]"
+        );
     }
 
     #[test]

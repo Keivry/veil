@@ -364,6 +364,8 @@ mod tests {
         crate::config::env_parse::{Config, test_support::base_env},
     };
 
+    mod f3;
+
     #[test]
     fn file_len_under_800_or_split() {
         // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，

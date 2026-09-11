@@ -40,7 +40,6 @@ fn test_app_with_token(extra: &[(&str, &str)], token: &str) -> axum::Router {
             sqlite_ok: true,
             sqlite_error: None,
             db_path: PathBuf::from(format!("/tmp/veil-e2e-admin-matrix-{n}.sqlite")),
-            memory_only: true,
         },
     )
     .with_keepass(keepass);

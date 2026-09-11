@@ -59,6 +59,8 @@ pub struct NonstreamCtx {
     pub approval_whitelist: Vec<String>,
     /// 非流 approve 建单表（P0-1.4：`NeedApproval` 记 pending，不断链）。
     pub pending: Arc<PendingApprovals>,
+    /// F2：非流对话响应体上限（`NONSTREAM_MAX_BYTES`，严格超限 502）。
+    pub nonstream_max_bytes: usize,
 }
 
 /// `serve_nonstream` 的结果：完整响应，或上游意外回 SSE 时把未消费的
@@ -121,11 +123,12 @@ pub async fn serve_nonstream(
                 .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response()),
         );
     }
-    // P0-1.1：502/401 不再早返原始字节，走完整后处理链（用量记录 +
-    // 审计判定 + 凭据/PII 还原，还原失败回退原文）；非 JSON 错误体按下文
-    // 显式豁免透传（无 JSON 可提取用量/工具调用，见尾部 `is_error_status` 分支）。
+    // P0-1.1 + N2/D6：502/401 不再早返原始字节，走完整后处理链（用量记录 +
+    // 审计判定 + 凭据/PII 还原，还原失败回退原文）；所有 4xx/5xx 的非 JSON
+    // 错误体按下文显式豁免透传（无 JSON 可提取用量/工具调用，见尾部
+    // `is_error_status` 分支），不再合成 502 `E_EMPTY_BODY`。
     let status_u16 = up.status().as_u16();
-    let is_error_status = status_u16 == 502 || status_u16 == 401;
+    let is_error_status = status_u16 >= 400;
     let resp_ct = up
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -140,7 +143,16 @@ pub async fn serve_nonstream(
     }
     let bytes = up.bytes().await.unwrap_or_default();
     let is_json = serde_json::from_slice::<Value>(&bytes).is_ok();
-    if classify_empty(true, bytes.len(), is_json, status_u16) == EmptyAction::NonStreamTo502 {
+    // F2/D2：先定空体分类（对齐 Python 先算 `_is_empty`），再判超限
+    // （严格 `len > cap`，体形态对齐 `_llm.py:2942`），最后才落空体 502：
+    // 空体 len=0 恒不超限，非 JSON 超限体不落空体分支（与 Python 可观测结果一致）。
+    // 精化：超限仅对非错误状态（`status < 400`）生效——4xx/5xx 错误体按 N2/D6
+    // 语义透传或走完整链，不因体大被改写为 502。
+    let empty_action = classify_empty(true, bytes.len(), is_json, status_u16);
+    if status_u16 < 400 && bytes.len() > ctx.nonstream_max_bytes {
+        return NonstreamOutcome::Responded(oversize_response());
+    }
+    if empty_action == EmptyAction::NonStreamTo502 {
         return NonstreamOutcome::Responded(empty_body_response());
     }
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
@@ -251,10 +263,11 @@ pub async fn serve_nonstream(
         );
         return NonstreamOutcome::Responded(resp);
     }
-    // P0-1.1 显式豁免 + E6/D4 意图声明：仅非 JSON 的 502/401 错误体走此透传
-    //（无用量/工具调用可提取，按设计备选路径原样透传，状态码保留，不吞错转空体）；
-    // 非 502/401 的错误 JSON（如 400 `truncation:disabled`）已在上方 `if let Ok(v)`
-    // 分支走完整后处理链（用量记录 + 审计判定 + 还原），非字节等价为有意行为。
+    // N2/D6 显式豁免：`status>=400` 的非 JSON 错误体（含空体）走此透传
+    //（无用量/工具调用可提取，按设计备选路径原样透传，状态码与正文字节保留，
+    // 不吞错转空体）；`status>=400` 的错误 JSON（如 400 `truncation:disabled`）
+    // 已在上方 `if let Ok(v)` 分支走完整后处理链（用量记录 + 审计判定 + 还原），
+    // 非字节等价为有意行为。
     if is_error_status {
         let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
         return NonstreamOutcome::Responded((status, bytes.to_vec()).into_response());
@@ -269,6 +282,17 @@ fn retry_stripped(restored: &str) -> Option<String> {
     serde_json::from_str::<Value>(&stripped)
         .is_ok()
         .then_some(stripped)
+}
+
+/// F2：对话非流响应体超限 502（体形态与 Python `_llm.py:2942` 同字）。
+fn oversize_response() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": {"message": "response too large", "type": "response_too_large"}
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

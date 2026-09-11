@@ -32,7 +32,6 @@ fn test_app() -> axum::Router {
             sqlite_ok: true,
             sqlite_error: None,
             db_path: PathBuf::from(format!("/tmp/veil-e2e-metrics-snap-{n}.sqlite")),
-            memory_only: true,
         },
     )
     .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));

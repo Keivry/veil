@@ -112,6 +112,19 @@ impl Scope {
         strip_partials(&step3)
     }
 
+    /// 单 token 回查（X3/D4）：凭据 token 经 `CredentialVault::restore_one`
+    /// 直查（不克隆全表、不重建 alternation 正则）；非凭据 token 原样进入
+    /// PII 回查。其余步骤与 [`Scope::restore_response`] 同序（PII 还原 →
+    /// 幻觉剥离 → 残缺清理），保证 span 明文与全量还原结果一致。
+    fn restore_response_one(&self, vault: &CredentialVault, token: &str) -> String {
+        let step1 = vault
+            .restore_one(token)
+            .unwrap_or_else(|| token.to_string());
+        let step2 = self.pii.restore_with_fuzzy(&step1, self.fuzzy_restore);
+        let step3 = vault.strip_hallucinated(&step2);
+        strip_partials(&step3)
+    }
+
     /// 响应还原（含 span 透传，§2.2）：
     /// 返回 `(还原文本, 还原明文区间)`；区间为还原文本中的字节下标。
     /// 调用方做响应侧新检出时须经 [`Scope::redact_response_new_pii_with_skip`]
@@ -129,8 +142,8 @@ impl Scope {
             if !seen.insert(token.clone()) {
                 continue;
             }
-            // 经公开还原路径单 token 回查明文：未注册/幻觉形态回查不变或清空，直接跳过。
-            let plain = self.restore_response(vault, &token);
+            // 逐 token 直查（不触全量快照）：未注册/幻觉形态回查不变或清空，直接跳过。
+            let plain = self.restore_response_one(vault, &token);
             if plain.is_empty() || plain == token {
                 continue;
             }
@@ -470,6 +483,25 @@ mod scope_tests {
         let (unchanged, empty) = scope.restore_response_with_spans(&vault, "纯文本无 token");
         assert_eq!(unchanged, "纯文本无 token");
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn per_token_lookup_does_not_snapshot_full_vault() {
+        let vault = CredentialVault::new();
+        let secret = "complexity-secret-001";
+        let token = vault.register(secret).unwrap();
+        let scope = Scope::new();
+        let text = format!("{token} {token} {token}");
+        let before = vault.snapshot_calls();
+        let (restored, spans) = scope.restore_response_with_spans(&vault, &text);
+        assert_eq!(restored, format!("{secret} {secret} {secret}"));
+        assert_eq!(spans.len(), 3);
+        // 全量 restore 恰一次快照；逐 token 回查零快照（旧路径每 token +1）。
+        assert_eq!(
+            vault.snapshot_calls() - before,
+            1,
+            "逐 token 回查不得触发全表克隆（复杂度 O(K×N)→O(K+N)）"
+        );
     }
 
     #[test]

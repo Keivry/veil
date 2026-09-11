@@ -282,3 +282,95 @@ fn placeholder_responses_partial_illegal_keeps_valid() {
     assert!(v3["input"].as_str().unwrap().contains(prompt));
     assert!(v3["instructions"].as_str().unwrap().contains(prompt));
 }
+
+#[test]
+fn x5_protocol_matrix_injection_stable_after_unreachable_block_removal() {
+    const PROMPT: &str = "PROMPT";
+    // Anthropic：system 存在（string/array）合并；缺失插入；非法形态拒绝且原体不变。
+    let mut anthropic_str = serde_json::json!({"system":"你是助手"});
+    assert!(placeholder_inject_obj(
+        &mut anthropic_str,
+        PROMPT,
+        Protocol::Anthropic
+    ));
+    assert_eq!(
+        anthropic_str["system"].as_str().unwrap(),
+        format!("你是助手\n\n{PROMPT}")
+    );
+    let mut anthropic_arr = serde_json::json!({"system":[{"type":"text","text":"你是助手"}]});
+    assert!(placeholder_inject_obj(
+        &mut anthropic_arr,
+        PROMPT,
+        Protocol::Anthropic
+    ));
+    assert_eq!(
+        anthropic_arr["system"][0]["text"].as_str().unwrap(),
+        format!("你是助手\n\n{PROMPT}")
+    );
+    let mut anthropic_missing = serde_json::json!({"model":"claude"});
+    assert!(placeholder_inject_obj(
+        &mut anthropic_missing,
+        PROMPT,
+        Protocol::Anthropic
+    ));
+    assert_eq!(anthropic_missing["system"].as_str().unwrap(), PROMPT);
+    let mut anthropic_invalid = serde_json::json!({"system":{"bad":true}});
+    assert!(!placeholder_inject_obj(
+        &mut anthropic_invalid,
+        PROMPT,
+        Protocol::Anthropic
+    ));
+    assert_eq!(
+        anthropic_invalid,
+        serde_json::json!({"system":{"bad":true}})
+    );
+
+    // Responses：input/instructions 独立注入、非法字段不连坐、双缺失拒绝。
+    let mut resp_both = serde_json::json!({"input":"hi","instructions":"be nice"});
+    assert!(placeholder_inject_obj(
+        &mut resp_both,
+        PROMPT,
+        Protocol::Responses
+    ));
+    assert!(resp_both["input"].as_str().unwrap().contains(PROMPT));
+    assert!(resp_both["instructions"].as_str().unwrap().contains(PROMPT));
+    let mut resp_one_invalid = serde_json::json!({"input":42,"instructions":"be nice"});
+    assert!(placeholder_inject_obj(
+        &mut resp_one_invalid,
+        PROMPT,
+        Protocol::Responses
+    ));
+    assert_eq!(resp_one_invalid["input"], 42, "非法字段不得被改写");
+    assert!(
+        resp_one_invalid["instructions"]
+            .as_str()
+            .unwrap()
+            .contains(PROMPT)
+    );
+    let mut resp_both_invalid = serde_json::json!({"input":42,"instructions":true});
+    assert!(!placeholder_inject_obj(
+        &mut resp_both_invalid,
+        PROMPT,
+        Protocol::Responses
+    ));
+    assert_eq!(
+        resp_both_invalid,
+        serde_json::json!({"input":42,"instructions":true})
+    );
+
+    // Chat：前插 system；NonDialog：schema 门禁拒绝（对象注入本体不识别该协议）。
+    let mut chat = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+    assert!(placeholder_inject_obj(&mut chat, PROMPT, Protocol::Chat));
+    assert_eq!(chat["messages"][0]["role"], "system");
+    assert_eq!(chat["messages"][0]["content"].as_str().unwrap(), PROMPT);
+    let nondialog = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+    assert!(!placeholder_schema_ok(&nondialog, Protocol::NonDialog));
+    assert!(
+        inject_placeholder_prompt(
+            &serde_json::to_string(&nondialog).unwrap(),
+            PROMPT,
+            Protocol::NonDialog
+        )
+        .is_none()
+    );
+}

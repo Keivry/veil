@@ -14,29 +14,80 @@ pub struct ToolCall {
     pub id_synth: bool,
 }
 
-pub fn normalize_tool_args(raw: Option<&Value>) -> String {
+pub fn normalize_tool_args(raw: Option<&Value>) -> String { normalize_tool_args_with(true, raw) }
+
+/// X2/D8：tool 参数归一共享实现：`emit_warn=true` 保留非流告警现值，
+/// `false` 静默（流式现值）；两入口共用防漂移。
+pub(crate) fn normalize_tool_args_with(emit_warn: bool, raw: Option<&Value>) -> String {
     match raw {
         None => {
-            tracing::warn!("tool args 缺失，已记告警不断链（置空串审计暂缓）");
+            if emit_warn {
+                tracing::warn!("tool args 缺失，已记告警不断链（置空串审计暂缓）");
+            }
+            String::new()
+        }
+        Some(Value::Null) => {
+            if emit_warn {
+                tracing::warn!("tool args 为 null，已记告警不断链");
+            }
             String::new()
         }
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Null) => {
-            tracing::warn!("tool args 为 null，已记告警不断链");
-            String::new()
-        }
         Some(other) => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 
 fn synth_id(index: u32, present: Option<&str>) -> (String, bool) {
+    synth_tool_id_with(true, index, present)
+}
+
+/// X2/D8：合成 id 共享实现（缺失/空 → `call_stable_<index>`），`emit_warn`
+/// 控制告警（非流 warn、流式静默），两入口共用防漂移。
+pub(crate) fn synth_tool_id_with(
+    emit_warn: bool,
+    index: u32,
+    present: Option<&str>,
+) -> (String, bool) {
     match present.filter(|s| !s.is_empty()) {
         Some(s) => (s.to_string(), false),
         None => {
-            tracing::warn!("tool id 缺失，已合成 call_stable_<index> 不断链");
+            if emit_warn {
+                tracing::warn!("tool id 缺失，已合成 call_stable_<index> 不断链");
+            }
             (format!("call_stable_{index}"), true)
         }
     }
+}
+
+/// X2/D8：custom 形态字段归一（`id/call_id/tool_call_id`、`name/tool_name/function.name`、
+/// `arguments/input/args`），流/非流共享；args 经 [`normalize_tool_args_with`] 归一。
+pub(crate) fn custom_tool_parts(
+    emit_warn: bool,
+    obj: &serde_json::Map<String, Value>,
+) -> (Option<String>, Option<String>, String) {
+    let id = obj
+        .get("id")
+        .or_else(|| obj.get("call_id"))
+        .or_else(|| obj.get("tool_call_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            obj.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string());
+    let args = normalize_tool_args_with(
+        emit_warn,
+        obj.get("arguments")
+            .or_else(|| obj.get("input"))
+            .or_else(|| obj.get("args")),
+    );
+    (id, name, args)
 }
 
 /// 检索调用名派生（C10）：`file_search_call`→`file_search`、
@@ -79,27 +130,8 @@ pub fn retrieval_args(obj: &serde_json::Map<String, Value>) -> String {
 }
 
 fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Option<ToolCall> {
-    let id_raw = obj
-        .get("id")
-        .or_else(|| obj.get("call_id"))
-        .or_else(|| obj.get("tool_call_id"))
-        .and_then(|v| v.as_str());
-    let name = obj
-        .get("name")
-        .or_else(|| obj.get("tool_name"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            obj.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-        })
-        .map(|s| s.to_string());
-    let args_raw = obj
-        .get("arguments")
-        .or_else(|| obj.get("input"))
-        .or_else(|| obj.get("args"));
-    let (id, id_synth) = synth_id(index, id_raw);
-    let args = normalize_tool_args(args_raw);
+    let (id_raw, name, args) = custom_tool_parts(true, obj);
+    let (id, id_synth) = synth_id(index, id_raw.as_deref());
     // L16：空增量（id 缺失合成 + 无名 + 无参，创槽心跳）只 warn 不建条目，
     // 与 anthropic 空跳过同条件；有真实 id 的待名槽仍保留锚定。
     if name.is_none() && args.is_empty() && id_synth {
@@ -119,6 +151,15 @@ fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Optio
 /// 同 `index` 分桶隔离；`ci=0` 时与旧键等值，单 choice 快照不变。
 pub fn chat_bucket(ci: usize, idx: u32) -> u32 {
     (ci as u32).saturating_mul(64).saturating_add(idx)
+}
+
+/// P9/X2：Responses `output[]` 桶号唯一实现（流/非流同键）：`item.output_index`
+/// 优先，缺失回退枚举下标；两路径共用防漂移。
+pub(crate) fn responses_output_bucket(item: &Value, fallback: usize) -> u32 {
+    item.get("output_index")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(fallback as u32)
 }
 
 /// Anthropic 分桶唯一实现（P0-2.2）：外层事件 `index` > 内层块 `index` >
@@ -459,11 +500,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
             }
             if let Some(output) = payload.get("output").and_then(|o| o.as_array()) {
                 for (i, item) in output.iter().enumerate() {
-                    let bucket = item
-                        .get("output_index")
-                        .and_then(|x| x.as_u64())
-                        .map(|n| n as u32)
-                        .unwrap_or(i as u32);
+                    let bucket = responses_output_bucket(item, i);
                     let is_tool = item.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
                         t.contains("function_call")
                             || t.contains("custom_tool_call")

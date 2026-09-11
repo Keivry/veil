@@ -19,6 +19,16 @@ fn file_len_under_800_or_split() {
 use super::*;
 
 #[test]
+fn responses_output_bucket_explicit_and_fallback() {
+    // P9/X2：`output_index` 优先，缺失回退枚举下标（流/非流共用唯一实现）。
+    let explicit = serde_json::json!({"output_index": 3});
+    assert_eq!(responses_output_bucket(&explicit, 0), 3);
+    let fallback = serde_json::json!({"type": "function_call"});
+    assert_eq!(responses_output_bucket(&fallback, 2), 2);
+    assert_eq!(responses_output_bucket(&fallback, 0), 0);
+}
+
+#[test]
 fn chat_multi_choice_same_index_isolated_by_ci() {
     // F-P1b：`n=2` 同 `index:0` 须分桶隔离，参数不串扰。
     let v = serde_json::json!({"choices":[

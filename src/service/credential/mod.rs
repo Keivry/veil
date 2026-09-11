@@ -1,7 +1,7 @@
 //! 凭据业务：三因子鉴权 / 注册吊销 / 审批双模 / KeePass 查询 / 限流表。
 //!
-//! A1 解耦说明：本层经 [`AppStateParts`] trait 读态，不再命名
-//! `crate::state::AppState`（`service -> state` 边已断）；`state.rs`
+//! A1 解耦说明：本层经 [`AppStateParts`] trait 读态，不再命名 `AppState`
+//! 具体类型（`service -> state` 边已断）；`state.rs`
 //! 聚合本层类型并实现本 trait（`state -> service` 单向，无环）。
 //! 旧路径 `crate::service::{handle_credential, RateTable, ...}` 经
 //! `service/mod.rs` 的 `pub use credential::*` 保持编译。
@@ -192,7 +192,6 @@ pub(crate) mod test_support {
                     Some("ENOSPC".to_string())
                 },
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: !sqlite_ok,
             },
         )
     }
@@ -225,7 +224,6 @@ pub(crate) mod test_support {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
             },
         );
         state.with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()))
@@ -293,7 +291,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::state::is_no_space_error, test_support::*};
+    use {super::*, test_support::*};
 
     #[test]
     fn health_status_exposes_degraded_flag() {
@@ -305,17 +303,15 @@ mod tests {
 
     #[test]
     fn disk_full_classified_and_degraded_flags_paired() {
-        use crate::state::SqliteOutcome;
         let full = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::StorageFull));
-        assert!(is_no_space_error(&full));
+        assert!(crate::state::is_no_space_error(&full));
         let other = anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert!(!is_no_space_error(&other));
-        let out = SqliteOutcome {
+        assert!(!crate::state::is_no_space_error(&other));
+        let out = crate::state::SqliteOutcome {
             sqlite_ok: false,
             sqlite_error: Some("ENOSPC (disk full)".to_string()),
             db_path: std::path::PathBuf::from("/tmp/x.sqlite"),
-            memory_only: true,
         };
-        assert!(!out.sqlite_ok && out.memory_only, "降级须成对出现");
+        assert!(!out.sqlite_ok, "降级须与 sqlite_error 成对出现");
     }
 }

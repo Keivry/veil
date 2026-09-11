@@ -34,34 +34,54 @@ fn tracked_ctx(
 }
 
 #[tokio::test]
-async fn vacuum_stream_anthropic_stays_open_ended_without_message_stop() {
-    // B2.1：Anthropic 真空流对齐 chat——零合成帧、无 message_stop，仅记 open_ended。
+async fn anthropic_vacuum_emits_minimal_start_and_stop() {
+    // P2/D3：Anthropic 真空流补最小 `message_start`+`message_stop`：空 content、
+    // null stop_reason、usage 全 0，无 `content_block_*`，不伪造成功。
     let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let (scope, vault, detector) = fresh_arcs();
     let (ctx, metrics) = tracked_ctx(Protocol::Anthropic, scope, vault, detector);
     let (outcome, frames) = collect_pump(upstream, ctx).await;
-    assert!(frames.is_empty(), "Anthropic 真空流须零合成帧: {frames:?}");
     let joined = frames.join("");
+    assert_eq!(frames.len(), 2, "最小终止恰两帧: {frames:?}");
+    let mut types: Vec<String> = Vec::new();
+    for f in &frames {
+        for line in f.lines() {
+            if let Some(p) = line.strip_prefix("data: ") {
+                let v: serde_json::Value = serde_json::from_str(p).expect("下游帧须为合法 JSON");
+                types.push(v["type"].as_str().unwrap_or("").to_string());
+                if v["type"] == "message_start" {
+                    assert_eq!(
+                        v["message"]["content"].as_array().map(|a| a.len()),
+                        Some(0),
+                        "content 须为空数组: {v}"
+                    );
+                    assert!(
+                        v["message"]["stop_reason"].is_null(),
+                        "stop_reason 须 null: {v}"
+                    );
+                    assert_eq!(v["message"]["usage"]["input_tokens"], 0);
+                    assert_eq!(v["message"]["usage"]["output_tokens"], 0);
+                }
+            }
+        }
+    }
+    assert_eq!(types, vec!["message_start", "message_stop"]);
     assert!(
-        !joined.contains("message_stop"),
-        "不得合成 message_stop: {joined}"
+        !joined.contains("content_block"),
+        "不得注入 content_block_*: {joined}"
     );
-    assert!(!joined.contains("content_block_stop"), "不得合成块终止");
-    assert!(!outcome.block_injected, "真空 open-ended 不得注阻断帧");
-    assert!(!outcome.terminal_injected, "无帧发出时不得标记终端已注入");
-    assert_eq!(
-        metrics.truncated_count("open_ended"),
-        1,
-        "须记 open_ended 可观测"
-    );
+    assert!(outcome.block_injected, "合成终端须置位 block_injected");
+    assert!(outcome.terminal_injected, "最小终止须落位终端标记");
+    assert_eq!(metrics.truncated_count("open_ended"), 1);
     server.abort();
 }
 
 #[tokio::test]
 async fn vacuum_stream_three_protocol_e2e_comparison() {
-    // B2.2：三协议空流 e2e 对照——chat/anthropic 零帧且正常关闭；responses 恰一 failed。
+    // P2：三协议真空流均补终止帧——chat 恰一 [DONE]、anthropic 最小终止、
+    // responses 恰一 failed；open-ended 仅余 chat/anthropic metrics 观测口径。
     for proto in [Protocol::Chat, Protocol::Anthropic] {
         let (url, server) = loopback_server(200, "text/event-stream", Vec::new()).await;
         let client = reqwest::Client::new();
@@ -69,12 +89,25 @@ async fn vacuum_stream_three_protocol_e2e_comparison() {
         let (scope, vault, detector) = fresh_arcs();
         let (ctx, metrics) = tracked_ctx(proto, scope, vault, detector);
         let (outcome, frames) = collect_pump(upstream, ctx).await;
-        assert!(frames.is_empty(), "{proto:?} 真空流须零帧: {frames:?}");
-        assert!(!outcome.terminal_injected, "{proto:?} 不得标记终端已注入");
+        let joined = frames.join("");
+        assert!(!frames.is_empty(), "{proto:?} 真空流须补终止帧");
+        assert!(outcome.terminal_injected, "{proto:?} 须落位终端标记");
+        if proto == Protocol::Chat {
+            assert_eq!(
+                frames.iter().filter(|f| f.contains("data: [DONE]")).count(),
+                1,
+                "chat 真空流恰一 [DONE]: {joined}"
+            );
+        } else {
+            assert!(
+                joined.contains("message_start") && joined.contains("message_stop"),
+                "anthropic 最小终止信封: {joined}"
+            );
+        }
         assert_eq!(
             metrics.truncated_count("open_ended"),
             1,
-            "{proto:?} 须记 open_ended"
+            "{proto:?} 须记 open_ended 观测"
         );
         server.abort();
     }
@@ -99,8 +132,33 @@ async fn vacuum_stream_three_protocol_e2e_comparison() {
 }
 
 #[tokio::test]
-async fn chat_finish_reason_without_done_marks_open_ended_without_synthesis() {
-    // B3.2：Chat 已见 finish_reason:"stop" 后 EOF 无 [DONE] → open_ended，零合成帧。
+async fn anthropic_error_terminal() {
+    // P2/D3：Anthropic `type:"error"` 即终端——原样透传后不再发任何帧
+    //（尤其不得注入 `message_stop` 或后续 message_delta）。
+    let sse = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (ctx, _metrics) = tracked_ctx(Protocol::Anthropic, scope, vault, detector);
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    let joined = frames.join("");
+    assert!(
+        joined.contains("overloaded"),
+        "error 帧须原样透传: {joined}"
+    );
+    assert_eq!(frames.len(), 1, "error 后不得透出任何数据帧: {frames:?}");
+    assert!(
+        !joined.contains("message_stop") && !joined.contains("message_delta"),
+        "error 后不得注入 message_stop/message_delta: {joined}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn chat_finish_reason_without_done_synthesizes_single_done() {
+    // P1/D2：Chat 已见 finish_reason:"stop" 后 EOF 无 [DONE] → 补发恰一 [DONE]，
+    // open_ended 观测保留（内容帧与 finish_reason 不伪造、不丢）。
     let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
@@ -111,24 +169,27 @@ async fn chat_finish_reason_without_done_marks_open_ended_without_synthesis() {
     let joined = frames.join("");
     assert!(joined.contains("hi"), "内容帧须透传: {joined}");
     assert!(joined.contains("\"finish_reason\":\"stop\""));
-    assert!(!joined.contains("[DONE]"), "不得合成 [DONE]: {joined}");
-    assert!(
-        !joined.contains("empty-stream"),
-        "不得合成空流兜底: {joined}"
+    assert_eq!(
+        frames.iter().filter(|f| f.contains("data: [DONE]")).count(),
+        1,
+        "缺 [DONE] 须补发恰一: {joined}"
     );
-    assert!(!outcome.terminal_injected, "不得伪造终端");
+    assert!(outcome.terminal_injected, "补发后终端须落位");
     assert_eq!(
         metrics.truncated_count("open_ended"),
         1,
-        "缺 [DONE] 须记 open_ended"
+        "缺 [DONE] 须记 open_ended 观测"
     );
     server.abort();
 }
 
 #[tokio::test]
-async fn responses_error_event_synthesizes_exactly_one_failed() {
-    // B4.1：Responses `error` 事件 → 恰一 response.failed，无 completed，无重复终端。
-    let sse = b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
+async fn responses_error_single_failed() {
+    // P4/D4：Responses `error` → 单帧 `response.failed`（携带上游 error message），
+    // 不注入 `output_index` 合成序列、无重复序号、无 completed。
+    let sse =
+        b"data: {\"type\":\"error\",\"sequence_number\":2,\"error\":{\"message\":\"boom\"}}\n\n"
+            .to_vec();
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
@@ -144,7 +205,15 @@ async fn responses_error_event_synthesizes_exactly_one_failed() {
         1,
         "error 须映射为恰一 failed: {joined}"
     );
+    assert!(
+        joined.contains("\"message\":\"boom\""),
+        "上游 error message 须随帧携带: {joined}"
+    );
     assert!(!joined.contains("response.completed"), "不得出现 completed");
+    assert!(
+        !joined.contains("output_item.added") && !joined.contains("output_index"),
+        "不得注入 output_index 合成序列: {joined}"
+    );
     assert!(
         !joined.contains("response.incomplete"),
         "原始 error 不得透出"
@@ -266,4 +335,135 @@ async fn responses_usage_recorded_from_completed_without_injection() {
     );
     assert_eq!(snap.per_protocol.get("v1/responses"), Some(&1));
     server.abort();
+}
+
+#[tokio::test]
+async fn responses_completed_then_error() {
+    // N1：`response.completed` 后跟 `type:"error"`——终端恰一、无合成 failed、终端后无数据帧。
+    let sse = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (ctx, _metrics) = tracked_ctx(Protocol::Responses, scope, vault, detector);
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    let joined = frames.join("");
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f.contains("response.completed"))
+            .count(),
+        1,
+        "completed 恰一: {joined}"
+    );
+    assert!(
+        !joined.contains("response.failed"),
+        "终端后不得合成 failed: {joined}"
+    );
+    assert_eq!(
+        crate::service::block_inject::terminal_count(&frames, "responses"),
+        1,
+        "Responses 终端恰一: {joined}"
+    );
+    let completed_idx = frames
+        .iter()
+        .position(|f| f.contains("response.completed"))
+        .expect("须有 completed");
+    assert!(
+        frames[completed_idx + 1..]
+            .iter()
+            .all(|f| !f.contains("data:")),
+        "终端后不得再透出数据帧: {frames:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn n1_single_terminal_completed_then_error_or_incomplete() {
+    // N1：`completed → error` 与 `completed → incomplete` 两序列均恒恰一终端、无 failed。
+    for tail in [
+        "data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"status\":\"incomplete\"}}\n\n",
+    ] {
+        let sse = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r1\",\"status\":\"completed\"}}}}\n\n{tail}"
+        );
+        let (url, server) = loopback_server(200, "text/event-stream", sse.into_bytes()).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (ctx, _metrics) = tracked_ctx(Protocol::Responses, scope, vault, detector);
+        let (_outcome, frames) = collect_pump(upstream, ctx).await;
+        let joined = frames.join("");
+        assert_eq!(
+            crate::service::block_inject::terminal_count(&frames, "responses"),
+            1,
+            "终端恰一（tail={tail:?}）: {joined}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f.contains("response.failed"))
+                .count(),
+            0,
+            "不得出现 failed（tail={tail:?}）: {joined}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f.contains("response.completed"))
+                .count(),
+            1,
+            "completed 恰一（tail={tail:?}）: {joined}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn p1_chat_done_three_scenarios() {
+    // P1/D2 三场景：finish_reason 后断流补发恰一；usage 尾帧（choices: []）保留；
+    // 上游已发 [DONE] 不重复补发。
+    for (name, sse, expect_open_ended) in [
+        (
+            "finish_reason 后断流",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+            1u64,
+        ),
+        (
+            "finish_reason+usage 尾帧后断流",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n".to_vec(),
+            1,
+        ),
+        (
+            "正常 [DONE] 不重复",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec(),
+            0,
+        ),
+    ] {
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let client = reqwest::Client::new();
+        let upstream = client.get(&url).send().await.expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let (ctx, metrics) = tracked_ctx(Protocol::Chat, scope, vault, detector);
+        let (_outcome, frames) = collect_pump(upstream, ctx).await;
+        let joined = frames.join("");
+        assert_eq!(
+            frames.iter().filter(|f| f.contains("data: [DONE]")).count(),
+            1,
+            "{name}: [DONE] 恰一: {joined}"
+        );
+        if name.contains("usage") {
+            assert!(
+                joined.contains("\"prompt_tokens\":1"),
+                "{name}: usage 尾帧不得丢: {joined}"
+            );
+        }
+        assert_eq!(
+            metrics.truncated_count("open_ended"),
+            expect_open_ended,
+            "{name}: open_ended 观测须符合补发/不补发语义"
+        );
+        server.abort();
+    }
 }

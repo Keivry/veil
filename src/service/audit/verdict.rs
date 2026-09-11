@@ -2,10 +2,7 @@
 
 use {
     super::{log::sanitize_for_log, policy::AuditPolicy, rules::is_dangerous},
-    crate::{
-        approval::{ApprovalGateway, ApprovalOutcome, PendingRecord},
-        config::AuditMode,
-    },
+    crate::config::{AuditMode, validate::is_truthy},
     std::collections::HashMap,
 };
 
@@ -20,38 +17,23 @@ pub enum AuditVerdict {
     NeedApproval { reason: String, summary: String },
 }
 
-impl AuditVerdict {
-    pub fn is_allow(&self) -> bool { matches!(self, Self::Allow) }
-}
-
-/// 审批网关转 hold 判定（A1：自 `audit_hold.rs` 上移至审计归属模块，
-/// `audit_hold` 经重导出复用，判定语义不变）。
+/// 审批网关转 hold 判定（A1：自 `audit_hold.rs` 上移至审计归属模块）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldVerdict {
     Approved,
     Rejected,
 }
 
-/// 经审批网关判定：`Approved`→放行，`Blocked`→拒绝，`Pending`→None（暂缓，收齐 done 后再审）。
-pub fn decide_via_gateway(
-    gateway: &dyn ApprovalGateway,
-    record: &PendingRecord,
-) -> Option<HoldVerdict> {
-    match gateway.request_approval(record) {
-        ApprovalOutcome::Approved => Some(HoldVerdict::Approved),
-        ApprovalOutcome::Blocked => Some(HoldVerdict::Rejected),
-        ApprovalOutcome::Pending => None,
-    }
-}
-
-/// 旧 `AUDIT_ENABLED` 兼容：`AUDIT_MODE` 未显式设置且 `AUDIT_ENABLED=1/true/yes`
-/// 时视为 `block`（对标 Python `_ensure_audit_init`）。
+/// 旧 `AUDIT_ENABLED` 兼容：`AUDIT_MODE` 缺失或空白且 `AUDIT_ENABLED` 为真值
+/// （`1/true/yes/on`，trim + 大小写不敏感）时视为 `block`（对标 Python
+/// `_ensure_audit_init`）；显式非空 `AUDIT_MODE` 优先（返回 `None`），非真值/空白不生效。
+/// 生产接线点为 `Config::load_from`（`src/config/env_parse.rs`）缺失回退分支。
 pub fn audit_enabled_compat(env: &HashMap<String, String>) -> Option<AuditMode> {
-    if env.contains_key("AUDIT_MODE") {
+    if env.get("AUDIT_MODE").is_some_and(|v| !v.trim().is_empty()) {
         return None;
     }
-    match env.get("AUDIT_ENABLED").map(|v| v.trim().to_lowercase()) {
-        Some(v) if v == "1" || v == "true" || v == "yes" => Some(AuditMode::Block),
+    match env.get("AUDIT_ENABLED") {
+        Some(v) if is_truthy(v) => Some(AuditMode::Block),
         _ => None,
     }
 }
@@ -205,6 +187,38 @@ mod verdict_tests {
             ("AUDIT_ENABLED".to_string(), "1".to_string()),
         ]);
         assert_eq!(audit_enabled_compat(&env2), None);
+    }
+
+    #[test]
+    fn legacy_audit_enabled() {
+        for raw in ["1", "true", "yes", "on", " TRUE ", " On "] {
+            let env = HashMap::from([("AUDIT_ENABLED".to_string(), raw.to_string())]);
+            assert_eq!(audit_enabled_compat(&env), Some(AuditMode::Block), "{raw}");
+        }
+        for raw in ["0", "off", "bogus", "", "   ", "false", "no"] {
+            let env = HashMap::from([("AUDIT_ENABLED".to_string(), raw.to_string())]);
+            assert_eq!(audit_enabled_compat(&env), None, "{raw}");
+        }
+        for mode in ["off", "block", "approve"] {
+            let env = HashMap::from([
+                ("AUDIT_MODE".to_string(), mode.to_string()),
+                ("AUDIT_ENABLED".to_string(), "1".to_string()),
+            ]);
+            assert_eq!(
+                audit_enabled_compat(&env),
+                None,
+                "显式 AUDIT_MODE={mode} 优先"
+            );
+        }
+        let blank_mode_env = HashMap::from([
+            ("AUDIT_MODE".to_string(), "   ".to_string()),
+            ("AUDIT_ENABLED".to_string(), "yes".to_string()),
+        ]);
+        assert_eq!(
+            audit_enabled_compat(&blank_mode_env),
+            Some(AuditMode::Block)
+        );
+        assert_eq!(audit_enabled_compat(&HashMap::new()), None);
     }
 
     #[test]

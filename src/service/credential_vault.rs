@@ -59,6 +59,9 @@ impl std::fmt::Display for VaultReject {
 #[derive(Debug, Default)]
 pub struct CredentialVault {
     inner: RwLock<VaultInner>,
+    /// X3/D4 复杂度回归观测（仅测试）：全量快照调用计数。
+    #[cfg(test)]
+    snapshot_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -121,33 +124,31 @@ impl CredentialVault {
 
     /// token→明文快照（流式显式 mapping 缓存键用）。
     pub fn snapshot_t2p(&self) -> HashMap<String, String> {
+        #[cfg(test)]
+        self.snapshot_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner
             .read()
             .map(|g| g.token_to_pwd.clone())
             .unwrap_or_default()
     }
 
-    /// 将 token 还原为凭据明文。
-    pub fn restore(&self, text: &str) -> String {
-        let map = self.snapshot_t2p();
-        if map.is_empty() {
-            return text.to_string();
-        }
-        let mut items: Vec<(&String, &String)> = map.iter().collect();
-        items.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-        let pat = items
-            .iter()
-            .map(|(tok, _)| regex::escape(tok))
-            .collect::<Vec<_>>()
-            .join("|");
-        let re = regex::Regex::new(&pat).expect("转义后 token 正则恒合法");
-        re.replace_all(text, |caps: &regex::Captures| {
-            map.get(&caps[0])
-                .cloned()
-                .unwrap_or_else(|| caps[0].to_string())
-        })
-        .into_owned()
+    /// 单 token 还原直查（X3/D4）：同一把读锁一次查表，不克隆全表、
+    /// 不重建 alternation 正则；未注册返回 `None`（调用方自决回退）。
+    /// 已注册 token 的结果与全量 `restore` 的同 token 子串一致。
+    pub fn restore_one(&self, token: &str) -> Option<String> {
+        self.inner.read().ok()?.token_to_pwd.get(token).cloned()
     }
+
+    /// 全量快照调用计数（仅测试可见；X3 复杂度回归断言用）。
+    #[cfg(test)]
+    pub fn snapshot_calls(&self) -> usize {
+        self.snapshot_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 将 token 还原为凭据明文。
+    pub fn restore(&self, text: &str) -> String { replace_all_by_map(text, &self.snapshot_t2p()) }
 
     /// 剥离未知完整凭据 token（模型幻觉/未知句柄）。
     /// 已还原的真实 token 不会落此函数；命中映射的一律保留。
@@ -172,8 +173,11 @@ fn touch(order: &mut VecDeque<String>, value: &str) {
     order.push_back(value.to_string());
 }
 
-/// 显式 mapping 的单次替换（长度降序），供请求级快照复用。
-pub fn redact_with_map(text: &str, map: &HashMap<String, String>) -> String {
+/// 按 map 键长度降序单次 alternation 替换（X7 单一来源）：`restore` 传
+/// token→明文（还原），`redact_with_map` 传明文→token（脱敏），方向差异由
+/// 入参 map 承载；命中键替换为值，未命中保持原样。键经 `regex::escape`，
+/// 等长键次序不影响结果（等长不同键互不为前缀）。
+pub fn replace_all_by_map(text: &str, map: &HashMap<String, String>) -> String {
     if map.is_empty() {
         return text.to_string();
     }
@@ -181,16 +185,21 @@ pub fn redact_with_map(text: &str, map: &HashMap<String, String>) -> String {
     items.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
     let pat = items
         .iter()
-        .map(|(pwd, _)| regex::escape(pwd))
+        .map(|(k, _)| regex::escape(k))
         .collect::<Vec<_>>()
         .join("|");
-    let re = regex::Regex::new(&pat).expect("转义后凭据正则恒合法");
+    let re = regex::Regex::new(&pat).expect("转义后 map 键正则恒合法");
     re.replace_all(text, |caps: &regex::Captures| {
         map.get(&caps[0])
             .cloned()
             .unwrap_or_else(|| caps[0].to_string())
     })
     .into_owned()
+}
+
+/// 显式 mapping 的单次替换（长度降序），供请求级快照复用。
+pub fn redact_with_map(text: &str, map: &HashMap<String, String>) -> String {
+    replace_all_by_map(text, map)
 }
 
 #[cfg(test)]
@@ -262,6 +271,27 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("__VG_CRED_"));
         assert_eq!(vault.len(), 1);
+    }
+
+    #[test]
+    fn restore_one_matches_full_restore_per_token() {
+        let vault = CredentialVault::new();
+        let tok_a = vault.register("alpha-secret-001").unwrap();
+        let tok_b = vault.register("beta-secret-002").unwrap();
+        assert_eq!(
+            vault.restore_one(&tok_a).as_deref(),
+            Some("alpha-secret-001")
+        );
+        assert_eq!(
+            vault.restore_one(&tok_b).as_deref(),
+            Some("beta-secret-002")
+        );
+        // 与全量 restore 的同 token 子串一致。
+        let full = vault.restore(&format!("a={tok_a} b={tok_b}"));
+        assert_eq!(full, "a=alpha-secret-001 b=beta-secret-002");
+        // 未注册/非 token 直查返回 None（不克隆全表、不猜测）。
+        assert_eq!(vault.restore_one("__VG_CRED_999999__"), None);
+        assert_eq!(vault.restore_one("plain-text"), None);
     }
 
     #[test]

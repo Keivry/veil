@@ -42,7 +42,6 @@ fn test_app(extra: &[(&str, &str)], locked: bool) -> axum::Router {
             sqlite_ok: true,
             sqlite_error: None,
             db_path: PathBuf::from(format!("/tmp/veil-e2e-credential-{n}.sqlite")),
-            memory_only: true,
         },
     )
     .with_keepass(keepass);

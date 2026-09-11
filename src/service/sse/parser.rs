@@ -82,6 +82,9 @@ pub struct SseParser {
     truncated_line_dropped_bytes: u64,
     /// C11：当前块是否含截断行（分发时落到 [`SseEvent::truncated`] 后复位）。
     block_truncated: bool,
+    /// N3：上一块以孤立 `\r` 结尾，下一块首字节为 `\n` 时按 `\r\n`
+    /// 合并吞掉，不产生空行/提前分发。
+    swallow_lf: bool,
 }
 
 impl Default for SseParser {
@@ -101,6 +104,7 @@ impl SseParser {
             line_overflow: false,
             truncated_line_dropped_bytes: 0,
             block_truncated: false,
+            swallow_lf: false,
         }
     }
 
@@ -124,6 +128,15 @@ impl SseParser {
             let bytes = s.as_bytes();
             let mut start = 0usize;
             let mut i = 0usize;
+            // N3/D5：上一块以孤立 `\r` 收尾时，本块首字节若为 `\n` 则按单个
+            // `\r\n` 行终止吞掉，不产生空行提前分发；否则按孤立 `\r` 处理。
+            if self.swallow_lf && !bytes.is_empty() {
+                if bytes[0] == b'\n' {
+                    i = 1;
+                    start = 1;
+                }
+                self.swallow_lf = false;
+            }
             while i < bytes.len() {
                 if bytes[i] == b'\r' {
                     lines.push(s[start..i].to_string());
@@ -141,6 +154,8 @@ impl SseParser {
                     i += 1;
                 }
             }
+            // 缓冲区以 `\r` 收尾（已按孤立 `\r` 终止行）：CRLF 判定暂存到下一块。
+            self.swallow_lf = bytes.last() == Some(&b'\r');
             rest = s[start..].to_string();
         }
         self.text_carry = rest;
@@ -226,6 +241,10 @@ impl SseParser {
                 ev.event_type = Some(v.strip_prefix(' ').unwrap_or(v).to_string());
             } else if let Some(v) = raw.strip_prefix("data:") {
                 data_parts.push(v.strip_prefix(' ').unwrap_or(v).to_string());
+            } else if raw == "data" {
+                // P11/D9：无冒号 `data` 行按空值字段处理（WHATWG），参与
+                // 多 `data:` 行 `\n` 合并；其他无冒号行维持忽略。
+                data_parts.push(String::new());
             } else if let Some(v) = raw.strip_prefix("id:") {
                 ev.id = Some(v.strip_prefix(' ').unwrap_or(v).to_string());
             } else if let Some(v) = raw.strip_prefix("retry:") {

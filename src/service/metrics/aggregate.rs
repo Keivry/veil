@@ -17,10 +17,6 @@ pub const LATENCY_BOUNDS_MS: [u64; 11] = [10, 25, 50, 100, 200, 400, 800, 1500, 
 pub const LATENCY_BUCKETS: usize = 12;
 /// `truncated_mode` 唯一三态（他值不落指标）。
 pub const TRUNCATED_MODES: [&str; 3] = ["silent_discard", "open_ended", "synthesized_failed"];
-/// `daily` 保留天数。
-pub const DAILY_RETENTION_DAYS: i64 = 30;
-/// `hourly` 保留天数。
-pub const HOURLY_RETENTION_DAYS: i64 = 7;
 /// PII 采样落盘滚动天数。
 pub const PII_SAMPLE_RETENTION_DAYS: i64 = 7;
 /// 模型名归一上限（字符，对标 Python `unknown_model` 回退口径的防注入截断）。

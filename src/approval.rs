@@ -12,7 +12,7 @@
 //!     + Unknown 兜底）流转，凭据 300s / 审计 90s 分表超时，`ORPHAN_SWEEP_SECS` 60s 孤儿清扫，
 //!       `spawn_sync_loop` 常驻同步。
 //!
-//! D1 保活二选一锁定：流内保活唯一实现为 `service::audit_hold::RequestKeepalive`
+//! D1 保活二选一锁定：流内保活唯一实现为 `service::audit::RequestKeepalive`
 //! （`handler::llm::pump` 经 `spawn_gated` 接线，间隔消费 `service::sse::KEEPALIVE_INTERVAL`
 //! 10s）；管理面 SSE 60s ping（`service::admin::sse::SSE_PING_INTERVAL`）+ 5min 强制重连
 //! 分属不同链路，差异有意。`KeepaliveTracker`（时间戳自检形态，生产零接线）已删，不再立项。

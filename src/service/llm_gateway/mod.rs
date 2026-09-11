@@ -123,10 +123,6 @@ impl GatewayMetrics {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn truncated_line_dropped_bytes_count(&self) -> u64 {
-        self.truncated_line_dropped_bytes.load(Ordering::Relaxed)
-    }
-
     pub fn record_nondialog_passthrough(&self) {
         self.nondialog_passthrough.fetch_add(1, Ordering::Relaxed);
     }
@@ -149,7 +145,7 @@ impl GatewayMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmptyAction {
     NonStreamTo502,
-    Passthrough502_401,
+    PassthroughErrorStatus,
     NonDialogExempt,
     PassthroughOk,
 }
@@ -165,8 +161,10 @@ pub fn classify_empty(
     if !is_chat {
         return EmptyAction::NonDialogExempt;
     }
-    if upstream_status == 502 || upstream_status == 401 {
-        return EmptyAction::Passthrough502_401;
+    if upstream_status >= 400 {
+        // N2/D6：`status>=400` 恒豁免合成 502（JSON 走调用方完整后处理链，
+        // 非 JSON 含空体原样透传状态码与正文字节，不再吞错转 `E_EMPTY_BODY`）。
+        return EmptyAction::PassthroughErrorStatus;
     }
     if body_len == 0 || !is_json {
         return EmptyAction::NonStreamTo502;
@@ -296,11 +294,11 @@ mod tests {
         );
         assert_eq!(
             classify_empty(true, 10, true, 502),
-            EmptyAction::Passthrough502_401
+            EmptyAction::PassthroughErrorStatus
         );
         assert_eq!(
             classify_empty(true, 5, true, 401),
-            EmptyAction::Passthrough502_401
+            EmptyAction::PassthroughErrorStatus
         );
         assert_eq!(
             classify_empty(false, 0, false, 200),

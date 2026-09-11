@@ -68,6 +68,7 @@ fn test_ctx(protocol: Protocol) -> NonstreamCtx {
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
         pending: Arc::new(PendingApprovals::default()),
+        nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
     }
 }
 
@@ -86,6 +87,9 @@ async fn loopback_server(
     let reason = match status {
         200 => "OK",
         401 => "Unauthorized",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
         502 => "Bad Gateway",
         _ => "OK",
     };
@@ -173,22 +177,19 @@ fn llm_empty_4_normal_text_not_502() {
 
 #[test]
 fn llm_empty_5_error_status_never_maps_to_502() {
-    // T2-5：502/401 豁免 502 映射（原样透传）；429 空体仍转 502（无体可透传）。
-    for status in [502u16, 401] {
+    // N2/D6：4xx/5xx 恒豁免 502 映射——JSON 走完整后处理链，非 JSON（含空体）
+    // 原样透传状态码与正文字节。
+    for status in [502u16, 401, 429, 500, 404] {
         assert_eq!(
             classify_empty(true, 0, false, status),
-            EmptyAction::Passthrough502_401,
+            EmptyAction::PassthroughErrorStatus,
             "status={status} 不应转 NonStreamTo502"
         );
     }
+    // 2xx 非 JSON/空体维持现值（合成 502 空体）。
     assert_eq!(
-        classify_empty(true, 0, false, 429),
-        EmptyAction::NonStreamTo502,
-        "429 空体无透传物，仍转 502"
-    );
-    assert_eq!(
-        classify_empty(true, 0, false, 502),
-        EmptyAction::Passthrough502_401
+        classify_empty(true, 0, false, 200),
+        EmptyAction::NonStreamTo502
     );
 }
 
@@ -218,6 +219,7 @@ fn llm_empty_7_nondialog_exempt_from_empty_mapping() {
     );
 }
 
+mod f2;
 #[tokio::test]
 async fn llm_empty_e2e_upstream_empty_body_returns_502() {
     // T2-E2E：上游空体经 serve_nonstream 返回 502（回环，无外网）。
@@ -622,4 +624,77 @@ async fn llm_empty_e2e_error_status_passthrough_not_502_shape() {
         panic!("401 上游须直接响应");
     };
     assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn non_json_error_passthrough() {
+    // N2/D6 2.1：429 `text/plain` 非 JSON 体原样透传，状态码与正文字节逐字节一致。
+    let client = reqwest::Client::new();
+    let body = b"slow down, rate limited".to_vec();
+    let (url, server) = loopback_server(429, "text/plain", body.clone()).await;
+    let outcome = serve_nonstream(
+        &client,
+        reqwest::Method::POST,
+        &url,
+        axum::http::HeaderMap::new(),
+        br#"{"model":"m","messages":[]}"#.to_vec(),
+        test_ctx(Protocol::Chat),
+    )
+    .await;
+    server.abort();
+    let NonstreamOutcome::Responded(resp) = outcome else {
+        panic!("非 JSON 错误体须直接响应而非转流泵");
+    };
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        "429 状态码须保留，不得被替换为 502"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("错误正文须可读");
+    assert_eq!(bytes.as_ref(), body.as_slice(), "正文字节须逐字节一致");
+}
+
+#[tokio::test]
+async fn error_status_non_json() {
+    // N2/D6 2.2：500 HTML 与 404 非 JSON 体（含空体错误）均保留状态与正文，不被替换为 502。
+    let client = reqwest::Client::new();
+    for (status, ctype, body) in [
+        (
+            500u16,
+            "text/html",
+            b"<html><body>internal error</body></html>".to_vec(),
+        ),
+        (404, "text/plain", b"no such model".to_vec()),
+        (500, "text/plain", Vec::new()),
+    ] {
+        let (url, server) = loopback_server(status, ctype, body.clone()).await;
+        let outcome = serve_nonstream(
+            &client,
+            reqwest::Method::POST,
+            &url,
+            axum::http::HeaderMap::new(),
+            br#"{"model":"m","messages":[]}"#.to_vec(),
+            test_ctx(Protocol::Chat),
+        )
+        .await;
+        server.abort();
+        let NonstreamOutcome::Responded(resp) = outcome else {
+            panic!("非 JSON 错误体须直接响应而非转流泵，status={status}");
+        };
+        assert_eq!(
+            resp.status().as_u16(),
+            status,
+            "status={status} 须保留，不得替换为 502"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("错误正文须可读");
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_slice(),
+            "status={status} 正文字节须一致"
+        );
+    }
 }

@@ -5,17 +5,13 @@
 use {
     crate::{
         error::{Result, VeilError},
+        handler::peer_ip::PeerIp,
         service::{self, CredentialBody, CredentialHeaders},
         state::AppState,
     },
-    axum::{
-        Json,
-        extract::{ConnectInfo, State},
-        http::HeaderMap,
-    },
+    axum::{Json, extract::State, http::HeaderMap},
     serde::Deserialize,
     serde_json::{Value, json},
-    std::net::SocketAddr,
 };
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -294,26 +290,6 @@ pub struct EmergencyRevokeBody {
     pub file_present: bool,
 }
 
-pub struct PeerIp(pub Option<String>);
-
-impl<S> axum::extract::FromRequestParts<S> for PeerIp
-where
-    S: Send + Sync,
-{
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let ip = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip().to_string());
-        Ok(Self(ip))
-    }
-}
-
 pub async fn emergency_revoke_handler(
     State(state): State<AppState>,
     peer: PeerIp,
@@ -331,7 +307,7 @@ pub async fn emergency_revoke_handler(
         .or_else(|| header_str(&headers, "x-admin-token"));
     // 安全契约（security-compat-fix）：紧急吊销只认 TCP 远端 `ConnectInfo`，
     // MUST NOT 回退 `X-Forwarded-For` 等代理头（伪造头可绕过内网豁免）。
-    let peer_ip = peer.0;
+    let peer_ip = peer.0.map(|ip| ip.to_string());
     let view = service::emergency_revoke(
         &state,
         &key,
@@ -395,7 +371,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
             },
         )
     }
@@ -421,7 +396,7 @@ mod tests {
         forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
         let err = emergency_revoke_handler(
             State(state.clone()),
-            PeerIp(Some("203.0.113.9".to_string())),
+            PeerIp(Some("203.0.113.9".parse().unwrap())),
             forged,
             revoke_body("/s/xff.sh"),
         )
@@ -431,7 +406,7 @@ mod tests {
         // 回环 TCP 对端无头时豁免路径仍可用。
         let ok = emergency_revoke_handler(
             State(state),
-            PeerIp(Some("127.0.0.1".to_string())),
+            PeerIp(Some("127.0.0.1".parse().unwrap())),
             HeaderMap::new(),
             revoke_body("/s/xff.sh"),
         )

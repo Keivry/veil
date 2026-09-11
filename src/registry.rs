@@ -307,14 +307,6 @@ impl CallerRegistry {
             })
     }
 
-    pub fn set_entries(&mut self, key: &str, entries: BTreeMap<String, Vec<String>>) -> Result<()> {
-        let entry = self.find_mut(key).ok_or_else(|| VeilError::BadRequest {
-            message: format!("调用方不存在: {key}"),
-        })?;
-        entry.entries = entries;
-        Ok(())
-    }
-
     pub fn revoke(&mut self, key: &str) -> Result<&CallerEntry> {
         let entry = self.find_mut(key).ok_or_else(|| VeilError::BadRequest {
             message: format!("调用方不存在: {key}"),

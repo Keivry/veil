@@ -102,50 +102,36 @@ fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
     }
 }
 
+/// 嵌套 `usage` 回退公共骨架（X8 单一来源）：按路径序列逐级定位 usage 对象
+/// 并归一，首个命中者胜。非流与流式的差异仅由调用方传入的路径序列与顶层
+/// `usage_in` 组合承载；流式快路径门与 Anthropic `delta.usage` 层调用时机
+/// 保留在调用方。
+fn usage_from_paths(root: &Value, protocol: Protocol, paths: &[&[&str]]) -> Option<Usage> {
+    paths.iter().find_map(|path| {
+        let mut cur = root;
+        for key in path.iter() {
+            cur = cur.get(*key)?;
+        }
+        cur.as_object().and_then(|o| usage_from_obj(o, protocol))
+    })
+}
+
 pub fn extract_usage_nonstream(protocol: Protocol, body: &Value) -> Option<Usage> {
     match protocol {
-        Protocol::Chat => body
-            .get("usage")?
-            .as_object()
-            .and_then(|o| usage_from_obj(o, protocol)),
+        Protocol::Chat => usage_in(body.as_object()?, protocol),
         Protocol::Responses => {
             // F-P1a：官方非流顶层 `usage` 优先，其次 `response.usage`，
             // 最后 `response.response.usage` 回退；缓存列同口径。
-            if let Some(u) = body
-                .get("usage")
-                .and_then(|v| v.as_object())
-                .and_then(|o| usage_from_obj(o, protocol))
-            {
-                return Some(u);
-            }
-            let outer = body.get("response")?.as_object()?;
-            if let Some(u) = outer
-                .get("usage")
-                .and_then(|v| v.as_object())
-                .and_then(|o| usage_from_obj(o, protocol))
-            {
-                return Some(u);
-            }
-            outer
-                .get("response")?
-                .as_object()?
-                .get("usage")?
-                .as_object()
-                .and_then(|o| usage_from_obj(o, protocol))
+            usage_in(body.as_object()?, protocol).or_else(|| {
+                usage_from_paths(
+                    body,
+                    protocol,
+                    &[&["response", "usage"], &["response", "response", "usage"]],
+                )
+            })
         }
-        Protocol::Anthropic => {
-            if let Some(u) = body
-                .get("usage")
-                .and_then(|v| v.as_object())
-                .and_then(|o| usage_from_obj(o, protocol))
-            {
-                return Some(u);
-            }
-            body.get("message")?
-                .get("usage")?
-                .as_object()
-                .and_then(|o| usage_from_obj(o, protocol))
-        }
+        Protocol::Anthropic => usage_in(body.as_object()?, protocol)
+            .or_else(|| usage_from_paths(body, protocol, &[&["message", "usage"]])),
         Protocol::NonDialog => None,
     }
 }
@@ -174,35 +160,16 @@ pub fn extract_usage_stream(protocol: Protocol, payload: &Value) -> Option<Usage
     }
     match protocol {
         Protocol::Chat => None,
-        Protocol::Responses => {
-            let resp = obj.get("response")?.as_object()?;
-            if let Some(u) = resp
-                .get("usage")
-                .and_then(|v| v.as_object())
-                .and_then(|o| usage_from_obj(o, protocol))
-            {
-                return Some(u);
-            }
-            resp.get("response")?
-                .as_object()?
-                .get("usage")?
-                .as_object()
-                .and_then(|o| usage_from_obj(o, protocol))
-        }
-        Protocol::Anthropic => {
-            if let Some(u) = obj
-                .get("delta")
-                .and_then(|v| v.as_object())
-                .and_then(|o| usage_in(o, protocol))
-            {
-                return Some(u);
-            }
-            obj.get("message")?
-                .as_object()?
-                .get("usage")?
-                .as_object()
-                .and_then(|o| usage_from_obj(o, protocol))
-        }
+        Protocol::Responses => usage_from_paths(
+            payload,
+            protocol,
+            &[&["response", "usage"], &["response", "response", "usage"]],
+        ),
+        Protocol::Anthropic => usage_from_paths(
+            payload,
+            protocol,
+            &[&["delta", "usage"], &["message", "usage"]],
+        ),
         Protocol::NonDialog => None,
     }
 }

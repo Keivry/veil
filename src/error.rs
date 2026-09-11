@@ -150,8 +150,14 @@ impl VeilError {
 
 impl IntoResponse for VeilError {
     fn into_response(self) -> Response {
-        tracing::error!(code = self.code(), error = ?self, "请求失败");
         let status = self.status_code();
+        // A4 日志级别纪律：5xx 记 error（被告警规则捕获），其余（预期 4xx、
+        // 202 审批挂起）记 warn，避免预期失败稀释真告警；`code` 字段保留。
+        if status.is_server_error() {
+            tracing::error!(code = self.code(), error = ?self, "请求失败");
+        } else {
+            tracing::warn!(code = self.code(), error = ?self, "请求失败");
+        }
         let message = self.public_message();
         let body = Json(json!({
             "error": {
@@ -274,5 +280,85 @@ mod tests {
         assert_eq!(value["error"]["message"], "拒绝");
         assert_eq!(value["error_detail"], "拒绝");
         assert!(value["error_detail"].is_string());
+    }
+
+    #[derive(Clone, Default)]
+    struct LevelCapture(std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+
+    impl tracing::Subscriber for LevelCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool { true }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn captured_level_and_status(err: VeilError) -> (Vec<tracing::Level>, StatusCode) {
+        let capture = LevelCapture::default();
+        let sink = capture.0.clone();
+        let status =
+            tracing::subscriber::with_default(capture, move || err.into_response().status());
+        let levels = sink.lock().unwrap().clone();
+        (levels, status)
+    }
+
+    #[test]
+    fn four_xx_logs_warn_five_xx_logs_error() {
+        // 4xx（预期失败）→ warn，状态码与错误体不变。
+        for err in [
+            VeilError::NotFound {
+                message: "条目未找到".to_string(),
+            },
+            VeilError::BadRequest {
+                message: "请求非法".to_string(),
+            },
+            VeilError::Auth {
+                message: "缺密钥".to_string(),
+            },
+            // 上游透传 4xx 同样按非 5xx 记 warn。
+            VeilError::Upstream {
+                status: 401,
+                message: "上游直回".to_string(),
+            },
+        ] {
+            let expected = err.status_code();
+            let (levels, status) = captured_level_and_status(err);
+            assert_eq!(status, expected);
+            assert_eq!(levels, vec![tracing::Level::WARN], "{status}");
+        }
+        // 5xx → error（被告警规则捕获）。
+        for err in [
+            VeilError::Internal(anyhow::anyhow!("根因")),
+            VeilError::Storage {
+                message: "写失败".to_string(),
+            },
+            VeilError::Upstream {
+                status: 502,
+                message: "坏网关".to_string(),
+            },
+        ] {
+            let expected = err.status_code();
+            let (levels, status) = captured_level_and_status(err);
+            assert_eq!(status, expected);
+            assert_eq!(levels, vec![tracing::Level::ERROR], "{status}");
+        }
+        // 202 审批挂起非 5xx，记 warn 不误报。
+        let (levels, status) = captured_level_and_status(VeilError::PendingApproval {
+            message: "待审".to_string(),
+        });
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(levels, vec![tracing::Level::WARN]);
     }
 }

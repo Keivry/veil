@@ -244,14 +244,6 @@ impl AuditLogger {
     }
 }
 
-/// 从环境映射解析策略文件路径（`AUDIT_POLICY_FILE`，缺省 `None` = 默认策略）。
-pub fn policy_path_from_env(env: &std::collections::HashMap<String, String>) -> Option<PathBuf> {
-    env.get("AUDIT_POLICY_FILE")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
 #[cfg(test)]
 mod log_tests {
     use super::*;

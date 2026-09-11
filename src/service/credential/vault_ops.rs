@@ -290,7 +290,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: dir.join("x.sqlite"),
-                memory_only: false,
             },
         )
         .with_keepass(Arc::new(crate::keepass::RealKeePass::new(
@@ -322,7 +321,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
             },
         );
         let err = handle_credential(

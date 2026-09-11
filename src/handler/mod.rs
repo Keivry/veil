@@ -1,15 +1,17 @@
 //! 处理器入口：凭据面（`credential`）与 LLM 网关面（`llm`）的装配与重导出。
 //! 路由（`router.rs`）只经本模块访问两面，对外路径保持 `handler::*` 不变。
 
+pub mod admin;
 pub mod credential;
 pub mod llm;
+pub mod peer_ip;
 
 use {
     crate::{service, state::AppState},
     axum::{Json, extract::State},
     serde_json::{Value, json},
 };
-pub use {credential::*, llm::*};
+pub use {credential::*, llm::*, peer_ip::PeerIp};
 
 pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
     let health = service::health_status(&state);
@@ -50,7 +52,6 @@ mod tests {
                 sqlite_ok: true,
                 sqlite_error: None,
                 db_path: PathBuf::from("/tmp/x.sqlite"),
-                memory_only: false,
             },
         );
         let Json(body) = health_handler(State(state)).await;

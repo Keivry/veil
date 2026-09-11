@@ -12,6 +12,11 @@ use {
     },
 };
 
+/// T3/7.2 ReDoS 扫描墙钟绝对上界（毫秒）：对抗输入必须在
+/// [`RE_DOS_BUDGET_MS`] 预算断言与连续三次禁用记账之外，以本明确绝对常量内返回
+/// （独立兜底锁；公式：预算 100ms + 调度/阻塞池余量）。
+pub const REDOS_WALL_CLOCK_CEILING_MS: u64 = 400;
+
 impl PiiDetector {
     /// 是否含 `\b`（ASCII 词边界，中文紧贴下零命中，禁止使用）。
     fn has_word_boundary(pattern: &str) -> bool { pattern.contains("\\b") }
@@ -416,6 +421,28 @@ mod tests {
         d3.account_rule("flaky", true);
         d3.account_rule("flaky", true);
         assert!(!d3.disabled_snapshot().contains(&"flaky".to_string()));
+    }
+
+    #[tokio::test]
+    async fn redos_wall_clock_absolute_ceiling_beyond_budget_assertion() {
+        // T3/7.2：对抗输入在明确绝对上界常量内返回，不依赖 `RE_DOS_BUDGET_MS`
+        // 预算断言，也不依赖连续三次禁用的记账路径（独立兜底锁）。
+        let d = detector();
+        d.load_custom_patterns(&[("evil-abs".to_string(), r"^(a+)+$".to_string())]);
+        let input = format!("{}b", "a".repeat(2000));
+        let start = std::time::Instant::now();
+        let hits = d.scan_custom(&input, &empty_cred()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(super::REDOS_WALL_CLOCK_CEILING_MS),
+            "对抗扫描须在绝对上界 {}ms 内返回，实际 {elapsed:?}",
+            super::REDOS_WALL_CLOCK_CEILING_MS
+        );
+        assert!(hits.iter().all(|h| h.0 != "evil-abs"), "{hits:?}");
+        assert!(
+            !d.disabled_snapshot().contains(&"evil-abs".to_string()),
+            "单次超时不得触发三连禁用记账（上界与记账解耦）"
+        );
     }
 
     #[test]

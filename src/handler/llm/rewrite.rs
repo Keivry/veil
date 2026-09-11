@@ -39,7 +39,7 @@ pub async fn request_rewrite(
 ) -> RewriteOutput {
     let original_valid = std::str::from_utf8(&body_bytes).is_ok();
     let original_text = String::from_utf8_lossy(&body_bytes).into_owned();
-    let mut body_value: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+    let body_value: Option<Value> = serde_json::from_slice(&body_bytes).ok();
     let mut normalized_out = false;
     let mut body_bytes = body_bytes;
     let mut redacted_text = original_text.clone();
@@ -56,17 +56,12 @@ pub async fn request_rewrite(
         .as_ref()
         .is_some_and(|v| llm_gateway::should_inject_stream_options(protocol, v));
     if need_inject {
-        // L15：注入即声明——本分支恒经 `to_vec` 重序列化（上下两子分支皆然），
-        // 输出恒为紧凑 JSON，与配置开关无关，故无条件置位。
-        normalized_out = true;
-        if let Ok(mut v) = serde_json::from_str::<Value>(&redacted_text) {
-            llm_gateway::inject_stream_options(&mut v);
-            body_value = Some(v);
-            body_bytes = serde_json::to_vec(body_value.as_ref().expect("刚注入的请求体"))
-                .unwrap_or_default();
-        } else if let Some(v) = body_value.as_ref() {
-            body_bytes = serde_json::to_vec(v).unwrap_or_default();
-        }
+        // P7/D7：注入分支回退决策纯函数——重解析失败回退转发**脱敏字节**
+        //（fail-closed，绝不回落未脱敏原文）；`normalized_out` 仅成功重序列化置位。
+        let (bytes, normalized) =
+            apply_stream_options_injection(&redacted_text, original_valid, body_value.as_ref());
+        body_bytes = bytes;
+        normalized_out = normalized;
     } else if redacted_text != original_text && original_valid {
         body_bytes = redacted_text.into_bytes();
     } else if config.normalize_json_whitespace
@@ -101,6 +96,28 @@ pub async fn request_rewrite(
         normalized_out,
         stream_flag,
         init_conv,
+    }
+}
+
+/// P7/D7 注入分支回退决策（纯函数）：重解析 `redacted_text` 成功 → 注入
+/// `stream_options` 并紧凑重序列化（`(bytes, true)`）；失败且原文有效 →
+/// 转发**脱敏字节**（fail-closed，绝不外泄原文）且不置位；原文无效 →
+/// 回退 `body_value` 序列化（既有行为）且不置位。
+fn apply_stream_options_injection(
+    redacted_text: &str,
+    original_valid: bool,
+    body_value: Option<&Value>,
+) -> (Vec<u8>, bool) {
+    if let Ok(mut v) = serde_json::from_str::<Value>(redacted_text) {
+        llm_gateway::inject_stream_options(&mut v);
+        return (serde_json::to_vec(&v).unwrap_or_default(), true);
+    }
+    if original_valid {
+        return (redacted_text.as_bytes().to_vec(), false);
+    }
+    match body_value {
+        Some(v) => (serde_json::to_vec(v).unwrap_or_default(), false),
+        None => (Vec::new(), false),
     }
 }
 
@@ -554,5 +571,42 @@ mod rewrite_unit_tests {
         .await;
         let v: serde_json::Value = serde_json::from_slice(&out.body).expect("合法 JSON");
         assert_eq!(v["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn redaction_fallback_never_emits_unredacted() {
+        // P7/D7：重解析失败时回退转发脱敏字节——含占位符、不含原文，
+        // `x-veil-normalized` 不置位（未成功重序列化）。
+        let original = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "secret-original-13812345678"}]
+        });
+        let redacted = r#"{"model":"m","messages":[{"role":"user","content":"__PII_1_ab12cd34__""#;
+        let (bytes, normalized) =
+            super::apply_stream_options_injection(redacted, true, Some(&original));
+        let text = String::from_utf8(bytes).expect("回退字节须可读");
+        assert!(text.contains("__PII_1_ab12cd34__"), "须含占位符: {text}");
+        assert!(!text.contains("secret-original"), "不得外泄原文: {text}");
+        assert!(!normalized, "未重序列化不得置位 normalized");
+    }
+
+    #[test]
+    fn redaction_fallback() {
+        // P7/D7 三场景：正常注入、重解析失败（original_valid）、original_valid=false。
+        let v = serde_json::json!({"model": "m", "stream": true});
+        let (bytes, normalized) =
+            super::apply_stream_options_injection(r#"{"model":"m","stream":true}"#, true, Some(&v));
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("须合法 JSON");
+        assert_eq!(parsed["stream_options"]["include_usage"], true);
+        assert!(normalized, "成功重序列化须置位");
+        let (bytes2, normalized2) =
+            super::apply_stream_options_injection("{ broken", true, Some(&v));
+        assert_eq!(bytes2, b"{ broken", "须回退脱敏字节");
+        assert!(!normalized2, "重解析失败不得置位");
+        let (bytes3, normalized3) =
+            super::apply_stream_options_injection("{ broken", false, Some(&v));
+        let parsed3: serde_json::Value = serde_json::from_slice(&bytes3).expect("须合法 JSON");
+        assert_eq!(parsed3["model"], "m");
+        assert!(!normalized3, "回退序列化不得置位");
     }
 }

@@ -23,8 +23,10 @@
 //! - 超限头与指标锁定：头名 `retry-after`（HTTP 头大小写不敏感，spec 写作 `Retry-After`）；错误码
 //!   `E_RATE_LIMITED`；SSE 并发水位经 `sse_current` 与网关 `sse_event_total` 观测。
 //!
-//! 子模块划分（A2）：`state` 聚合状态，`ratelimit` 速率限流，`sse` 实时推送，
-//! `events` 鉴权与查询 handler；旧路径 `crate::service::admin::X` 经重导出兼容。
+//! 子模块划分（A2）：`state` 聚合状态，`ratelimit` 速率限流，`sse` SSE 并发守卫
+//! 与建连过滤，`events` 兼容映射与 token 等长比较；实现 axum `State` handler 的
+//! 管理面逻辑归 `handler::admin`（A1），本层不 import axum。旧路径
+//! `crate::service::admin::X` 经重导出兼容。
 
 pub mod events;
 pub mod ratelimit;

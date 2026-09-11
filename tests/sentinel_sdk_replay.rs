@@ -51,7 +51,6 @@ fn test_app(extra: &[(&str, &str)], db: &str) -> axum::Router {
             sqlite_ok: true,
             sqlite_error: None,
             db_path: PathBuf::from(db),
-            memory_only: true,
         },
     )
     .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
@@ -392,5 +391,84 @@ fn usage_regressing_out_of_order_takes_max() {
         (a.prompt_tokens, a.completion_tokens, a.total_tokens),
         (100, 50, 150),
         "递减输入不得回退"
+    );
+}
+
+// —— T2/6.2：Responses CR-only fixture 回放（对标 06 Anthropic CR/LF 双路径） ——
+
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+#[test]
+fn responses_cr_only_fixture_no_lf_and_completed_terminal() {
+    use veil::service::sse::SseParser;
+    let raw = std::fs::read(fixture_path("sentinel_responses_cr.jsonl")).expect("fixture 可读");
+    assert!(!raw.contains(&b'\n'), "fixture 须逐字节无 LF");
+    assert!(raw.ends_with(b"\r"), "fixture 须单行 CR 终止");
+    let record: serde_json::Value =
+        serde_json::from_slice(raw.strip_suffix(b"\r").expect("须有 CR 终止"))
+            .expect("JSON 可解析");
+    let line = record["line"].as_str().expect("sse line 字段");
+    // CR-only 行解析出恰一 data 事件，含 response.completed 终止。
+    let mut parser = SseParser::new();
+    let events = parser.push_bytes(line.as_bytes());
+    let data: Vec<&str> = events
+        .iter()
+        .map(|e| e.data.as_str())
+        .filter(|d| !d.is_empty())
+        .collect();
+    assert_eq!(data.len(), 1, "CR-only 行须产出恰一 data 事件");
+    assert!(
+        data[0].contains("response.completed"),
+        "缺终止: {}",
+        data[0]
+    );
+    let v: serde_json::Value = serde_json::from_str(data[0]).expect("终止体须为 JSON");
+    assert_eq!(v["type"], "response.completed");
+    // 对标 LF 路径：同内容 `\n` 帧事件数据与 CR-only 逐字节一致。
+    let mut lf_parser = SseParser::new();
+    let lf_events = lf_parser.push_bytes(line.replace('\r', "\n").as_bytes());
+    let lf_data: Vec<&str> = lf_events
+        .iter()
+        .map(|e| e.data.as_str())
+        .filter(|d| !d.is_empty())
+        .collect();
+    assert_eq!(lf_data, data, "CR-only 与 LF 解析事件数据须一致");
+}
+
+#[tokio::test]
+async fn responses_cr_only_and_lf_gateway_outputs_match() {
+    let lf_frames = vec![
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"CR双路径甲\"}\n\n".to_string(),
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cr\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_string(),
+    ];
+    let cr_frames: Vec<String> = lf_frames.iter().map(|f| f.replace('\n', "\r")).collect();
+    let req_body = "{\"model\":\"m\",\"input\":\"hi\",\"stream\":true}";
+    let mut outputs = Vec::new();
+    for (tag, frames) in [("lf", lf_frames), ("cr", cr_frames)] {
+        let (upstream, uhandle) = mock_upstream(frames).await;
+        let (base, handle) = serve(test_app(
+            &[("LLM_UPSTREAM", upstream.as_str())],
+            &format!("/tmp/veil-sdk-06r-{tag}.sqlite"),
+        ))
+        .await;
+        let (status, body) = post_stream(&base, "/v1/responses", req_body).await;
+        assert_eq!(status, 200, "{tag}: {body}");
+        assert!(body.contains("CR双路径甲"), "{tag} 须含增量文本: {body}");
+        assert!(
+            body.contains("response.completed"),
+            "{tag} 须含终止: {body}"
+        );
+        outputs.push(body.replace('\r', "\n"));
+        handle.abort();
+        uhandle.abort();
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "CR-only 与 LF 经网关输出须一致（行尾归一后）"
     );
 }

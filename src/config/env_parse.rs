@@ -1,5 +1,10 @@
 //! 环境解析：常量/三枚举/`Config`/`load_from`/`resolve_kdbx`/入口选路。
 //!
+//! A2 拆分：`load_from` 按域拆为 `load_auth`/`load_limits`/`load_audit`/
+//! `load_storage`/`load_redaction`/`load_llm`/`load_keepass_backend`，调用顺序
+//! 与原实现逐语句同序（默认值、错误顺序与错误消息不变）；单测与共享测试
+//! 基准拆至 `env_parse/tests.rs`、`env_parse/test_support.rs`（行数红线保持）。
+//!
 //! 跨子模块引用：自定义文件经 `super::custom_file`，校验器经
 //! `super::validate`（同级 `use` 成环无碍，Rust 允许）。
 
@@ -20,7 +25,10 @@ use {
             require_non_empty,
         },
     },
-    crate::error::{Result, VeilError},
+    crate::{
+        error::{Result, VeilError},
+        service::audit::audit_enabled_compat,
+    },
     std::{collections::HashMap, path::PathBuf, time::Duration},
 };
 
@@ -45,6 +53,10 @@ pub const GATEWAY_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 /// 本常量为回归锚点，不接任何请求入口，不改变现行子限行为。
 /// 归属 `config.rs`（D1 常量下沉），`handler::llm` 原位 `pub use` 转发。
 pub const AUDIT_SUBLIMIT_CEILING_BYTES: usize = 8 * 1024 * 1024;
+/// `NONSTREAM_MAX_BYTES` 默认值 8MB（对齐 Python `_llm.py:139`）：非流对话响应体入口上限，
+/// 严格 `len >` 本值触发 502 `response_too_large`；与 `AUDIT_SUBLIMIT_CEILING_BYTES`
+/// （审计子限锚点、非入口 enforcement）分属不同检查点（见 `veil-parity-gap-closeout` D2）。
+pub const NONSTREAM_MAX_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
 /// SSE 单行上限 16KB（D5 下沉自 `service::sse`，只搬不改值；`sse.rs` 原位转发）：
 /// 超长行按 C11 截断并记 `truncated_line_dropped_bytes`；
 /// 理由：SSE 帧语义要求行完整，16KB 覆盖正常事件体（含 usage 完成帧），
@@ -55,7 +67,7 @@ pub const LINE_LIMIT_BYTES: usize = 16 * 1024;
 /// 理由：与 `HTTP_TIMEOUT_SECS`（默认 30s）同数量级有意对齐，任一先到先收尾。
 pub const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 流内保活帧间隔 10s（D5 下沉自 `service::sse`，只搬不改值；`sse.rs` 原位转发；
-/// `audit_hold::RequestKeepalive` 经 `pump.rs::spawn_gated` 接线消费）：
+/// `service::audit::RequestKeepalive` 经 `pump.rs::spawn_gated` 接线消费）：
 /// 理由：10s 远小于常见代理 NAT 空闲超时（60s+）且带宽可忽略，
 /// 与管理面 60s SSE ping 分属不同链路（流内保活 vs 管理推送），差异有意。
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -166,6 +178,8 @@ pub struct Config {
     pub approval_whitelist: Vec<String>,
     pub pii_hold_max: i64,
     pub audit_hold_max_bytes: i64,
+    /// 非流对话响应体上限（`NONSTREAM_MAX_BYTES`，默认 8MB；严格超限 502）。
+    pub nonstream_max_bytes: usize,
     pub data_dir: PathBuf,
     pub credential_secret: Option<String>,
     pub get_binary_hash: Option<String>,
@@ -253,6 +267,11 @@ impl Config {
     }
 
     /// 可注入的加载核心，单测用、心智负担低。
+    ///
+    /// A2 按域拆分后仍按原语句顺序编排：认证 → 限额（PII hold/审计 hold/
+    /// 非流上限）→ 审计（模式/超时/白名单）→ 存储/入口 → 脱敏（自定义
+    /// 文件）→ LLM（上游/HTTP）→ KeePass 后端，保证错误顺序与错误消息
+    /// 逐项不变。
     pub fn load_from(env: &HashMap<String, String>) -> Result<Self> {
         let get = |name: &str| env.get(name).map(|v| v.trim().to_string());
         for name in super::validate::legacy_ignored_detected(env) {
@@ -264,163 +283,57 @@ impl Config {
             tracing::warn!("{name} 已置位但二进制不读取（沿用旧名静默不生效）：{hint}");
         }
 
-        let observability_admin_token = require_non_empty(&get, "OBSERVABILITY_ADMIN_TOKEN")?;
-        if let Some(cred) = get("CREDENTIAL_ADMIN_TOKEN")
-            && !cred.is_empty()
-            && cred == observability_admin_token
-        {
-            return Err(config_error(
-                "OBSERVABILITY_ADMIN_TOKEN",
-                "OBSERVABILITY_ADMIN_TOKEN 须独立，不得复用 CREDENTIAL_ADMIN_TOKEN",
-            ));
-        }
-
-        let homeserver = require_non_empty(&get, "HOMESERVER")?;
-        let room_id = require_non_empty(&get, "ROOM_ID")?;
-        let matrix_access_token = require_non_empty(&get, "MATRIX_ACCESS_TOKEN")?;
-        if observability_admin_token == matrix_access_token {
-            return Err(config_error(
-                "OBSERVABILITY_ADMIN_TOKEN",
-                "OBSERVABILITY_ADMIN_TOKEN 须独立，不得复用 MATRIX_ACCESS_TOKEN",
-            ));
-        }
-        if observability_admin_token.len() < ADMIN_TOKEN_MIN_LEN {
-            tracing::warn!(
-                "OBSERVABILITY_ADMIN_TOKEN 长度不足 {ADMIN_TOKEN_MIN_LEN}，建议使用更长随机值"
-            );
-        }
-
-        let pii_hold_max = parse_positive(&get, "PII_HOLD_MAX", PII_HOLD_MAX_DEFAULT)?;
-        let audit_hold_max_bytes =
-            parse_positive(&get, "AUDIT_HOLD_MAX_BYTES", AUDIT_HOLD_MAX_BYTES_DEFAULT)?;
-
-        let audit_mode: AuditMode = match get("AUDIT_MODE") {
-            Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-                var: "AUDIT_MODE".to_string(),
-                message,
-            })?,
-            _ => AuditMode::Off,
-        };
-        let audit_timeout_secs = parse_audit_timeout(&get)?;
-        let approval_whitelist = parse_whitelist(&get)?;
-
-        if audit_mode == AuditMode::Approve && approval_whitelist.is_empty() {
-            return Err(config_error(
-                "APPROVAL_WHITELIST",
-                "AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id），否则拒绝启动",
-            ));
-        }
-
-        let data_dir = get("DATA_DIR")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| PathBuf::from("/data"), PathBuf::from);
-
-        let credential_secret = get("GET_BINARY_SECRET")
-            .filter(|v| !v.is_empty())
-            .or_else(|| get("CREDENTIAL_SECRET").filter(|v| !v.is_empty()));
-        let get_binary_hash = get("GET_BINARY_HASH").filter(|v| !v.is_empty());
-        let auto_approve: AutoApprove = match get("AUTO_APPROVE") {
-            Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-                var: "AUTO_APPROVE".to_string(),
-                message,
-            })?,
-            _ => AutoApprove::Allow,
-        };
-        let entry_mode: EntryMode = match get("VEIL_ENTRY_MODE") {
-            Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-                var: "VEIL_ENTRY_MODE".to_string(),
-                message,
-            })?,
-            _ => EntryMode::Full,
-        };
-        let registry_path = get("CALLER_REGISTRY_PATH")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| data_dir.join("caller_registry.json"), PathBuf::from);
-
-        let mut llm_upstreams = HashMap::new();
-        for (k, v) in env.iter() {
-            if v.trim().is_empty() {
-                continue;
-            }
-            if let Some(port_str) = k.strip_prefix("LLM_")
-                && let Ok(port) = port_str.parse::<u16>()
-            {
-                llm_upstreams.insert(port, v.trim().to_string());
-            }
-        }
-        let llm_default_upstream = get("LLM_UPSTREAM").filter(|v| !v.is_empty());
-        // 脱敏总开关：`REDACTION_ENABLED` 优先，`PII_REDACTION_ENABLED` 为原仓别名；
-        // 两者皆空默认开启，显式假值（0/false/no/off）关闭。
-        let redaction_enabled = match get("REDACTION_ENABLED").filter(|v| !v.is_empty()) {
-            Some(v) => !is_falsy(&v),
-            None => match get("PII_REDACTION_ENABLED").filter(|v| !v.is_empty()) {
-                Some(v) => !is_falsy(&v),
-                None => true,
-            },
-        };
-        let pii_response_side = parse_bool_on(&get, "PII_RESPONSE_SIDE");
-        let pii_fuzzy_restore = parse_bool_off(&get, "PII_FUZZY_RESTORE");
-        let pii_detection_hardening = parse_bool_off(&get, "PII_DETECTION_HARDENING");
-        let pii_custom_rules_file = load_custom_file(
-            &get,
-            &[
-                "PII_CUSTOM_RULES_FILE",
-                "PII_RULES_FILE",
-                "PII_CUSTOM_RULES",
-            ],
-        )?;
-        let pii_custom_patterns_file = load_custom_file(
-            &get,
-            &[
-                "PII_CUSTOM_PATTERNS_FILE",
-                "PII_CUSTOM_PATTERN_FILE",
-                "PII_CUSTOM_PATTERNS",
-            ],
-        )?;
-        let pii_custom_dict_file = load_custom_file(
-            &get,
-            &[
-                "PII_CUSTOM_DICT_FILE",
-                "PII_SENSITIVE_DICT_FILE",
-                "PII_SENSITIVE_NAMES_FILE",
-                "PII_CUSTOM_DICT",
-            ],
-        )?;
-        let pii_value_sample_enabled = parse_bool_off(&get, "PII_VALUE_SAMPLE_ENABLED");
-        let pii_value_sample_persist = parse_bool_on(&get, "PII_VALUE_SAMPLE_PERSIST");
-        let pii_value_sample_hmac_key = get("PII_VALUE_SAMPLE_HMAC_KEY").filter(|v| !v.is_empty());
-        let audit_policy_file = get("AUDIT_POLICY_FILE")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
-        let normalize_json_whitespace =
-            matches!(get("NORMALIZE_JSON_WHITESPACE").as_deref(), Some("1"));
-        let (placeholder_prompt_enabled, placeholder_prompt_text) = parse_placeholder_prompt(&get);
-        let http_timeout_secs =
-            parse_positive_u64(&get, "HTTP_TIMEOUT_SECS", HTTP_TIMEOUT_SECS_DEFAULT)?;
-        let http_pool_max_idle_per_host = parse_positive_usize(
-            &get,
-            "HTTP_POOL_MAX_IDLE_PER_HOST",
-            HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT,
-        )?;
-        let http_pool_idle_timeout_secs = parse_positive_u64(
-            &get,
-            "HTTP_POOL_IDLE_TIMEOUT_SECS",
-            HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT,
-        )?;
-        let db_dir = get("DB_DIR")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| data_dir.join("db"), PathBuf::from);
-        let tpm_dir = get("TPM_DIR")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| data_dir.join("tpm"), PathBuf::from);
-        let keepass_backend: KeepassBackendKind = match get("VEIL_KEEPASS_BACKEND") {
-            Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-                var: "VEIL_KEEPASS_BACKEND".to_string(),
-                message,
-            })?,
-            _ => KeepassBackendKind::Real,
-        };
-        let credential_block_wait = parse_bool_off(&get, "CREDENTIAL_BLOCK_WAIT");
+        let AuthParts {
+            observability_admin_token,
+            homeserver,
+            room_id,
+            matrix_access_token,
+        } = load_auth(&get)?;
+        let LimitParts {
+            pii_hold_max,
+            audit_hold_max_bytes,
+            nonstream_max_bytes,
+        } = load_limits(&get)?;
+        let AuditParts {
+            audit_mode,
+            audit_timeout_secs,
+            approval_whitelist,
+            audit_policy_file,
+        } = load_audit(env, &get)?;
+        let StorageParts {
+            data_dir,
+            credential_secret,
+            get_binary_hash,
+            auto_approve,
+            entry_mode,
+            registry_path,
+            db_dir,
+            tpm_dir,
+            credential_block_wait,
+        } = load_storage(&get)?;
+        let RedactionParts {
+            redaction_enabled,
+            pii_response_side,
+            pii_fuzzy_restore,
+            pii_detection_hardening,
+            pii_custom_rules_file,
+            pii_custom_patterns_file,
+            pii_custom_dict_file,
+            pii_value_sample_enabled,
+            pii_value_sample_persist,
+            pii_value_sample_hmac_key,
+            placeholder_prompt_enabled,
+            placeholder_prompt_text,
+        } = load_redaction(&get)?;
+        let LlmParts {
+            llm_upstreams,
+            llm_default_upstream,
+            normalize_json_whitespace,
+            http_timeout_secs,
+            http_pool_max_idle_per_host,
+            http_pool_idle_timeout_secs,
+        } = load_llm(env, &get)?;
+        let keepass_backend = load_keepass_backend(&get)?;
         // 可观测性总开关：仅精确 `1`（去空白后）生效，其余值（含 true/yes）不触发，
         // 与 B1 Verify 边缘（值非 1 时不 404）对齐。
         let observability_disabled = matches!(
@@ -433,11 +346,13 @@ impl Config {
             room_id,
             matrix_access_token,
             observability_admin_token,
+            observability_disabled,
             audit_mode,
             audit_timeout_secs,
             approval_whitelist,
             pii_hold_max,
             audit_hold_max_bytes,
+            nonstream_max_bytes,
             data_dir,
             credential_secret,
             get_binary_hash,
@@ -457,10 +372,10 @@ impl Config {
             pii_value_sample_enabled,
             pii_value_sample_persist,
             pii_value_sample_hmac_key,
-            normalize_json_whitespace,
-            audit_policy_file,
             placeholder_prompt_enabled,
             placeholder_prompt_text,
+            normalize_json_whitespace,
+            audit_policy_file,
             http_timeout_secs,
             http_pool_max_idle_per_host,
             http_pool_idle_timeout_secs,
@@ -468,40 +383,329 @@ impl Config {
             tpm_dir,
             keepass_backend,
             credential_block_wait,
-            observability_disabled,
         })
     }
 }
 
-/// 跨子模块测试共享：基准环境（其它子模块测试经
-/// `crate::config::env_parse::test_support` 复用）。
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::collections::HashMap;
+/// 认证/服务身份域（A2；最先校验，错误顺序与原实现一致）。
+struct AuthParts {
+    observability_admin_token: String,
+    homeserver: String,
+    room_id: String,
+    matrix_access_token: String,
+}
 
-    pub(crate) fn base_env() -> HashMap<String, String> {
-        HashMap::from([
-            (
-                "HOMESERVER".to_string(),
-                "https://matrix.example.com".to_string(),
-            ),
-            ("ROOM_ID".to_string(), "!room:example.com".to_string()),
-            (
-                "MATRIX_ACCESS_TOKEN".to_string(),
-                "syt_matrix_token_xxx".to_string(),
-            ),
-            (
-                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-                "admin-observability-token-0123456789abcdef".to_string(),
-            ),
-        ])
+fn load_auth(get: &dyn Fn(&str) -> Option<String>) -> Result<AuthParts> {
+    let observability_admin_token = require_non_empty(get, "OBSERVABILITY_ADMIN_TOKEN")?;
+    if let Some(cred) = get("CREDENTIAL_ADMIN_TOKEN")
+        && !cred.is_empty()
+        && cred == observability_admin_token
+    {
+        return Err(config_error(
+            "OBSERVABILITY_ADMIN_TOKEN",
+            "OBSERVABILITY_ADMIN_TOKEN 须独立，不得复用 CREDENTIAL_ADMIN_TOKEN",
+        ));
+    }
+    let homeserver = require_non_empty(get, "HOMESERVER")?;
+    let room_id = require_non_empty(get, "ROOM_ID")?;
+    let matrix_access_token = require_non_empty(get, "MATRIX_ACCESS_TOKEN")?;
+    if observability_admin_token == matrix_access_token {
+        return Err(config_error(
+            "OBSERVABILITY_ADMIN_TOKEN",
+            "OBSERVABILITY_ADMIN_TOKEN 须独立，不得复用 MATRIX_ACCESS_TOKEN",
+        ));
+    }
+    if observability_admin_token.len() < ADMIN_TOKEN_MIN_LEN {
+        tracing::warn!(
+            "OBSERVABILITY_ADMIN_TOKEN 长度不足 {ADMIN_TOKEN_MIN_LEN}，建议使用更长随机值"
+        );
+    }
+    Ok(AuthParts {
+        observability_admin_token,
+        homeserver,
+        room_id,
+        matrix_access_token,
+    })
+}
+
+/// 限额域（A2）：三个限额早于审计模式解析，错误顺序与原实现一致。
+struct LimitParts {
+    pii_hold_max: i64,
+    audit_hold_max_bytes: i64,
+    nonstream_max_bytes: usize,
+}
+
+fn load_limits(get: &dyn Fn(&str) -> Option<String>) -> Result<LimitParts> {
+    Ok(LimitParts {
+        pii_hold_max: parse_positive(get, "PII_HOLD_MAX", PII_HOLD_MAX_DEFAULT)?,
+        audit_hold_max_bytes: parse_positive(
+            get,
+            "AUDIT_HOLD_MAX_BYTES",
+            AUDIT_HOLD_MAX_BYTES_DEFAULT,
+        )?,
+        nonstream_max_bytes: parse_positive_usize(
+            get,
+            "NONSTREAM_MAX_BYTES",
+            NONSTREAM_MAX_BYTES_DEFAULT,
+        )?,
+    })
+}
+
+/// 审计域（A2）：模式（含遗留 `AUDIT_ENABLED` 回退）/超时/白名单/策略文件。
+struct AuditParts {
+    audit_mode: AuditMode,
+    audit_timeout_secs: i64,
+    approval_whitelist: Vec<String>,
+    audit_policy_file: Option<PathBuf>,
+}
+
+fn load_audit(
+    env: &HashMap<String, String>,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<AuditParts> {
+    let audit_mode: AuditMode = match get("AUDIT_MODE") {
+        Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
+            var: "AUDIT_MODE".to_string(),
+            message,
+        })?,
+        // X1/D1 遗留兼容回退（fail-closed）：`AUDIT_MODE` 缺失/空白时读
+        // `AUDIT_ENABLED`（真值 `1/true/yes/on` → `block`），显式非空优先。
+        _ => match audit_enabled_compat(env) {
+            Some(mode) => {
+                tracing::warn!(
+                    "AUDIT_MODE 缺失或空白，采用遗留 AUDIT_ENABLED 兼容回退：audit_mode={mode:?}\
+                    （fail-closed；如需关闭请显式设置 AUDIT_MODE=off）"
+                );
+                mode
+            }
+            None => AuditMode::Off,
+        },
+    };
+    let audit_timeout_secs = parse_audit_timeout(get)?;
+    let approval_whitelist = parse_whitelist(get)?;
+    if audit_mode == AuditMode::Approve && approval_whitelist.is_empty() {
+        return Err(config_error(
+            "APPROVAL_WHITELIST",
+            "AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id），否则拒绝启动",
+        ));
+    }
+    let audit_policy_file = get("AUDIT_POLICY_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    Ok(AuditParts {
+        audit_mode,
+        audit_timeout_secs,
+        approval_whitelist,
+        audit_policy_file,
+    })
+}
+
+/// 存储/入口域（A2）：目录派生、三因子密钥、入口三态与审批双模开关。
+struct StorageParts {
+    data_dir: PathBuf,
+    credential_secret: Option<String>,
+    get_binary_hash: Option<String>,
+    auto_approve: AutoApprove,
+    entry_mode: EntryMode,
+    registry_path: PathBuf,
+    db_dir: PathBuf,
+    tpm_dir: PathBuf,
+    credential_block_wait: bool,
+}
+
+fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
+    let data_dir = get("DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from("/data"), PathBuf::from);
+    let credential_secret = get("GET_BINARY_SECRET")
+        .filter(|v| !v.is_empty())
+        .or_else(|| get("CREDENTIAL_SECRET").filter(|v| !v.is_empty()));
+    let get_binary_hash = get("GET_BINARY_HASH").filter(|v| !v.is_empty());
+    let auto_approve: AutoApprove = match get("AUTO_APPROVE") {
+        Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
+            var: "AUTO_APPROVE".to_string(),
+            message,
+        })?,
+        _ => AutoApprove::Allow,
+    };
+    let entry_mode: EntryMode = match get("VEIL_ENTRY_MODE") {
+        Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
+            var: "VEIL_ENTRY_MODE".to_string(),
+            message,
+        })?,
+        _ => EntryMode::Full,
+    };
+    let registry_path = get("CALLER_REGISTRY_PATH")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| data_dir.join("caller_registry.json"), PathBuf::from);
+    let db_dir = get("DB_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| data_dir.join("db"), PathBuf::from);
+    let tpm_dir = get("TPM_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| data_dir.join("tpm"), PathBuf::from);
+    let credential_block_wait = parse_bool_off(get, "CREDENTIAL_BLOCK_WAIT");
+    Ok(StorageParts {
+        data_dir,
+        credential_secret,
+        get_binary_hash,
+        auto_approve,
+        entry_mode,
+        registry_path,
+        db_dir,
+        tpm_dir,
+        credential_block_wait,
+    })
+}
+
+/// 脱敏域（A2）：总开关/三语义开关/自定义文件/值级采样/占位符说明。
+struct RedactionParts {
+    redaction_enabled: bool,
+    pii_response_side: bool,
+    pii_fuzzy_restore: bool,
+    pii_detection_hardening: bool,
+    pii_custom_rules_file: Option<PathBuf>,
+    pii_custom_patterns_file: Option<PathBuf>,
+    pii_custom_dict_file: Option<PathBuf>,
+    pii_value_sample_enabled: bool,
+    pii_value_sample_persist: bool,
+    pii_value_sample_hmac_key: Option<String>,
+    placeholder_prompt_enabled: bool,
+    placeholder_prompt_text: String,
+}
+
+fn load_redaction(get: &dyn Fn(&str) -> Option<String>) -> Result<RedactionParts> {
+    // 脱敏总开关：`REDACTION_ENABLED` 优先，`PII_REDACTION_ENABLED` 为原仓别名；
+    // 两者皆空默认开启，显式假值（0/false/no/off）关闭。
+    let redaction_enabled = match get("REDACTION_ENABLED").filter(|v| !v.is_empty()) {
+        Some(v) => !is_falsy(&v),
+        None => match get("PII_REDACTION_ENABLED").filter(|v| !v.is_empty()) {
+            Some(v) => !is_falsy(&v),
+            None => true,
+        },
+    };
+    let pii_response_side = parse_bool_on(get, "PII_RESPONSE_SIDE");
+    let pii_fuzzy_restore = parse_bool_off(get, "PII_FUZZY_RESTORE");
+    let pii_detection_hardening = parse_bool_off(get, "PII_DETECTION_HARDENING");
+    let pii_custom_rules_file = load_custom_file(
+        get,
+        &[
+            "PII_CUSTOM_RULES_FILE",
+            "PII_RULES_FILE",
+            "PII_CUSTOM_RULES",
+        ],
+    )?;
+    let pii_custom_patterns_file = load_custom_file(
+        get,
+        &[
+            "PII_CUSTOM_PATTERNS_FILE",
+            "PII_CUSTOM_PATTERN_FILE",
+            "PII_CUSTOM_PATTERNS",
+        ],
+    )?;
+    let pii_custom_dict_file = load_custom_file(
+        get,
+        &[
+            "PII_CUSTOM_DICT_FILE",
+            "PII_DICT_FILE",
+            "PII_SENSITIVE_DICT_FILE",
+            "PII_SENSITIVE_NAMES_FILE",
+            "PII_CUSTOM_DICT",
+        ],
+    )?;
+    let pii_value_sample_enabled = parse_bool_off(get, "PII_VALUE_SAMPLE_ENABLED");
+    let pii_value_sample_persist = parse_bool_on(get, "PII_VALUE_SAMPLE_PERSIST");
+    let pii_value_sample_hmac_key = get("PII_VALUE_SAMPLE_HMAC_KEY").filter(|v| !v.is_empty());
+    let (placeholder_prompt_enabled, placeholder_prompt_text) = parse_placeholder_prompt(get);
+    Ok(RedactionParts {
+        redaction_enabled,
+        pii_response_side,
+        pii_fuzzy_restore,
+        pii_detection_hardening,
+        pii_custom_rules_file,
+        pii_custom_patterns_file,
+        pii_custom_dict_file,
+        pii_value_sample_enabled,
+        pii_value_sample_persist,
+        pii_value_sample_hmac_key,
+        placeholder_prompt_enabled,
+        placeholder_prompt_text,
+    })
+}
+
+/// LLM 网关域（A2）：端口上游表/缺省上游/空白归一/HTTP 客户端参数。
+struct LlmParts {
+    llm_upstreams: HashMap<u16, String>,
+    llm_default_upstream: Option<String>,
+    normalize_json_whitespace: bool,
+    http_timeout_secs: u64,
+    http_pool_max_idle_per_host: usize,
+    http_pool_idle_timeout_secs: u64,
+}
+
+fn load_llm(
+    env: &HashMap<String, String>,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<LlmParts> {
+    let mut llm_upstreams = HashMap::new();
+    for (k, v) in env.iter() {
+        if v.trim().is_empty() {
+            continue;
+        }
+        if let Some(port_str) = k.strip_prefix("LLM_")
+            && let Ok(port) = port_str.parse::<u16>()
+        {
+            llm_upstreams.insert(port, v.trim().to_string());
+        }
+    }
+    let llm_default_upstream = get("LLM_UPSTREAM").filter(|v| !v.is_empty());
+    let normalize_json_whitespace =
+        matches!(get("NORMALIZE_JSON_WHITESPACE").as_deref(), Some("1"));
+    let http_timeout_secs =
+        parse_positive_u64(get, "HTTP_TIMEOUT_SECS", HTTP_TIMEOUT_SECS_DEFAULT)?;
+    let http_pool_max_idle_per_host = parse_positive_usize(
+        get,
+        "HTTP_POOL_MAX_IDLE_PER_HOST",
+        HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT,
+    )?;
+    let http_pool_idle_timeout_secs = parse_positive_u64(
+        get,
+        "HTTP_POOL_IDLE_TIMEOUT_SECS",
+        HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT,
+    )?;
+    Ok(LlmParts {
+        llm_upstreams,
+        llm_default_upstream,
+        normalize_json_whitespace,
+        http_timeout_secs,
+        http_pool_max_idle_per_host,
+        http_pool_idle_timeout_secs,
+    })
+}
+
+/// KeePass 后端选路（A2；置于 HTTP 校验之后，保持原错误顺序）。
+fn load_keepass_backend(get: &dyn Fn(&str) -> Option<String>) -> Result<KeepassBackendKind> {
+    match get("VEIL_KEEPASS_BACKEND") {
+        Some(v) if !v.is_empty() => {
+            let parsed: KeepassBackendKind = v.parse().map_err(|message| VeilError::Config {
+                var: "VEIL_KEEPASS_BACKEND".to_string(),
+                message,
+            })?;
+            Ok(parsed)
+        }
+        _ => Ok(KeepassBackendKind::Real),
     }
 }
 
+/// 跨子模块测试共享基准（见 `test_support.rs`）。
 #[cfg(test)]
-mod tests {
-    use {super::*, test_support::base_env};
+pub(crate) mod test_support;
 
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod redline {
     #[test]
     fn file_len_under_800_or_split() {
         // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，
@@ -512,259 +716,5 @@ mod tests {
             lines <= 800,
             "env_parse.rs {lines} 行超 800 红线：须拆分（见 veil-review-followup-arch-hygiene H1/H2.1）"
         );
-    }
-
-    #[test]
-    fn missing_required_each_rejects_startup_naming_var() {
-        for var in [
-            "HOMESERVER",
-            "ROOM_ID",
-            "MATRIX_ACCESS_TOKEN",
-            "OBSERVABILITY_ADMIN_TOKEN",
-        ] {
-            let mut env = base_env();
-            env.remove(var);
-            let err = Config::load_from(&env).unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains(var), "报错须指明变量名 {var}，实际: {msg}");
-        }
-    }
-
-    #[test]
-    fn blank_required_also_rejects_startup() {
-        let mut env = base_env();
-        env.insert("ROOM_ID".to_string(), "   ".to_string());
-        let err = Config::load_from(&env).unwrap_err();
-        assert!(err.to_string().contains("ROOM_ID"));
-    }
-
-    #[test]
-    fn admin_token_must_not_reuse_service_token() {
-        let mut env = base_env();
-        env.insert(
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "syt_matrix_token_xxx".to_string(),
-        );
-        let err = Config::load_from(&env).unwrap_err();
-        assert!(err.to_string().contains("OBSERVABILITY_ADMIN_TOKEN"));
-    }
-
-    #[test]
-    fn approve_without_whitelist_rejects_startup() {
-        let mut env = base_env();
-        env.insert("AUDIT_MODE".to_string(), "approve".to_string());
-        let err = Config::load_from(&env).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("APPROVAL_WHITELIST") && msg.contains("approve"));
-    }
-
-    #[test]
-    fn approve_with_whitelist_allows() {
-        let mut env = base_env();
-        env.insert("AUDIT_MODE".to_string(), "approve".to_string());
-        env.insert(
-            "APPROVAL_WHITELIST".to_string(),
-            "@admin:example.com, @ops:example.com".to_string(),
-        );
-        let cfg = Config::load_from(&env).unwrap();
-        assert_eq!(cfg.approval_whitelist.len(), 2);
-    }
-
-    #[test]
-    fn http_client_defaults_and_overrides_ok() {
-        let cfg = Config::load_from(&base_env()).unwrap();
-        assert_eq!(cfg.http_timeout_secs, HTTP_TIMEOUT_SECS_DEFAULT);
-        assert_eq!(
-            cfg.http_pool_max_idle_per_host,
-            HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT
-        );
-        assert_eq!(
-            cfg.http_pool_idle_timeout_secs,
-            HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT
-        );
-        let mut env = base_env();
-        env.insert("HTTP_TIMEOUT_SECS".to_string(), "10".to_string());
-        env.insert("HTTP_POOL_MAX_IDLE_PER_HOST".to_string(), "8".to_string());
-        env.insert("HTTP_POOL_IDLE_TIMEOUT_SECS".to_string(), "60".to_string());
-        let cfg = Config::load_from(&env).unwrap();
-        assert_eq!(cfg.http_timeout_secs, 10);
-        assert_eq!(cfg.http_pool_max_idle_per_host, 8);
-        assert_eq!(cfg.http_pool_idle_timeout_secs, 60);
-    }
-
-    #[test]
-    fn http_client_invalid_rejects_startup() {
-        for (var, raw) in [
-            ("HTTP_TIMEOUT_SECS", "0"),
-            ("HTTP_TIMEOUT_SECS", "abc"),
-            ("HTTP_POOL_MAX_IDLE_PER_HOST", "0"),
-            ("HTTP_POOL_IDLE_TIMEOUT_SECS", "-5"),
-        ] {
-            let mut env = base_env();
-            env.insert(var.to_string(), raw.to_string());
-            let err = Config::load_from(&env).unwrap_err();
-            assert!(
-                err.to_string().contains(var),
-                "输入 {var}={raw} 报错须指明变量名"
-            );
-        }
-    }
-
-    #[test]
-    fn redaction_alias_and_three_semantic_toggles() {
-        // 默认：脱敏开、响应侧开、宽松关、强化关。
-        let cfg = Config::load_from(&base_env()).unwrap();
-        assert!(cfg.redaction_enabled);
-        assert!(cfg.pii_response_side);
-        assert!(!cfg.pii_fuzzy_restore);
-        assert!(!cfg.pii_detection_hardening);
-        // 原仓别名单独置位等价开启。
-        let mut env = base_env();
-        env.insert("PII_REDACTION_ENABLED".to_string(), "1".to_string());
-        assert!(Config::load_from(&env).unwrap().redaction_enabled);
-        // 别名显式关闭同样生效。
-        let mut env = base_env();
-        env.insert("PII_REDACTION_ENABLED".to_string(), "0".to_string());
-        assert!(!Config::load_from(&env).unwrap().redaction_enabled);
-        // 主变量优先于别名。
-        let mut env = base_env();
-        env.insert("REDACTION_ENABLED".to_string(), "0".to_string());
-        env.insert("PII_REDACTION_ENABLED".to_string(), "1".to_string());
-        assert!(!Config::load_from(&env).unwrap().redaction_enabled);
-        // 三语义覆盖。
-        let mut env = base_env();
-        env.insert("PII_RESPONSE_SIDE".to_string(), "0".to_string());
-        env.insert("PII_FUZZY_RESTORE".to_string(), "yes".to_string());
-        env.insert("PII_DETECTION_HARDENING".to_string(), "on".to_string());
-        let cfg = Config::load_from(&env).unwrap();
-        assert!(!cfg.pii_response_side);
-        assert!(cfg.pii_fuzzy_restore);
-        assert!(cfg.pii_detection_hardening);
-    }
-
-    #[test]
-    fn sampling_toggles_defaults_and_overrides() {
-        let cfg = Config::load_from(&base_env()).unwrap();
-        assert!(!cfg.pii_value_sample_enabled);
-        assert!(cfg.pii_value_sample_persist);
-        assert!(cfg.pii_value_sample_hmac_key.is_none());
-        let mut env = base_env();
-        env.insert("PII_VALUE_SAMPLE_ENABLED".to_string(), "1".to_string());
-        env.insert("PII_VALUE_SAMPLE_PERSIST".to_string(), "0".to_string());
-        env.insert(
-            "PII_VALUE_SAMPLE_HMAC_KEY".to_string(),
-            "k-0123456789".to_string(),
-        );
-        let cfg = Config::load_from(&env).unwrap();
-        assert!(cfg.pii_value_sample_enabled);
-        assert!(!cfg.pii_value_sample_persist);
-        assert_eq!(
-            cfg.pii_value_sample_hmac_key.as_deref(),
-            Some("k-0123456789")
-        );
-    }
-
-    #[test]
-    fn lib_dirs_default_derived_and_explicit_override() {
-        let cfg = Config::load_from(&base_env()).unwrap();
-        assert_eq!(cfg.db_dir, PathBuf::from("/data/db"));
-        assert_eq!(cfg.tpm_dir, PathBuf::from("/data/tpm"));
-        assert_eq!(cfg.keepass_backend, KeepassBackendKind::Real);
-        let mut env = base_env();
-        env.insert("DB_DIR".to_string(), "/srv/kdbx".to_string());
-        env.insert("TPM_DIR".to_string(), "/srv/tpm".to_string());
-        env.insert("VEIL_KEEPASS_BACKEND".to_string(), "mock".to_string());
-        let cfg = Config::load_from(&env).unwrap();
-        assert_eq!(cfg.db_dir, PathBuf::from("/srv/kdbx"));
-        assert_eq!(cfg.tpm_dir, PathBuf::from("/srv/tpm"));
-        assert_eq!(cfg.keepass_backend, KeepassBackendKind::Mock);
-        let mut env = base_env();
-        env.insert("VEIL_KEEPASS_BACKEND".to_string(), "bogus".to_string());
-        let err = Config::load_from(&env).unwrap_err();
-        assert!(err.to_string().contains("VEIL_KEEPASS_BACKEND"));
-    }
-
-    fn upstream_env() -> HashMap<String, String> {
-        let mut env = base_env();
-        env.insert(
-            "LLM_UPSTREAM".to_string(),
-            "http://缺省上游:11434".to_string(),
-        );
-        env.insert(
-            "LLM_8878".to_string(),
-            "http://八七七八上游:11434".to_string(),
-        );
-        env.insert(
-            "LLM_8879".to_string(),
-            "http://八七七九上游:11434".to_string(),
-        );
-        env
-    }
-
-    #[test]
-    fn ingress_port_hits_matching_upstream() {
-        use crate::service::llm_gateway::resolve_upstream;
-        let cfg = Config::load_from(&upstream_env()).unwrap();
-        assert_eq!(
-            resolve_upstream(&cfg, Some(8878)).as_deref(),
-            Some("http://八七七八上游:11434")
-        );
-        assert_eq!(
-            resolve_upstream(&cfg, Some(8879)).as_deref(),
-            Some("http://八七七九上游:11434")
-        );
-    }
-
-    #[test]
-    fn unmatched_port_and_empty_context_fall_back_to_default() {
-        use crate::service::llm_gateway::resolve_upstream;
-        let cfg = Config::load_from(&upstream_env()).unwrap();
-        for port in [None, Some(8877), Some(9999)] {
-            assert_eq!(
-                resolve_upstream(&cfg, port).as_deref(),
-                Some("http://缺省上游:11434"),
-                "端口 {port:?} 须回落缺省而非猜测"
-            );
-        }
-    }
-
-    #[test]
-    fn without_default_falls_back_to_any_port_upstream() {
-        use crate::service::llm_gateway::resolve_upstream;
-        let mut env = upstream_env();
-        env.remove("LLM_UPSTREAM");
-        let cfg = Config::load_from(&env).unwrap();
-        let got = resolve_upstream(&cfg, Some(9999)).expect("须有回落");
-        assert!(
-            got == "http://八七七八上游:11434" || got == "http://八七七九上游:11434",
-            "回落须为已知端口上游之一，实际: {got}"
-        );
-        assert!(resolve_upstream(&cfg, None).is_some());
-    }
-
-    #[test]
-    fn approval_block_wait_default_off() {
-        let cfg = Config::load_from(&base_env()).unwrap();
-        assert!(!cfg.credential_block_wait);
-        for raw in ["1", "true", "yes", "on"] {
-            let mut env = base_env();
-            env.insert("CREDENTIAL_BLOCK_WAIT".to_string(), raw.to_string());
-            assert!(
-                Config::load_from(&env).unwrap().credential_block_wait,
-                "{raw}"
-            );
-        }
-        for raw in ["0", "false", "", "off"] {
-            let mut env = base_env();
-            if raw.is_empty() {
-                env.remove("CREDENTIAL_BLOCK_WAIT");
-            } else {
-                env.insert("CREDENTIAL_BLOCK_WAIT".to_string(), raw.to_string());
-            }
-            assert!(
-                !Config::load_from(&env).unwrap().credential_block_wait,
-                "{raw}"
-            );
-        }
     }
 }
