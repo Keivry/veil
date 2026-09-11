@@ -107,7 +107,7 @@ PENDING_REFS: dict[tuple[str, str], str] = {
         "openspec/specs/test-coverage-fill/spec.md",
     ): "未来 canonical 登记（该 change 尚未归档），其他 change 目录禁改",
     (
-        "openspec/changes/veil-docs-contract-resync/tasks.md",
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-resync/tasks.md",
         "openspec/specs/admin-ratelimit-contract/spec.md",
     ): _FUTURE_CANONICAL,
 }
