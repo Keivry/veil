@@ -278,6 +278,32 @@ async fn thinking_delta_token_restore_no_reorder() {
 }
 
 #[tokio::test]
+async fn real_wire_redacted_content_block_start_not_masked() {
+    // M3/D6 补漏：真实 wire 形态的 opaque 载体位于 `content_block.type`
+    //（`content_block_start` 的 `redacted_thinking`/`thinking`），既非顶层
+    // `type` 亦非 `delta.type`；密文含 PII 形数字串时须逐字节透传、无 `__PII_`。
+    let redacted = r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"13812345678-8.8.8.8-cipher"}}"#;
+    let thinking = r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":"sig-13812345678-8.8.8.8-cipher"}}"#;
+    let sse = format!(
+        "event: content_block_start\ndata: {redacted}\n\nevent: content_block_start\ndata: {thinking}\n\n"
+    )
+    .into_bytes();
+    let frames =
+        pump_sse_with_vault(Protocol::Anthropic, Arc::new(CredentialVault::new()), sse).await;
+    let joined = frames.join("");
+    assert!(
+        !joined.contains("__PII_"),
+        "opaque 帧不得注入占位符: {joined}"
+    );
+    for expected in [redacted, thinking] {
+        assert!(
+            joined.contains(expected),
+            "载荷须逐字节一致\n期望: {expected}\n实得: {joined}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn go_sse_terminal_transparent() {
     // GO/D8.5：三协议流恒以终止帧闭合（无 SSE 消费代码的 Go 客户端视为正常
     // 结束，不重试不挂起）：Chat 恰一 `[DONE]`、Anthropic 恰一 `message_stop`、

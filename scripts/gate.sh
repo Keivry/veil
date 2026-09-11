@@ -10,8 +10,8 @@
 #   6) scripts/api_conformance.py（真 SDK 一致性，20 项）
 #
 # 前置条件（第 6 步）：
-#   - Python venv：默认原仓 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
-#     可用 `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖。
+#   - Python venv：默认按仓库相对定位 `<veil 仓库>/../../Python/credential-proxy/.venv/bin/python`
+#     （即原仓 Python credential-proxy venv），可用 `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖。
 #   - SDK pin：`openai==3.5.0`、`anthropic==1.1.0`，另需 `pykeepass`（取用相建临时库）；
 #     api_conformance.py 自身断言版本 pin。
 #   - Mock TPM 回退：无 TPM 硬件时脚本内建 `VEIL_ALLOW_MOCK_TPM=1` 重试（仅开发/CI，
@@ -23,12 +23,12 @@
 #
 # 文档：README §8.5（测试口径注明）、scripts/README.md（脚本用法与 SDK pin）。
 
-set -u
+set -euo pipefail
 
 VEIL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$VEIL_ROOT" || exit 1
 
-CONFORMANCE_PY="${VEIL_CONFORMANCE_PYTHON:-/home/keivry/项目/Python/credential-proxy/.venv/bin/python}"
+CONFORMANCE_PY="${VEIL_CONFORMANCE_PYTHON:-$VEIL_ROOT/../../Python/credential-proxy/.venv/bin/python}"
 SKIP_CONFORMANCE="${GATE_SKIP_CONFORMANCE:-0}"
 
 run_step() {

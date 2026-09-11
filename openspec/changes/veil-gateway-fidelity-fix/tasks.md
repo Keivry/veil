@@ -50,12 +50,13 @@
 
 ## 5. `M3` opaque 字段原字节透传
 
-- [x] 5.1 `src/handler/llm/pump/spawn.rs`：`is_minor_event`（`event.rs:214-231`）命中的 Anthropic thinking/signature/redacted 帧跳过 `redact_response_new_pii_with_skip` 与 `json_aware_line`，以字节级还原后帧透传（token 精确还原可执行，不触发全帧重排）
+- [x] 5.1 `src/handler/llm/pump/spawn.rs`：`is_anthropic_opaque_event`（`event.rs:235-250`）命中的 Anthropic thinking/signature/redacted 帧（含真实 wire `content_block_start` 的 `content_block.type` 载体）跳过 `redact_response_new_pii_with_skip` 与 `json_aware_line`，以字节级还原后帧透传（token 精确还原可执行，不触发全帧重排）
   - Verify: `cargo test -p veil opaque_frames_bypass_scan` 通过；`signature_delta`/`redacted_thinking` 输出字节 == 上游字节
-  - Verify: `grep -n "is_minor_event" src/handler/llm/pump/spawn.rs` 命中短路分支（位于响应扫描/`json_aware_line` 调用之前 `continue`）
-- [x] 5.2 补 `M3` 三场景测试：`signature_delta` 字节不变、`redacted_thinking` 密文不掩码、`thinking_delta` 内 token 精确还原不重排
+  - Verify: `grep -n "is_anthropic_opaque_event" src/handler/llm/pump/spawn.rs` 命中短路分支（位于响应扫描/`json_aware_line` 调用之前 `continue`）
+- [x] 5.2 补 `M3` 四场景测试：`signature_delta` 字节不变、`redacted_thinking` 密文不掩码、`thinking_delta` 内 token 精确还原不重排、真实 wire `content_block_start`（opaque 载体在 `content_block.type`）逐字节透传不掩码（`real_wire_redacted_content_block_start_not_masked`）
   - Verify: `cargo test -p veil redacted_thinking_pii_shaped_cipher_not_masked` 通过；无 `__PII_` 注入、无字节改写
   - Verify: `cargo test -p veil thinking_delta_token_restore_no_reorder` 通过；token 还原为明文且帧其余字节与上游一致
+  - Verify: `cargo test -p veil real_wire_redacted_content_block_start_not_masked` 通过；`content_block_start` 的 `content_block.type` 为 `redacted_thinking`/`thinking` 时逐字节透传、无 `__PII_`
 
 ## 6. `L1` 残缺剥离边界收敛
 

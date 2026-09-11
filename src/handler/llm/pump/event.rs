@@ -230,6 +230,8 @@ pub(super) fn chat_finish_reason_seen(v: &Value) -> bool {
 /// M3/D6：Anthropic opaque 帧（`thinking`/`signature`/`redacted` 载体）——
 /// 签名/密文完整性优先，响应侧须跳过新 PII 扫描（`redact_response_new_pii*`）
 /// 与 `json_aware_line` 重序列化，仅做字节级还原后透传。
+/// 载体三处：顶层 `type`、`delta.type`、真实 wire 的 `content_block.type`
+/// （`content_block_start` 的 `redacted_thinking`/`thinking`）。
 pub(super) fn is_anthropic_opaque_event(v: &Value) -> bool {
     let opaque =
         |t: &str| t.contains("thinking") || t.contains("signature") || t.contains("redacted");
@@ -241,6 +243,10 @@ pub(super) fn is_anthropic_opaque_event(v: &Value) -> bool {
         .and_then(|d| d.get("type"))
         .and_then(|x| x.as_str())
         .is_some_and(opaque)
+        || v.get("content_block")
+            .and_then(|b| b.get("type"))
+            .and_then(|x| x.as_str())
+            .is_some_and(opaque)
 }
 
 pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {

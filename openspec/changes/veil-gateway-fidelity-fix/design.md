@@ -101,7 +101,7 @@
 
 ### D6：`M3` opaque 帧短路响应侧扫描与重序列化
 
-**决策**：`spawn.rs` 事件循环中，`is_minor_event` 命中 Anthropic thinking/signature/redacted（`event.rs:214-231`）或按类型判定为 opaque 的帧，跳过 `redact_response_new_pii_with_skip` 与 `json_aware_line`，以「字节级还原后帧」透传；已注册 token 的还原仍可经字节级精确替换，但不触发全帧重排与掩码。审计 hold/次要判定维持现状（`spawn.rs:307-308`）。
+**决策**：`spawn.rs` 事件循环中，`is_anthropic_opaque_event`（`event.rs:235-250`）命中的 Anthropic thinking/signature/redacted 帧（含真实 wire `content_block_start` 的 `content_block.type` 载体），跳过 `redact_response_new_pii_with_skip` 与 `json_aware_line`，以「字节级还原后帧」透传；已注册 token 的还原仍可经字节级精确替换，但不触发全帧重排与掩码。审计 hold/次要判定维持现状（`spawn.rs:307-308`）。
 
 **理由**：`signature_delta` 与 `redacted_thinking` 承载签名/密文，任何字节改写都会导致下游校验失败；`thinking` 由上游生成（非用户输入），新 PII 扫描收益低、完整性代价高。
 
