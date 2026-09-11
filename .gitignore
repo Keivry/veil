@@ -3,3 +3,5 @@
 /.opencode
 
 /.omo
+
+__pycache__/

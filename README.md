@@ -2,7 +2,7 @@
 
 Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 LLM 脱敏反向代理（SSE 流式还原 + 输出审计）。
 
-本文档是部署与行为的唯一文档入口，阈值表与 `openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md`（未归档，`veil-hardening` 5.1–5.3 完成后晋升 canonical）契约同字；如有出入以 spec 为准。
+本文档是部署与行为的唯一文档入口，阈值表与 `openspec/specs/admin-ratelimit-contract/spec.md`（canonical，自 `veil-hardening` 归档晋升）契约同字；如有出入以 spec 为准。
 
 ## 1. 部署方式
 
@@ -136,8 +136,8 @@ docker compose up -d --build
 ```bash
 # 存活探针（无需鉴权）
 curl -fsS http://127.0.0.1:8877/health
-# 期望（含超集字段 status/unlocked，向后兼容只增不减）：
-# {"ok":true,"sqlite_ok":true,"sqlite_error":null,"status":"ok","unlocked":true}
+# 期望（含超集字段 status/unlocked/pending/llm_secrets，向后兼容只增不减）：
+# {"ok":true,"sqlite_ok":true,"sqlite_error":null,"status":"ok","unlocked":true,"pending":0,"llm_secrets":0}
 
 # 管理面探针（需 X-Admin-Token）
 curl -fsS -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8877/_admin/health
@@ -204,7 +204,7 @@ done
 
 ## 4. 阈值表
 
-下表与 `openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md`（未归档，`veil-hardening` 5.1–5.3 完成后晋升）同字；差异均为有意设计（不同检查点），超限行为统一为
+下表与 `openspec/specs/admin-ratelimit-contract/spec.md`（canonical，自 `veil-hardening` 归档晋升）同字；差异均为有意设计（不同检查点），超限行为统一为
 `429 + Retry-After`（限流）、`413`（body 超限）与 `502`（非流对话响应超限）。
 
 | 维度 | 取值 | 超限行为 | 是否接入口 | 说明 |
@@ -244,7 +244,7 @@ done
 | 用途 | 方法与路径 | 鉴权 |
 |:-----|:-----------|:-----|
 | 取用凭据 | `POST /credential` | 三因子（`X-Get-Binary-Hash` + `X-Get-Binary-Secret`/`body.secret` + `body.auth.caller_hash`/`caller_path`） |
-| 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` / Cookie / 仅 SSE 回退 query；无 token 恒 401，原仓无鉴权直读，旧脚本须补 token） |
+| 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` 或部署密钥 `X-Get-Binary-Secret`；两者皆缺/不匹配 401；原仓无鉴权直读，旧脚本须补凭据，Go `get list` 经部署密钥可用） |
 | 注册调用方 | `POST /register-caller` | 三因子（同取用；重名 409） |
 | 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销管理 token/文件在位/内网三者任一（见 7.5） |
 | 批准哈希变更 | `POST /approve-hash-change` | 三因子 |
@@ -266,12 +266,12 @@ get revoke --name "check-mail"
 - 凭据审批 `202` 轮询语义：默认（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）待审请求返回
   `202 + E_PENDING` 即已建单，客户端应对同一请求轮询重试（建议指数退避），批准后重试返回凭据、
   拒绝后 `403`；`CREDENTIAL_BLOCK_WAIT=1` 时无需轮询（同请求阻塞等待，批准返回凭据、拒绝/超时 `403`）。
-- Go `202` 处理结论（只读核实 `get/internal/proxy.go::FetchCredential`，未改 Go）：Go 先整包
-  `json.Unmarshal` 再判 `status >= 400`；网关 `202` 体为 `{"error":{"code":"E_PENDING",...}}`
-  （`error` 为对象），而 Go `CredentialResponse.Error` 为 `string`，反序列化在状态判定前即失败并返回
-  「解析响应失败」——**判定：Go 存量客户端不可直接轮询该 `202`**（也拿不到 `E_PENDING`）。
-  承接建议：由新 change 让 Go 容忍 `202/E_PENDING`（解析 error 对象或按状态码分派后轮询），或部署侧
-  临时改 `CREDENTIAL_BLOCK_WAIT=1` 走同请求阻塞；与 `veil-hardening` 5.2 未勾项联动（该 change 文件不改）。
+- Go `202` 处理结论（`get/internal/proxy.go`）：Go `CredentialResponse` 已容忍网关错误体对象
+  （`ErrMessage`：`{"error":{"code","message"}}` 取 `message`、兼容 Python 字符串错误体）与
+  `/credential` 成功信封 `{"ok":true,"credential":{...}}`；`202` 体 `{"error":{"code":"E_PENDING",...}}`
+  不再报「解析响应失败」。但 `FetchCredential` 仅在 `status >= 400` 报错且不向上层暴露 HTTP 状态码，
+  故 `get credential` CLI 对 `202` 仍走成功分支（不打印 `E_PENDING`）；**端到端轮询需调用方在收到
+  `202` 后自行重试，或部署侧用 `CREDENTIAL_BLOCK_WAIT=1` 走同请求阻塞**（见 `veil-hardening` 5.2 已闭环）。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
 
 ## 6. 行为变更（BREAKING）与迁移
@@ -357,9 +357,9 @@ get revoke --name "check-mail"
   （建议指数退避），批准后重试返回凭据、拒绝后 `403`。
 - 迁移：恢复 Python 式同步阻塞请设 `CREDENTIAL_BLOCK_WAIT=1`（真值集合 `1/true/yes/on`）：
   `300`s 内批准同请求返回凭据、拒绝 `403`、超时按拒绝返回 `403` 且不悬挂。
-- 影响：不识别 `202` 的旧客户端须补轮询；Go 存量 `get` 判定为**不可直接轮询**（错误体解析失败，
-  结论见 §5），与 `veil-hardening` 5.2 未勾项联动，Go 侧修复由新 change 承接（恢复旧默认须新 change
-  并撤回本条）。
+- 影响：不识别 `202` 的旧客户端须补轮询；Go 存量 `get` 已能解析 `202 + E_PENDING` 错误体
+  （`ErrMessage`，见 §5），但 CLI 不自动轮询——轮询由调用方实现，或用 `CREDENTIAL_BLOCK_WAIT=1` 阻塞；
+  恢复旧默认须新 change 并撤回本条。
 
 ## 7. 传输与兼容声明
 
@@ -476,9 +476,9 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   管理 token 可走请求体或 `X-Admin-Token` 头；内网判定只认 TCP 远端地址
   （`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头（防伪造绕过）。
   与常规吊销同注册表定位条目（见 `src/handler/credential.rs::emergency_revoke_handler`）。
-- `GET /registrations`：原仓无鉴权直读；本仓要求管理面鉴权（`X-Admin-Token` /
-  Cookie / 仅 SSE 回退 query），无 token 恒 401。旧脚本直读须补 token，
-  否则按 401 处理（有意收敛，见 `observability-admin` spec）。
+- `GET /registrations`：原仓无鉴权直读；本仓要求管理面鉴权（`X-Admin-Token` 或部署密钥
+  `X-Get-Binary-Secret`，见 `src/handler/credential.rs::registrations_handler`），两者皆缺/不匹配 401。
+  旧脚本直读须补凭据；Go `get list` 携带部署密钥可用（有意收敛，见 `observability-admin` spec）。
 
 ### 7.6 非对话透传声明
 
@@ -524,11 +524,11 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 排障代替指引：结构化日志 + `AUDIT_POLICY_FILE` 审计面；恢复落盘需新 change 交付，
   且落盘即涉密、须配套脱敏方案。
 
-### 8.3 Go 未闭环清单（F3，`veil-hardening 5.x` 承接）
+### 8.3 Go 对接验证（`veil-hardening` 5.x，已闭环）
 
-- 存量 Go `get` 客户端对接指引见 §5；以下三项验证未闭环，由 `veil-hardening` 第 5 节承接：
-  `5.1` 存量 Go 直连全链路验证、`5.2` 三因子齐全/缺失两场景验证、`5.3` 阻断流终止验证
-  （收到终止帧且无重试挂起）。
+- 存量 Go `get` 客户端对接指引见 §5；三项验证均已闭环：`5.1` 存量 Go 直连全链路、`5.2` 三因子
+  齐全/缺失两场景、`5.3` 阻断流终止（收到终止帧且无重试挂起）。端到端 runner：
+  `scripts/go_interop_e2e.py`（共 14 项、失败 0 项）。
 
 ### 8.4 入口与审批语义（F4）
 

@@ -38,62 +38,13 @@ SPEC_REF_RE = re.compile(
 ERRATUM_RE = re.compile(r"（勘误：.*?）")
 IGNORE_MARKER = "<!-- doc-paths-ignore -->"
 
-_FUTURE_SPLIT = "未来新建/拆分目标（该 change apply 时创建），其他 change 目录禁改"
-_FUTURE_CANONICAL = "未来 canonical 登记（该 change 尚未归档），归档后按 canonical 复核"
 _ARCHIVED_HISTORY = "目标 change 已归档（canonical 在位），历史记录，其他 change 目录禁改"
+_ARCHIVED_HARDENING_REF = "veil-hardening 归档后其 change-local admin-ratelimit-contract spec 引用（历史/情景文本），canonical 已在位"
 
 # 已知悬空引用登记表，键为（引用所在文件相对路径，引用原文）。
-# 仅登记本 change apply 禁改的其他 change 目录内的未来/历史路径；打印 PENDING
+# 仅登记历史/情景性悬空引用（其他 change 目录、归档 change、canonical 中的旧 change-local 路径）；打印 PENDING
 # 但不算失败。其余悬空引用（含 README.md 全部引用）一律 FAIL。
 PENDING_REFS: dict[tuple[str, str], str] = {
-    (
-        "openspec/changes/veil-hygiene-round5/proposal.md",
-        "src/registry/migrate.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-hygiene-round5/tasks.md",
-        "src/registry/migrate.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-runtime-robustness/tasks.md",
-        "src/registry/entry.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-runtime-robustness/tasks.md",
-        "src/registry/acl.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-runtime-robustness/tasks.md",
-        "src/registry/store.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-runtime-robustness/tasks.md",
-        "src/registry/migrate.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-test-coverage-fill/design.md",
-        "src/handler/llm/pump/decide.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-test-coverage-fill/design.md",
-        "src/handler/llm/pump/spawn_tests.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-test-coverage-fill/proposal.md",
-        "src/handler/llm/pump/decide.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-test-coverage-fill/proposal.md",
-        "src/handler/llm/pump/spawn_tests.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-test-coverage-fill/tasks.md",
-        "src/handler/llm/pump/decide.rs",
-    ): _FUTURE_SPLIT,
-    (
-        "openspec/changes/veil-test-coverage-fill/tasks.md",
-        "src/handler/llm/pump/spawn_tests.rs",
-    ): _FUTURE_SPLIT,
     (
         "openspec/changes/veil-config-legacy-compat/tasks.md",
         "openspec/changes/veil-full-parity-fix/specs/audit-parity/spec.md",
@@ -103,13 +54,29 @@ PENDING_REFS: dict[tuple[str, str], str] = {
         "openspec/changes/veil-arch-docs-cleanup/specs/arch-docs-cleanup/spec.md",
     ): "归档兜底路径（canonical arch-docs-cleanup 在位）；历史记录，其他 change 目录禁改",
     (
-        "openspec/changes/veil-test-coverage-fill/design.md",
-        "openspec/specs/test-coverage-fill/spec.md",
-    ): "未来 canonical 登记（该 change 尚未归档），其他 change 目录禁改",
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-resync/design.md",
+        "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
+    ): _ARCHIVED_HARDENING_REF,
     (
-        "openspec/changes/archive/2026-09-11-veil-docs-contract-resync/tasks.md",
-        "openspec/specs/admin-ratelimit-contract/spec.md",
-    ): _FUTURE_CANONICAL,
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-resync/proposal.md",
+        "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
+    ): _ARCHIVED_HARDENING_REF,
+    (
+        "openspec/changes/archive/2026-09-11-veil-docs-contract-resync/specs/docs-contract-resync/spec.md",
+        "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
+    ): _ARCHIVED_HARDENING_REF,
+    (
+        "openspec/changes/veil-docs-contract-sync/design.md",
+        "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
+    ): _ARCHIVED_HARDENING_REF,
+    (
+        "openspec/changes/veil-docs-contract-sync/tasks.md",
+        "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
+    ): _ARCHIVED_HARDENING_REF,
+    (
+        "openspec/specs/docs-contract-resync/spec.md",
+        "openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md",
+    ): _ARCHIVED_HARDENING_REF,
 }
 
 

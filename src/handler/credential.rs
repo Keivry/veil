@@ -220,6 +220,24 @@ fn parse_register_allow_mode(body: &RegisterBody) -> Option<crate::config::AutoA
     })
 }
 
+/// Go 加性兼容（`veil-hardening` 5.x 网关侧补齐）：推导非空 `reg_id`。
+/// 服务层注册前置校验 `caller_path`/`caller_hash` 均非空，`RegistrationView`
+/// 的 `script_hash`（`expected_hash` 回显）在成功路径恒非空且随注册表唯一，
+/// 故以其为稳定标识；依次回退 `caller_path`/`name`，末尾常量仅为防御性兜底
+/// （禁止空串语义，当前校验下不可达）。
+fn registration_reg_id(view: &service::RegistrationView) -> String {
+    if !view.script_hash.is_empty() {
+        return view.script_hash.clone();
+    }
+    if !view.caller_path.is_empty() {
+        return view.caller_path.clone();
+    }
+    if !view.name.is_empty() {
+        return view.name.clone();
+    }
+    "reg_unknown".to_string()
+}
+
 pub async fn register_caller_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -244,10 +262,12 @@ pub async fn register_caller_handler(
     let view =
         service::register_caller_extended(&state, &params, source.as_deref().unwrap_or("unknown"))
             .await?;
-    // D8.3 Go 加性超集：既有 `ok`/`registration` 不删，顶层同步 Go 形态字段
-    //（`name`/`script_path`/`script_hash`/`entries`/`allow_mode`）供直接解析。
+    let reg_id = registration_reg_id(&view);
+    // Go 加性超集：既有 `ok`/`registration` 不删，顶层同步 Go 形态字段
+    //（`reg_id`/`name`/`script_path`/`script_hash`/`entries`/`allow_mode`）供直接解析。
     Ok(Json(json!({
         "ok": true,
+        "reg_id": reg_id,
         "registration": view.clone(),
         "name": view.name,
         "script_path": view.script_path,
@@ -393,6 +413,40 @@ mod tests {
             admin_token: None,
             file_present: false,
         })
+    }
+
+    #[tokio::test]
+    async fn register_response_carries_nonempty_reg_id_and_legacy_fields() {
+        // GO：`/register-caller` 加性超集——新增非空 `reg_id`（脚本哈希回显），
+        // 既有 `ok`/`registration`/`name`/`script_path`/`script_hash`/`entries`/`allow_mode` 不删。
+        let state = revoke_test_state();
+        let body = Json(RegisterBody {
+            caller_path: "/srv/reg-id.sh".to_string(),
+            caller_hash: "h-reg-id-1".to_string(),
+            source: Some("go-client".to_string()),
+            name: "reg-id-job".to_string(),
+            description: String::new(),
+            entries: Some(json!({"网易": ["授权码"]})),
+            entry: None,
+            fields: None,
+            field: None,
+            allow_mode: Some("true".to_string()),
+            auto: None,
+        });
+        let Json(resp) = register_caller_handler(State(state), HeaderMap::new(), body)
+            .await
+            .unwrap();
+        let reg_id = resp["reg_id"].as_str().unwrap_or("");
+        assert!(!reg_id.is_empty(), "reg_id 须非空: {resp}");
+        assert_eq!(reg_id, "h-reg-id-1", "reg_id 须稳定可取（脚本哈希回显）");
+        assert_eq!(resp["ok"], true);
+        let registration = &resp["registration"];
+        assert_eq!(registration["caller_path"], "/srv/reg-id.sh");
+        assert_eq!(resp["name"], "reg-id-job");
+        assert_eq!(resp["script_path"], "/srv/reg-id.sh");
+        assert_eq!(resp["script_hash"], "h-reg-id-1");
+        assert_eq!(resp["entries"]["网易"][0], "授权码");
+        assert_eq!(resp["allow_mode"], "true");
     }
 
     #[tokio::test]
