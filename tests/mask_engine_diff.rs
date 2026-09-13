@@ -74,24 +74,24 @@ fn mask_engine_diff_matrix_registered_relations() {
         // ipv4 四段与非四段短值（len<6）：等价。
         ("ipv4", "192.168.1.10", Same("192.168.**.**")),
         ("ipv4", "1.2.3", Same("1****3")),
-        // ipv4 非四段 6≤len<8（apply 实测登记）：detector 走 short 前3后3，
+        // ipv4 非四段 6-7（P9/D10 对齐原仓后登记）：detector 前4后4，
         // sample 走短值首末 —— 同族分叉的另一子例，以测试实测为准并入清单。
         (
             "ipv4",
             "123456",
             Diff {
-                detector: "123****456",
+                detector: "1234****3456",
                 sample: "1****6",
-                reason: "非四段 6≤len<8：detector short 前3后3 vs sample 短值首末",
+                reason: "非四段 6-7：detector 前4后4（重叠不裁剪）vs sample 短值首末",
             },
         ),
         (
             "ipv4",
             "1234567",
             Diff {
-                detector: "123****567",
+                detector: "1234****4567",
                 sample: "1****7",
-                reason: "非四段 6≤len<8：detector short 前3后3 vs sample 短值首末",
+                reason: "非四段 6-7：detector 前4后4（重叠不裁剪）vs sample 短值首末",
             },
         ),
         // ipv4 非四段 len≥8（spec 登记差异）：detector 前3后3 vs sample 前4后4。
@@ -280,10 +280,10 @@ fn mask_engine_diff_ipv4_non_quad_fallback() {
     // 非四段 len≥8（spec 登记）：detector short 前3后3 vs sample 前4后4。
     assert_eq!(mask_pii_value("ipv4", "12345678"), "123****678");
     assert_eq!(sample_mask("ipv4", "12345678"), "1234****5678");
-    // 非四段 6≤len<8（apply 实测并入清单）：detector 前3后3 vs sample 短值首末。
-    assert_eq!(mask_pii_value("ipv4", "123456"), "123****456");
+    // 非四段 6-7（P9/D10 对齐原仓）：detector 前4后4 vs sample 短值首末。
+    assert_eq!(mask_pii_value("ipv4", "123456"), "1234****3456");
     assert_eq!(sample_mask("ipv4", "123456"), "1****6");
-    assert_eq!(mask_pii_value("ipv4", "1234567"), "123****567");
+    assert_eq!(mask_pii_value("ipv4", "1234567"), "1234****4567");
     assert_eq!(sample_mask("ipv4", "1234567"), "1****7");
     // 非四段 len<6：两引擎同走短值口径（等价）。
     assert_eq!(

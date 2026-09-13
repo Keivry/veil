@@ -456,3 +456,80 @@ fn sampling_master_switch_off_means_zero_persist() {
     assert_eq!((sampled, disabled), (0, 2), "关闭时只记跳过不采样");
     assert!(s.top_n(5).is_empty(), "零落盘：无样本可查");
 }
+
+#[test]
+fn pii_value_sample_same_masked_merge() {
+    // G4/P11：同 kind+upstream+明文（同 mask+hash）内存合并 hits；合并条目不含明文。
+    let s = PiiValueSampler::new(
+        PiiSamplerConfig::for_test(true, false, None),
+        tmp_db("pii-same-masked"),
+    );
+    let value = "13812348000";
+    let (mask, _) = s.sample("phone", value, true, "8878").unwrap();
+    s.sample("phone", value, true, "8878");
+    let top = s.top_n(5);
+    assert_eq!(top.len(), 1, "同 mask+hash+kind+upstream 须合并为一条");
+    assert_eq!(top[0].hits, 2);
+    assert_eq!(top[0].mask, mask);
+    assert!(!top[0].mask.contains(value), "合并条目不得含明文");
+}
+
+#[test]
+fn pii_value_sample_cross_day_topn() {
+    // G4/P11：跨天 day 键分桶（UTC 整数天转日期），同日稳定、邻日不同；TopN 按 hits 降序。
+    use super::sampler_day;
+    let d1 = sampler_day(86_400 * 10 + 100);
+    let d2 = sampler_day(86_400 * 11 + 100);
+    assert_ne!(d1, d2, "相邻两天 day 键须不同");
+    assert_eq!(d1, sampler_day(86_400 * 10 + 80_000), "同日 day 键须稳定");
+    let s = PiiValueSampler::new(
+        PiiSamplerConfig::for_test(true, false, None),
+        tmp_db("pii-cross-day-topn"),
+    );
+    for _ in 0..3 {
+        s.sample("phone", "13800000001", true, "8878").unwrap();
+    }
+    s.sample("phone", "13800000002", true, "8878").unwrap();
+    let top = s.top_n(1);
+    assert_eq!(top[0].hits, 3, "TopN 须取高频值");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pii_value_sample_persist_hot_switch_to_zero() {
+    // G4/P11：PERSIST 热切换 1→0（Rust 启动期解析，以新配置重建采样器等价）后不再落盘。
+    let db = tmp_db("pii-persist-switch");
+    let _ = std::fs::remove_file(&db);
+    let on = PiiValueSampler::new(PiiSamplerConfig::for_test(true, true, None), db.clone());
+    let (_, h_on) = on.sample("phone", "13800000001", true, "8878").unwrap();
+    let mut landed = false;
+    for _ in 0..200 {
+        if let Ok(conn) = open_wal(&db) {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pii_value_samples WHERE hash=?1",
+                    [h_on.clone()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if n >= 1 {
+                landed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(landed, "persist=1 须将采样行落库");
+    // 切换 persist=0：新采样器不再入落盘队列、不新增行。
+    let off = PiiValueSampler::new(PiiSamplerConfig::for_test(true, false, None), db.clone());
+    off.sample("phone", "13800000002", true, "8878").unwrap();
+    off.sample("phone", "13800000002", true, "8878").unwrap();
+    assert_eq!(off.pending_len(), 0, "persist=0 不得入落盘队列");
+    assert_eq!(off.top_n(5).len(), 1, "内存采样仍生效（persist 仅控落盘）");
+    let conn = open_wal(&db).unwrap();
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pii_value_samples", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 1, "persist=0 后不得新增落盘行");
+    drop(conn);
+    let _ = std::fs::remove_file(&db);
+}

@@ -1,49 +1,10 @@
-//! 上游中途断流 E2E（§8.1）：mock 上游真 HTTP，发送部分 SSE 分片后直接结束
-//! 响应（不断链语义：开环截断），断言下游 200、已透传分片保留、无伪造
-//! `stop`/`[DONE]`、无合成阻断帧。
+//! 上游中途断流 E2E（§8.1/D6）：mock 上游真 HTTP，发送部分 SSE 分片后直接结束
+//! 响应（不断链语义），断言下游 200、已透传分片保留、无伪造成功 `stop`、无合成
+//! 阻断帧；Chat 按 D6 补恰一 `data: [DONE]` 传输层终止。
 
-use {
-    std::{collections::HashMap, path::PathBuf, sync::Arc},
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
-};
+use common::{serve, test_app_router};
 
-fn test_app(extra: &[(&str, &str)]) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from("/tmp/veil-e2e-truncation.sqlite"),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
+mod common;
 
 /// 中途断流的上游：两个数据分片后直接结束流，不发 `[DONE]`。
 async fn mock_upstream_truncated() -> (String, tokio::task::JoinHandle<()>) {
@@ -97,9 +58,9 @@ async fn post_stream(
 }
 
 #[tokio::test]
-async fn truncated_open_loop_keeps_forwarded_fragments_without_fake_terminal() {
+async fn truncated_chat_backfills_single_done_keeps_fragments() {
     let (upstream, uhandle) = mock_upstream_truncated().await;
-    let (base, handle) = serve(test_app(&[("LLM_UPSTREAM", upstream.as_str())])).await;
+    let (base, handle) = serve(test_app_router(&[("LLM_UPSTREAM", upstream.as_str())])).await;
     let client = reqwest::Client::new();
     let (status, body, headers) = post_stream(&base, &client).await;
     assert_eq!(status, 200);
@@ -123,17 +84,17 @@ async fn truncated_open_loop_keeps_forwarded_fragments_without_fake_terminal() {
     );
     assert_eq!(
         body.matches("data: [DONE]").count(),
-        0,
-        "开环截断不得伪造 [DONE]（下游按开环处理）: {body}"
+        1,
+        "D6：Chat 中途断流须补恰一 [DONE] 传输层终止: {body}"
     );
     handle.abort();
     uhandle.abort();
 }
 
 #[tokio::test]
-async fn truncated_slow_audit_keeps_open_loop() {
+async fn truncated_slow_audit_backfills_single_done() {
     let (upstream, uhandle) = mock_upstream_truncated().await;
-    let (base, handle) = serve(test_app(&[
+    let (base, handle) = serve(test_app_router(&[
         ("LLM_UPSTREAM", upstream.as_str()),
         ("AUDIT_MODE", "block"),
     ]))
@@ -144,7 +105,7 @@ async fn truncated_slow_audit_keeps_open_loop() {
     assert!(body.contains("截断前分片甲"), "{body}");
     assert!(body.contains("截断前分片乙"), "{body}");
     assert!(!body.contains("[blocked:"), "{body}");
-    assert_eq!(body.matches("data: [DONE]").count(), 0, "{body}");
+    assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
     handle.abort();
     uhandle.abort();
 }

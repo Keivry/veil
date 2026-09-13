@@ -174,9 +174,13 @@ mod tests {
         assert_eq!(strip_bom("abc"), "abc");
         // 三包装器逐项：对象 / 数组 / 字符串叶。
         let out = process_text(r#"{"w":{"x":"v"}}"#, &mut |s| s.to_string(), DEPTH_LIMIT);
-        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+        let v: serde_json::Value =
+            serde_json::from_str(strip_bom(&out)).expect("对象包装器输出须合法 JSON");
+        assert_eq!(v["w"]["x"], "v");
         let out = process_text(r#"[{"x":"v"}]"#, &mut |s| s.to_string(), DEPTH_LIMIT);
-        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+        let v: serde_json::Value =
+            serde_json::from_str(strip_bom(&out)).expect("数组包装器输出须合法 JSON");
+        assert_eq!(v[0]["x"], "v");
         // 嵌套包装器：串中串中串逐层还原且转义安全。
         let inner = serde_json::to_string(&serde_json::json!({"k": "p@ss\"q"})).unwrap();
         let mid = serde_json::to_string(&serde_json::json!({"args": inner})).unwrap();
@@ -194,7 +198,9 @@ mod tests {
             s = serde_json::to_string(&serde_json::json!({"w": s})).unwrap();
         }
         let out = process_text(&s, &mut |x| x.to_string(), DEPTH_LIMIT);
-        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+        let _v: serde_json::Value =
+            serde_json::from_str(strip_bom(&out)).expect("超深输出须合法 JSON");
+        assert_eq!(out, s, "恒等叶超深截断须保持原值");
     }
 
     #[test]
@@ -258,7 +264,11 @@ mod tests {
             s = serde_json::to_string(&v).unwrap();
         }
         let out = process_text(&s, &mut |x| x.replace("deep_value", "MASKED"), 5);
-        assert!(serde_json::from_str::<serde_json::Value>(strip_bom(&out)).is_ok());
+        let v: serde_json::Value =
+            serde_json::from_str(strip_bom(&out)).expect("超深回退输出须合法 JSON");
+        assert!(v.is_object(), "顶层结构须保持对象: {out}");
+        assert!(out.contains("MASKED"), "超深叶须走 plain 替换: {out}");
+        assert!(!out.contains("deep_value"), "替换后源值不得残留: {out}");
     }
 
     #[test]
@@ -284,6 +294,62 @@ mod tests {
     fn non_json_goes_plain() {
         let out = process_text("plain p@ss text", &mut |s| s.replace("p@ss", "X"), 5);
         assert_eq!(out, "plain X text");
+    }
+
+    #[test]
+    fn three_wrappers_nasty_values_stay_valid_json() {
+        // G1.2 对照 Python `tests/vault_stable_test.py:298-342`：含引号密码、
+        // Unicode 转义、嵌套 stringified JSON、数组成员经 JSON-aware 路径后
+        // 输出恒可解析且还原值一致（token 脱敏/还原 + LLM 响应还原三条）。
+        let nasty = r#"{"pwd":"p@ss\"quote","uni":"\u0061\u0031\u0062","nested":"{\"k\":\"v1\"}","list":["x","y"]}"#;
+        // ① token 脱敏：密码值替换为凭据 token。
+        let redacted = process_text(
+            nasty,
+            &mut |s| s.replace("p@ss\"quote", "__VG_CRED_000001__"),
+            DEPTH_LIMIT,
+        );
+        let rv: serde_json::Value = serde_json::from_str(&redacted).expect("脱敏输出须合法 JSON");
+        assert_eq!(rv["pwd"], "__VG_CRED_000001__");
+        assert_eq!(rv["uni"], "a1b", "Unicode 转义须解码正确");
+        assert_eq!(rv["list"][0], "x");
+        let nested: serde_json::Value =
+            serde_json::from_str(rv["nested"].as_str().expect("nested 为字符串"))
+                .expect("嵌套 JSON 须完好");
+        assert_eq!(nested["k"], "v1");
+
+        // ①b token 还原：token → 明文，字段值一致。
+        let restored = process_text(
+            &redacted,
+            &mut |s| s.replace("__VG_CRED_000001__", "p@ss\"quote"),
+            DEPTH_LIMIT,
+        );
+        let sv: serde_json::Value = serde_json::from_str(&restored).expect("还原输出须合法 JSON");
+        assert_eq!(sv["pwd"], "p@ss\"quote");
+
+        // ③ LLM 响应还原：token 出现在 JSON 字符串内被还原。
+        let frame = r#"{"msg":"hi __VG_CRED_000001__"}"#;
+        let out = process_text(
+            frame,
+            &mut |s| s.replace("__VG_CRED_000001__", "p@ss\"quote"),
+            DEPTH_LIMIT,
+        );
+        let ov: serde_json::Value = serde_json::from_str(&out).expect("响应输出须合法 JSON");
+        assert_eq!(ov["msg"], "hi p@ss\"quote");
+    }
+
+    #[test]
+    fn validate_roundtrip_contract() {
+        // G1.3 三校验器共用契约（Rust 单实现 `validate_json_roundtrip`）：
+        // 合法原文 + 非法输出 → 回退原文；非 JSON 原文 + 任意输出 → 输出。
+        let legal = r#"{"a":1}"#;
+        let bad = r#"{"a":}"#;
+        assert_eq!(validate_json_roundtrip(legal, bad, "t"), legal);
+        assert_eq!(
+            validate_json_roundtrip(legal, r#"{"a":2}"#, "t"),
+            r#"{"a":2}"#
+        );
+        assert_eq!(validate_json_roundtrip("plain", bad, "t"), bad);
+        assert_eq!(validate_json_roundtrip("plain text", "xxx", "t"), "xxx");
     }
 
     #[test]

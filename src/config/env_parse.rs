@@ -710,6 +710,7 @@ mod redline {
     fn file_len_under_800_or_split() {
         // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，
         // 须按 H1 门面+子模块模板拆分，不得只改数字放行。
+        // G8.7：本测试为文件大小守护，非行为覆盖（不校验业务语义）。
         const SELF_SRC: &str = include_str!("env_parse.rs");
         let lines = SELF_SRC.lines().count();
         assert!(

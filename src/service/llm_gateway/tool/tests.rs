@@ -303,3 +303,41 @@ fn fix6_single_double_layer_fallback_with_missing_archive() {
     assert!(hexempt);
     assert_eq!(m.conv_missing_count("failed"), 1);
 }
+
+#[test]
+fn retrieval_args_action_query() {
+    // T11/D10：官方 action 形态提取（query 字符串 / queries 数组序列化）。
+    let single = serde_json::json!({"type":"web_search_call","action":{"type":"search","query":"veil audit"}});
+    assert_eq!(retrieval_args(single.as_object().unwrap()), "veil audit");
+    let multi = serde_json::json!({"type":"file_search_call","action":{"type":"search","queries":["a","b"]}});
+    assert_eq!(retrieval_args(multi.as_object().unwrap()), r#"["a","b"]"#);
+    let prefer_action = serde_json::json!({"action":{"query":"from-action"},"query":"from-top"});
+    assert_eq!(
+        retrieval_args(prefer_action.as_object().unwrap()),
+        "from-action",
+        "action 优先于顶层回退"
+    );
+    let null_action = serde_json::json!({"action":{"query":null,"queries":["q1"]}});
+    assert_eq!(
+        retrieval_args(null_action.as_object().unwrap()),
+        r#"["q1"]"#
+    );
+}
+
+#[test]
+fn retrieval_args_legacy_fallback() {
+    // T11/D10：legacy 顶层 query/queries 提取不因新增 action 分支回退。
+    let q = serde_json::json!({"type":"web_search_call","query":"legacy"});
+    assert_eq!(retrieval_args(q.as_object().unwrap()), "legacy");
+    let qs = serde_json::json!({"type":"file_search_call","queries":["legacy","x"]});
+    assert_eq!(retrieval_args(qs.as_object().unwrap()), r#"["legacy","x"]"#);
+    let args_first = serde_json::json!({"arguments":"{\"a\":1}","action":{"query":"ignore"}});
+    assert_eq!(
+        retrieval_args(args_first.as_object().unwrap()),
+        r#"{"a":1}"#,
+        "arguments 优先于 action"
+    );
+    // `results` 仍排除（体量风险，只看查询）。
+    let with_results = serde_json::json!({"action":{"query":"q"},"results":[{"big":"body"}]});
+    assert_eq!(retrieval_args(with_results.as_object().unwrap()), "q");
+}

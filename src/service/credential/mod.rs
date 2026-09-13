@@ -25,6 +25,7 @@ use {
 pub mod approval;
 pub mod auth;
 pub mod ratelimit;
+pub mod register_map;
 pub mod vault_ops;
 
 pub use {
@@ -38,13 +39,19 @@ pub use {
         query_keepass,
         register_caller,
         register_caller_extended,
+        register_caller_with_approval,
         revoke_caller,
+        revoke_caller_with_approval,
     },
 };
 
 /// 服务层读态 trait（A1 依赖倒置）：凭据/健康/管理业务只经本 trait
 /// 访问共享状态，不触 `AppState` 具体类型；`AppState` 在 `state.rs`
 /// 中实现本 trait（构造链签名不变，调用方传 `&AppState` 仍编译）。
+///
+/// H6 只读快照契约：`health_status` 经 `keepass()`/`pending()`/`vault()` 组装
+/// `unlocked`/`pending`/`llm_secrets`，仅读取快照、不触发状态迁移；handler 仅
+/// 序列化本层结果，不得直读进程内状态字段（层边界归本 trait 收口）。
 pub trait AppStateParts {
     fn config(&self) -> &Arc<Config>;
     fn sqlite_ok_flag(&self) -> bool;
@@ -62,18 +69,26 @@ pub trait AppStateParts {
     fn register_hits(&self) -> &Arc<tokio::sync::Mutex<RateTable>>;
     fn gateway_metrics(&self) -> &Arc<llm_gateway::GatewayMetrics>;
     fn admin_state(&self) -> &Arc<admin::AdminState>;
+    /// H10/D10：失败/审批通知统一有界 spool（应用层单例）。
+    fn notify(&self) -> &Arc<matrix::NotificationSpool>;
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthStatus {
     pub sqlite_ok: bool,
     pub sqlite_error: Option<String>,
+    pub unlocked: bool,
+    pub pending: usize,
+    pub llm_secrets: usize,
 }
 
 pub fn health_status(state: &impl AppStateParts) -> HealthStatus {
     HealthStatus {
         sqlite_ok: state.sqlite_ok_flag(),
         sqlite_error: state.sqlite_error_text(),
+        unlocked: state.keepass().is_unlocked(),
+        pending: state.pending().len(),
+        llm_secrets: state.vault().len(),
     }
 }
 
@@ -172,12 +187,23 @@ pub(crate) mod test_support {
         crate::{
             config::Config,
             registry::RegisterParams,
+            service::matrix::{
+                MatrixBot,
+                NOTIFICATION_QUEUE_CAPACITY,
+                NotificationSink,
+                NotificationSpool,
+            },
             state::{AppState, SqliteOutcome},
         },
         std::{
             collections::{BTreeMap, HashMap},
+            future::Future,
             path::PathBuf,
-            sync::Arc,
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
         },
     };
 
@@ -232,15 +258,79 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn cred_state(env: &HashMap<String, String>) -> AppState {
-        let state = AppState::new(
-            Config::load_from(env).unwrap(),
-            SqliteOutcome {
-                sqlite_ok: true,
-                sqlite_error: None,
-                db_path: PathBuf::from("/tmp/x.sqlite"),
-            },
-        );
-        state.with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()))
+        cred_state_with_sink(env, InjectSink::success())
+    }
+
+    /// `F1` 测试注入 sink：成功返回自增真实 id（`$test-event-{n}`），失败返回 `None`。
+    /// 默认注入成功 sink，避免审批建单触发真实网络；失败分支供 fail-closed 断言。
+    #[derive(Debug)]
+    pub(crate) struct InjectSink {
+        next: AtomicU64,
+        fail: bool,
+    }
+
+    impl InjectSink {
+        pub(crate) fn success() -> Arc<Self> {
+            Arc::new(Self {
+                next: AtomicU64::new(1),
+                fail: false,
+            })
+        }
+
+        pub(crate) fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                next: AtomicU64::new(1),
+                fail: true,
+            })
+        }
+    }
+
+    impl NotificationSink for InjectSink {
+        fn send_text(&self, _text: String) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+
+        fn send_text_tracked(
+            &self,
+            _text: String,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+            let id = (!self.fail)
+                .then(|| format!("$test-event-{}", self.next.fetch_add(1, Ordering::SeqCst)));
+            Box::pin(async move { id })
+        }
+    }
+
+    /// 以注入 sink 覆盖 `AppState.notify`（审批 tracked 发送改走注入 sink）。
+    pub(crate) fn inject_sink(mut state: AppState, sink: Arc<dyn NotificationSink>) -> AppState {
+        let bot = Arc::new(MatrixBot::new(
+            state.config.homeserver.clone(),
+            state.config.room_id.clone(),
+            state.config.matrix_access_token.clone(),
+        ));
+        state.notify = Arc::new(NotificationSpool::with_sink(
+            bot,
+            sink,
+            NOTIFICATION_QUEUE_CAPACITY,
+        ));
+        state
+    }
+
+    pub(crate) fn cred_state_with_sink(
+        env: &HashMap<String, String>,
+        sink: Arc<dyn NotificationSink>,
+    ) -> AppState {
+        inject_sink(
+            AppState::new(
+                Config::load_from(env).unwrap(),
+                SqliteOutcome {
+                    sqlite_ok: true,
+                    sqlite_error: None,
+                    db_path: PathBuf::from("/tmp/x.sqlite"),
+                },
+            )
+            .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked())),
+            sink,
+        )
     }
 
     pub(crate) fn body(hash: &str, path: &str, secret: Option<&str>) -> CredentialBody {
@@ -301,6 +391,13 @@ pub(crate) mod test_support {
             .set_enabled(path, true)
             .unwrap();
     }
+
+    pub(crate) fn seed_health_fixtures(state: &AppState) {
+        state
+            .pending
+            .insert(crate::approval::PendingRecord::new("k-health", "test"));
+        state.vault.register("health-secret-001").unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +410,23 @@ mod tests {
         let degraded = health_status(&test_state(false));
         assert!(!degraded.sqlite_ok);
         assert_eq!(degraded.sqlite_error.as_deref(), Some("ENOSPC"));
+    }
+
+    #[test]
+    fn health_status_full_fields() {
+        let state = cred_state(&cred_env(&[]));
+        let health = health_status(&state);
+        assert!(health.sqlite_ok);
+        assert!(health.unlocked, "unlocked 经 trait 数据组装");
+        assert_eq!(health.pending, 0);
+        assert_eq!(health.llm_secrets, 0);
+        state
+            .pending
+            .insert(crate::approval::PendingRecord::new("k-h", "t"));
+        state.vault.register("h-secret-1").unwrap();
+        let health = health_status(&state);
+        assert_eq!(health.pending, 1, "pending 经 trait 数据组装");
+        assert_eq!(health.llm_secrets, 1, "llm_secrets 经 trait 数据组装");
     }
 
     #[test]

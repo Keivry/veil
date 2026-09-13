@@ -88,6 +88,9 @@ impl BoundaryHold {
     }
 }
 
+mod prefix;
+pub use prefix::PrefixHold;
+
 /// 窗口过滤：在原文上去除 JSON 信封（`"` `{` `}` `[` `]` `,` 与 `"key":` 键），
 /// 返回过滤文本及逐字符原字节映射。`"key":` 要求引号后首字符为字母/下划线，
 /// 故纯数字值（IPv6 组、电话片段）不受影响；`:` 本身保留（IPv6 跨缝需要）。
@@ -397,6 +400,68 @@ mod seam_tests {
         assert!(d1.contains("\"content\""), "信封键须完整保留: {d1}");
         let (_, df) = h.flush().expect("次帧须滞留");
         assert!(!df.contains("12345678"), "次帧头部延续须掩码: {df}");
+    }
+
+    /// P7/D8 跨缝行为矩阵：跨缝手机号两侧掩码、`PII_HOLD_MAX=0` 直通、JSON 信封隔断同掩码。
+    #[test]
+    fn seam_matrix_cross_seam_zero_window_envelope() {
+        // ① 跨缝手机号：缝两侧残片均掩码，整帧延迟一级。
+        let mut h = BoundaryHold::new(64);
+        let (p0, d0) = h.push(
+            "event: message\n".to_string(),
+            "call 138".to_string(),
+            |_, _| vec![],
+        );
+        assert!(p0.is_empty() && d0.is_empty(), "首帧延迟无放行");
+        let span_fn = |_: &str, sm: usize| {
+            vec![(5, 16)]
+                .into_iter()
+                .filter(|(s, e)| *s < sm && *e > sm)
+                .collect()
+        };
+        let (p1, d1) = h.push(
+            "event: message\n".to_string(),
+            "12345678 ok".to_string(),
+            span_fn,
+        );
+        assert_eq!(p1, "event: message\n");
+        assert_eq!(d1, "call ***", "缝前残片须掩码: {d1}");
+        let (_, df) = h.flush().expect("次帧须滞留");
+        assert_eq!(df, "******** ok", "缝后延续须掩码: {df}");
+        assert!(!h.has_held());
+
+        // ② 窗口 0（响应侧关闭）：直通不滞留，spans 回调不生效。
+        let mut h0 = BoundaryHold::new(0);
+        let (pz, dz) = h0.push("e\n".to_string(), "{\"a\":1}".to_string(), |_, _| {
+            vec![(0, 7)]
+        });
+        assert_eq!((pz.as_str(), dz.as_str()), ("e\n", "{\"a\":1}"));
+        assert!(!h0.has_held(), "窗口 0 不做缝窗滞留");
+
+        // ③ JSON 信封隔断：信封过滤后仍缝合命中，两侧掩码且结构字符保真。
+        let mut he = BoundaryHold::new(128);
+        let prev = "{\"delta\":{\"content\":\"call 138\"}}".to_string();
+        let cur = "{\"delta\":{\"content\":\"12345678 ok\"}}".to_string();
+        let (ep0, ed0) = he.push("event: message\n".to_string(), prev, |_, _| vec![]);
+        assert!(ep0.is_empty() && ed0.is_empty(), "首帧延迟无放行");
+        let env_span = |w: &str, sm: usize| {
+            let rel = w.find("13812345678").expect("过滤窗口须缝合数字");
+            vec![(rel, rel + 11)]
+                .into_iter()
+                .filter(|(s, e)| *s < sm && *e > sm)
+                .collect()
+        };
+        let (ep1, ed1) = he.push("event: message\n".to_string(), cur, env_span);
+        assert_eq!(ep1, "event: message\n");
+        assert!(!ed1.contains("138"), "缝前 envelope 内残片须掩码: {ed1}");
+        assert!(ed1.contains("\"content\""), "信封键须完整保留: {ed1}");
+        let (_, edf) = he.flush().expect("次帧须滞留");
+        assert!(
+            !edf.contains("12345678"),
+            "缝后 envelope 内延续须掩码: {edf}"
+        );
+        let _: serde_json::Value =
+            serde_json::from_str(&edf).expect("掩码后信封恒可解析（结构字符保真）");
     }
 
     #[test]

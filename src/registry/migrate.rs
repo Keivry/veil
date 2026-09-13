@@ -1,6 +1,6 @@
 //! Python 旧格式注册表迁移（B6/D6 自 `registry.rs` 拆出）。
-//! 仅测试口径（D2/hygiene-round5）：模块级 `#[cfg(test)]` gating
-//! （见 `registry.rs`），生产零引用；`load_from` 为生产唯一加载入口。
+//! 生产加载期接入（`C4`/D4）：[`CallerRegistry::load_from`] 在新格式解析/完整性
+//! 失败且识别到旧形态时调用 [`CallerRegistry::migrate_python_registry`]。
 
 use {
     super::{
@@ -17,8 +17,8 @@ use {
 impl CallerRegistry {
     /// Python `caller_registry.json` 迁移（`version/callers/allowed_entries` 形态）。
     /// 成功后旧文件保留 `.bak` 备份；新格式文件直接走 [`CallerRegistry::load_from`]。
-    /// 仅测试口径（见模块文档）：生产零调用，测试与 `.bak` 语义保持原样。
-    fn migrate_python_registry(path: &Path) -> Result<Self> {
+    /// 生产仅由 `load_from` 在新格式校验失败时调用（`C4`/D4）。
+    pub(super) fn migrate_python_registry(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }

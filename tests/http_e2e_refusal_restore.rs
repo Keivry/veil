@@ -3,56 +3,13 @@
 //! `src/handler/llm/pump/event.rs` 单元覆盖之外的集成锁定。
 
 use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-        time::Duration,
-    },
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
+    common::{serve, test_app_router},
+    std::time::Duration,
 };
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
+mod common;
 
 const PHONE: &str = "13812345678";
-
-fn test_app(extra: &[(&str, &str)]) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(format!("/tmp/veil-e2e-refusal-{n}.sqlite")),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
 
 /// 从改写后请求体提取请求期 PII 占位符（网关已把明文替换为 token；
 /// 说明注入文案里的 `__PII_*__` 字面量不匹配真实 token 形态）。
@@ -88,7 +45,7 @@ async fn mock_upstream_echo_refusal() -> (String, tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn refusal_frame_restores_pii_plaintext_not_placeholder() {
     let (upstream, uhandle) = mock_upstream_echo_refusal().await;
-    let (base, handle) = serve(test_app(&[("LLM_UPSTREAM", upstream.as_str())])).await;
+    let (base, handle) = serve(test_app_router(&[("LLM_UPSTREAM", upstream.as_str())])).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/v1/chat/completions"))

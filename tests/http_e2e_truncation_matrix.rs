@@ -3,48 +3,9 @@
 //! TSS04 Responses 截断合成 `failed` + 真实 reasoning 开环 + 真实 toolcalls 开环无伪造。
 //! 全部夹具为合成数据，无真实 PII。
 
-use {
-    std::{collections::HashMap, path::PathBuf, sync::Arc},
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
-};
+use common::{serve, test_app_db};
 
-fn test_app(extra: &[(&str, &str)], db: &str) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(db),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
+mod common;
 
 /// 通用 mock 上游：按给定帧序列发送后直接断流（无 `[DONE]`/终止帧）。
 async fn mock_upstream(frames: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
@@ -60,6 +21,35 @@ async fn mock_upstream(frames: Vec<String>) -> (String, tokio::task::JoinHandle<
                         yield Ok::<_, anyhow::Error>(bytes::Bytes::from(f.into_bytes()));
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// 中途报错 mock 上游：发送给定帧后以流错误终止（触发网关 `chunk()` Err）。
+async fn mock_upstream_error(frames: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().route(
+        "/{*tail}",
+        axum::routing::any(move || {
+            let frames = frames.clone();
+            async move {
+                let stream = async_stream::stream! {
+                    for f in frames {
+                        yield Ok::<_, anyhow::Error>(bytes::Bytes::from(f.into_bytes()));
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    yield Err(anyhow::anyhow!("mock upstream mid-stream failure"));
                 };
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
@@ -106,7 +96,7 @@ async fn tss01_truncated_tail_silently_dropped_without_success_terminal() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"未完".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss01.sqlite",
     ))
@@ -130,7 +120,7 @@ async fn tss01_truncated_tail_silently_dropped_without_success_terminal() {
     uhandle.abort();
 }
 
-// —— 1.1 TSS02：文本中截断开环（保留已收分片，无伪造 DONE 载荷） ——
+// —— 1.1 TSS02：文本中截断开环（保留已收分片；D6 补恰一 DONE） ——
 
 #[tokio::test]
 async fn tss02_midtext_truncation_keeps_open_loop_fragments() {
@@ -139,7 +129,7 @@ async fn tss02_midtext_truncation_keeps_open_loop_fragments() {
         "data: {\"choices\":[{\"delta\":{\"content\":\"乙\"}}]}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss02.sqlite",
     ))
@@ -152,8 +142,8 @@ async fn tss02_midtext_truncation_keeps_open_loop_fragments() {
     );
     assert_eq!(
         body.matches("data: [DONE]").count(),
-        0,
-        "开环语义：不得伪造 DONE 载荷: {body}"
+        1,
+        "D6：Chat 中途断流须补恰一 DONE 载荷: {body}"
     );
     assert!(!body.contains("[blocked:"), "{body}");
     handle.abort();
@@ -169,7 +159,7 @@ async fn tss03_truncated_tool_call_dropped_without_fake_success() {
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{\\\"tz\\\":\\\"\"}}]}}]}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss03.sqlite",
     ))
@@ -201,7 +191,7 @@ async fn real_tool_calls_open_loop_multi_index_without_fabrication() {
         "data: [DONE]\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss03b.sqlite",
     ))
@@ -225,7 +215,7 @@ async fn real_tool_calls_open_loop_multi_index_without_fabrication() {
 async fn tss04_responses_truncation_synthesizes_failed_excluding_completed() {
     // 空流：上游立即断流（零帧），网关合成截断序列。
     let (upstream, uhandle) = mock_upstream(vec![]).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss04.sqlite",
     ))
@@ -258,7 +248,7 @@ async fn real_reasoning_open_loop_keeps_fragments_without_fabrication() {
         "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"item_id\":\"r1\",\"output_index\":0,\"content_index\":0,\"delta\":\"合成推理乙\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss04b.sqlite",
     ))
@@ -274,6 +264,11 @@ async fn real_reasoning_open_loop_keeps_fragments_without_fabrication() {
         body.contains("合成推理甲") && body.contains("合成推理乙"),
         "reasoning 分片须保留: {body}"
     );
+    assert_eq!(
+        body.matches("\"type\":\"response.failed\"").count(),
+        1,
+        "D6：Responses 中途断流须合成恰一 failed: {body}"
+    );
     assert!(
         !body.contains("response.completed"),
         "开环不得伪造 completed: {body}"
@@ -282,7 +277,7 @@ async fn real_reasoning_open_loop_keeps_fragments_without_fabrication() {
     uhandle.abort();
 }
 
-// —— 1.3 Anthropic 截断：message_stop 正常闭合，不断言 failed 合成 ——
+// —— 1.3 Anthropic 截断：不合成 message_stop / failed ——
 
 #[tokio::test]
 async fn anthropic_truncation_closes_cleanly_without_failed() {
@@ -291,7 +286,7 @@ async fn anthropic_truncation_closes_cleanly_without_failed() {
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"分片乙\"}}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-e2e-tss04c.sqlite",
     ))
@@ -304,6 +299,11 @@ async fn anthropic_truncation_closes_cleanly_without_failed() {
     .await;
     assert_eq!(status, 200);
     assert!(body.contains("分片甲") && body.contains("分片乙"), "{body}");
+    assert_eq!(
+        body.matches("\"type\":\"message_stop\"").count(),
+        0,
+        "D6：Anthropic 中途断流不得合成 message_stop: {body}"
+    );
     assert!(
         !body.contains("response.failed"),
         "Anthropic 不合成 failed: {body}"
@@ -311,6 +311,89 @@ async fn anthropic_truncation_closes_cleanly_without_failed() {
     assert!(
         !body.contains("response.completed"),
         "Anthropic 不合成 completed: {body}"
+    );
+    handle.abort();
+    uhandle.abort();
+}
+
+// —— 5.3 S5/D6：chunk() 报错形态三协议终端口径矩阵 ——
+
+#[tokio::test]
+async fn chunk_err_chat_backfills_single_done() {
+    let frames = vec!["data: {\"choices\":[{\"delta\":{\"content\":\"甲\"}}]}\n\n".to_string()];
+    let (upstream, uhandle) = mock_upstream_error(frames).await;
+    let (base, handle) = serve(test_app_db(
+        &[("LLM_UPSTREAM", upstream.as_str())],
+        "/tmp/veil-e2e-err-chat.sqlite",
+    ))
+    .await;
+    let (status, body) = post_stream(&base, "/v1/chat/completions", CHAT_STREAM_BODY).await;
+    assert_eq!(status, 200);
+    assert!(body.contains('甲'), "已收分片须保留: {body}");
+    assert_eq!(
+        body.matches("data: [DONE]").count(),
+        1,
+        "chunk Err 须按 D6 补恰一 DONE: {body}"
+    );
+    handle.abort();
+    uhandle.abort();
+}
+
+#[tokio::test]
+async fn chunk_err_anthropic_never_synthesizes_message_stop() {
+    let frames = vec![
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"甲\"}}\n\n".to_string(),
+    ];
+    let (upstream, uhandle) = mock_upstream_error(frames).await;
+    let (base, handle) = serve(test_app_db(
+        &[("LLM_UPSTREAM", upstream.as_str())],
+        "/tmp/veil-e2e-err-anth.sqlite",
+    ))
+    .await;
+    let (status, body) = post_stream(
+        &base,
+        "/v1/messages",
+        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains('甲'), "已收分片须保留: {body}");
+    assert_eq!(
+        body.matches("\"type\":\"message_stop\"").count(),
+        0,
+        "chunk Err 不得合成 message_stop: {body}"
+    );
+    handle.abort();
+    uhandle.abort();
+}
+
+#[tokio::test]
+async fn chunk_err_responses_synthesizes_single_failed() {
+    let frames = vec![
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"甲\"}\n\n".to_string(),
+    ];
+    let (upstream, uhandle) = mock_upstream_error(frames).await;
+    let (base, handle) = serve(test_app_db(
+        &[("LLM_UPSTREAM", upstream.as_str())],
+        "/tmp/veil-e2e-err-resp.sqlite",
+    ))
+    .await;
+    let (status, body) = post_stream(
+        &base,
+        "/v1/responses",
+        "{\"model\":\"m\",\"input\":\"hi\",\"stream\":true}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains('甲'), "已收分片须保留: {body}");
+    assert_eq!(
+        body.matches("\"type\":\"response.failed\"").count(),
+        1,
+        "chunk Err 须合成恰一 failed: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "不得伪造 completed: {body}"
     );
     handle.abort();
     uhandle.abort();

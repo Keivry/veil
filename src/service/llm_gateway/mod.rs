@@ -7,11 +7,7 @@ use {
     crate::config::Config,
     axum::http::HeaderMap,
     std::{
-        collections::HashMap,
-        sync::{
-            Mutex,
-            atomic::{AtomicU64, Ordering},
-        },
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
         time::Duration,
     },
 };
@@ -31,12 +27,70 @@ pub const RETRY_DELAYS_MS: [u64; 3] = [500, 1000, 2000];
 /// 一一对应，超限下标回退末档 2000ms（见 `retry_delay`）。
 pub const MAX_RETRY_ATTEMPTS: usize = 3;
 
-#[derive(Debug, Default)]
+/// 固定键原子计数（H2/D2）：已知键编译期枚举，热路径无锁写入；未知键归 `other`
+/// 桶并每进程仅告警一次（不静默丢失，也不无限刷屏）。
+#[derive(Debug)]
+struct KeyedCounters<const N: usize> {
+    keys: [&'static str; N],
+    counts: [AtomicU64; N],
+    other: AtomicU64,
+    other_warned: AtomicBool,
+}
+
+impl<const N: usize> KeyedCounters<N> {
+    fn new(keys: [&'static str; N]) -> Self {
+        Self {
+            keys,
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            other: AtomicU64::new(0),
+            other_warned: AtomicBool::new(false),
+        }
+    }
+
+    fn record(&self, key: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        match self.index_of(key) {
+            Some(i) => {
+                self.counts[i].fetch_add(n, Ordering::Relaxed);
+            }
+            None => {
+                self.other.fetch_add(n, Ordering::Relaxed);
+                if !self.other_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(key = %key, "网关度量未知键归 other 桶（本进程仅提示一次）");
+                }
+            }
+        }
+    }
+
+    fn get(&self, key: &str) -> u64 {
+        match self.index_of(key) {
+            Some(i) => self.counts[i].load(Ordering::Relaxed),
+            None => self.other.load(Ordering::Relaxed),
+        }
+    }
+
+    fn index_of(&self, key: &str) -> Option<usize> { self.keys.iter().position(|k| *k == key) }
+}
+
+const LENIENT_TAIL_KEYS: [&str; 3] = ["chat/completions", "v1/messages", "v1/responses"];
+const TRUNCATED_MODE_KEYS: [&str; 3] = ["silent_discard", "open_ended", "synthesized_failed"];
+const HOP_DIR_KEYS: [&str; 2] = ["upstream", "downstream"];
+const CONV_MISSING_KEYS: [&str; 5] = [
+    "failed",
+    "block",
+    "truncated",
+    "nondialog-stream",
+    "nonstream-block",
+];
+
+#[derive(Debug)]
 pub struct GatewayMetrics {
-    lenient: Mutex<HashMap<String, u64>>,
-    truncated: Mutex<HashMap<String, u64>>,
-    hop_filtered: Mutex<HashMap<String, u64>>,
-    conv_missing: Mutex<HashMap<String, u64>>,
+    lenient: KeyedCounters<3>,
+    truncated: KeyedCounters<3>,
+    hop_filtered: KeyedCounters<2>,
+    conv_missing: KeyedCounters<5>,
     sse_events: AtomicU64,
     /// P0-3.1/TSS-03：截断丢弃的残缺 tool 分片帧数。
     truncated_tool_dropped: AtomicU64,
@@ -50,65 +104,45 @@ pub struct GatewayMetrics {
     terminal_fallback: AtomicU64,
 }
 
+impl Default for GatewayMetrics {
+    fn default() -> Self {
+        Self {
+            lenient: KeyedCounters::new(LENIENT_TAIL_KEYS),
+            truncated: KeyedCounters::new(TRUNCATED_MODE_KEYS),
+            hop_filtered: KeyedCounters::new(HOP_DIR_KEYS),
+            conv_missing: KeyedCounters::new(CONV_MISSING_KEYS),
+            sse_events: AtomicU64::new(0),
+            truncated_tool_dropped: AtomicU64::new(0),
+            truncated_line_dropped_bytes: AtomicU64::new(0),
+            nondialog_passthrough: AtomicU64::new(0),
+            restore_fallback: AtomicU64::new(0),
+            terminal_fallback: AtomicU64::new(0),
+        }
+    }
+}
+
 impl GatewayMetrics {
-    pub fn record_lenient(&self, tail: &str) {
-        if let Ok(mut g) = self.lenient.lock() {
-            *g.entry(tail.to_string()).or_insert(0) += 1;
-        }
-    }
+    pub fn record_lenient(&self, tail: &str) { self.lenient.record(tail, 1); }
 
-    pub fn lenient_count(&self, tail: &str) -> u64 {
-        self.lenient
-            .lock()
-            .map(|g| g.get(tail).copied().unwrap_or(0))
-            .unwrap_or(0)
-    }
+    pub fn lenient_count(&self, tail: &str) -> u64 { self.lenient.get(tail) }
 
-    pub fn record_truncated(&self, mode: &str) {
-        if let Ok(mut g) = self.truncated.lock() {
-            *g.entry(mode.to_string()).or_insert(0) += 1;
-        }
-    }
+    pub fn record_truncated(&self, mode: &str) { self.truncated.record(mode, 1); }
 
-    pub fn truncated_count(&self, mode: &str) -> u64 {
-        self.truncated
-            .lock()
-            .map(|g| g.get(mode).copied().unwrap_or(0))
-            .unwrap_or(0)
-    }
+    pub fn truncated_count(&self, mode: &str) -> u64 { self.truncated.get(mode) }
 
     pub fn add_sse_event(&self) { self.sse_events.fetch_add(1, Ordering::Relaxed); }
 
     pub fn sse_event_total(&self) -> u64 { self.sse_events.load(Ordering::Relaxed) }
 
     pub fn record_hop_filtered(&self, dir: &str, count: u64) {
-        if count == 0 {
-            return;
-        }
-        if let Ok(mut g) = self.hop_filtered.lock() {
-            *g.entry(dir.to_string()).or_insert(0) += count;
-        }
+        self.hop_filtered.record(dir, count);
     }
 
-    pub fn hop_filtered_count(&self, dir: &str) -> u64 {
-        self.hop_filtered
-            .lock()
-            .map(|g| g.get(dir).copied().unwrap_or(0))
-            .unwrap_or(0)
-    }
+    pub fn hop_filtered_count(&self, dir: &str) -> u64 { self.hop_filtered.get(dir) }
 
-    pub fn record_conv_missing(&self, reason: &str) {
-        if let Ok(mut g) = self.conv_missing.lock() {
-            *g.entry(reason.to_string()).or_insert(0) += 1;
-        }
-    }
+    pub fn record_conv_missing(&self, reason: &str) { self.conv_missing.record(reason, 1); }
 
-    pub fn conv_missing_count(&self, reason: &str) -> u64 {
-        self.conv_missing
-            .lock()
-            .map(|g| g.get(reason).copied().unwrap_or(0))
-            .unwrap_or(0)
-    }
+    pub fn conv_missing_count(&self, reason: &str) -> u64 { self.conv_missing.get(reason) }
 
     pub fn record_truncated_tool_dropped(&self, n: u64) {
         self.truncated_tool_dropped.fetch_add(n, Ordering::Relaxed);
@@ -225,7 +259,7 @@ pub async fn fetch_upstream_with_retry(
         match req.send().await {
             Ok(resp) => return Ok(resp),
             Err(e) => {
-                if e.is_connect() || e.is_timeout() {
+                if e.is_connect() || e.is_timeout() || e.is_request() {
                     last_err = Some(e);
                     if attempt < MAX_RETRY_ATTEMPTS {
                         tokio::time::sleep(retry_delay(attempt)).await;
@@ -282,6 +316,9 @@ pub use {
     },
     usage::{Usage, accumulate_usage, extract_usage_nonstream, extract_usage_stream},
 };
+
+#[cfg(test)]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {
@@ -562,5 +599,89 @@ mod tests {
         m.record_hop_filtered("upstream", 3);
         assert_eq!(m.hop_filtered_count("upstream"), 3);
         assert_eq!(m.hop_filtered_count("downstream"), 0, "方向隔离");
+    }
+
+    #[test]
+    fn gateway_metrics_atomic_keys() {
+        let m = GatewayMetrics::default();
+        for key in LENIENT_TAIL_KEYS {
+            assert_eq!(m.lenient_count(key), 0);
+            m.record_lenient(key);
+            assert_eq!(m.lenient_count(key), 1, "{key}");
+        }
+        for key in TRUNCATED_MODE_KEYS {
+            m.record_truncated(key);
+            assert_eq!(m.truncated_count(key), 1, "{key}");
+        }
+        for key in HOP_DIR_KEYS {
+            m.record_hop_filtered(key, 2);
+            assert_eq!(m.hop_filtered_count(key), 2, "{key}");
+        }
+        for key in CONV_MISSING_KEYS {
+            m.record_conv_missing(key);
+            assert_eq!(m.conv_missing_count(key), 1, "{key}");
+        }
+    }
+
+    #[test]
+    fn gateway_metrics_unknown_key_other() {
+        let m = GatewayMetrics::default();
+        m.record_lenient("unknown-tail");
+        m.record_lenient("unknown-tail");
+        assert_eq!(
+            m.lenient_count("chat/completions"),
+            0,
+            "未知键不影响已知键读数"
+        );
+        assert_eq!(m.lenient_count("another-unknown"), 2, "未知键共享 other 桶");
+        m.record_lenient("chat/completions");
+        assert_eq!(m.lenient_count("chat/completions"), 1);
+    }
+
+    #[test]
+    fn admin_metrics_keys_unchanged() {
+        let m = GatewayMetrics::default();
+        for k in ["chat/completions", "v1/messages", "v1/responses"] {
+            m.record_lenient(k);
+        }
+        for k in ["chat/completions", "v1/messages", "v1/responses"] {
+            assert_eq!(m.lenient_count(k), 1, "{k}");
+        }
+        assert_eq!(m.sse_event_total(), 0);
+        m.add_sse_event();
+        assert_eq!(m.sse_event_total(), 1);
+        for k in TRUNCATED_MODE_KEYS {
+            m.record_truncated(k);
+            assert_eq!(m.truncated_count(k), 1, "{k}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_metrics_concurrent_count() {
+        use std::sync::Arc;
+        let m = Arc::new(GatewayMetrics::default());
+        const TASKS: u64 = 8;
+        const PER_TASK: u64 = 1_000;
+        let mut handles = Vec::new();
+        for _ in 0..TASKS {
+            let m = m.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..PER_TASK {
+                    m.record_lenient("chat/completions");
+                    m.record_truncated("open_ended");
+                    m.record_hop_filtered("upstream", 1);
+                    m.record_conv_missing("failed");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("并发任务须完成");
+        }
+        assert_eq!(m.lenient_count("chat/completions"), TASKS * PER_TASK);
+        assert_eq!(m.truncated_count("open_ended"), TASKS * PER_TASK);
+        assert_eq!(m.hop_filtered_count("upstream"), TASKS * PER_TASK);
+        assert_eq!(m.conv_missing_count("failed"), TASKS * PER_TASK);
+        assert_eq!(m.hop_filtered_count("downstream"), 0, "方向隔离");
+        assert_eq!(m.truncated_count("synthesized_failed"), 0, "模式隔离");
     }
 }

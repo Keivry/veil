@@ -50,9 +50,20 @@ pub struct AppState {
     pub register_hits: Arc<tokio::sync::Mutex<crate::service::RateTable>>,
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
     pub admin: Arc<crate::service::admin::AdminState>,
+    /// A1/D1：`AuditLogger` 启动期单例（`audit_sink` 持同一 `Arc` 写盘）。
+    pub audit_logger: Arc<crate::service::audit::AuditLogger>,
+    /// A1/D1：审计落盘 + 事件环接线单例（`DATA_DIR/audit.log`，`spawn_blocking` 写盘）。
+    pub audit_sink: Arc<crate::service::audit::AuditSink>,
     pub http_client: Arc<reqwest::Client>,
+    /// T3/D3：流式（SSE）转发专用 client——不设覆盖整响应体读取的总超时，
+    /// 避免长流被 `HTTP_TIMEOUT_SECS` 截断；非流与 NonDialog 仍用 `http_client`。
+    /// 读空闲超时默认禁用（无），失活连接依赖 TCP keepalive；口径见 README §7.2。
+    pub http_stream_client: Arc<reqwest::Client>,
     pub vault: Arc<crate::service::credential_vault::CredentialVault>,
     pub detector: Arc<crate::service::pii::PiiDetector>,
+    /// H10/D10：失败/审批通知统一有界 spool（单 Bot + 有界队列 + 常驻消费者）。
+    /// 消费者由 `main` 启动期 `start()` 拉起；未启动时 `notify_text` 按满队列丢弃。
+    pub notify: Arc<crate::service::matrix::NotificationSpool>,
 }
 
 impl AppState {
@@ -67,7 +78,24 @@ impl AppState {
             config.approval_whitelist.clone(),
             config.audit_timeout_secs.max(1) as u64,
         ));
+        let audit_logger = Arc::new(crate::service::audit::AuditLogger::new(
+            config.data_dir.clone(),
+        ));
+        let audit_sink = Arc::new(crate::service::audit::AuditSink::new(
+            audit_logger.clone(),
+            admin.clone(),
+        ));
         let http_client = Arc::new(build_http_client(&config));
+        let http_stream_client = Arc::new(build_stream_http_client(&config));
+        let notify = Arc::new(crate::service::matrix::NotificationSpool::new(
+            Arc::new(crate::service::matrix::MatrixBot::with_client(
+                config.homeserver.clone(),
+                config.room_id.clone(),
+                config.matrix_access_token.clone(),
+                (*http_client).clone(),
+            )),
+            crate::service::matrix::NOTIFICATION_QUEUE_CAPACITY,
+        ));
         let vault = Arc::new(crate::service::credential_vault::CredentialVault::new());
         let detector = Arc::new(crate::service::pii::PiiDetector::new());
         detector.set_hardening(config.pii_detection_hardening);
@@ -86,9 +114,13 @@ impl AppState {
             register_hits: Arc::new(tokio::sync::Mutex::new(crate::service::RateTable::new())),
             gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
             admin,
+            audit_logger,
+            audit_sink,
             http_client,
+            http_stream_client,
             vault,
             detector,
+            notify,
         }
     }
 
@@ -143,21 +175,91 @@ impl crate::service::credential::AppStateParts for AppState {
     }
 
     fn admin_state(&self) -> &Arc<crate::service::admin::AdminState> { &self.admin }
+
+    fn notify(&self) -> &Arc<crate::service::matrix::NotificationSpool> { &self.notify }
+}
+
+/// `C6`/D6：网关侧清理接线——Matrix 文本指令经此读写真实口令缓存、
+/// KeePass 会话、内存/矩阵 pending 与 token 映射，避免 Matrix 层依赖 `AppState`。
+impl crate::service::matrix::GatewayCleanup for AppState {
+    fn keepass_unlocked(&self) -> bool { self.keepass.is_unlocked() }
+
+    fn vault_len(&self) -> usize { self.vault.len() }
+
+    fn lock_cleanup(&self) -> usize {
+        let cleared = self.vault.clear();
+        self.keepass.clear_cache();
+        let pending = self.pending.clear_all();
+        tracing::info!("lock 清理: 口令缓存 {cleared} 条、内存待审 {pending} 条、KeePass 会话已清");
+        cleared
+    }
+
+    fn forget_cleanup(&self) -> usize {
+        let cleared = self.vault.clear();
+        tracing::info!("forget 清理: token 映射 {cleared} 条");
+        cleared
+    }
+}
+
+/// H9/D9：构造失败降级告警文案（纯函数，供测试断言含注入原因）。
+fn http_client_degrade_warning(reason: &str) -> String {
+    format!("HTTP client 构造失败，已降级为默认 Client（timeout/连接池配置未生效）: {reason}")
+}
+
+/// H9/D9：构造核心——`build` 失败经 `warn` 显式告警并降级 `Client::new()`，
+/// 不再静默 `unwrap_or_else`；`warn` 注入供测试捕获告警文案。
+fn finish_http_client_with<F>(build: F, warn: impl Fn(&str)) -> reqwest::Client
+where
+    F: FnOnce() -> Result<reqwest::Client, String>,
+{
+    match build() {
+        Ok(client) => client,
+        Err(reason) => {
+            warn(&http_client_degrade_warning(&reason));
+            reqwest::Client::new()
+        }
+    }
+}
+
+fn finish_http_client<F>(build: F) -> reqwest::Client
+where
+    F: FnOnce() -> Result<reqwest::Client, String>,
+{
+    finish_http_client_with(build, |msg| tracing::warn!("{msg}"))
 }
 
 pub fn build_http_client(config: &Config) -> reqwest::Client {
+    use std::time::Duration;
+    finish_http_client(|| {
+        http_client_builder(config)
+            .timeout(Duration::from_secs(config.http_timeout_secs.max(1)))
+            .build()
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// T3/D3：流式 client 与 `build_http_client` 共用解码/连接池配置，但**不调
+/// `.timeout()`**——reqwest `ClientBuilder::timeout` 是「请求总时长（含响应体
+/// 读取）」而非连接超时，长 SSE 流必然被 `HTTP_TIMEOUT_SECS` 截断；读空闲超时
+/// 亦不配置（默认禁用）。非流/NonDialog 的总超时语义由 `build_http_client` 保持。
+pub fn build_stream_http_client(config: &Config) -> reqwest::Client {
+    finish_http_client(|| {
+        http_client_builder(config)
+            .build()
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn http_client_builder(config: &Config) -> reqwest::ClientBuilder {
     use std::time::Duration;
     reqwest::Client::builder()
         .gzip(crate::service::llm_gateway::DECODE_ENABLED)
         .brotli(crate::service::llm_gateway::DECODE_ENABLED)
         .deflate(crate::service::llm_gateway::DECODE_ENABLED)
-        .timeout(Duration::from_secs(config.http_timeout_secs.max(1)))
         .pool_max_idle_per_host(config.http_pool_max_idle_per_host.max(1))
         .pool_idle_timeout(Duration::from_secs(
             config.http_pool_idle_timeout_secs.max(1),
         ))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// sqlite 初始化结果：健康或内存-only 降级（降级由 `sqlite_ok=false` +
@@ -392,6 +494,111 @@ mod tests {
     }
 
     #[test]
+    fn http_client_build_failure_visible() {
+        let captured: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let client = finish_http_client_with(
+            || Err("injected-construct-failure".to_string()),
+            |msg| captured.lock().unwrap().push(msg.to_string()),
+        );
+        let logs = captured.lock().unwrap();
+        assert_eq!(logs.len(), 1, "注入失败须恰一条 warn");
+        assert!(
+            logs[0].contains("injected-construct-failure"),
+            "warn 须含失败原因，实际 {:?}",
+            logs[0]
+        );
+        assert!(
+            client.get("http://127.0.0.1:1/").build().is_ok(),
+            "降级客户端须仍可用"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_client_has_no_total_timeout() {
+        // T3/D3：流式 client 无总超时——总时长 > `HTTP_TIMEOUT_SECS` 的慢流仍两帧俱达。
+        let cfg = config_with_timeout_secs(1);
+        let stream = build_stream_http_client(&cfg);
+        let (url, server) = slow_sse_server(std::time::Duration::from_millis(1500)).await;
+        let resp = stream
+            .get(&url)
+            .send()
+            .await
+            .expect("流式 client 须拿到响应头");
+        let body = resp.bytes().await.expect("长流不得因总超时被截断");
+        server.abort();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("data: first") && text.contains("data: second"),
+            "两帧均须到达，实际 {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonstream_keeps_total_timeout() {
+        // T3/D3：非流 client 保持 `HTTP_TIMEOUT_SECS` 总超时——慢体读取映射为报错。
+        let cfg = config_with_timeout_secs(1);
+        let client = build_http_client(&cfg);
+        let (url, server) = slow_sse_server(std::time::Duration::from_millis(1500)).await;
+        let resp = client.get(&url).send().await.expect("须先拿到响应头");
+        let err = resp.bytes().await;
+        server.abort();
+        assert!(
+            err.is_err(),
+            "非流 client 须按 HTTP_TIMEOUT_SECS 超时，实际 {:?}",
+            err.map(|b| b.len())
+        );
+    }
+
+    /// T3 测试装配：以指定 `HTTP_TIMEOUT_SECS` 构造合法 `Config`。
+    fn config_with_timeout_secs(secs: u64) -> Config {
+        let env = std::collections::HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+            ("HTTP_TIMEOUT_SECS".to_string(), secs.to_string()),
+        ]);
+        Config::load_from(&env).expect("测试配置须合法")
+    }
+
+    /// T3 测试上游：响应头后先发一帧，`delay` 后再发第二帧并关闭（总时长 > 超时预算）。
+    async fn slow_sse_server(delay: std::time::Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                if sock.write_all(head.as_bytes()).await.is_err() {
+                    continue;
+                }
+                if sock.write_all(b"data: first\n\n").await.is_err() {
+                    continue;
+                }
+                let _ = sock.flush().await;
+                tokio::time::sleep(delay).await;
+                let _ = sock.write_all(b"data: second\n\n").await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (url, handle)
+    }
+
+    #[test]
     fn vault_and_detector_singletons_shared_across_clones() {
         let env = std::collections::HashMap::from([
             (
@@ -421,5 +628,116 @@ mod tests {
         let second = again.vault.register("跨请求秘密-abc123").unwrap();
         assert_eq!(first, second);
         assert!(first.starts_with("__VG_CRED_"));
+    }
+
+    /// `C6` 测试后端：`clear_cache` 即上锁，使 `lock` 清理后可断言凭据取用失败。
+    #[derive(Debug)]
+    struct LockableKeePass {
+        unlocked: AtomicBool,
+    }
+
+    impl LockableKeePass {
+        fn new(unlocked: bool) -> Self {
+            Self {
+                unlocked: AtomicBool::new(unlocked),
+            }
+        }
+    }
+
+    impl KeePassBackend for LockableKeePass {
+        fn is_unlocked(&self) -> bool { self.unlocked.load(Ordering::SeqCst) }
+
+        fn fetch_entry(
+            &self,
+            title: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::keepass::EntrySnapshot>> + Send + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if !self.unlocked.load(Ordering::SeqCst) {
+                    return Err(VeilError::Unavailable {
+                        message: "KeePass 未解锁".to_string(),
+                    });
+                }
+                Ok(crate::keepass::EntrySnapshot {
+                    title,
+                    username: "u".to_string(),
+                    password: "p".to_string(),
+                    url: String::new(),
+                    custom: Vec::new(),
+                })
+            })
+        }
+
+        fn clear_cache(&self) { self.unlocked.store(false, Ordering::SeqCst); }
+    }
+
+    fn state_with_keepass(backend: Arc<dyn KeePassBackend>) -> AppState {
+        let env = std::collections::HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+        ]);
+        AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: PathBuf::from("/tmp/x.sqlite"),
+            },
+        )
+        .with_keepass(backend)
+    }
+
+    #[tokio::test]
+    async fn lock_clears_vault_and_pending() {
+        use crate::service::matrix::{MatrixBot, MatrixBranch, TextCommand};
+        let state = state_with_keepass(Arc::new(LockableKeePass::new(true)));
+        state.vault.register("lock-secret-1234").unwrap();
+        state
+            .pending
+            .insert(crate::approval::PendingRecord::new("k1", "reason"));
+        state
+            .approval
+            .submit_branch("$evt-lock", MatrixBranch::Credential)
+            .await;
+        let reply =
+            MatrixBot::handle_text_command_full(&state.approval, TextCommand::Lock, &state).await;
+        assert!(reply.is_some_and(|s| s.contains("🔒 Proxy 已锁定")));
+        assert!(state.vault.is_empty(), "lock 后口令缓存须清空");
+        assert_eq!(state.pending.len(), 0, "lock 后内存 pending 须清零");
+        assert_eq!(
+            state.approval.pending_len().await,
+            0,
+            "lock 后矩阵 pending 须清零"
+        );
+        assert!(
+            state.keepass.fetch_entry("网易".to_string()).await.is_err(),
+            "lock 后凭据取用须失败"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_clears_token_map_counted() {
+        use crate::service::matrix::{MatrixBot, TextCommand};
+        let state = state_with_keepass(Arc::new(LockableKeePass::new(true)));
+        state.vault.register("forget-secret-a1").unwrap();
+        state.vault.register("forget-secret-b2").unwrap();
+        assert_eq!(state.vault.len(), 2);
+        let reply =
+            MatrixBot::handle_text_command_full(&state.approval, TextCommand::Forget, &state)
+                .await
+                .expect("forget 须有回执");
+        assert!(reply.contains('2'), "回执计数须与清理数一致: {reply}");
+        assert!(state.vault.is_empty(), "forget 后 token 映射须清空");
     }
 }

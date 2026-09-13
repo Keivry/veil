@@ -244,7 +244,16 @@ pub fn mask_pii_value(kind: &str, value: &str) -> String {
             if parts.len() == 4 {
                 format!("{}.{}.**.**", parts[0], parts[1])
             } else {
-                short(value)
+                let chars: Vec<char> = value.chars().collect();
+                if (6..=7).contains(&chars.len()) {
+                    format!(
+                        "{}****{}",
+                        chars[..4].iter().collect::<String>(),
+                        chars[chars.len() - 4..].iter().collect::<String>()
+                    )
+                } else {
+                    short(value)
+                }
             }
         }
         "ipv6" | "api_key" | "apikey" => {
@@ -417,28 +426,39 @@ pub fn is_keep_prefix_ip(value: &str, kind: &str) -> bool {
 #[derive(Debug, Clone)]
 struct ValidationCache {
     cache: moka::future::Cache<String, bool>,
+    hits: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ValidationCache {
     fn global() -> &'static Self {
         static CACHE: OnceLock<ValidationCache> = OnceLock::new();
-        CACHE.get_or_init(|| ValidationCache {
+        CACHE.get_or_init(ValidationCache::build)
+    }
+
+    fn build() -> Self {
+        ValidationCache {
             cache: moka::future::Cache::builder()
                 .max_capacity(VALIDATION_CACHE_CAP)
                 .eviction_policy(moka::policy::EvictionPolicy::lru())
                 .time_to_live(Duration::from_secs(600))
                 .build(),
-        })
+            hits: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 
     async fn check(&self, key: &str, compute: impl FnOnce() -> bool) -> bool {
         if let Some(v) = self.cache.get(key).await {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return v;
         }
         let v = compute();
         self.cache.insert(key.to_string(), v).await;
         v
     }
+
+    /// F8/D8：缓存命中计数（可观测跨调用复用证据）。
+    #[cfg(test)]
+    fn hit_count(&self) -> u64 { self.hits.load(std::sync::atomic::Ordering::Relaxed) }
 }
 
 pub(crate) async fn cached_luhn(digits: &str) -> bool {

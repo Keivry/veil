@@ -164,6 +164,42 @@ fn hardening_drops_attached_and_leading_zero_ipv4() {
 }
 
 #[test]
+fn hardening_adjacency() {
+    // P13/D14：ASCII 粘连门仅在 `PII_DETECTION_HARDENING=1` 生效（有意收紧）。
+    let plain = detector();
+    let hard = detector();
+    hard.set_hardening(true);
+    for (text, kind) in [
+        ("x13812345678y", "phone"),
+        ("a11010519491231002Xb", "id_card"),
+        ("a4532015112830366b", "bank_card"),
+    ] {
+        let off = plain.scan_spans_sync(text, &empty_cred());
+        assert!(
+            kinds(&off).contains(&kind),
+            "强化关粘连须保留 {kind}: {off:?}"
+        );
+        let on = hard.scan_spans_sync(text, &empty_cred());
+        assert!(
+            !kinds(&on).contains(&kind),
+            "强化开粘连须丢弃 {kind}: {on:?}"
+        );
+    }
+    // 独立出现（无 ASCII 粘连）两态均命中。
+    let text = "联系 13812345678 处理";
+    assert!(kinds(&plain.scan_spans_sync(text, &empty_cred())).contains(&"phone"));
+    assert!(kinds(&hard.scan_spans_sync(text, &empty_cred())).contains(&"phone"));
+    // IPv4 前导零：关命中、开拒；公网无前导零两态一致命中。
+    assert!(
+        kinds(&plain.scan_spans_sync("访问 8.008.008.008 获取", &empty_cred())).contains(&"ipv4")
+    );
+    assert!(
+        !kinds(&hard.scan_spans_sync("访问 8.008.008.008 获取", &empty_cred())).contains(&"ipv4")
+    );
+    assert!(kinds(&hard.scan_spans_sync("访问 8.8.8.8 获取", &empty_cred())).contains(&"ipv4"));
+}
+
+#[test]
 fn mask_six_branch_shapes_correct() {
     assert_eq!(mask_pii_value("phone", "13812345678"), "138****5678");
     assert_eq!(mask_pii_value("email", "a@b.com"), "***@***.com");
@@ -182,6 +218,57 @@ fn mask_six_branch_shapes_correct() {
     );
     assert_eq!(mask_pii_value("other", "abcdef"), "abc****def");
     assert_eq!(mask_pii_value("phone", ""), "***");
+}
+
+#[test]
+fn mask_ipv4_edge_non_quad_six_seven_first4_last4() {
+    // P9/D10：非 4 段 6-7 字符 IPv4 形对齐原仓前 4/后 4（重叠不裁剪、逐字符）。
+    assert_eq!(mask_pii_value("ipv4", "123456"), "1234****3456");
+    assert_eq!(mask_pii_value("ipv4", "1234567"), "1234****4567");
+    // 非 4 段 <6 与 4 段分支不受影响。
+    assert_eq!(mask_pii_value("ipv4", "1.2.3"), "1****3");
+    assert_eq!(mask_pii_value("ipv4", "8.8.8.8"), "8.8.**.**");
+}
+
+#[test]
+fn mask_kind_alias_bankcard_apikey_same_as_main() {
+    // P9/D10：bankcard/apikey 为已声明别名，行为与主名逐字一致。
+    for v in ["4532015112830366", "12345678", "1234"] {
+        assert_eq!(
+            mask_pii_value("bankcard", v),
+            mask_pii_value("bank_card", v),
+            "bankcard 别名须等价 bank_card: {v}"
+        );
+    }
+    for v in ["abcd1234", "sk-abcdefgh12345678", "12345"] {
+        assert_eq!(
+            mask_pii_value("apikey", v),
+            mask_pii_value("api_key", v),
+            "apikey 别名须等价 api_key: {v}"
+        );
+    }
+}
+
+#[test]
+fn mask_pii_value_branches_and_64_cap_regression() {
+    assert_eq!(mask_pii_value("phone", "13812345678"), "138****5678");
+    assert_eq!(mask_pii_value("email", "a@b.com"), "***@***.com");
+    assert_eq!(
+        mask_pii_value("bank_card", "4532015112830366"),
+        "**** **** **** 0366"
+    );
+    assert_eq!(
+        mask_pii_value("ipv6", "2001:4860:4860::8888"),
+        "2001****8888"
+    );
+    assert_eq!(
+        mask_pii_value("api_key", "sk-abcdefgh12345678"),
+        "sk-a****5678"
+    );
+    assert_eq!(mask_pii_value("other", "abcdef"), "abc****def");
+    assert_eq!(mask_pii_value("phone", ""), "***");
+    let long_email = format!("a@b.{}", "x".repeat(70));
+    assert_eq!(mask_pii_value("email", &long_email).chars().count(), 64);
 }
 
 #[test]
@@ -293,4 +380,42 @@ fn ipv6_timestamp_not_ipv6_and_uncompressed_requires_8_groups() {
         hits.iter().all(|h| h.0 != "ipv6"),
         "文档段豁免：尾部双冒号文档地址不得检出: {hits:?}"
     );
+}
+
+#[tokio::test]
+async fn hardening_boundary_rules() {
+    // G6/P13：开启态三断言——ASCII 粘连拒绝、前导零 IPv4 丢弃、CJK 边界不误伤。
+    let hard = detector();
+    hard.set_hardening(true);
+    assert!(
+        !kinds(&hard.scan_spans_sync("x13812345678y", &empty_cred())).contains(&"phone"),
+        "ASCII 粘连须拒绝"
+    );
+    assert!(
+        !kinds(&hard.scan_spans_sync("访问 8.008.008.008 获取", &empty_cred())).contains(&"ipv4"),
+        "前导零 IPv4 须丢弃"
+    );
+    assert!(
+        kinds(&hard.scan_spans_sync("联系13812345678处理", &empty_cred())).contains(&"phone"),
+        "CJK 边界不得误伤手机号"
+    );
+}
+
+#[tokio::test]
+async fn hardening_analyzer_cache_reuse() {
+    // F8/D8：缓存断言升级为可观测命中——首算未命中、第二次跨调用命中计数 +1，
+    // 替代「同输入同输出」的替代性断言。
+    let cache = ValidationCache::build();
+    assert!(
+        !cache.check("analyzer:k1", || false).await,
+        "首算须返回计算值"
+    );
+    assert_eq!(cache.hit_count(), 0, "首算不得命中缓存");
+    assert!(
+        !cache.check("analyzer:k1", || true).await,
+        "第二次须命中缓存值（不得重算）"
+    );
+    assert_eq!(cache.hit_count(), 1, "跨调用复用须观测到一次命中");
+    assert!(cache.check("analyzer:k2", || true).await);
+    assert_eq!(cache.hit_count(), 1, "新键不得命中缓存");
 }

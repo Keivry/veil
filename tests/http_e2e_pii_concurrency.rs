@@ -6,61 +6,15 @@
 //! flaky 隔离策略：失败即加 `#[ignore]` 并在 tasks 登记，不阻塞门禁；
 //! 超时预算 120s，mock 回声零外部依赖。
 
-use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-    },
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
-};
+use common::{serve, test_app_router};
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
+mod common;
 
 const CONCURRENCY: usize = 100;
 
 const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
 
 fn phone(i: usize) -> String { format!("138{:08}", 1000 + i) }
-
-fn test_app(extra: &[(&str, &str)]) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(format!("/tmp/veil-e2e-pii-conc-{n}.sqlite")),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
 
 /// 回声上游：把收到的请求体原文嵌入 chat completion 的 `content` 回显。
 async fn mock_upstream_echo() -> (String, tokio::task::JoinHandle<()>) {
@@ -93,7 +47,7 @@ async fn mock_upstream_echo() -> (String, tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn t3_1_pii_100_concurrent_restore_isolated_no_crosstalk() {
     let (upstream, uhandle) = mock_upstream_echo().await;
-    let (base, handle) = serve(test_app(&[("LLM_UPSTREAM", upstream.as_str())])).await;
+    let (base, handle) = serve(test_app_router(&[("LLM_UPSTREAM", upstream.as_str())])).await;
     let client = reqwest::Client::new();
 
     let mut tasks = Vec::with_capacity(CONCURRENCY);

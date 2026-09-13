@@ -266,6 +266,11 @@ pub(crate) fn parse_whitelist(get: &dyn Fn(&str) -> Option<String>) -> Result<Ve
 
 fn is_valid_mxid(s: &str) -> bool {
     let rest = s.strip_prefix('@').unwrap_or("");
+    // A12/D11：`@` 前缀之后（localpart + domain）不得再含 `@`
+    // （等价 Python `s[1:].count('@') == 0`），否则 `@a@b:c` 被误放行。
+    if rest.contains('@') {
+        return false;
+    }
     let mut parts = rest.split(':');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(user), Some(server), None) => {
@@ -406,6 +411,93 @@ mod tests {
             Config::load_from(&falsy).unwrap().audit_mode,
             AuditMode::Off
         );
+    }
+
+    /// A7/D6：真值集恒为 `1/true/yes/on`（trim + 大小写不敏感）；显式非空 `AUDIT_MODE`
+    /// 优先，空白 `AUDIT_MODE` 走 `AUDIT_ENABLED` 回退映射 `block`。
+    #[test]
+    fn audit_enabled_truthy_table() {
+        let mode_of = |audit_mode: Option<&str>, audit_enabled: Option<&str>| {
+            let mut env = base_env();
+            env.insert(
+                "APPROVAL_WHITELIST".to_string(),
+                "@admin:example.com".to_string(),
+            );
+            match audit_mode {
+                Some(v) => env.insert("AUDIT_MODE".to_string(), v.to_string()),
+                None => env.remove("AUDIT_MODE"),
+            };
+            match audit_enabled {
+                Some(v) => env.insert("AUDIT_ENABLED".to_string(), v.to_string()),
+                None => env.remove("AUDIT_ENABLED"),
+            };
+            Config::load_from(&env).unwrap().audit_mode
+        };
+        // 真值样本（含大小写与首尾空白变体）→ block。
+        for raw in ["1", "true", "TRUE", "yes", "YES", "on", " On ", "\ttrue\n"] {
+            assert_eq!(
+                mode_of(None, Some(raw)),
+                AuditMode::Block,
+                "真值须启用审计: {raw:?}"
+            );
+            assert_eq!(
+                mode_of(Some("   "), Some(raw)),
+                AuditMode::Block,
+                "空白 AUDIT_MODE 须走回退: {raw:?}"
+            );
+        }
+        // 非真值/乱值 → 不启用（off）。
+        for raw in ["0", "false", "no", "off", "bogus", "", "   "] {
+            assert_eq!(
+                mode_of(None, Some(raw)),
+                AuditMode::Off,
+                "非真值不得启用审计: {raw:?}"
+            );
+        }
+        // 显式非空 AUDIT_MODE 优先（含显式 off），回退不生效。
+        for explicit in ["off", "block", "approve"] {
+            let enabled = matches!(explicit, "block" | "approve");
+            let mode = mode_of(Some(explicit), Some(if enabled { "0" } else { "1" }));
+            let want = match explicit {
+                "off" => AuditMode::Off,
+                "block" => AuditMode::Block,
+                _ => AuditMode::Approve,
+            };
+            assert_eq!(mode, want, "显式 AUDIT_MODE={explicit} 须优先");
+        }
+        // 两者皆缺省 → off。
+        assert_eq!(mode_of(None, None), AuditMode::Off);
+    }
+
+    /// A7/D6：非法 `AUDIT_TIMEOUT`（0/负/110-130）与 `AUDIT_HOLD_MAX_BYTES`（0/非整数）
+    /// 一律拒启动，不静默回落默认值。
+    #[test]
+    fn audit_invalid_env_rejects() {
+        for raw in ["0", "-1", "110", "120", "130", "abc", "1.5"] {
+            let mut env = base_env();
+            env.insert("AUDIT_TIMEOUT".to_string(), raw.to_string());
+            let err = Config::load_from(&env).unwrap_err();
+            assert!(
+                err.to_string().contains("AUDIT_TIMEOUT"),
+                "AUDIT_TIMEOUT={raw:?} 须拒启动并指明变量"
+            );
+        }
+        for raw in ["0", "-1", "abc", "1.5"] {
+            let mut env = base_env();
+            env.insert("AUDIT_HOLD_MAX_BYTES".to_string(), raw.to_string());
+            let err = Config::load_from(&env).unwrap_err();
+            assert!(
+                err.to_string().contains("AUDIT_HOLD_MAX_BYTES"),
+                "AUDIT_HOLD_MAX_BYTES={raw:?} 须拒启动并指明变量"
+            );
+        }
+        // 合法边界仍放行（1 与 109/131 避开禁区）。
+        let mut env = base_env();
+        env.insert("AUDIT_TIMEOUT".to_string(), "109".to_string());
+        env.insert("AUDIT_HOLD_MAX_BYTES".to_string(), "1".to_string());
+        let cfg = Config::load_from(&env).unwrap();
+        assert_eq!(cfg.audit_timeout_secs, 109);
+        assert_eq!(cfg.audit_hold_max_bytes, 1);
     }
 
     #[test]
@@ -595,5 +687,59 @@ mod tests {
             "README §7.4 与 LEGACY_IGNORED_VARS 名称集合须相等"
         );
         assert_eq!(names.len(), readme_set.len(), "README §7.4 不得重复变量行");
+    }
+
+    /// A12/D11：`@` 前缀后再含 `@` 的 MXID 一律拒绝（配置侧与 Matrix 链路侧同结论）。
+    #[test]
+    fn mxid_reject_multiple_at() {
+        assert!(!is_valid_mxid("@a@b:c"));
+        let get = |_: &str| Some("@a@b:c".to_string());
+        assert!(parse_whitelist(&get).is_err());
+        assert!(crate::service::matrix::validate_whitelist_mxids(&["@a@b:c".to_string()]).is_err());
+    }
+
+    /// A12/D11：常规合法形态通过，缺段/多段/空白/多点 `@` 拒绝。
+    #[test]
+    fn mxid_valid_forms() {
+        for s in [
+            "@admin:example.com",
+            "@keivry:matrix.example.org",
+            "@a.b-c_d:x.y",
+        ] {
+            assert!(is_valid_mxid(s), "合法 MXID 须通过: {s}");
+        }
+        for s in [
+            "@a@b:c",
+            "admin:example.com",
+            "@a:",
+            "@:b",
+            "@a b:c",
+            "@a:b:c",
+        ] {
+            assert!(!is_valid_mxid(s), "非法 MXID 须拒绝: {s}");
+        }
+    }
+
+    /// A15/D14：配置加载期真源与 `branch.rs::validate_whitelist_mxids` 表驱动同结论。
+    #[test]
+    fn whitelist_validator_parity() {
+        for s in [
+            "@admin:example.com",
+            "@a@b:c",
+            "admin:example.com",
+            "@a:",
+            "@:b",
+            "@a b:c",
+            "@keivry@matrix.example",
+        ] {
+            let get = |_: &str| Some(s.to_string());
+            let via_config = parse_whitelist(&get);
+            let via_branch = crate::service::matrix::validate_whitelist_mxids(&[s.to_string()]);
+            assert_eq!(
+                via_config.is_ok(),
+                via_branch.is_ok(),
+                "校验真源与 Matrix 门禁须同结论: {s:?}"
+            );
+        }
     }
 }

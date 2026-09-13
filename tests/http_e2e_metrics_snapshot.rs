@@ -2,25 +2,16 @@
 //! 空窗零值不崩溃、seed 后 series 行求和与快照一致。
 
 use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-        time::{SystemTime, UNIX_EPOCH},
-    },
-    veil::{
-        config::Config,
-        router::build_router,
-        service::{
-            credential::AppStateParts,
-            llm_gateway::{Protocol, Usage},
-            metrics::ChatRecord,
-        },
-        state::SqliteOutcome,
+    common::{serve, test_app},
+    std::time::{SystemTime, UNIX_EPOCH},
+    veil::service::{
+        credential::AppStateParts,
+        llm_gateway::{Protocol, Usage},
+        metrics::ChatRecord,
     },
 };
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
+mod common;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -34,51 +25,10 @@ fn usage(p: u64, c: u64, t: u64) -> Usage {
         prompt_tokens: p,
         completion_tokens: c,
         total_tokens: t,
+        total_explicit: true,
         cached_read: 0,
         cached_write: 0,
     }
-}
-
-fn test_app(extra: &[(&str, &str)]) -> (axum::Router, veil::state::AppState) {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let db = PathBuf::from(format!("/tmp/veil-e2e-metrics-snap-{n}.sqlite"));
-    let _ = std::fs::remove_file(&db);
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: db,
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    let router = build_router(state.clone());
-    (router, state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
 }
 
 const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
@@ -211,6 +161,16 @@ async fn b5_snapshot_shape_matches_series_and_empty_window_ok() {
     assert_eq!(snap["per_protocol"]["chat/completions"], 1);
     assert_eq!(snap["per_protocol"]["v1/responses"], 1);
     assert_eq!(snap["per_model"]["snap-m"], 2);
+    assert_eq!(snap["tokens"]["cached_read"], 0);
+    assert_eq!(snap["tokens"]["cached_write"], 0);
+    // 协议分桶求和须等于 requests（非空窗业务值，不止 shape）。
+    let proto_sum: u64 = snap["per_protocol"]
+        .as_object()
+        .expect("per_protocol 须对象")
+        .values()
+        .map(|v| v.as_u64().expect("协议桶须数值"))
+        .sum();
+    assert_eq!(proto_sum, snap["requests"].as_u64().unwrap());
     assert_eq!(snap["truncated"]["open_ended"], 1);
     assert_eq!(snap["truncated"]["silent_discard"], 0);
     assert_eq!(snap["truncated"]["synthesized_failed"], 0);

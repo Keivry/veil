@@ -109,6 +109,99 @@ async fn nonstream_and_stream_tail_partials_cleaned() {
 }
 
 #[tokio::test]
+async fn skip_segments_recursive_stringified_pii() {
+    // T8/D8：同一响应既还原凭据（跳过区间）又命工具参数内嵌套 stringified JSON 新 PII。
+    let vault = CredentialVault::new();
+    vault.register("veil-secret-001").unwrap();
+    let detector = PiiDetector::new();
+    detector.load_dict(&[("a\"b".to_string(), "hostname".to_string())]);
+    let scope = Scope::new();
+    let frame = r#"{"a":"__VG_CRED_000001__","b":"{\"host\":\"a\\\"b\"}"}"#;
+    let (restored, spans) = scope.restore_response_with_spans_json(&vault, frame);
+    assert!(restored.contains("veil-secret-001"), "{restored}");
+    assert!(!spans.is_empty());
+    let out = scope
+        .redact_response_new_pii_with_skip(&vault, &detector, &restored, &spans)
+        .await;
+    assert!(out.contains("veil-secret-001"), "凭据明文须保留: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("输出须合法 JSON");
+    let inner: serde_json::Value =
+        serde_json::from_str(v["b"].as_str().expect("b 为字符串")).expect("嵌套 JSON 须完好");
+    assert!(
+        inner["host"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("__PII_")),
+        "嵌套 dict PII 须被掩码: {out}"
+    );
+}
+
+#[tokio::test]
+async fn skip_segments_byte_identical() {
+    // T8：仅跳过区间且零命中时输出与输入逐字节一致。
+    let vault = CredentialVault::new();
+    let detector = PiiDetector::new();
+    let scope = Scope::new();
+    for (text, skip) in [
+        (r#"{"k":"secret-abc"}"#, (6usize, 16usize)),
+        (r#"{"b":2,"a":1}"#, (2, 3)),
+    ] {
+        let out = scope
+            .redact_response_new_pii_with_skip(&vault, &detector, text, &[skip])
+            .await;
+        assert_eq!(out, text, "零命中跳过须字节一致: {text}");
+    }
+}
+
+#[tokio::test]
+async fn skip_span_boundaries() {
+    // T8/9.2：相邻/重叠 span、段首尾截断、关闭响应侧检测旁路。
+    let vault = CredentialVault::new();
+    let detector = PiiDetector::new();
+    let scope = Scope::new();
+    let text = r#"{"k":"AAAABBBB"}"#;
+    assert_eq!(
+        scope
+            .redact_response_new_pii_with_skip(&vault, &detector, text, &[(0, 1)])
+            .await,
+        text,
+        "段首截断须字节一致"
+    );
+    assert_eq!(
+        scope
+            .redact_response_new_pii_with_skip(
+                &vault,
+                &detector,
+                text,
+                &[(text.len() - 1, text.len())]
+            )
+            .await,
+        text,
+        "段尾截断须字节一致"
+    );
+    assert_eq!(
+        scope
+            .redact_response_new_pii_with_skip(&vault, &detector, text, &[(5, 9), (9, 13)])
+            .await,
+        text,
+        "相邻 span 须字节一致"
+    );
+    assert_eq!(
+        scope
+            .redact_response_new_pii_with_skip(&vault, &detector, text, &[(5, 10), (7, 12)])
+            .await,
+        text,
+        "重叠 span 须字节一致"
+    );
+    // 关闭响应侧检测：旁路直接透传，跳过区间与新 PII 均不改写。
+    let off = Scope::with_opts(false, false);
+    let pii_text = r#"{"k":"secret-abc","p":"8.8.8.8"}"#;
+    let out = off
+        .redact_response_new_pii_with_skip(&vault, &detector, pii_text, &[(6, 16)])
+        .await;
+    assert_eq!(out, pii_text, "关闭响应侧检测须整段透传");
+}
+
+#[tokio::test]
 async fn response_side_disabled_passes_through() {
     let vault = CredentialVault::new();
     let detector = PiiDetector::new();
@@ -177,6 +270,101 @@ async fn response_number_literal_passthrough() {
             .await;
         assert_eq!(out, frame, "零替换须逐字节保留数字/空白");
     }
+}
+
+#[tokio::test]
+async fn three_wrappers_nasty_scope_paths() {
+    // G1.2 对照 Python `tests/vault_stable_test.py:298-342`：含引号密码、
+    // Unicode 转义、嵌套 stringified JSON、数组成员经三条 JSON-aware 路径
+    // （① token 脱敏/还原 ② PII 脱敏 ③ LLM 响应还原）后输出恒可解析且值一致。
+    let vault = CredentialVault::new();
+    let secret = "p@ss\"quote";
+    let detector = PiiDetector::new();
+    let nasty = serde_json::json!({
+        "pwd": secret,
+        "uni": "\u{61}1b",
+        "nested": serde_json::to_string(&serde_json::json!({"k":"v1"})).unwrap(),
+        "list": ["x", "y"],
+    });
+    let raw = serde_json::to_string(&nasty).unwrap();
+    let token = vault.register(secret).unwrap();
+    let scope = Scope::new();
+
+    // ① token 脱敏：凭据值替换为 `__VG_CRED_` token。
+    let redacted = scope.redact_request(&vault, &detector, &raw).await;
+    let rv: serde_json::Value = serde_json::from_str(&redacted).expect("脱敏输出须合法 JSON");
+    assert!(
+        rv["pwd"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("__VG_CRED_")),
+        "{redacted}"
+    );
+    assert_eq!(rv["uni"], "a1b", "Unicode 转义须解码正确");
+    assert_eq!(rv["list"][0], "x");
+    let nested: serde_json::Value =
+        serde_json::from_str(rv["nested"].as_str().expect("nested 为字符串"))
+            .expect("嵌套 JSON 须完好");
+    assert_eq!(nested["k"], "v1");
+
+    // ①b token 还原：JSON 字符串上下文还原（RFC 8259 转义）后输出合法且值一致。
+    let (restored, _) = scope.restore_response_with_spans_json(&vault, &redacted);
+    let sv: serde_json::Value = serde_json::from_str(&restored).expect("还原输出须合法 JSON");
+    assert_eq!(sv["pwd"], secret);
+
+    // ② PII 脱敏：新检出以 `__PII_` 占位符呈现且输出可解析。
+    let pii_raw = serde_json::to_string(&serde_json::json!({"phone":"13812345678"})).unwrap();
+    let pii_out = scope.redact_request(&vault, &detector, &pii_raw).await;
+    let pv: serde_json::Value = serde_json::from_str(&pii_out).expect("PII 脱敏输出须合法 JSON");
+    assert!(
+        pv["phone"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("__PII_")),
+        "{pii_out}"
+    );
+
+    // ③ LLM 响应还原：token 出现在 JSON 字符串内被还原。
+    let frame = serde_json::to_string(&serde_json::json!({"msg": format!("hi {token}")})).unwrap();
+    let (llm_out, _) = scope.restore_response_with_spans_json(&vault, &frame);
+    let lv: serde_json::Value = serde_json::from_str(&llm_out).expect("响应还原输出须合法 JSON");
+    assert_eq!(lv["msg"], format!("hi {secret}"));
+}
+
+#[test]
+fn fuzzy_case_drift_exact_vs_sequence_lookup() {
+    // G1.1 对照 Python `tests/vault_stable_test.py:132-167`：
+    // `PII_FUZZY_RESTORE` 关闭时大小写漂移不还原（精确原样保留），
+    // 开启时按序号回查还原。`__PII_<seq>_ZZZZABCD__` 为大写非 hex 漂移形。
+    let vault = CredentialVault::new();
+    let plain = "13812345678";
+    let exact = Scope::with_opts(true, false);
+    let token = exact
+        .pii_scope()
+        .register(plain, false)
+        .expect("注册恒成功");
+    let seq: usize = token
+        .strip_prefix("__PII_")
+        .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
+        .flatten()
+        .expect("token 恒带序号");
+    let case_drift = format!("__PII_{seq}_ZZZZABCD__");
+    // 关闭：大小写漂移不还原，原样保留。
+    let out = exact.restore_response(&vault, &format!("回拨 {case_drift} 结束"));
+    assert!(out.contains(&case_drift), "关闭态须原样保留: {out}");
+    assert!(!out.contains(plain), "关闭态不得还原: {out}");
+    // 开启：按序号回查还原。
+    let fuzzy = Scope::with_opts(true, true);
+    let token2 = fuzzy
+        .pii_scope()
+        .register(plain, false)
+        .expect("注册恒成功");
+    let seq2: usize = token2
+        .strip_prefix("__PII_")
+        .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
+        .flatten()
+        .expect("token 恒带序号");
+    let out2 = fuzzy.restore_response(&vault, &format!("回拨 __PII_{seq2}_ZZZZABCD__ 结束"));
+    assert!(out2.contains(plain), "开启态须还原: {out2}");
+    assert!(!out2.contains("__PII_"), "还原后不留 token: {out2}");
 }
 
 #[test]

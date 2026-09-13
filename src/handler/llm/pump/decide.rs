@@ -65,14 +65,23 @@ pub(super) fn sticky_suppress_action(
     }
 }
 
-/// P1 补 DONE 四条件：Chat 且未终端且见 `finish_reason` 且未置截断观测。
-pub(super) fn should_backfill_chat_done(
+/// D6/S11 断流统一收尾门：未终端、未阻断，且已发帧或有截断信号（`chunk()` Err /
+/// 丢弃残缺 tool 分片）时才注入断流终端；Responses 零帧（未发任何帧）保持真空流
+/// 最小终止，不进本策略。真空流（无帧无截断信号）走空流守门。
+pub(super) fn should_apply_midstream_terminal(
     protocol: Protocol,
     terminal_sent: bool,
-    saw_finish_reason: bool,
-    truncated_mode_set: bool,
+    block_injected: bool,
+    any_frame_sent: bool,
+    stream_truncated: bool,
 ) -> bool {
-    protocol == Protocol::Chat && !terminal_sent && saw_finish_reason && !truncated_mode_set
+    if terminal_sent || block_injected {
+        return false;
+    }
+    if !any_frame_sent && !stream_truncated {
+        return false;
+    }
+    protocol != Protocol::Responses || any_frame_sent
 }
 
 /// tool hold-until-complete 缓冲判定：审计开启且 tool 事件且非完成且非
@@ -104,11 +113,13 @@ pub(super) fn tool_replay_slot(
     }
 }
 
-/// 边界 hold 抑制：非次要事件且 hold 有滞留且本帧有输出。
+/// D1 持有抑制：仅「审计开启 + 确有未完成 tool 分片 + 本帧有输出 + 非次要」
+/// 四条件同时成立才持有；流级未完成不构成持有信号。
 pub(super) fn should_suppress_held_output(
-    minor: bool,
-    hold_held: bool,
+    audit_hold_on: bool,
+    has_pending_fragments: bool,
     out_data_nonempty: bool,
+    minor: bool,
 ) -> bool {
-    !minor && hold_held && out_data_nonempty
+    audit_hold_on && has_pending_fragments && out_data_nonempty && !minor
 }

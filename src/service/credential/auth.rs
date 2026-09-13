@@ -74,7 +74,7 @@ fn entry_selector(body: &CredentialBody) -> (Option<String>, Option<String>) {
 }
 
 pub async fn handle_credential(
-    state: &impl AppStateParts,
+    state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     headers: &CredentialHeaders,
     body: &CredentialBody,
 ) -> Result<serde_json::Value> {

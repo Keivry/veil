@@ -701,6 +701,36 @@ mod tests {
     }
 
     #[test]
+    fn kdbx_key_pairing() {
+        // C14/D14：多库取排序末位，仅同名 `.key` 配对，不取首个 `.key`。
+        let dir = std::env::temp_dir().join(format!(
+            "veil-resolve-pair-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.kdbx"), b"a").unwrap();
+        std::fs::write(dir.join("a.key"), b"first-key").unwrap();
+        std::fs::write(dir.join("z.kdbx"), b"z").unwrap();
+        let found = resolve_kdbx(&dir).expect("须选中末位库");
+        assert_eq!(found.db_path, dir.join("z.kdbx"), "须取排序末位 .kdbx");
+        assert_eq!(
+            found.keyfile_path, None,
+            "末位库无同名 key 时不得取首个 .key"
+        );
+        std::fs::write(dir.join("z.key"), b"z-key").unwrap();
+        let found = resolve_kdbx(&dir).expect("须选中末位库");
+        assert_eq!(
+            found.keyfile_path,
+            Some(dir.join("z.key")),
+            "仅同名 .key 配对"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn no_db_returns_none() {
         let dir = std::env::temp_dir().join(format!(
             "veil-resolve-empty-{}",

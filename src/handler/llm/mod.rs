@@ -59,12 +59,24 @@ pub(crate) fn protocol_header_value(protocol: Protocol) -> &'static str {
     }
 }
 
-pub(crate) fn empty_body_response() -> Response {
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}})),
+/// T10/D9：网关生成响应统一置 `x-veil-protocol`（与成功/阻断分支口径一致）。
+pub(crate) fn with_protocol_header(mut resp: Response, protocol: Protocol) -> Response {
+    resp.headers_mut().insert(
+        "x-veil-protocol",
+        header::HeaderValue::from_static(protocol_header_value(protocol)),
+    );
+    resp
+}
+
+pub(crate) fn empty_body_response(protocol: Protocol) -> Response {
+    with_protocol_header(
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}})),
+        )
+            .into_response(),
+        protocol,
     )
-        .into_response()
 }
 
 /// 流泵路由判定（D5 定稿：客户端 `stream` 意图优先）：上游 `Content-Type`
@@ -76,7 +88,7 @@ pub fn should_pump_stream(resp_content_type: &str, stream_flag: bool) -> bool {
 
 pub use {
     dispatch::llm_proxy_handler,
-    nonstream::{NonstreamCtx, NonstreamOutcome, serve_nonstream},
+    nonstream::{NonstreamCtx, NonstreamOutcome, serve_nondialog_passthrough, serve_nonstream},
     pump::{PumpOutcome, StreamPumpCtx, build_sse_response, spawn_stream_pump},
     rewrite::{RewriteOutput, request_rewrite},
 };

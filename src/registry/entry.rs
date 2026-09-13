@@ -39,6 +39,31 @@ pub struct CallerEntry {
 /// 旧哈希宽限窗口（秒，对标 Python 3600s 语义）。
 pub const OLD_HASH_GRACE_SECS: u64 = 3600;
 
+/// 哈希变更落定三态（`C3`/D3）：对应 Matrix reaction 表情与等待超时。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashChangeOutcome {
+    /// `🔓`：批准但保持现有 `allow_mode`（自动放行延续），兼容既有二元批准。
+    #[default]
+    KeepAuto,
+    /// `✅`：批准并降级为人工审批模式（`allow_mode = Some(AutoApprove::Pending)`）。
+    DemoteManual,
+    /// `❎` 或等待超时：未获批准，禁用条目（fail-closed）。
+    Disable,
+}
+
+impl HashChangeOutcome {
+    /// 从 `reaction` 入参解析：缺省/空串按保持自动；`✅` 降级；`❎` 禁用；
+    /// 其它非空值返回 `None`（调用方按 `400` 处理，对标 Python 显式校验）。
+    pub fn from_reaction(reaction: Option<&str>) -> Option<Self> {
+        match reaction.map(str::trim) {
+            None | Some("") | Some("🔓") => Some(Self::KeepAuto),
+            Some("✅") => Some(Self::DemoteManual),
+            Some("❎") => Some(Self::Disable),
+            Some(_) => None,
+        }
+    }
+}
+
 /// 注册扩展参数（网关侧做 Go 字段映射，协议不 breaking）。
 #[derive(Debug, Clone, Default)]
 pub struct RegisterParams {
@@ -96,7 +121,27 @@ impl<'de> serde::Deserialize<'de> for AutoApprove {
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::CallerRegistry;
+    use {
+        super::{CallerEntry, OLD_HASH_GRACE_SECS},
+        crate::registry::CallerRegistry,
+    };
+
+    fn entry_with_expiry(exp: u64) -> CallerEntry {
+        CallerEntry {
+            caller_path: "/s/grace.sh".to_string(),
+            expected_hash: "new".to_string(),
+            script_sha256: String::new(),
+            enabled: true,
+            revoked: false,
+            auto_approve: None,
+            name: String::new(),
+            description: String::new(),
+            entries: Default::default(),
+            allow_mode: None,
+            old_hash: Some("old".to_string()),
+            old_hash_expires_at: Some(exp),
+        }
+    }
 
     #[test]
     fn old_hash_grace_accepts_old_rejects_other() {
@@ -107,5 +152,22 @@ mod tests {
         assert_eq!(e.old_hash.as_deref(), Some("h1"));
         assert!(e.matches_old_hash("h1"));
         assert!(!e.matches_old_hash("hX"));
+    }
+
+    #[test]
+    fn old_hash_grace_window() {
+        // C12/D12：Rust 真置 `now+3600` 宽限（Python 死码），宽限内旧 hash 可用、过期失效。
+        let now = super::now_unix_secs();
+        let entry = entry_with_expiry(now + OLD_HASH_GRACE_SECS);
+        assert!(entry.matches_old_hash("old"), "宽限内旧 hash 须可用");
+        assert!(
+            entry.old_hash_expires_at.unwrap() - now >= OLD_HASH_GRACE_SECS - 2,
+            "宽限须约 3600s"
+        );
+        // 边界：exp-1s（距过期 1s）仍可用。
+        assert!(entry_with_expiry(now + 1).matches_old_hash("old"));
+        // 边界：exp+1s（已过 1s）失效，且其它 hash 不匹配。
+        assert!(!entry_with_expiry(now.saturating_sub(1)).matches_old_hash("old"));
+        assert!(!entry_with_expiry(now + 1).matches_old_hash("other"));
     }
 }

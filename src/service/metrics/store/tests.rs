@@ -408,6 +408,259 @@ async fn series_four_windows_cross_day_approx_sum_query() {
 }
 
 #[test]
+fn sample_upsert_rollover() {
+    use super::super::aggregate::PII_SAMPLE_RETENTION_DAYS;
+    // P11/D12：复合键 (day,upstream,kind,hash) 覆盖式 UPSERT + 7 天滚动删除。
+    let db = tmp_db("sample-upsert-rollover");
+    let _ = std::fs::remove_file(&db);
+    let ts = now();
+    let row = |seen: i64| super::SampleRow {
+        day: "2026-09-09".to_string(),
+        upstream: "https://u.example".to_string(),
+        kind: "phone".to_string(),
+        hash: "hash-phone".to_string(),
+        mask: "138****8000".to_string(),
+        seen,
+    };
+    persist_sample_batch(&db, &[row(ts)]).unwrap();
+    persist_sample_batch(&db, &[row(ts + 1)]).unwrap();
+    let conn = open_wal(&db).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pii_value_samples", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "重复 flush 同复合键须合一行");
+    let (hits, last): (i64, i64) = conn
+        .query_row("SELECT hits, last_seen FROM pii_value_samples", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(hits, 2, "重复 flush hits 须累加为 2");
+    assert_eq!(last, ts + 1, "last_seen 须刷新为最近一次");
+    drop(conn);
+    let old = ts - (PII_SAMPLE_RETENTION_DAYS + 1) * 86_400;
+    persist_sample_batch(&db, &[row(old)]).unwrap();
+    purge_retention_blocking(&db).unwrap();
+    let conn = open_wal(&db).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pii_value_samples", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "超 7 天 last_seen 行须被滚动删除");
+    drop(conn);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn sample_retention() {
+    use super::super::aggregate::PII_SAMPLE_RETENTION_DAYS;
+    // P11/D12：7 天滚动窗口边界（窗口内 / 恰入窗前保留，越界删除）。
+    let db = tmp_db("sample-retention");
+    let _ = std::fs::remove_file(&db);
+    let ts = now();
+    let window = PII_SAMPLE_RETENTION_DAYS * 86_400;
+    let row = |hash: &str, seen: i64| super::SampleRow {
+        day: "2026-09-09".to_string(),
+        upstream: String::new(),
+        kind: "phone".to_string(),
+        hash: hash.to_string(),
+        mask: "***".to_string(),
+        seen,
+    };
+    persist_sample_batch(
+        &db,
+        &[
+            row("fresh", ts - 3 * 86_400),
+            row("boundary", ts - window + 60),
+            row("expired", ts - window - 60),
+        ],
+    )
+    .unwrap();
+    purge_retention_blocking(&db).unwrap();
+    let conn = open_wal(&db).unwrap();
+    let kept: Vec<String> = conn
+        .prepare("SELECT hash FROM pii_value_samples ORDER BY hash")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(kept, vec!["boundary", "fresh"], "窗口/边界内保留、越界删除");
+    drop(conn);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn pii_value_sample_roll_7d() {
+    use super::super::aggregate::PII_SAMPLE_RETENTION_DAYS;
+    // P11/G4：复合键覆盖式 UPSERT 合并不增行；超 7 天滚动删除；落盘仅掩码+hash 无明文。
+    let db = tmp_db("pii-roll-7d");
+    let _ = std::fs::remove_file(&db);
+    let ts = now();
+    let row = |hash: &str, seen: i64| super::SampleRow {
+        day: "2026-09-09".to_string(),
+        upstream: "8878".to_string(),
+        kind: "phone".to_string(),
+        hash: hash.to_string(),
+        mask: "138****0000".to_string(),
+        seen,
+    };
+    persist_sample_batch(
+        &db,
+        &[
+            row("keep", ts - 3 * 86_400),
+            row("old", ts - (PII_SAMPLE_RETENTION_DAYS + 1) * 86_400),
+        ],
+    )
+    .unwrap();
+    persist_sample_batch(&db, &[row("keep", ts - 3 * 86_400 + 1)]).unwrap();
+    let conn = open_wal(&db).unwrap();
+    let cols: std::collections::HashSet<String> = conn
+        .prepare("PRAGMA table_info(pii_value_samples)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .flatten()
+        .collect();
+    for forbidden in ["value", "plaintext", "raw", "secret", "content"] {
+        assert!(
+            !cols.contains(forbidden),
+            "落盘表不得含明文列 {forbidden}: {cols:?}"
+        );
+    }
+    let keep_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pii_value_samples WHERE hash='keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(keep_rows, 1, "重复 flush 同复合键须合一行");
+    let hits: i64 = conn
+        .query_row(
+            "SELECT hits FROM pii_value_samples WHERE hash='keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 2, "重复 flush hits 须累加不翻倍行数");
+    drop(conn);
+    purge_retention_blocking(&db).unwrap();
+    let conn = open_wal(&db).unwrap();
+    let kept: Vec<String> = conn
+        .prepare("SELECT hash FROM pii_value_samples ORDER BY hash")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(kept, vec!["keep"], "超 7 天行须滚动删除、窗口内保留");
+    let mask: String = conn
+        .query_row("SELECT mask FROM pii_value_samples", [], |r| r.get(0))
+        .unwrap();
+    assert!(!mask.contains("13812345678"), "落盘仅掩码不含明文");
+    drop(conn);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn pii_value_sample_cross_day_buckets() {
+    // P11/G4：同 hash 跨天按 day 复合键分桶不合并（TopN 各自独立）。
+    use crate::service::metrics::sample::sampler_day;
+    let db = tmp_db("pii-cross-day");
+    let _ = std::fs::remove_file(&db);
+    let d1 = sampler_day(86_400 * 10 + 100);
+    let d2 = sampler_day(86_400 * 11 + 100);
+    assert_ne!(d1, d2, "相邻两天 day 键须不同");
+    let row = |day: &str, seen: i64| super::SampleRow {
+        day: day.to_string(),
+        upstream: "8878".to_string(),
+        kind: "phone".to_string(),
+        hash: "same-hash".to_string(),
+        mask: "138****0000".to_string(),
+        seen,
+    };
+    persist_sample_batch(&db, &[row(&d1, 100)]).unwrap();
+    persist_sample_batch(&db, &[row(&d2, 200)]).unwrap();
+    let conn = open_wal(&db).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pii_value_samples WHERE hash='same-hash'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 2, "同 hash 跨天须分两行不合并");
+    let days: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT day) FROM pii_value_samples",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(days, 2);
+    drop(conn);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn model_with_version_colon() {
+    // G7/D7：冒号版本号模型进入模型分桶，不归 unknown_model（对照 redact_extra_test.py:194-208）。
+    use super::super::aggregate::normalize_model;
+    assert_eq!(normalize_model("gpt-4o:2024-08-06"), "gpt-4o:2024-08-06");
+    assert_ne!(normalize_model("gpt-4o:2024-08-06"), "unknown_model");
+    let store = MetricsStore::new(tmp_db("model-colon"));
+    store.record_chat(chat_rec(
+        Protocol::Chat,
+        "gpt-4o:2024-08-06",
+        10,
+        None,
+        None,
+        true,
+        now(),
+    ));
+    let snap = store.snapshot();
+    assert_eq!(snap.per_model.get("gpt-4o:2024-08-06"), Some(&1));
+    assert!(
+        !snap.per_model.contains_key("unknown_model"),
+        "冒号版本不得归 unknown_model: {:?}",
+        snap.per_model
+    );
+    // 既有归一不回退：空归 unknown_model、控制字符剔除。
+    assert_eq!(normalize_model(""), "unknown_model");
+    assert_eq!(normalize_model("a\u{0}b"), "ab");
+}
+
+#[tokio::test]
+async fn flush_idempotent_window() {
+    // G7/D7：批量驱动窗口不丢行、重复 flush 覆盖式 UPSERT 不翻倍（Rust 无 2s
+    // 去抖，事件驱动批量等价）。
+    let db = tmp_db("flush-idem-window");
+    let _ = std::fs::remove_file(&db);
+    let ts = now();
+    let store = MetricsStore::new(db.clone());
+    for i in 0..3 {
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            "flush-m",
+            12,
+            Some(&usage(1, 1, 2)),
+            None,
+            true,
+            ts + i,
+        ));
+    }
+    store.flush().await.unwrap();
+    let first = store.query_series("daily", None, None).await.unwrap();
+    let reqs1: u64 = first.iter().map(|p| p.requests).sum();
+    assert_eq!(reqs1, 3, "批量窗口须含全部三行不丢");
+    store.flush().await.unwrap();
+    let second = store.query_series("daily", None, None).await.unwrap();
+    let reqs2: u64 = second.iter().map(|p| p.requests).sum();
+    assert_eq!(reqs2, 3, "重复 flush 覆盖式不翻倍");
+    assert_eq!(first.len(), second.len(), "窗口行数一致");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
 fn model_approximation_caliber_and_window_check() {
     assert!(super::super::aggregate::is_precise_for_window(3600, 100));
     assert!(super::super::aggregate::is_precise_for_window(86400, 1000));

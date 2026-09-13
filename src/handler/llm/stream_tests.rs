@@ -12,6 +12,7 @@ use {
         approval::PendingApprovals,
         config::AuditMode,
         service::{
+            block_inject,
             credential_vault::CredentialVault,
             llm_gateway::{GatewayMetrics, Protocol},
             metrics::MetricsStore,
@@ -46,6 +47,7 @@ pub(super) fn pump_ctx(
         audit_mode: AuditMode::Off,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
         gateway_metrics: Arc::new(GatewayMetrics::default()),
@@ -103,6 +105,41 @@ pub(super) async fn loopback_server(
     (url, handle)
 }
 
+/// 中途传输错误上游：声明 `content-length` 大于实际写入体后关闭连接，
+/// 触发 reqwest `chunk()` 返回 `Err`（S5/D5 观测回归用）。
+pub(super) async fn broken_body_server(
+    content_type: &str,
+    declared_len: usize,
+    body: Vec<u8>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("回环监听须成功");
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("回环地址须可读")
+    );
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n"
+    );
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 65536];
+            let _ = sock.read(&mut buf).await;
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                continue;
+            }
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (url, handle)
+}
+
 pub(super) async fn collect_pump(
     upstream: reqwest::Response,
     ctx: StreamPumpCtx,
@@ -140,6 +177,7 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"argu
         audit_mode: AuditMode::Block,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
         gateway_metrics: metrics.clone(),
@@ -164,7 +202,11 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"argu
         "残缺调用 id 得到下游: {joined}"
     );
     assert!(!joined.contains("city"), "残缺参数得到下游: {joined}");
-    assert!(!joined.contains("[DONE]"), "截断不得伪造成功终止: {joined}");
+    assert_eq!(
+        block_inject::terminal_count(&frames, "chat"),
+        1,
+        "D6：Chat 截断须补恰一 [DONE] 收尾: {joined}"
+    );
     assert_eq!(
         metrics.truncated_tool_dropped_count(),
         2,
@@ -200,6 +242,7 @@ data: [DONE]
         audit_mode: AuditMode::Block,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
         gateway_metrics: metrics.clone(),
@@ -582,4 +625,108 @@ fn sse_response_builder_headers_compliant() {
             .and_then(|v| v.to_str().ok()),
         Some("json-whitespace")
     );
+}
+
+#[tokio::test]
+async fn stream_transport_error_observed() {
+    // S5/D5：`chunk()` 返回 `Err` 时须记 warn + 截断观测，不静默按 EOF 退出；
+    // Chat 按 D6 补恰一 `[DONE]` 收尾。
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe7\x94\xb2\"}}]}\n\n"
+        .to_vec();
+    let (url, server) = broken_body_server("text/event-stream", body.len() + 128, body).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
+    ctx.gateway_metrics = metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    let joined = frames.join("");
+    assert!(joined.contains('甲'), "已收分片须保留: {joined}");
+    assert_eq!(
+        block_inject::terminal_count(&frames, "chat"),
+        1,
+        "传输错误须按 Chat 策略补恰一 [DONE]: {joined}"
+    );
+    assert_eq!(
+        metrics.truncated_count("open_ended"),
+        1,
+        "chunk Err 须置截断观测（open_ended）"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn midstream_truncation_terminal_matrix() {
+    // D6/S11：三协议中途断流（chunk Err）终端口径矩阵。
+    // Chat 补恰一 [DONE]（open_ended）；Anthropic 不合成 message_stop（open_ended）；
+    // Responses 合成恰一 response.failed（synthesized_failed）。
+    let chat = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xe7\x94\xb2\"}}]}\n\n"
+        .to_vec();
+    let (url, server) = broken_body_server("text/event-stream", chat.len() + 128, chat).await;
+    let upstream = reqwest::Client::new().get(&url).send().await.unwrap();
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
+    ctx.gateway_metrics = metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    assert_eq!(
+        block_inject::terminal_count(&frames, "chat"),
+        1,
+        "Chat 断流须补恰一 [DONE]: {}",
+        frames.join("")
+    );
+    assert_eq!(
+        metrics.truncated_count("open_ended"),
+        1,
+        "Chat 记 open_ended"
+    );
+    server.abort();
+
+    let anthropic = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\xe7\x94\xb2\"}}\n\n".to_vec();
+    let (url, server) =
+        broken_body_server("text/event-stream", anthropic.len() + 128, anthropic).await;
+    let upstream = reqwest::Client::new().get(&url).send().await.unwrap();
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Anthropic, scope, vault, detector);
+    ctx.gateway_metrics = metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    assert_eq!(
+        block_inject::terminal_count(&frames, "anthropic"),
+        0,
+        "Anthropic 断流不得合成 message_stop: {}",
+        frames.join("")
+    );
+    assert_eq!(
+        metrics.truncated_count("open_ended"),
+        1,
+        "Anthropic 记 open_ended"
+    );
+    server.abort();
+
+    let responses = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"\xe7\x94\xb2\"}\n\n".to_vec();
+    let (url, server) =
+        broken_body_server("text/event-stream", responses.len() + 128, responses).await;
+    let upstream = reqwest::Client::new().get(&url).send().await.unwrap();
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+    ctx.gateway_metrics = metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "Responses 断流须合成恰一 response.failed: {}",
+        frames.join("")
+    );
+    assert_eq!(
+        metrics.truncated_count("synthesized_failed"),
+        1,
+        "Responses 记 synthesized_failed"
+    );
+    server.abort();
 }

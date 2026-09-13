@@ -8,23 +8,25 @@ use {
         StreamPumpCtx,
         build_sse_response,
         forward_headers,
+        serve_nondialog_passthrough,
         serve_nonstream,
         spawn_stream_pump,
     },
     crate::{
         service::{
-            llm_gateway::{self, resolve_protocol, resolve_upstream},
+            llm_gateway::{self, Protocol, resolve_protocol, resolve_upstream},
             redaction::Scope,
         },
         state::AppState,
     },
     axum::{
         Json,
+        body::Body,
         extract::{Request, State},
-        http::{StatusCode, header},
+        http::{HeaderMap, StatusCode, header},
         response::{IntoResponse, Response},
     },
-    serde_json::{Value, json},
+    serde_json::json,
     std::{sync::Arc, time::Instant},
 };
 
@@ -70,6 +72,30 @@ pub async fn llm_proxy_handler(State(state): State<AppState>, req: Request) -> R
         gateway_serve(&state, &mut parts, &path, body_bytes).await
     })
     .await
+}
+
+/// T1/D1：入站 query 保序拼接上游 URL。`path` 取 `uri.path()`，query 取
+/// `Uri::query()` 原始切片（不重排、不重编码、不丢空值参数），无 query 时
+/// SHALL NOT 追加 `?`；上游基址自带 query（`?x=y`）时把入站 query 以 `&`
+/// 合并到基址 query 之后，避免双 `?`（T1.2 边界）。
+fn build_upstream_url(base: &str, path: &str, inbound_query: Option<&str>) -> String {
+    let (raw_path, base_query) = match base.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base, None),
+    };
+    let base_path = raw_path.trim_end_matches('/');
+    let mut url = format!("{base_path}{path}");
+    let query = match (base_query, inbound_query) {
+        (Some(b), Some(i)) => Some(format!("{b}&{i}")),
+        (Some(b), None) => Some(b.to_string()),
+        (None, Some(i)) => Some(i.to_string()),
+        (None, None) => None,
+    };
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(&q);
+    }
+    url
 }
 
 /// A1/D8 入口宿主机端口解析：`]` 存在时按方括号 IPv6 取 `]:` 后段端口
@@ -121,8 +147,11 @@ pub(crate) async fn gateway_serve(
                 .into_response();
         }
     };
-    let url = format!("{}{}", upstream_base.trim_end_matches('/'), path);
+    let url = build_upstream_url(&upstream_base, path, parts.uri.query());
     let client: &reqwest::Client = &state.http_client;
+    // T3/D3：流式（SSE）分支用无总超时的独立 client，长流不被 `HTTP_TIMEOUT_SECS` 截断；
+    // 非流与 NonDialog 透传保持既有总超时 client。
+    let stream_client: &reqwest::Client = &state.http_stream_client;
     let scope = Arc::new(Scope::with_opts(
         state.config.pii_response_side,
         state.config.pii_fuzzy_restore,
@@ -143,81 +172,20 @@ pub(crate) async fn gateway_serve(
     };
 
     if !is_chat {
-        // D6：NonDialog 请求体快照：上游意外回 SSE 转泵时 conv 归档与对话路径
-        // 同源（同一 `resolve_conv_id`，未知体归档不断链）；仅 Stream 臂使用。
-        let nondialog_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+        // H11/D11：NonDialog 走专用透传入口（返回 `Response`，无 `Stream` 死臂）；
+        // 上游意外回 SSE 亦按字节透传，类型即契约。
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
-        let nctx = NonstreamCtx {
-            protocol,
-            normalized_out: false,
-            stream_flag: false,
-            scope: scope.clone(),
-            vault: vault.clone(),
-            detector: detector.clone(),
-            gateway_metrics: state.gateway_metrics.clone(),
-            admin_metrics: state.admin.metrics.clone(),
-            sqlite_precise,
-            req_start,
-            audit_mode,
-            audit_policy_file: audit_policy_file.clone(),
-            approval_whitelist: approval_whitelist.clone(),
-            pending: state.pending.clone(),
-            nonstream_max_bytes: state.config.nonstream_max_bytes,
-        };
-        return match serve_nonstream(
+        return serve_nondialog_passthrough(
             client,
             upstream_method,
             &url,
             parts.headers.clone(),
             body_bytes,
-            nctx,
+            protocol,
+            &state.gateway_metrics,
         )
-        .await
-        {
-            NonstreamOutcome::Responded(resp) => resp,
-            // 非对话本不应回 SSE；上游意外回流时仍按字节泵闭合。
-            NonstreamOutcome::Stream(up, req_conv) => {
-                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-                let pctx = StreamPumpCtx {
-                    protocol,
-                    scope,
-                    vault,
-                    detector,
-                    audit_mode: state.config.audit_mode,
-                    audit_policy_file: state.config.audit_policy_file.clone(),
-                    approval_whitelist: state.config.approval_whitelist.clone(),
-                    hold_max,
-                    pii_boundary_chars: if state.config.pii_response_side {
-                        state.config.pii_hold_max.max(1) as usize
-                    } else {
-                        0
-                    },
-                    gateway_metrics: state.gateway_metrics.clone(),
-                    admin_metrics: state.admin.metrics.clone(),
-                    sqlite_precise,
-                    req_start,
-                    pending: state.pending.clone(),
-                    // D6 + E12/D7：转泵 conv 首选透传的请求会话，缺失才经同一
-                    // `resolve_conv_id` 归档（记 `conv_missing`，不断链），
-                    // 阻断帧 id 与对话路径同源。
-                    init_conv: req_conv.or_else(|| {
-                        Some(
-                            llm_gateway::resolve_conv_id(
-                                None,
-                                &nondialog_body,
-                                Some(&state.gateway_metrics),
-                                "nondialog-stream",
-                            )
-                            .0,
-                        )
-                    }),
-                    normalized_out: false,
-                };
-                let _pump = spawn_stream_pump(up, tx, pctx);
-                build_sse_response(rx, false)
-            }
-        };
+        .await;
     }
 
     let rw = super::request_rewrite(
@@ -239,6 +207,7 @@ pub(crate) async fn gateway_serve(
         audit_mode,
         audit_policy_file: audit_policy_file.clone(),
         approval_whitelist: approval_whitelist.clone(),
+        audit_sink: state.audit_sink.clone(),
         hold_max,
         pii_boundary_chars,
         gateway_metrics: state.gateway_metrics.clone(),
@@ -252,7 +221,7 @@ pub(crate) async fn gateway_serve(
     if rw.stream_flag {
         let fwd_headers = forward_headers(&parts.headers, &state.gateway_metrics);
         match llm_gateway::fetch_upstream_with_retry(
-            client,
+            stream_client,
             dialog_method,
             &url,
             fwd_headers,
@@ -261,11 +230,31 @@ pub(crate) async fn gateway_serve(
         .await
         {
             Ok(up) => {
+                let status_u16 = up.status().as_u16();
+                let resp_ct = up
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                // S6/D7：仅 `status<400` 且上游正文为 `text/event-stream` 才转 SSE 泵；
+                // 上游错误状态（4xx/5xx）或 2xx 非 SSE 正文按非流口径保状态保正文透传，
+                // 不得改写为 200 SSE 假流（客户端会误判为流式成功）。
+                if status_u16 >= 400 || !resp_ct.contains("text/event-stream") {
+                    return stream_upstream_passthrough(
+                        up,
+                        rw.normalized_out,
+                        protocol,
+                        state.config.nonstream_max_bytes,
+                        &state.gateway_metrics,
+                    )
+                    .await;
+                }
                 let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
                 let _pump = spawn_stream_pump(up, tx, pump_ctx());
                 build_sse_response(rx, rw.normalized_out)
             }
-            Err(_) => super::empty_body_response(),
+            Err(_) => super::empty_body_response(protocol),
         }
     } else {
         let nctx = NonstreamCtx {
@@ -282,6 +271,7 @@ pub(crate) async fn gateway_serve(
             audit_mode,
             audit_policy_file: audit_policy_file.clone(),
             approval_whitelist: approval_whitelist.clone(),
+            audit_sink: state.audit_sink.clone(),
             pending: state.pending.clone(),
             nonstream_max_bytes: state.config.nonstream_max_bytes,
         };
@@ -312,6 +302,53 @@ pub(crate) async fn gateway_serve(
     }
 }
 
+/// S6/D7：流式请求命中上游错误状态（`status>=400`）或非 `text/event-stream` 正文时，
+/// 读取正文字节并按原状态返回（受 `NONSTREAM_MAX_BYTES` 约束），hop 头过滤后附
+/// `x-veil-protocol`，对齐非流错误/非 JSON 透传口径；不进入 SSE 泵。
+/// 非错误状态严格超限走 502 `response_too_large`（与非流一致），4xx/5xx 错误体
+/// 不因体大改写。
+async fn stream_upstream_passthrough(
+    up: reqwest::Response,
+    normalized_out: bool,
+    protocol: Protocol,
+    max_bytes: usize,
+    metrics: &llm_gateway::GatewayMetrics,
+) -> Response {
+    let status_u16 = up.status().as_u16();
+    let mut resp_headers = HeaderMap::new();
+    for (k, v) in up.headers().iter() {
+        if let (Ok(n), Ok(val)) = (
+            k.to_string().parse::<axum::http::HeaderName>(),
+            axum::http::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            resp_headers.insert(n, val);
+        }
+    }
+    let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
+    let bytes = up.bytes().await.unwrap_or_default();
+    if status_u16 < 400 && bytes.len() > max_bytes {
+        return super::nonstream::oversize_response(protocol);
+    }
+    llm_gateway::filter_hop_headers_counted(
+        &mut resp_headers,
+        "downstream",
+        decode_enabled,
+        Some(metrics),
+    );
+    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for (k, v) in resp_headers.iter() {
+        builder = builder.header(k, v);
+    }
+    if normalized_out {
+        builder = builder.header("x-veil-normalized", "json-whitespace");
+    }
+    builder
+        .header("x-veil-protocol", super::protocol_header_value(protocol))
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
+}
+
 #[cfg(test)]
 mod entry_tests {
     use super::{
@@ -323,6 +360,31 @@ mod entry_tests {
         },
         *,
     };
+
+    #[test]
+    fn build_upstream_url_query_join_and_absent() {
+        // 无 query 不追加 `?`；有 query 原样拼接；基址自带 query 以 `&` 合并。
+        assert_eq!(
+            super::build_upstream_url("http://up:1", "/v1/models", None),
+            "http://up:1/v1/models"
+        );
+        assert_eq!(
+            super::build_upstream_url(
+                "http://up:1",
+                "/v1/models",
+                Some("limit=&tag=a&tag=b&q=a+b&x=a%2Fb")
+            ),
+            "http://up:1/v1/models?limit=&tag=a&tag=b&q=a+b&x=a%2Fb"
+        );
+        assert_eq!(
+            super::build_upstream_url("http://up:1?base=1", "/v1/models", Some("limit=")),
+            "http://up:1/v1/models?base=1&limit="
+        );
+        assert_eq!(
+            super::build_upstream_url("http://up:1/?base=1", "/v1/models", None),
+            "http://up:1/v1/models?base=1"
+        );
+    }
 
     #[test]
     fn ingress_port_bracketed_ipv6_and_bare_fallback_a1() {
@@ -380,7 +442,14 @@ mod entry_tests {
         let over = vec![b'x'; 64];
         let err = axum::body::to_bytes(axum::body::Body::from(over), 16).await;
         assert!(err.is_err());
-        let ok = axum::body::to_bytes(axum::body::Body::from(vec![b'x'; 16]), 16).await;
-        assert!(ok.is_ok());
+        // 恰达上限放行：结果体内容与长度精确对拍，不得静默为空。
+        let ok = axum::body::to_bytes(axum::body::Body::from(vec![b'x'; 16]), 16)
+            .await
+            .expect("恰达上限须放行");
+        assert_eq!(ok.len(), 16, "结果体长度须等于输入: {ok:?}");
+        assert_eq!(&ok[..], &[b'x'; 16][..], "结果体内容须逐字节保留");
+        // 超限一字节即报错（非 Ok 空体），不静默截断。
+        let over_by_one = axum::body::to_bytes(axum::body::Body::from(vec![b'y'; 17]), 16).await;
+        assert!(over_by_one.is_err(), "17 字节超 16 上限须报错而非静默");
     }
 }

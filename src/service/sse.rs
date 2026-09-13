@@ -154,6 +154,27 @@ mod tests {
     }
 
     #[test]
+    fn push_bytes_reassembles_multiline_and_split_utf8_before_dispatch() {
+        // G8.1：`push_bytes` 重组语义——多行 data 跨块合并且 UTF-8 跨块拼接后
+        // 分发完整文本，而非仅断言帧数/切分。
+        let mut p = SseParser::new();
+        assert!(p.push_bytes("data: 第一行\n".as_bytes()).is_empty());
+        assert!(p.push_bytes("data: 第二行\n".as_bytes()).is_empty());
+        let evs = p.push_bytes(b"\n");
+        assert_eq!(evs.len(), 1, "空行到达方分发: {evs:?}");
+        assert_eq!(evs[0].data, "第一行\n第二行", "多行 data 须以 \\n 合并");
+        // 跨块 UTF-8：逐字节喂入多字节字符，任何切点都不得丢字节或提前分发。
+        let mut q = SseParser::new();
+        assert!(q.push_bytes("data: ".as_bytes()).is_empty());
+        for byte in "跨越分片的中文".as_bytes() {
+            assert!(q.push_bytes(&[*byte]).is_empty(), "字符中途不得提前分发");
+        }
+        let evs = q.push_bytes(b"\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "跨越分片的中文", "跨块 UTF-8 须拼出完整文本");
+    }
+
+    #[test]
     fn line_buffer_16kb_truncates_with_counter_and_mark() {
         // C11：超长行改丢弃为截断——头 16KB 保留分发审计，尾部计数，
         // 事件带截断标记；后续正常帧不受影响。

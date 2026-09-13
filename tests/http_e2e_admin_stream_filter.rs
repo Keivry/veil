@@ -3,25 +3,16 @@
 //! 旧 `?model=&upstream=` 的「忽略过滤 + deprecated 标注」口径。
 
 use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    },
-    veil::{
-        config::Config,
-        router::build_router,
-        service::{
-            credential::AppStateParts,
-            llm_gateway::{Protocol, Usage},
-            metrics::ChatRecord,
-        },
-        state::SqliteOutcome,
+    common::{serve, test_app},
+    std::time::{Duration, SystemTime, UNIX_EPOCH},
+    veil::service::{
+        credential::AppStateParts,
+        llm_gateway::{Protocol, Usage},
+        metrics::ChatRecord,
     },
 };
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
+mod common;
 
 const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
 
@@ -37,48 +28,10 @@ fn usage(p: u64, c: u64, t: u64) -> Usage {
         prompt_tokens: p,
         completion_tokens: c,
         total_tokens: t,
+        total_explicit: true,
         cached_read: 0,
         cached_write: 0,
     }
-}
-
-fn test_app() -> (axum::Router, veil::state::AppState) {
-    let env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            ADMIN_TOKEN.to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-    ]);
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let db = PathBuf::from(format!("/tmp/veil-e2e-admin-stream-{n}.sqlite"));
-    let _ = std::fs::remove_file(&db);
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: db,
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    let router = build_router(state.clone());
-    (router, state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
 }
 
 async fn get_json(client: &reqwest::Client, base: &str, path: &str) -> (u16, serde_json::Value) {
@@ -137,7 +90,7 @@ async fn read_sse_data(mut resp: reqwest::Response, want: usize, window: Duratio
 async fn sse_stream_model_upstream_filter() {
     // T4/D4：SSE 建连 `?model=` 按事件 protocol 子串、`?upstream=` 按摘要子串
     // 过滤；命中流非零事件、未命中流零事件、双条件取交集、空值不过滤。
-    let (app, state) = test_app();
+    let (app, state) = test_app(common::TestOpts::default());
     state.admin_state().push_event(
         "audit",
         "up-A 命中摘要",
@@ -212,7 +165,7 @@ async fn sse_stream_model_upstream_filter() {
 async fn metrics_events_deprecated_ignore() {
     // T4/D4：metrics/events 旧 `?model=&upstream=` 忽略过滤 + deprecated 标注，
     // 结果与全局口径一致（不做空结果误导）。
-    let (app, state) = test_app();
+    let (app, state) = test_app(common::TestOpts::default());
     let ts = now_secs();
     let u = usage(10, 5, 15);
     state.admin_state().metrics.record_chat(ChatRecord {

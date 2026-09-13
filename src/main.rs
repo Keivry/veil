@@ -36,6 +36,12 @@ fn lock_memory_linux() {
 #[cfg(not(target_os = "linux"))]
 fn lock_memory_linux() {}
 
+/// A15/D14：启动前显式白名单门禁（第一真源为 `Config::load_from` 的配置加载期校验）；
+/// 纯校验零副作用，置于 TPM/sqlite/KeePass/后台任务之前，非法白名单 fail-fast。
+fn preflight_whitelist(whitelist: &[String]) -> Result<(), String> {
+    veil::service::matrix::validate_whitelist_mxids(whitelist)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     lock_memory_linux();
@@ -46,6 +52,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // A15/D14：白名单显式门禁前移至 TPM/sqlite/KeePass/清扫/回填之前——
+    // 校验失败在触盘/触网/触 TPM 前即退出。
+    if let Err(err) = preflight_whitelist(&config.approval_whitelist) {
+        eprintln!("启动失败: {err}");
+        return ExitCode::from(1);
+    }
 
     let allow_mock_tpm = allow_mock_from_env();
     if config.pii_value_sample_enabled
@@ -108,16 +121,11 @@ async fn main() -> ExitCode {
     }
     let _orphan_sweeper = state.approval.spawn_sweeper();
     let _pending_sweeper = state.pending.spawn_sweeper();
+    state.notify.start();
     // 指标重启回填：sqlite 聚合覆盖式恢复内存窗口；失败仅 warn（内存-only 照常服务）。
     match state.admin.metrics.backfill_from_sqlite().await {
         Ok(n) => tracing::info!("指标回填完成: {n} 个聚合窗口"),
         Err(err) => tracing::warn!("指标回填失败，内存窗口从空累计: {err:#}"),
-    }
-    if let Err(err) =
-        veil::service::matrix::validate_whitelist_mxids(&state.config.approval_whitelist)
-    {
-        eprintln!("启动失败: {err}");
-        return ExitCode::from(1);
     }
     let sync_bot = veil::service::matrix::MatrixBot::with_client(
         state.config.homeserver.clone(),
@@ -130,8 +138,11 @@ async fn main() -> ExitCode {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let gateway_cleanup: std::sync::Arc<dyn veil::service::matrix::GatewayCleanup> =
+        std::sync::Arc::new(state.clone());
     let _matrix_sync = sync_bot.spawn_sync_loop(
         std::sync::Arc::clone(&state.approval),
+        gateway_cleanup,
         sync_token_file,
         start_ts_ms,
     );
@@ -153,4 +164,38 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preflight_whitelist;
+
+    /// A15/D14：真实门禁函数行为（非法拒绝/合法放行）+ 生产启动序不变量——门禁调用须早于
+    /// TPM/sqlite/后台任务等副作用点；门禁纯校验零副作用，其失败即 fail-fast，不触盘/触
+    /// TPM/起任务。
+    #[test]
+    fn startup_whitelist_fail_fast() {
+        assert!(
+            preflight_whitelist(&["@a@b:c".to_string()]).is_err(),
+            "非法白名单须拒绝"
+        );
+        assert!(
+            preflight_whitelist(&["@admin:example.com".to_string()]).is_ok(),
+            "合法白名单须放行"
+        );
+        let src = include_str!("main.rs");
+        let gate = src
+            .find("preflight_whitelist(&config.approval_whitelist)")
+            .expect("白名单门禁调用点");
+        for after in [
+            "startup_tpm_in(&config.tpm_dir",
+            "init_sqlite(&config.data_dir)",
+            ".spawn_sweeper()",
+        ] {
+            let at = src
+                .find(after)
+                .unwrap_or_else(|| panic!("缺少启动点 {after}"));
+            assert!(gate < at, "白名单门禁须早于 {after}");
+        }
+    }
 }

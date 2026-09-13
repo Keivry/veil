@@ -74,6 +74,7 @@ fn nonstream_ctx(
         audit_mode: AuditMode::Off,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         pending: Arc::new(PendingApprovals::default()),
         nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
     }
@@ -348,8 +349,9 @@ async fn nonstream_error_non_json_passthrough_without_swallowing() {
 }
 
 #[tokio::test]
-async fn nonstream_broken_restore_falls_back_to_upstream() {
-    // P0-1.2 回归：还原把含引号明文写回 JSON 串内致破裂时，回退上游原文并 warn。
+async fn nonstream_quote_plain_restored_escaped() {
+    // T6/D6 新语义：明文含引号经 JSON 转义变体还原，不再破裂回退上游原文；
+    // 下游 JSON 可解析且字段为完整明文、无占位符。
     let (scope, vault, detector) = fresh_arcs();
     let plain = "ab\"cd-ef";
     let token = vault.register(plain).expect("测试凭据须注册成功");
@@ -381,10 +383,19 @@ async fn nonstream_broken_restore_falls_back_to_upstream() {
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .expect("响应体须可读");
-    assert_eq!(body.as_ref(), up_body.as_bytes(), "破裂还原须回退上游原文");
+    let got: Value = serde_json::from_slice(&body).expect("还原后下游须收到合法 JSON");
+    assert_eq!(
+        got["choices"][0]["message"]["content"], plain,
+        "字段须为完整明文"
+    );
     assert!(
-        serde_json::from_slice::<Value>(&body).is_ok(),
-        "回退后下游须收到合法 JSON"
+        !String::from_utf8_lossy(&body).contains("__VG_CRED_"),
+        "不得残留占位符"
+    );
+    assert_ne!(
+        body.as_ref(),
+        up_body.as_bytes(),
+        "须完成还原（含转义），不得原样回退上游 token 原文"
     );
     server.abort();
 }

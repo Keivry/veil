@@ -7,6 +7,10 @@ pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// 该事件是否显式携带 total（`total_tokens`/`total`）。
+    /// 跨事件合并口径：任一事件显式 total 取显式 `max`；全部事件均无显式
+    /// total 时最终 `total = max(prompt)+max(completion)`（T7/D7）。
+    pub total_explicit: bool,
     /// 缓存命中读（对标 `_metrics.py:155` `cached_read` 列）。
     pub cached_read: u64,
     /// 缓存写入（仅 Anthropic 有值，其余归零）。
@@ -68,16 +72,17 @@ fn usage_from_obj(obj: &serde_json::Map<String, Value>, protocol: Protocol) -> O
         .and_then(as_u64)
         .or_else(|| obj.get("output_tokens").and_then(as_u64))
         .unwrap_or(0);
-    let total = obj
+    let explicit_total = obj
         .get("total_tokens")
         .and_then(as_u64)
-        .or_else(|| obj.get("total").and_then(as_u64))
-        .unwrap_or_else(|| prompt.saturating_add(completion));
+        .or_else(|| obj.get("total").and_then(as_u64));
+    let total = explicit_total.unwrap_or_else(|| prompt.saturating_add(completion));
     let (cached_read, cached_write) = cached_columns(protocol, obj);
     Some(Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
+        total_explicit: explicit_total.is_some(),
         cached_read,
         cached_write,
     })
@@ -89,14 +94,28 @@ fn usage_in(obj: &serde_json::Map<String, Value>, protocol: Protocol) -> Option<
         .and_then(|o| usage_from_obj(o, protocol))
 }
 
+/// 跨事件合并（T7/D7 口径，勿改）：`prompt/completion/cached_*` 逐列 `max`；
+/// `total_tokens` 若任一事件显式携带则取显式 `max`（保留上游声明），
+/// 若全部事件均无显式 total 则最终按合并后 `prompt_max+completion_max` 归一
+/// （Anthropic `message_start` 输入 + `message_delta` 输出必须求和而非取 max）。
 fn merge_usage(acc: &mut Option<Usage>, next: Usage) {
     match acc {
         Some(a) => {
             a.prompt_tokens = a.prompt_tokens.max(next.prompt_tokens);
             a.completion_tokens = a.completion_tokens.max(next.completion_tokens);
-            a.total_tokens = a.total_tokens.max(next.total_tokens);
             a.cached_read = a.cached_read.max(next.cached_read);
             a.cached_write = a.cached_write.max(next.cached_write);
+            if next.total_explicit {
+                a.total_tokens = if a.total_explicit {
+                    a.total_tokens.max(next.total_tokens)
+                } else {
+                    next.total_tokens
+                };
+            }
+            a.total_explicit |= next.total_explicit;
+            if !a.total_explicit {
+                a.total_tokens = a.prompt_tokens.saturating_add(a.completion_tokens);
+            }
         }
         None => *acc = Some(next),
     }
@@ -483,5 +502,94 @@ mod tests {
             "乱序输入按列取历史最大"
         );
         assert_ne!(b.total_tokens, 150 + 15 + 220, "禁止 sum 双计");
+    }
+
+    #[test]
+    fn anthropic_usage_total_across_events() {
+        // T7/D7：start 给输入、delta 给输出，全部无显式 total → total 求和非取 max。
+        let start = serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}});
+        let delta = serde_json::json!({"type":"message_delta","usage":{"output_tokens":50}});
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &start));
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &delta));
+        let a = acc.expect("须有累计值");
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+            (100, 50, 150),
+            "跨事件须 prompt_max + completion_max，不得单事件派生取 max"
+        );
+    }
+
+    #[test]
+    fn usage_explicit_total_priority() {
+        // T7/D7：任一事件显式 total 时取显式 max，忽略分列和。
+        let explicit = serde_json::json!({"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":999}});
+        let derived = serde_json::json!({"usage":{"prompt_tokens":20,"completion_tokens":7}});
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Chat, &explicit));
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Chat, &derived));
+        let a = acc.expect("须有累计值");
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+            (20, 7, 999),
+            "显式 total 优先，分列各自 max 不覆盖 total"
+        );
+        let mut acc2: Option<Usage> = None;
+        accumulate_usage(&mut acc2, extract_usage_stream(Protocol::Chat, &explicit));
+        accumulate_usage(
+            &mut acc2,
+            extract_usage_stream(
+                Protocol::Chat,
+                &serde_json::json!({"usage":{"total_tokens":1234}}),
+            ),
+        );
+        assert_eq!(
+            acc2.expect("须有累计值").total_tokens,
+            1234,
+            "多个显式 total 取 max"
+        );
+    }
+
+    #[test]
+    fn usage_merge_regression() {
+        // T7/8.2：三协议回归，合并改动不得漂移既有取数。
+        let chat =
+            serde_json::json!({"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}});
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Chat, &chat));
+        let a = acc.expect("chat 单帧须取值");
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+            (3, 4, 7)
+        );
+        let multi = serde_json::json!({"choices":[{"delta":{"content":"x"}}],
+            "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}});
+        let mut acc2: Option<Usage> = None;
+        accumulate_usage(&mut acc2, extract_usage_stream(Protocol::Chat, &multi));
+        assert_eq!(acc2.expect("chat 多帧须取值").total_tokens, 7);
+        // Responses 三级回退数值不变：顶层 → response.usage → response.response.usage。
+        let cases = [
+            (
+                serde_json::json!({"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57}}}),
+                57,
+            ),
+            (
+                serde_json::json!({"type":"response.completed","response":{"response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}}),
+                5,
+            ),
+            (
+                serde_json::json!({"type":"response.completed","usage":{"input_tokens":7,"output_tokens":8,"total_tokens":15}}),
+                15,
+            ),
+        ];
+        for (ev, total) in cases {
+            let mut acc: Option<Usage> = None;
+            accumulate_usage(&mut acc, extract_usage_stream(Protocol::Responses, &ev));
+            assert_eq!(
+                acc.expect("responses 回退须取值").total_tokens,
+                total,
+                "Responses 三级回退数值不得漂移: {ev}"
+            );
+        }
     }
 }

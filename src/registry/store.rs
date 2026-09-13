@@ -1,14 +1,14 @@
 //! 注册表存储（B6/D6 自 `registry.rs` 拆出）：加载/原子落盘/完整性/绑定哈希。
 
 use {
-    super::entry::{CallerEntry, OLD_HASH_GRACE_SECS, RegisterParams},
+    super::entry::{CallerEntry, HashChangeOutcome, OLD_HASH_GRACE_SECS, RegisterParams},
     crate::{
         auth::sha256_hex,
         error::{Result, VeilError},
         fs_perm::ensure_0600,
     },
     serde::{Deserialize, Serialize},
-    std::{collections::BTreeMap, path::Path},
+    std::{collections::BTreeMap, io::Write as _, path::Path},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -110,8 +110,16 @@ pub(crate) static BIND_READ_DELAY_MS: std::sync::atomic::AtomicU64 =
 pub(crate) static BIND_READ_ENTERED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 纯字节原子落盘（B1/D1）：`create_dir_all` + tmp 写 + `0600` + rename + `0600`，
-/// 不引用 `CallerRegistry`，可在 `spawn_blocking` 中于写锁外调用。
+fn storage_io(what: &str, e: std::io::Error) -> VeilError {
+    VeilError::Storage {
+        message: format!("{what}: {e}"),
+    }
+}
+
+/// 纯字节原子落盘（B1/D1）：`create_dir_all` + tmp 写 + `0600`，
+/// 随后 `sync_all`、rename、`0600`、父目录 `sync_all`（`C14`/D14，
+/// 掉电后已确认写不丢失）；不引用 `CallerRegistry`，可在 `spawn_blocking`
+/// 中于写锁外调用。
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(test)]
     {
@@ -125,19 +133,31 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|e| VeilError::Storage {
-            message: format!("注册表目录创建失败: {e}"),
-        })?;
+        std::fs::create_dir_all(parent).map_err(|e| storage_io("注册表目录创建失败", e))?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| VeilError::Storage {
-        message: format!("注册表暂存写入失败: {e}"),
-    })?;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| storage_io("注册表暂存写入失败", e))?;
+    file.write_all(bytes)
+        .map_err(|e| storage_io("注册表暂存写入失败", e))?;
+    #[cfg(test)]
+    if FAIL_SYNC.with(std::cell::Cell::get) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(storage_io(
+            "注册表 fsync 失败（测试注入）",
+            std::io::Error::other("injected fsync failure"),
+        ));
+    }
+    file.sync_all()
+        .map_err(|e| storage_io("注册表 fsync 失败", e))?;
+    drop(file);
     ensure_0600(&tmp);
-    std::fs::rename(&tmp, path).map_err(|e| VeilError::Storage {
-        message: format!("注册表原子提交失败: {e}"),
-    })?;
+    std::fs::rename(&tmp, path).map_err(|e| storage_io("注册表原子提交失败", e))?;
     ensure_0600(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| storage_io("注册表目录 fsync 失败", e))?;
+    }
     Ok(())
 }
 
@@ -145,6 +165,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     pub(crate) static FAIL_INTEGRITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// 测试钩子（仅测试，线程局部）：本线程置位后 `write_atomic` 模拟 fsync 失败（C14 故障注入）。
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// 完整性哈希（B4/D4）：序列化失败显式返回错误，不得以空串/默认值弱化校验。
@@ -171,17 +197,14 @@ impl CallerRegistry {
         let raw = std::fs::read(path).map_err(|e| VeilError::Storage {
             message: format!("注册表读取失败: {}: {e}", path.display()),
         })?;
-        let file: RegistryFile = serde_json::from_slice(&raw).map_err(|e| VeilError::Storage {
-            message: format!("注册表解析失败: {e}"),
-        })?;
-        if file.sha256 != integrity_of(&file.entries)? {
-            return Err(VeilError::Storage {
-                message: "注册表完整性校验失败（sha256 失配），拒绝加载".to_string(),
-            });
+        // 新格式直读；解析或完整性失败时交迁移入口识别旧形态（`C4`/D4），
+        // 两者皆不匹配仍 fail-closed。
+        match serde_json::from_slice::<RegistryFile>(&raw) {
+            Ok(file) if file.sha256 == integrity_of(&file.entries)? => Ok(Self {
+                entries: file.entries,
+            }),
+            _ => Self::migrate_python_registry(path),
         }
-        Ok(Self {
-            entries: file.entries,
-        })
     }
 
     /// 锁内纯段（B1/D1）：仅构造完整性并序列化（纯 CPU，不触文件系统）。
@@ -213,6 +236,28 @@ impl CallerRegistry {
             .find(|e| crate::auth::ct_eq(&e.expected_hash, caller_hash))
     }
 
+    /// 按展示名定位（`C5`/D5）：未吊销条目优先；因注册已拒未吊销重名，
+    /// 未吊销集合内至多一条，历史已吊销同名仅在无未吊销命中时兜底。
+    pub fn lookup_by_name(&self, name: &str) -> Option<&CallerEntry> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.entries
+            .values()
+            .find(|e| !e.revoked && e.name == name)
+            .or_else(|| self.entries.values().find(|e| e.name == name))
+    }
+
+    /// 按 `path`/`hash`/`name` 解析规范 `caller_path`（`C3`/D3：哈希变更落定入口的
+    /// `reg_id` 缺省回退 `caller_path`；`C5`/D5：按名吊销定位入口）。
+    pub fn resolve_path(&self, key: &str) -> Option<String> {
+        self.lookup_by_path(key)
+            .map(|e| e.caller_path.clone())
+            .or_else(|| self.lookup_by_hash(key).map(|e| e.caller_path.clone()))
+            .or_else(|| self.lookup_by_name(key).map(|e| e.caller_path.clone()))
+    }
+
     pub fn register(&mut self, caller_path: &str, caller_hash: &str) -> Result<&CallerEntry> {
         self.register_extended(&RegisterParams {
             caller_path: caller_path.to_string(),
@@ -241,11 +286,19 @@ impl CallerRegistry {
                 message: "caller_path 与 caller_hash 均必填".to_string(),
             });
         }
-        // 冲突判定只看 path：同值多路径允许分别注册（对标 Python 口径）。
-        // 全局 hash 唯一拒绝已删除：内容相同的双脚本可各自注册。
+        // 注册判重口径（`F17`，`veil-oracle-followup-fix`）：全局 hash 去重已移除
+        // （内容相同双脚本可各自注册）；判重仍按 `caller_path` 与未吊销 `name`——
+        // path 已存在直接拒绝；`name` 非空且与任一未吊销条目重名亦拒绝
+        // （`C5`/D5，已吊销条目释放其名以允许复用）。
         if self.entries.contains_key(caller_path) {
             return Err(VeilError::Conflict {
                 message: format!("调用方已注册: {caller_path}"),
+            });
+        }
+        let name = params.name.trim();
+        if !name.is_empty() && self.entries.values().any(|e| !e.revoked && e.name == name) {
+            return Err(VeilError::Conflict {
+                message: format!("调用方名称已存在: {name}"),
             });
         }
         let entry = CallerEntry {
@@ -285,15 +338,24 @@ impl CallerRegistry {
         new_hash: &str,
     ) -> Result<&CallerEntry> {
         let script_sha256 = bind_script_sha256(caller_path, new_hash);
-        self.approve_hash_change_with_script_sha256(caller_path, new_hash, script_sha256)
+        self.approve_hash_change_with_script_sha256(
+            caller_path,
+            new_hash,
+            script_sha256,
+            HashChangeOutcome::KeepAuto,
+        )
     }
 
     /// 预计算脚本哈希入口（D5）：生产写路径在取写锁前异步读取后传入。
+    /// `outcome`（`C3`/D3）三态：`KeepAuto` 保持 `allow_mode`、`DemoteManual`
+    /// 降级 `Pending`、`Disable` 置 `enabled=false`；三态均写旧哈希宽限与
+    /// `script_sha256`。
     pub fn approve_hash_change_with_script_sha256(
         &mut self,
         caller_path: &str,
         new_hash: &str,
         script_sha256: String,
+        outcome: HashChangeOutcome,
     ) -> Result<&CallerEntry> {
         let entry = self
             .entries
@@ -307,8 +369,20 @@ impl CallerRegistry {
         }
         entry.expected_hash = new_hash.to_string();
         entry.script_sha256 = script_sha256;
-        entry.revoked = false;
-        entry.enabled = true;
+        match outcome {
+            HashChangeOutcome::KeepAuto => {
+                entry.revoked = false;
+                entry.enabled = true;
+            }
+            HashChangeOutcome::DemoteManual => {
+                entry.revoked = false;
+                entry.enabled = true;
+                entry.allow_mode = Some(crate::config::AutoApprove::Pending);
+            }
+            HashChangeOutcome::Disable => {
+                entry.enabled = false;
+            }
+        }
         Ok(entry)
     }
 
@@ -332,7 +406,17 @@ impl CallerRegistry {
             .iter()
             .find(|(_, e)| crate::auth::ct_eq(&e.expected_hash, key))
             .map(|(k, _)| k.clone());
-        path.and_then(|k| self.entries.get_mut(&k))
+        if let Some(k) = path {
+            return self.entries.get_mut(&k);
+        }
+        let name = self
+            .entries
+            .iter()
+            .find(|(_, e)| !e.revoked && e.name == key);
+        let name = name
+            .or_else(|| self.entries.iter().find(|(_, e)| e.name == key))
+            .map(|(k, _)| k.clone());
+        name.and_then(|k| self.entries.get_mut(&k))
     }
 
     pub fn len(&self) -> usize { self.entries.len() }
@@ -343,231 +427,4 @@ impl CallerRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_path_conflicts_409_same_hash_multi_path_allowed() {
-        let mut reg = CallerRegistry::empty();
-        reg.register("/s/a.sh", "h1").unwrap();
-        let err = reg.register("/s/a.sh", "h2").unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::CONFLICT);
-        // 同 hash 不同 path：允许分别注册（冲突只看 path）。
-        let e2 = reg.register("/s/b.sh", "h1").unwrap();
-        assert_eq!(e2.caller_path, "/s/b.sh");
-        assert_eq!(reg.len(), 2);
-    }
-
-    #[test]
-    fn new_registration_disabled_by_default() {
-        let mut reg = CallerRegistry::empty();
-        let e = reg.register("/s/a.sh", "h1").unwrap();
-        assert!(!e.enabled && !e.revoked);
-        assert_eq!(e.status_emoji(), "🔓");
-    }
-
-    #[test]
-    fn atomic_save_and_integrity_check() {
-        let dir = std::env::temp_dir().join(format!(
-            "veil-reg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("caller_registry.json");
-        let mut reg = CallerRegistry::empty();
-        reg.register("/s/a.sh", "h1").unwrap();
-        reg.save_to(&path).unwrap();
-        let loaded = CallerRegistry::load_from(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-        let mut raw = std::fs::read_to_string(&path).unwrap();
-        raw = raw.replace('h', "x");
-        std::fs::write(&path, raw).unwrap();
-        assert!(CallerRegistry::load_from(&path).is_err());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn revoke_disables_entry() {
-        let mut reg = CallerRegistry::empty();
-        reg.register("/s/a.sh", "h1").unwrap();
-        reg.set_enabled("/s/a.sh", true).unwrap();
-        reg.revoke("/s/a.sh").unwrap();
-        let e = reg.lookup_by_path("/s/a.sh").unwrap();
-        assert!(e.revoked && !e.enabled);
-        assert_eq!(e.status_emoji(), "❎");
-    }
-
-    #[test]
-    fn approve_hash_change_applies_and_enables() {
-        let mut reg = CallerRegistry::empty();
-        reg.register("/s/a.sh", "h1").unwrap();
-        reg.approve_hash_change("/s/a.sh", "h2").unwrap();
-        let e = reg.lookup_by_path("/s/a.sh").unwrap();
-        assert_eq!(e.expected_hash, "h2");
-        assert!(e.enabled && !e.revoked);
-        assert_eq!(e.status_emoji(), "✅");
-    }
-
-    #[test]
-    fn saved_file_permissions_0600() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!(
-            "veil-reg-0600-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("caller_registry.json");
-        let mut reg = CallerRegistry::empty();
-        reg.register("/s/a.sh", "h1").unwrap();
-        reg.save_to(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn extended_register_keeps_name_desc_and_allowlist() {
-        let mut reg = CallerRegistry::empty();
-        reg.register_extended(&RegisterParams {
-            caller_path: "/s/go.sh".to_string(),
-            caller_hash: "gh1".to_string(),
-            name: "check-mail".to_string(),
-            description: "检查邮件".to_string(),
-            entries: BTreeMap::from([("网易".to_string(), vec!["授权码".to_string()])]),
-            allow_mode: Some(crate::config::AutoApprove::Pending),
-        })
-        .unwrap();
-        let e = reg.lookup_by_path("/s/go.sh").unwrap();
-        assert_eq!(e.name, "check-mail");
-        assert_eq!(e.description, "检查邮件");
-        assert_eq!(
-            e.effective_allow_mode(crate::config::AutoApprove::Allow),
-            crate::config::AutoApprove::Pending
-        );
-    }
-
-    #[test]
-    fn missing_entry_no_db_invalid_json_and_double_revoke_idempotent() {
-        let mut reg = CallerRegistry::empty();
-        assert!(reg.lookup_by_path("/s/nope.sh").is_none(), "未注册缺条目");
-        let err = reg.revoke("/s/nope.sh").unwrap_err();
-        assert!(err.to_string().contains("调用方不存在"), "缺条目吊销须明错");
-        reg.register("/s/d.sh", "h1").unwrap();
-        reg.revoke("/s/d.sh").unwrap();
-        reg.revoke("/s/d.sh").expect("清理双删须幂等成功");
-        let e = reg.lookup_by_path("/s/d.sh").unwrap();
-        assert!(e.revoked && !e.enabled);
-        let missing = std::env::temp_dir().join(format!(
-            "veil-reg-missing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let loaded = CallerRegistry::load_from(&missing.join("no.json")).unwrap();
-        assert_eq!(loaded.len(), 0, "无库须兼容空表");
-        std::fs::create_dir_all(&missing).unwrap();
-        let bad = missing.join("bad.json");
-        std::fs::write(&bad, b"{not json").unwrap();
-        assert!(CallerRegistry::load_from(&bad).is_err(), "无效 JSON 须拒载");
-        std::fs::remove_dir_all(&missing).ok();
-    }
-
-    #[test]
-    fn integrity_serialize_failure() {
-        let dir = std::env::temp_dir().join(format!(
-            "veil-reg-failint-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("caller_registry.json");
-        let mut reg = CallerRegistry::empty();
-        reg.register("/s/a.sh", "h1").unwrap();
-        reg.save_to(&path).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        FAIL_INTEGRITY.with(|f| f.set(true));
-        let err = reg.save_to(&path).unwrap_err();
-        assert!(err.to_string().contains("完整性"), "{err}");
-        assert!(!path.with_extension("tmp").exists(), "失败不得残留 tmp");
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "原文件字节不得被覆盖"
-        );
-        let err = CallerRegistry::load_from(&path).unwrap_err();
-        assert!(err.to_string().contains("完整性"), "{err}");
-        FAIL_INTEGRITY.with(|f| f.set(false));
-        assert!(CallerRegistry::load_from(&path).is_ok());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn bind_script_size_cap() {
-        let dir = std::env::temp_dir().join(format!(
-            "veil-reg-bindcap-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let big = dir.join("big.sh");
-        let file = std::fs::File::create(&big).unwrap();
-        file.set_len(BIND_SCRIPT_MAX_BYTES + 1).unwrap();
-        drop(file);
-        let big_str = big.to_string_lossy().into_owned();
-        let got = bind_script_sha256_async(big_str.clone(), "cap-h".to_string()).await;
-        assert_eq!(
-            got,
-            derived_script_sha256("cap-h", &big_str),
-            "超限文件须回退派生且结果与公式一致"
-        );
-        let small = dir.join("small.sh");
-        std::fs::write(&small, b"echo hi").unwrap();
-        let small_str = small.to_string_lossy().into_owned();
-        let got = bind_script_sha256_async(small_str, "cap-h".to_string()).await;
-        assert_eq!(got, script_sha256_of_bytes(b"echo hi"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn bind_script_path_length() {
-        let too_long = format!("/nonexistent/{}.sh", "a".repeat(BIND_SCRIPT_MAX_PATH_LEN));
-        let got = bind_script_sha256_async(too_long.clone(), "len-h".to_string()).await;
-        assert_eq!(got, derived_script_sha256("len-h", &too_long));
-        assert_eq!(bind_script_sha256(&too_long, "len-h"), got);
-    }
-
-    #[test]
-    fn bind_script_relative_path() {
-        let rel = "relative/scripts/job.sh";
-        let abs = "/nonexistent/scripts/job.sh";
-        assert_eq!(
-            bind_script_sha256(rel, "rel-h"),
-            derived_script_sha256("rel-h", rel),
-            "相对路径未被拒绝（仅长度/大小校验，decision D5）"
-        );
-        assert_eq!(
-            bind_script_sha256(abs, "rel-h"),
-            derived_script_sha256("rel-h", abs)
-        );
-        assert_eq!(
-            bind_script_sha256(rel, "rel-h"),
-            bind_script_sha256(rel, "rel-h")
-        );
-    }
-}
+mod tests;

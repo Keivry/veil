@@ -37,6 +37,7 @@ async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetric
         audit_mode: AuditMode::Off,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
         gateway_metrics: metrics.clone(),
@@ -227,6 +228,7 @@ async fn pump_sse_with_vault(
         audit_mode: AuditMode::Off,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
         gateway_metrics: Arc::new(GatewayMetrics::default()),
@@ -329,5 +331,103 @@ async fn go_sse_terminal_transparent() {
     assert!(
         resp.join("").contains("response.completed") || resp.join("").contains("response.failed"),
         "须含唯一终止类型"
+    );
+}
+
+/// 4.1/S4 辅助：抽取下游各帧 `choices[0].delta.content` 并拼接。
+fn delta_contents(frames: &[String]) -> String {
+    let mut out = String::new();
+    for f in frames {
+        for line in f.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload.trim() == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(payload)
+                && let Some(c) = v
+                    .pointer("/choices/0/delta/content")
+                    .and_then(|x| x.as_str())
+            {
+                out.push_str(c);
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn cross_frame_token_stitch_cred() {
+    // 4.1/S4/D4：token 以两个合法 JSON 内容值跨帧切开（`__VG_CRE` + `D_000001__`）；
+    // 下游须收到还原明文，且无残缺前缀、无续段残片、无完整 token 泄漏。
+    let vault = Arc::new(CredentialVault::new());
+    let token = vault
+        .register("cross-frame-secret-xyz")
+        .expect("注册恒成功");
+    assert_eq!(token, "__VG_CRED_000001__", "首注册 token 形态");
+    let (head, tail) = token.split_at(8);
+    assert_eq!(head, "__VG_CRE");
+    let sse = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{head}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{tail}\"}}}}]}}\n\ndata: [DONE]\n\n"
+    )
+    .into_bytes();
+    let frames = pump_sse_with_vault(Protocol::Chat, vault, sse).await;
+    let decoded = delta_contents(&frames);
+    assert_eq!(
+        decoded, "cross-frame-secret-xyz",
+        "跨帧 token 须还原为明文: {frames:?}"
+    );
+    assert!(!decoded.contains("__VG_CRE"), "残缺前缀不得残留: {decoded}");
+    assert!(!decoded.contains(tail), "续段不得泄漏: {decoded}");
+}
+
+#[tokio::test]
+async fn cross_frame_token_stitch_pii() {
+    // 4.1/S4/D4：PII token 以两个合法 JSON 内容值跨帧切开，下游须收到还原明文。
+    let (scope, vault, detector) = fresh_arcs();
+    let token = scope
+        .pii_scope()
+        .register("13800138000", false)
+        .expect("PII 注册恒成功");
+    assert!(token.starts_with("__PII_1_"), "首注册 PII token: {token}");
+    let (head, tail) = token.split_at("__PII_1_".len() + 3);
+    let sse = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{head}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{tail}\"}}}}]}}\n\ndata: [DONE]\n\n"
+    )
+    .into_bytes();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (_outcome, frames) =
+        collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+    server.abort();
+    let decoded = delta_contents(&frames);
+    assert_eq!(decoded, "13800138000", "PII 跨帧须还原明文: {frames:?}");
+    assert!(!decoded.contains("__PII_"), "token 残片不得泄漏: {decoded}");
+}
+
+#[tokio::test]
+async fn cross_frame_residual_strip() {
+    // 4.2/S4：流末未配对残缺前缀须按既有口径剥离——输出无残片、无明文/token 泄漏。
+    let sse = br#"data: {"choices":[{"index":0,"delta":{"content":"prefix __VG_CRE"}}]}
+
+data: [DONE]
+
+"#
+    .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (_outcome, frames) =
+        collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+    server.abort();
+    let decoded = delta_contents(&frames);
+    assert_eq!(decoded, "prefix ", "安全前缀须保留、残缺须剥离: {frames:?}");
+    assert!(!decoded.contains("__VG"), "残缺前缀不得透出: {decoded}");
+    assert!(
+        frames.iter().all(|f| !f.contains("__VG")),
+        "下游任何帧不得含残缺/token: {frames:?}"
     );
 }

@@ -3,63 +3,16 @@
 //! 逐出语义经同二进制 `CredentialVault` 大容量断言（与单测同口径）。
 
 use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-    },
-    veil::{
-        config::Config,
-        router::build_router,
-        service::{credential::AppStateParts, credential_vault::MAX_TOKEN_ENTRIES},
-        state::SqliteOutcome,
-    },
+    common::{serve, test_app},
+    veil::service::{credential::AppStateParts, credential_vault::MAX_TOKEN_ENTRIES},
 };
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn test_app() -> (axum::Router, veil::state::AppState) {
-    let env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-        ("GET_BINARY_HASH".to_string(), "gethash1".to_string()),
-    ]);
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(format!("/tmp/veil-e2e-vault-{n}.sqlite")),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    let router = build_router(state.clone());
-    (router, state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
+mod common;
 
 #[tokio::test]
 async fn t3_2_vault_backed_credential_flow_e2e() {
     // vault 承载的注册取用全链路：注册 200 → 取用 200。
-    let (app, _state) = test_app();
+    let (app, _state) = test_app(common::TestOpts::default());
     let (base, handle) = serve(app).await;
     let client = reqwest::Client::new();
     let reg = client
@@ -73,7 +26,7 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
         .send()
         .await
         .unwrap();
-    assert_eq!(reg.status().as_u16(), 200);
+    assert_eq!(reg.status().as_u16(), 202, "C1：注册默认转审批");
     let cred_body = serde_json::json!({
         "auth": {"caller_hash": "h-vault-flow-1", "caller_path": "/srv/vault-flow.sh"},
         "entry": "网易", "field": "授权码"
@@ -119,7 +72,7 @@ async fn t3_2_vault_lru_eviction_and_capacity_split() {
         "PII 单表容量分表锁定"
     );
     // LRU 逐出：同二进制 vault 批量注册至溢出，最久未用优先淘汰、热点保留。
-    let (_app, state) = test_app();
+    let (_app, state) = test_app(common::TestOpts::default());
     let vault = state.vault().clone();
     let val = |i: usize| format!("t3-vault-value-{i:06}-padding-ok");
     let mut first_tokens = Vec::new();

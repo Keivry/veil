@@ -22,6 +22,36 @@ use {
     std::{path::PathBuf, sync::Arc, time::Duration},
 };
 
+/// 网关侧清理回调（`C6`/D6）：Matrix 层不依赖 `AppState`，由网关实现注入，
+/// 使 `lock`/`forget`/`status` 能读写真实的口令缓存、KeePass 会话与 token 映射。
+pub trait GatewayCleanup: Send + Sync {
+    /// `status`：KeePass 后端是否已解锁。
+    fn keepass_unlocked(&self) -> bool;
+    /// `status`：当前 token 映射条数（LLM secrets）。
+    fn vault_len(&self) -> usize;
+    /// `lock`：清口令缓存 + KeePass 会话 + 内存 pending；返回清掉的口令缓存条数。
+    fn lock_cleanup(&self) -> usize;
+    /// `forget`：清 token 映射；返回清掉的映射条数。
+    fn forget_cleanup(&self) -> usize;
+}
+
+/// 固定清理量兜底（兼容入口与单测）：只读 `unlocked/secrets`，清理动作 no-op。
+#[derive(Debug, Clone, Copy)]
+pub struct FixedCleanup {
+    pub unlocked: bool,
+    pub secrets: usize,
+}
+
+impl GatewayCleanup for FixedCleanup {
+    fn keepass_unlocked(&self) -> bool { self.unlocked }
+
+    fn vault_len(&self) -> usize { self.secrets }
+
+    fn lock_cleanup(&self) -> usize { 0 }
+
+    fn forget_cleanup(&self) -> usize { 0 }
+}
+
 /// Matrix Bot（reqwest 长轮询 sync，不引入 matrix-sdk）。
 #[derive(Debug, Clone)]
 pub struct MatrixBot {
@@ -155,65 +185,71 @@ impl MatrixBot {
             .unwrap_or_default()
     }
 
-    /// 文本指令执行（Python 口径全量版）：`lock`→`🔒 Proxy 已锁定`、
-    /// `status`→`Proxy: {✅ 已解锁/🔒 未解锁} | 待审批: {n} | LLM secrets: {n}`、
-    /// `forget`→`🧹 已清除 {n} 个 LLM 密码映射`。
+    /// 文本指令执行（`C6`/D6）：`lock`→清口令缓存 + KeePass 会话 + 双 pending；
+    /// `status`→`Proxy: {✅ 已解锁/🔒 未解锁} | 待审批: {n} | LLM secrets: {n}`；
+    /// `forget`→清 token 映射并以真实条数回执。
     ///
     /// BREAKING 说明（注册/吊销/哈希变更审批链）：本库只做审批单流转；
     /// 注册-批准链的实际生效（`set_enabled(true)` / 吊销落盘）由网关侧在收到
     /// `ReactionOutcome::Applied` 后执行——若网关直接生效而不经审批，即为相对原仓的
     /// BREAKING（直接生效语义），须在发布说明中声明并给出风险说明。
-    /// 网关接线人注意：
-    /// - `lock` 除本函数落定外，还须清口令缓存 + KeePass 会话 + PII scope；
-    /// - `status` 的 `unlocked/secrets` 由网关侧传入；
-    /// - `forget` 的 `n` 为网关侧实际清除的 token 映射数（本函数只清审批单）。
     pub async fn handle_text_command_full(
         approval: &MatrixApproval,
         command: TextCommand,
-        unlocked: bool,
-        secrets: usize,
+        cleanup: &dyn GatewayCleanup,
     ) -> Option<String> {
         match command {
             TextCommand::Lock => {
+                let cleared = cleanup.lock_cleanup();
                 let count = approval.lock_reject_all().await;
                 approval.lock_clear_all().await;
-                Some(format!("🔒 Proxy 已锁定（未决 {count} 单已按拒绝落定）"))
+                Some(format!(
+                    "🔒 Proxy 已锁定（清口令缓存 {cleared} 条、未决 {count} 单已按拒绝落定）"
+                ))
             }
             TextCommand::Status => {
                 let pending = approval.pending_len().await;
-                let s = if unlocked {
+                let s = if cleanup.keepass_unlocked() {
                     "✅ 已解锁"
                 } else {
                     "🔒 未解锁"
                 };
                 Some(format!(
-                    "Proxy: {s} | 待审批: {pending} | LLM secrets: {secrets}"
+                    "Proxy: {s} | 待审批: {pending} | LLM secrets: {}",
+                    cleanup.vault_len()
                 ))
             }
             TextCommand::Forget => {
-                let cleared = approval.forget_decided().await;
+                let cleared = cleanup.forget_cleanup();
+                let decided = approval.forget_decided().await;
                 Some(format!(
-                    "🧹 已清除 {cleared} 个已决审批单（网关侧另清 {secrets} 个口令映射）"
+                    "🧹 已清除 {cleared} 个 LLM 密码映射（另清 {decided} 个已决审批单）"
                 ))
             }
             TextCommand::Unknown => None,
         }
     }
 
-    /// 文本指令执行（兼容版）：签名不变，内部走全量版（`unlocked=true/secrets=0`）。
+    /// 文本指令执行（兼容版）：签名不变，降级为固定清理量（`unlocked=true/secrets=0`）。
     pub async fn handle_text_command(
         approval: &MatrixApproval,
         command: TextCommand,
     ) -> Option<String> {
-        Self::handle_text_command_full(approval, command, true, 0).await
+        let fixed = FixedCleanup {
+            unlocked: true,
+            secrets: 0,
+        };
+        Self::handle_text_command_full(approval, command, &fixed).await
     }
 
     /// 常驻 sync 循环：since 持久化 + 指数退避 + 启动时间戳过滤。
     /// reaction 经 `MatrixApproval::on_reaction` 落定，文本指令经
-    /// `handle_text_command` 执行；发送失败走审批超时默认拒绝路径。
+    /// `handle_text_command_full` + 网关注入的 `cleanup` 执行；
+    /// 发送失败走审批超时默认拒绝路径。
     pub fn spawn_sync_loop(
         self,
         approval: Arc<MatrixApproval>,
+        cleanup: Arc<dyn GatewayCleanup>,
         token_file: PathBuf,
         start_ts_ms: u128,
     ) -> tokio::task::JoinHandle<()> {
@@ -296,7 +332,9 @@ impl MatrixBot {
                                 continue;
                             }
                             let command = parse_text_command(&text.body);
-                            if let Some(reply) = Self::handle_text_command(&approval, command).await
+                            if let Some(reply) =
+                                Self::handle_text_command_full(&approval, command, cleanup.as_ref())
+                                    .await
                                 && let Err(err) = self.send_text(&reply).await
                             {
                                 tracing::debug!("指令回执发送失败: {err:#}");

@@ -284,6 +284,63 @@ fn placeholder_responses_partial_illegal_keeps_valid() {
 }
 
 #[test]
+fn placeholder_case_sensitive() {
+    use crate::service::pii::detector::{cred_token_shape_re, pii_token_re};
+    // 注入门：精确大小写前缀（无折叠）。
+    assert!(has_placeholder_tokens(b"a __PII_1_ab12cd34__ b"));
+    assert!(has_placeholder_tokens(b"a __VG_CRED_000123__ b"));
+    for drift in [
+        b"__pii_1_ab12cd34__".as_slice(),
+        b"__Pii_1_ab12cd34__".as_slice(),
+        b"__vg_cred_000123__".as_slice(),
+        b"__Vg_Cred_000123__".as_slice(),
+        b"__VG_cred_000123__".as_slice(),
+    ] {
+        assert!(
+            !has_placeholder_tokens(drift),
+            "漂移形不得触发注入门: {drift:?}"
+        );
+    }
+    // 还原形态（pii_token_re/cred_token_shape_re）同为大小写敏感精确前缀。
+    assert!(pii_token_re().is_match("__PII_1_ab12cd34__"));
+    assert!(!pii_token_re().is_match("__pii_1_ab12cd34__"));
+    assert!(!pii_token_re().is_match("__Pii_1_ab12cd34__"));
+    assert!(cred_token_shape_re().is_match("__VG_CRED_000123__"));
+    assert!(!cred_token_shape_re().is_match("__vg_cred_000123__"));
+    assert!(!cred_token_shape_re().is_match("__VG_cred_000123__"));
+}
+
+#[test]
+fn placeholder_case_drift() {
+    use crate::service::{
+        credential_vault::CredentialVault,
+        pii::{PiiScope, detector::pii_token_re},
+    };
+    // 注入侧：大小写漂移 prefix 既不触发门，也不进入三条件注入链。
+    let drift_pii = b"body __pii_1_ab12cd34__ tail";
+    let drift_cred = b"body __vg_cred_000123__ tail";
+    assert!(!has_placeholder_tokens(drift_pii));
+    assert!(!has_placeholder_tokens(drift_cred));
+    assert!(!should_inject_placeholders(
+        true,
+        true,
+        has_placeholder_tokens(drift_pii)
+    ));
+    assert!(should_inject_placeholders(
+        true,
+        true,
+        has_placeholder_tokens(b"__PII_1_ab12cd34__")
+    ));
+    // 还原侧：漂移形原样保留（大小写敏感，不做替换）。
+    let vault = CredentialVault::new();
+    assert_eq!(vault.restore("__vg_cred_000123__"), "__vg_cred_000123__");
+    let scope = PiiScope::new();
+    let tok = scope.register("13800138000", false).expect("注册须成功");
+    assert!(pii_token_re().is_match(&tok));
+    assert_eq!(scope.restore("__pii_1_ab12cd34__"), "__pii_1_ab12cd34__");
+}
+
+#[test]
 fn x5_protocol_matrix_injection_stable_after_unreachable_block_removal() {
     const PROMPT: &str = "PROMPT";
     // Anthropic：system 存在（string/array）合并；缺失插入；非法形态拒绝且原体不变。

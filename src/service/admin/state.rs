@@ -218,6 +218,35 @@ mod tests {
     }
 
     #[test]
+    fn admin_event_ring_capacity_order() {
+        // A10/10.2：超容量淘汰最旧、FIFO 顺序保持、kind 查询与建连回放可见。
+        let st = test_admin_state();
+        let total = EVENT_RING_CAP + 10;
+        for i in 1..=total {
+            st.push_event("audit", &format!("ev-{i}"), None);
+        }
+        let all = st.query_events(None, None, 500);
+        assert_eq!(all.len(), 500, "query_events limit 上限 500");
+        assert_eq!(all[0].id, total as u64, "最新事件在前");
+        assert_eq!(all[499].id, (total - 499) as u64, "逆序顺序保持");
+        assert!(all.iter().all(|e| e.id > 10), "超容量须淘汰最旧 10 条");
+        let audit = st.query_events(Some("audit"), None, 500);
+        assert_eq!(audit.len(), 500, "kind=audit 全命中");
+        assert!(st.query_events(Some("other"), None, 10).is_empty());
+        // SSE 建连回放口径：最近 20 条升序（旧→新）且均落环内。
+        let replay: Vec<u64> = st
+            .query_events(None, None, 20)
+            .into_iter()
+            .rev()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            replay,
+            ((total - 19) as u64..=total as u64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn late_subscriber_receives_only_live_events() {
         let st = test_admin_state();
         st.push_event("audit", "历史摘要", None);

@@ -1,4 +1,8 @@
 //! 自定义规则与字典：三槽加载 + ReDoS 守卫扫描 + 字典独立扫描。
+//!
+//! H7/D7 锁序不变量：`account_rule` 内 **`strikes` 先于 `disabled`**（两把 std
+//! `Mutex` 恒按此序获取，后续新增获取点须遵循）；审查清单真源见 design D7，
+//! 源码扫描守护见 `service::declaration_lock::lock_order_invariants`。
 
 use {
     super::{
@@ -8,6 +12,7 @@ use {
     },
     std::{
         collections::{HashMap, HashSet},
+        sync::atomic::AtomicBool,
         time::Duration,
     },
 };
@@ -16,6 +21,139 @@ use {
 /// [`RE_DOS_BUDGET_MS`] 预算断言与连续三次禁用记账之外，以本明确绝对常量内返回
 /// （独立兜底锁；公式：预算 100ms + 调度/阻塞池余量）。
 pub const REDOS_WALL_CLOCK_CEILING_MS: u64 = 400;
+
+/// 全局首次中毒告警位（进程级 once 语义）。
+static POISON_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// P14/D1 锁中毒恢复：`PoisonError::into_inner` 返回可用守卫，首次恢复 warn 一次。
+/// 与 `scope.rs::recover_mutex` 同形；泛型覆盖 `Mutex`/`RwLock` 全部守卫类型，
+/// 中毒后按当前内存状态继续服务（`scan` 读当前映射，`load_*` 全量覆盖写自愈）。
+fn warn_poison_once() -> bool { warn_poison_once_at(&POISON_WARNED) }
+
+/// 可注入标志位的告警实现（测试隔离用；`warn_poison_once` 置位全局标志）。
+fn warn_poison_once_at(flag: &AtomicBool) -> bool {
+    let first = !flag.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        tracing::warn!("PII custom 检测器锁中毒，已 PoisonError::into_inner 恢复（首次告警）");
+    }
+    first
+}
+
+/// 锁访问统一入口：中毒即恢复并首次告警，绝不 panic。
+fn recover<T>(lock: std::sync::LockResult<T>) -> T {
+    lock.unwrap_or_else(|e: std::sync::PoisonError<T>| {
+        warn_poison_once();
+        e.into_inner()
+    })
+}
+
+/// 按字符截断（hint cap 用，不按字节切 `CJK`）。
+fn truncate_chars(s: &str, cap: usize) -> String { s.chars().take(cap).collect() }
+
+/// 跳过 `pattern[start..]` 处的一个平衡圆括号组（含转义与字符类），
+/// 返回组结束后下标；不平衡返回 `None`。用于跳过零宽断言与命名组前缀。
+fn skip_group(pattern: &str, start: usize) -> Option<usize> {
+    let bytes = pattern.as_bytes();
+    if bytes.get(start) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b']' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 从正则 `pattern` 保守提取起始字面前缀：跳过行首锚点/组前缀/零宽断言，
+/// 收集字面段至首个元字符；转义标点计入字面，转义类（`\d` 等）终止。
+/// 无可提取字面前缀返回空串（该规则退化为缝窗保护）。
+fn regex_literal_prefix(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'^' => {
+                if out.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            b'(' => {
+                if !out.is_empty() {
+                    break;
+                }
+                let rest = &pattern[i..];
+                let next = if rest.starts_with("(?P<") {
+                    rest.find('>').map(|p| i + p + 1)
+                } else if rest.starts_with("(?:") {
+                    Some(i + 3)
+                } else if rest.starts_with("(?=")
+                    || rest.starts_with("(?!")
+                    || rest.starts_with("(?<=")
+                    || rest.starts_with("(?<!")
+                {
+                    skip_group(pattern, i)
+                } else if rest.starts_with("(?") {
+                    None
+                } else {
+                    Some(i + 1)
+                };
+                match next {
+                    Some(n) => {
+                        i = n;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            b'\\' => {
+                let Some(next) = bytes.get(i + 1).copied() else {
+                    break;
+                };
+                if next.is_ascii_alphanumeric() {
+                    break;
+                }
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+            b'.' | b'*' | b'+' | b'?' | b'[' | b'{' | b'|' | b'$' | b')' => break,
+            _ => {}
+        }
+        let ch = pattern[i..].chars().next().unwrap_or('\u{0}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
 
 impl PiiDetector {
     /// 是否含 `\b`（ASCII 词边界，中文紧贴下零命中，禁止使用）。
@@ -85,7 +223,7 @@ impl PiiDetector {
                 continue;
             }
             {
-                let names = self.custom_names.read().expect("检测器锁无毒");
+                let names = recover(self.custom_names.read());
                 if names.contains(name) {
                     tracing::warn!("自定义正则 {name} 与已加载规则重名，拒绝加载");
                     continue;
@@ -115,8 +253,8 @@ impl PiiDetector {
                 continue;
             }
             {
-                let mut custom = self.custom.write().expect("检测器锁无毒");
-                let mut names = self.custom_names.write().expect("检测器锁无毒");
+                let mut custom = recover(self.custom.write());
+                let mut names = recover(self.custom_names.write());
                 if names.contains(name) {
                     continue;
                 }
@@ -138,24 +276,44 @@ impl PiiDetector {
     ) -> (usize, usize) {
         let n = self.load_custom_patterns(patterns);
         self.load_dict(dict);
-        let m = self.dict.read().map(|g| g.len()).unwrap_or_default();
+        let m = recover(self.dict.read()).len();
         (n, m)
     }
 
     /// 已加载的自定义规则名（断言/可观测用）。
     pub fn custom_names_snapshot(&self) -> Vec<String> {
-        self.custom_names
-            .read()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default()
+        recover(self.custom_names.read()).iter().cloned().collect()
     }
 
     /// 已停用的自定义规则名（连续超时 3 次）。
     pub fn disabled_snapshot(&self) -> Vec<String> {
-        self.disabled
-            .lock()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default()
+        recover(self.disabled.lock()).iter().cloned().collect()
+    }
+
+    /// P1/D2 跨帧前缀 hold 的 hint 集：自定义正则可提取字面前缀 + 字典全名，
+    /// cap 64 字符、按长度降序去重；无可提取前缀的规则不产生 hint（退化为缝窗保护）。
+    pub fn partial_prefix_hints(&self) -> Vec<String> {
+        const CAP: usize = 64;
+        let mut hints: Vec<String> = Vec::new();
+        for (_, _, pattern) in recover(self.custom.read()).iter() {
+            let prefix = regex_literal_prefix(pattern);
+            if !prefix.is_empty() {
+                hints.push(truncate_chars(&prefix, CAP));
+            }
+        }
+        for (name, _) in recover(self.dict.read()).iter() {
+            if !name.is_empty() {
+                hints.push(truncate_chars(name, CAP));
+            }
+        }
+        hints.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
+        hints.dedup();
+        hints
     }
 
     /// 加载敏感名称名单 `[(name, type)]`，按长度降序。
@@ -172,26 +330,29 @@ impl PiiDetector {
         } else {
             regex::Regex::new(&pat).ok()
         };
-        *self.dict.write().expect("检测器锁无毒") = sorted;
-        *self.dict_re.write().expect("检测器锁无毒") = compiled;
+        *recover(self.dict.write()) = sorted;
+        *recover(self.dict_re.write()) = compiled;
     }
 
     /// 字典命中边界：对标 Python `_dict_boundary_ok`（硬化门控差异化）。
-    /// `name/person` 在强化开时走严格 CJK 边界，关闭时退化为 ASCII 字母数字边界
-    /// （后接 CJK 仍阻断，保张三丰不误伤）；其余类型仅挡 ASCII 字母数字粘连。
+    /// `name/person` 在强化开时走严格 CJK 边界（双侧 CJK 表意 ∪ Unicode 字母数字），
+    /// 关闭时退化为「before 仅 ASCII 字母数字、after 仅 CJK 表意文字」边界，
+    /// 避免 `é`/`ñ` 等西文变音字母数字误拒（后接真正 CJK 仍阻断，保张三丰不误伤）；
+    /// 其余类型仅挡 ASCII 字母数字粘连。
     fn dict_boundary_ok(text: &str, start: usize, end: usize, typ: &str, strict_cjk: bool) -> bool {
         let before = text[..start].chars().next_back();
         let after = text[end..].chars().next();
-        let is_cjk = |c: char| ('\u{4e00}'..='\u{9fff}').contains(&c) || c.is_alphanumeric();
+        let is_cjk_ideograph = |c: char| ('\u{4e00}'..='\u{9fff}').contains(&c);
+        let is_alnum_or_cjk = |c: char| is_cjk_ideograph(c) || c.is_alphanumeric();
         if typ == "name" || typ == "person" {
             if strict_cjk {
-                if before.is_some_and(is_cjk) || after.is_some_and(is_cjk) {
+                if before.is_some_and(is_alnum_or_cjk) || after.is_some_and(is_alnum_or_cjk) {
                     return false;
                 }
                 return true;
             }
             let ascii_before = before.is_some_and(|c| c.is_ascii() && c.is_alphanumeric());
-            if ascii_before || after.is_some_and(is_cjk) {
+            if ascii_before || after.is_some_and(is_cjk_ideograph) {
                 return false;
             }
             return true;
@@ -206,11 +367,11 @@ impl PiiDetector {
         text: &str,
         credential_p2t: &HashMap<String, String>,
     ) -> Vec<PiiHit> {
-        let dict_re = self.dict_re.read().expect("检测器锁无毒");
+        let dict_re = recover(self.dict_re.read());
         let Some(re) = dict_re.as_ref() else {
             return Vec::new();
         };
-        let dict = self.dict.read().expect("检测器锁无毒");
+        let dict = recover(self.dict.read());
         let cred = credential_spans(text, credential_p2t);
         let mut out = Vec::new();
         let mut seen: HashSet<(usize, usize)> = HashSet::new();
@@ -246,12 +407,11 @@ impl PiiDetector {
         text: &str,
         credential_p2t: &HashMap<String, String>,
     ) -> Vec<PiiHit> {
-        let custom: Vec<(String, fancy_regex::Regex, String)> =
-            self.custom.read().map(|g| g.clone()).unwrap_or_default();
+        let custom: Vec<(String, fancy_regex::Regex, String)> = recover(self.custom.read()).clone();
         if custom.is_empty() || text.is_empty() {
             return Vec::new();
         }
-        let disabled: HashSet<String> = self.disabled.lock().map(|g| g.clone()).unwrap_or_default();
+        let disabled: HashSet<String> = recover(self.disabled.lock()).clone();
         let protected = protected_spans(text);
         let cred = credential_spans(text, credential_p2t);
         let chunks: Vec<(usize, String)> = split_chunks(text, SCAN_INPUT_LIMIT, 256);
@@ -317,9 +477,9 @@ impl PiiDetector {
     }
 
     /// 超时记账状态机：成功清零；超时累计，连续 [`RE_DOS_STRIKES`] 次停用并告警。
-    fn account_rule(&self, name: &str, timed_out: bool) {
-        let mut strikes = self.strikes.lock().expect("检测器锁无毒");
-        let mut disabled = self.disabled.lock().expect("检测器锁无毒");
+    pub(crate) fn account_rule(&self, name: &str, timed_out: bool) {
+        let mut strikes = recover(self.strikes.lock());
+        let mut disabled = recover(self.disabled.lock());
         if !timed_out {
             strikes.remove(name);
             return;
@@ -336,279 +496,4 @@ impl PiiDetector {
 }
 
 #[cfg(test)]
-mod tests {
-    use {
-        crate::service::pii::detector::{
-            RE_DOS_BUDGET_MS,
-            test_support::{detector, empty_cred},
-        },
-        std::time::Duration,
-    };
-
-    #[tokio::test]
-    async fn b4_cjk_mixed_and_reserved_edges() {
-        use super::super::detector::is_reserved_ip;
-        assert!(is_reserved_ip("10.1.2.3", "ipv4"));
-        assert!(!is_reserved_ip("8.8.8.8", "ipv4"));
-        assert!(is_reserved_ip("fc00::1", "ipv6"));
-        assert!(!is_reserved_ip("2001:4860:4860::8888", "ipv6"));
-        let d = detector();
-        d.load_custom_patterns(&[(
-            "emp_no".to_string(),
-            r"(?P<emp_no>(?<![\d])工号\d{6}(?![\d]))".to_string(),
-        )]);
-        let hits = d
-            .scan_custom("Hi联系工号123456处理Done 上线", &empty_cred())
-            .await;
-        assert!(hits.iter().any(|h| h.1 == "工号123456"), "{hits:?}");
-        d.load_dict(&[("张三".to_string(), "name".to_string())]);
-        let hits = d.scan_dict_sync("Hi 张三，Done 来了", &empty_cred());
-        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
-        // ASCII 字母数字紧贴粘连按边界口径阻断（防误伤，不断字即正确）。
-        let hits = d.scan_dict_sync("Hi张三Done 来了", &empty_cred());
-        assert!(hits.iter().all(|h| h.1 != "张三"), "{hits:?}");
-        let hits = d.scan_dict_sync("中文测试文本", &empty_cred());
-        assert!(hits.iter().all(|h| h.1 != "中文测试文本"), "{hits:?}");
-    }
-
-    #[test]
-    fn custom_regex_with_word_boundary_rejected() {
-        let d = detector();
-        let n = d.load_custom_patterns(&[("bad".to_string(), r"\bfoo\d+\b".to_string())]);
-        assert_eq!(n, 0);
-        assert!(d.custom_names_snapshot().is_empty());
-        // 与内置重名同样拒绝。
-        let n = d.load_custom_patterns(&[("phone".to_string(), r"1\d{10}".to_string())]);
-        assert_eq!(n, 0);
-        // 合法 lookaround 规则加载成功。
-        let n = d.load_custom_patterns(&[(
-            "emp_no".to_string(),
-            r"(?P<emp_no>(?<![\d])工号\d{6}(?![\d]))".to_string(),
-        )]);
-        assert_eq!(n, 1);
-    }
-
-    #[tokio::test]
-    async fn malicious_pattern_fast_reject_and_disable_after_three_timeouts() {
-        // 引擎层：`^(a+)+$` 对抗性输入微秒级返回，远快于 100ms 预算（不挂起主链）。
-        let d = detector();
-        d.load_custom_patterns(&[("evil".to_string(), r"^(a+)+$".to_string())]);
-        assert!(d.custom_names_snapshot().contains(&"evil".to_string()));
-        assert_eq!(RE_DOS_BUDGET_MS, 100);
-        let input = "a".repeat(2000) + "b";
-        let start = std::time::Instant::now();
-        let hits = d.scan_custom(&input, &empty_cred()).await;
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "恶意模式必须远快于预算返回"
-        );
-        assert!(hits.iter().all(|h| h.0 != "evil"));
-        // 状态机层：连续 3 次超时停用（确定性单测记账逻辑）。
-        let d2 = detector();
-        d2.load_custom_patterns(&[("slow".to_string(), r"slow\d+".to_string())]);
-        assert!(!d2.disabled_snapshot().contains(&"slow".to_string()));
-        d2.account_rule("slow", true);
-        d2.account_rule("slow", true);
-        assert!(!d2.disabled_snapshot().contains(&"slow".to_string()));
-        d2.account_rule("slow", true);
-        assert!(d2.disabled_snapshot().contains(&"slow".to_string()));
-        // 成功清零：超时 2 次后成功则计数重置。
-        let d3 = detector();
-        d3.load_custom_patterns(&[("flaky".to_string(), r"flaky\d+".to_string())]);
-        d3.account_rule("flaky", true);
-        d3.account_rule("flaky", true);
-        d3.account_rule("flaky", false);
-        d3.account_rule("flaky", true);
-        d3.account_rule("flaky", true);
-        assert!(!d3.disabled_snapshot().contains(&"flaky".to_string()));
-    }
-
-    #[tokio::test]
-    async fn redos_wall_clock_absolute_ceiling_beyond_budget_assertion() {
-        // T3/7.2：对抗输入在明确绝对上界常量内返回，不依赖 `RE_DOS_BUDGET_MS`
-        // 预算断言，也不依赖连续三次禁用的记账路径（独立兜底锁）。
-        let d = detector();
-        d.load_custom_patterns(&[("evil-abs".to_string(), r"^(a+)+$".to_string())]);
-        let input = format!("{}b", "a".repeat(2000));
-        let start = std::time::Instant::now();
-        let hits = d.scan_custom(&input, &empty_cred()).await;
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(super::REDOS_WALL_CLOCK_CEILING_MS),
-            "对抗扫描须在绝对上界 {}ms 内返回，实际 {elapsed:?}",
-            super::REDOS_WALL_CLOCK_CEILING_MS
-        );
-        assert!(hits.iter().all(|h| h.0 != "evil-abs"), "{hits:?}");
-        assert!(
-            !d.disabled_snapshot().contains(&"evil-abs".to_string()),
-            "单次超时不得触发三连禁用记账（上界与记账解耦）"
-        );
-    }
-
-    #[test]
-    fn dict_standalone_scan_with_cjk_boundary() {
-        let d = detector();
-        d.load_dict(&[
-            ("张三".to_string(), "name".to_string()),
-            ("db-prod-01".to_string(), "hostname".to_string()),
-        ]);
-        // 标点分界命中（严格 CJK 边界：两侧非 CJK 字母数字）。
-        let hits = d.scan_dict_sync("hi 张三，你好", &empty_cred());
-        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
-        // 张三丰不误伤（后接 CJK 即阻断，双模式一致）。
-        let hits = d.scan_dict_sync("张三丰来了", &empty_cred());
-        assert!(hits.iter().all(|h| h.1 != "张三"), "{hits:?}");
-        // 非硬化：前接 CJK 按原仓口径放行（before 仅 ASCII 门）；
-        // 硬化开：前接 CJK 阻断（严格 CJK 边界）。
-        let hits = d.scan_dict_sync("我张三", &empty_cred());
-        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
-        d.set_hardening(true);
-        let hits = d.scan_dict_sync("我张三", &empty_cred());
-        assert!(hits.iter().all(|h| h.1 != "张三"), "{hits:?}");
-        let hits = d.scan_dict_sync("hi 张三，你好", &empty_cred());
-        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
-        // 主机名 ASCII 粘连不命中。
-        let hits = d.scan_dict_sync("abcdb-prod-01x", &empty_cred());
-        assert!(hits.iter().all(|h| h.1 != "db-prod-01"));
-        let hits = d.scan_dict_sync("主机 db-prod-01 在线", &empty_cred());
-        assert!(hits.iter().any(|h| h.1 == "db-prod-01"));
-    }
-
-    #[test]
-    fn named_group_inner_mismatch_uses_outer_name() {
-        let d = detector();
-        // 原仓口径：内命名组与外层失配允许加载（分类以外层 name 为准）。
-        let n = d.load_custom_patterns(&[(
-            "emp_no".to_string(),
-            "(?P<other>(?<![\\d])AB\\d{6}(?![\\d]))".to_string(),
-        )]);
-        assert_eq!(n, 1, "内命名组失配按原仓口径放行");
-        assert!(d.custom_names_snapshot().contains(&"emp_no".to_string()));
-        let n = d.load_custom_patterns(&[("plain".to_string(), "ZZ-\\d{6}".to_string())]);
-        assert_eq!(n, 1, "无命名组必须放行");
-    }
-
-    #[test]
-    fn nested_group_and_duplicate_name_rejected() {
-        let d = detector();
-        let n = d.load_custom_patterns(&[(
-            "nested".to_string(),
-            "(?P<nested>a(?P<inner>b)c)".to_string(),
-        )]);
-        assert_eq!(n, 0, "嵌套命名组必须拒绝");
-        let n = d.load_custom_patterns(&[("dup".to_string(), "DUP-\\d+".to_string())]);
-        assert_eq!(n, 1);
-        let n = d.load_custom_patterns(&[("dup".to_string(), "DUP-\\d+".to_string())]);
-        assert_eq!(n, 0, "跨文件重名必须去重拒绝");
-        assert_eq!(
-            d.custom_names_snapshot()
-                .iter()
-                .filter(|n| *n == "dup")
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn custom_overlap_placeholder_skipped_and_disabled_skipped() {
-        let d = detector();
-        d.load_custom_patterns(&[("tag".to_string(), "TAG-\\d+".to_string())]);
-        let hits = d
-            .scan_custom("已有 __PII_1_ab12cd34__ 与 TAG-99", &empty_cred())
-            .await;
-        assert!(hits.iter().any(|h| h.1 == "TAG-99"), "{hits:?}");
-        let hits = d
-            .scan_custom("data:image/png;base64,TAG-99", &empty_cred())
-            .await;
-        assert!(
-            hits.is_empty(),
-            "与 data URL 保护区间重叠必须跳过: {hits:?}"
-        );
-        d.account_rule("tag", true);
-        d.account_rule("tag", true);
-        d.account_rule("tag", true);
-        assert!(d.disabled_snapshot().contains(&"tag".to_string()));
-        let hits = d.scan_custom("TAG-77 独立出现", &empty_cred()).await;
-        assert!(
-            hits.iter().all(|h| h.0 != "tag"),
-            "停用规则必须跳过: {hits:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn custom_pattern_cjk_adjacent_match() {
-        let d = detector();
-        d.load_custom_patterns(&[(
-            "工号".to_string(),
-            "(?P<工号>(?<![\\d])工号\\d{6}(?![\\d]))".to_string(),
-        )]);
-        let hits = d.scan_custom("联系工号123456处理", &empty_cred()).await;
-        assert!(
-            hits.iter().any(|h| h.1 == "工号123456"),
-            "CJK 紧贴必须命中: {hits:?}"
-        );
-    }
-
-    #[test]
-    fn named_group_mismatch_relaxed_to_legacy() {
-        let d = detector();
-        // 内命名组与外层 name 不同名：原仓口径允许加载（分类以外层为准）。
-        let n = d.load_custom_patterns(&[(
-            "outer".to_string(),
-            r"(?P<inner>(?<![\d])工号\d{6}(?![\d]))".to_string(),
-        )]);
-        assert_eq!(n, 1);
-        assert!(d.custom_names_snapshot().contains(&"outer".to_string()));
-    }
-
-    #[test]
-    fn three_slot_custom_dict_combined() {
-        let d = detector();
-        let (n, m) = d.load_custom_all(
-            &[(
-                "emp_no".to_string(),
-                r"(?<![\d])工号\d{6}(?![\d])".to_string(),
-            )],
-            &[("张三".to_string(), "name".to_string())],
-        );
-        assert_eq!((n, m), (1, 1));
-        let hits = d.scan_dict_sync("hi 张三，工号123456", &empty_cred());
-        assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
-    }
-
-    #[test]
-    fn dict_scan_excluded_from_combined_regex() {
-        let d = detector();
-        d.load_dict(&[("张三".to_string(), "name".to_string())]);
-        // 联合正则扫描不含字典命中（独立扫描语义）。
-        let builtin = super::super::chunk::scan_builtin_sync("hi 张三，你好", &empty_cred());
-        assert!(builtin.iter().all(|h| h.1 != "张三"), "{builtin:?}");
-        let dict = d.scan_dict_sync("hi 张三，你好", &empty_cred());
-        assert!(dict.iter().any(|h| h.1 == "张三"), "{dict:?}");
-    }
-
-    #[test]
-    fn perf_5000_dict_scan_time_anchor() {
-        let d = detector();
-        let entries: Vec<(String, String)> = (0..5000)
-            .map(|i| (format!("敏感词{i:05}号"), "name".to_string()))
-            .collect();
-        let start = std::time::Instant::now();
-        d.load_dict(&entries);
-        let text = "公告 敏感词01234号 与 敏感词04999号 上线";
-        let hits = d.scan_dict_sync(text, &empty_cred());
-        let elapsed = start.elapsed();
-        assert!(
-            hits.iter().any(|h| h.1 == "敏感词01234号"),
-            "5000 字典首段须命中: {hits:?}"
-        );
-        assert!(
-            hits.iter().any(|h| h.1 == "敏感词04999号"),
-            "5000 字典尾段须命中: {hits:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "5000 字典加载+扫描须 <10s，实测 {elapsed:?}"
-        );
-    }
-}
+mod tests;

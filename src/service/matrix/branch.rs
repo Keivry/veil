@@ -23,7 +23,11 @@ impl MatrixBranch {
         let r = reason.to_lowercase();
         if r.contains("unlock") || r.contains("解锁") {
             Self::Unlock
-        } else if r.contains("register") || r.contains("注册") {
+        } else if r.contains("register")
+            || r.contains("注册")
+            || r.contains("revoke")
+            || r.contains("吊销")
+        {
             Self::Register
         } else if r.contains("hash") || r.contains("哈希") {
             Self::HashChange
@@ -66,6 +70,11 @@ pub fn validate_whitelist_mxids(whitelist: &[String]) -> Result<(), String> {
 
 fn is_valid_mxid(s: &str) -> bool {
     let rest = s.strip_prefix('@').unwrap_or("");
+    // A12/D11：`@` 前缀之后（localpart + domain）不得再含 `@`
+    // （等价 Python `s[1:].count('@') == 0`）；与 `config::validate::is_valid_mxid` 语义一致。
+    if rest.contains('@') {
+        return false;
+    }
     let mut parts = rest.split(':');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(user), Some(server), None) => {
@@ -294,6 +303,15 @@ mod branch_tests {
         assert_eq!(MatrixBranch::from_reason("unlock"), MatrixBranch::Unlock);
         assert_eq!(
             MatrixBranch::from_reason("注册审批"),
+            MatrixBranch::Register
+        );
+        // D2/C2：常规吊销复用 `Register` 分支的三态映射（`from_reason` 须识别）。
+        assert_eq!(
+            MatrixBranch::from_reason("revoke审批"),
+            MatrixBranch::Register
+        );
+        assert_eq!(
+            MatrixBranch::from_reason("吊销审批"),
             MatrixBranch::Register
         );
         assert_eq!(

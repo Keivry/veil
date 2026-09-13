@@ -7,8 +7,39 @@
 //! 接线：`main` 启动链经 [`startup_tpm`] 门禁 fail-closed（默认真实 TPM；
 //! `VEIL_ALLOW_MOCK_TPM=1` 仅 CI/本地联调显式放行 Mock）。KeePass 主密钥
 //! TPM 派生随真实 kdbx 后端延后（Non-Goal，见 credential-api spec）。
+//!
+//! H8/D8 调用约束：同步 `std::process::Command`/忙轮询（[`RealTpm::run`]，10ms
+//! sleep 轮询）与 `is_available`（`tpm2_pcrread`）**仅允许启动期与
+//! `spawn_blocking` 内调用，禁 async 上下文直调**（阻塞线程池）；忙轮询保留在
+//! 阻塞语境，不迁移 `tokio::process`（理由见 design D8）。调用点守护见
+//! `service::declaration_lock::tpm_sync_subprocess_guard`。
 
-use std::{fmt::Debug, path::PathBuf, time::Duration};
+use std::{
+    fmt::Debug,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+/// `C9`/D9：解封工作目录序号，配合 pid/nanos 保证每次调用唯一，并发不互覆。
+static TPM_WORKDIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `veil-tpm-{pid}-{nanos}-{seq}`：每次调用唯一，替代固定 `veil-tpm-{pid}`。
+fn unique_tpm_workdir() -> PathBuf {
+    let seq = TPM_WORKDIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("veil-tpm-{}-{nanos}-{seq}", std::process::id()))
+}
+
+/// 工作目录守卫：成功、失败、提前返回均经 `Drop` 清理（不轮询、不全局锁）。
+struct TempWorkdir(PathBuf);
+
+impl Drop for TempWorkdir {
+    fn drop(&mut self) { std::fs::remove_dir_all(&self.0).ok(); }
+}
 
 /// TPM 解封抽象：真实 TPM 与 CI Mock 同接口。
 pub trait TpmUnlock: Send + Sync + Debug {
@@ -57,6 +88,8 @@ impl TpmUnlock for MockTpm {
 pub struct RealTpm {
     pub tpm_dir: PathBuf,
     pub timeout: Duration,
+    /// 测试注入：自定义 `tpm2-*` 可执行目录（生产 `None`，走 `PATH`）。
+    bin_dir: Option<PathBuf>,
 }
 
 impl RealTpm {
@@ -64,6 +97,7 @@ impl RealTpm {
         Self {
             tpm_dir: PathBuf::from("/data/tpm"),
             timeout: Duration::from_secs(30),
+            bin_dir: None,
         }
     }
 
@@ -71,6 +105,16 @@ impl RealTpm {
         Self {
             tpm_dir,
             timeout: Duration::from_secs(30),
+            bin_dir: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_bin_dir(tpm_dir: PathBuf, bin_dir: PathBuf) -> Self {
+        Self {
+            tpm_dir,
+            timeout: Duration::from_secs(30),
+            bin_dir: Some(bin_dir),
         }
     }
 
@@ -94,7 +138,11 @@ impl RealTpm {
 
     fn run(&self, program: &str, args: &[&str]) -> anyhow::Result<String> {
         use std::io::Read as _;
-        let mut child = std::process::Command::new(program)
+        let executable = match &self.bin_dir {
+            Some(dir) => dir.join(program),
+            None => PathBuf::from(program),
+        };
+        let mut child = std::process::Command::new(&executable)
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -170,13 +218,9 @@ impl TpmUnlock for RealTpm {
                 anyhow::bail!("TPM 密封文件缺失 {}，拒绝以空密钥运行", path.display());
             }
         }
-        let workdir = std::env::temp_dir().join(format!("veil-tpm-{}", std::process::id()));
+        let workdir = unique_tpm_workdir();
         std::fs::create_dir_all(&workdir)?;
-        struct Guard(PathBuf);
-        impl Drop for Guard {
-            fn drop(&mut self) { std::fs::remove_dir_all(&self.0).ok(); }
-        }
-        let _guard = Guard(workdir.clone());
+        let _guard = TempWorkdir(workdir.clone());
         let primary_ctx = workdir.join("primary.ctx");
         let primary_arg = primary_ctx.to_string_lossy().into_owned();
         let template = self.createprimary_args(primary_arg.as_str());
@@ -210,7 +254,7 @@ impl TpmUnlock for RealTpm {
     }
 }
 
-fn sealed_ctx_arg(workdir: &std::path::Path) -> String {
+fn sealed_ctx_arg(workdir: &Path) -> String {
     workdir.join("sealed.ctx").to_string_lossy().into_owned()
 }
 
@@ -350,5 +394,123 @@ mod tests {
             RealTpm::with_dir(PathBuf::from("/x")).timeout,
             Duration::from_secs(30)
         );
+    }
+
+    fn unique_test_base(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "veil-tpm-test-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    /// 伪造 `tpm2-*` 工具：`createprimary` 将 `-c` 目标路径追加日志（可观测工作目录），
+    /// `load` 直通，`unseal` 按用例返回固定密码或失败；使并发/清理路径可确定性验证。
+    fn fake_tpm(tag: &str, unseal_ok: bool) -> (PathBuf, PathBuf, RealTpm) {
+        let base = unique_test_base(tag);
+        let seal_dir = base.join("seal");
+        let bin_dir = base.join("bin");
+        std::fs::create_dir_all(&seal_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(seal_dir.join("seal.pub"), b"pub").unwrap();
+        std::fs::write(seal_dir.join("seal.priv"), b"priv").unwrap();
+        let log = base.join("calls.log");
+        let log_lit = log.to_string_lossy().into_owned();
+        write_executable(
+            &bin_dir.join("tpm2_createprimary"),
+            &format!("#!/bin/sh\necho \"$*\" >> \"{log_lit}\"\nexit 0\n"),
+        );
+        write_executable(&bin_dir.join("tpm2_load"), "#!/bin/sh\nexit 0\n");
+        if unseal_ok {
+            write_executable(
+                &bin_dir.join("tpm2_unseal"),
+                "#!/bin/sh\necho secret-password\nexit 0\n",
+            );
+        } else {
+            write_executable(
+                &bin_dir.join("tpm2_unseal"),
+                "#!/bin/sh\necho boom >&2\nexit 1\n",
+            );
+        }
+        (base, log, RealTpm::with_bin_dir(seal_dir, bin_dir))
+    }
+
+    fn logged_workdirs(log: &Path) -> Vec<PathBuf> {
+        let content = std::fs::read_to_string(log).unwrap_or_default();
+        let mut dirs = Vec::new();
+        for line in content.lines() {
+            let mut prev = "";
+            for tok in line.split_whitespace() {
+                if prev == "-c"
+                    && let Some(parent) = Path::new(tok).parent()
+                {
+                    dirs.push(parent.to_path_buf());
+                }
+                prev = tok;
+            }
+        }
+        dirs
+    }
+
+    #[test]
+    fn tpm_concurrent_unseal_isolated() {
+        let (base, log, tpm) = fake_tpm("concurrent", true);
+        let n = 16;
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let tpm = tpm.clone();
+            handles.push(std::thread::spawn(move || tpm.unseal()));
+        }
+        for handle in handles {
+            let out = handle
+                .join()
+                .expect("解封线程不得 panic")
+                .expect("并发解封须成功");
+            assert_eq!(out, b"secret-password");
+        }
+        let dirs = logged_workdirs(&log);
+        let unique: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(dirs.len(), n, "每次解封须各记录一次工作目录");
+        assert_eq!(unique.len(), n, "并发工作目录必须互不相同");
+        for dir in &dirs {
+            assert!(dir.to_string_lossy().contains("veil-tpm-"), "{dir:?}");
+            assert!(!dir.exists(), "解封后工作目录须清理: {dir:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn tpm_tempdir_cleanup() {
+        let (base, log, tpm) = fake_tpm("cleanup-ok", true);
+        assert_eq!(tpm.unseal().expect("成功解封"), b"secret-password");
+        for dir in logged_workdirs(&log) {
+            assert!(!dir.exists(), "成功路径不得残留临时目录: {dir:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+
+        let (base, log, tpm) = fake_tpm("cleanup-fail", false);
+        assert!(tpm.unseal().is_err(), "tpm2_unseal 失败须透出错误");
+        for dir in logged_workdirs(&log) {
+            assert!(!dir.exists(), "失败路径不得残留临时目录: {dir:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+
+        let base = unique_test_base("cleanup-missing");
+        std::fs::create_dir_all(&base).unwrap();
+        let tpm = RealTpm::with_dir(base.join("empty"));
+        let err = tpm.unseal().unwrap_err();
+        assert!(err.to_string().contains("密封文件缺失"), "{err}");
+        std::fs::remove_dir_all(&base).ok();
     }
 }

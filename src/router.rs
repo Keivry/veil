@@ -63,11 +63,17 @@ pub fn build_router(state: AppState) -> Router {
 mod tests {
     use {
         super::*,
-        crate::{config::Config, state::SqliteOutcome},
-        std::{collections::HashMap, path::PathBuf, sync::Arc},
+        crate::{
+            config::Config,
+            service::credential::test_support::{InjectSink, inject_sink},
+            state::SqliteOutcome,
+        },
+        std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration},
     };
 
-    fn test_app(extra: &[(&str, &str)]) -> Router {
+    fn test_app(extra: &[(&str, &str)]) -> Router { test_app_with_state(extra).0 }
+
+    fn test_app_with_state(extra: &[(&str, &str)]) -> (Router, AppState) {
         let mut env = HashMap::from([
             (
                 "HOMESERVER".to_string(),
@@ -84,16 +90,19 @@ mod tests {
         for (k, v) in extra {
             env.insert((*k).to_string(), (*v).to_string());
         }
-        let state = AppState::new(
-            Config::load_from(&env).unwrap(),
-            SqliteOutcome {
-                sqlite_ok: true,
-                sqlite_error: None,
-                db_path: PathBuf::from("/tmp/x.sqlite"),
-            },
-        )
-        .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()));
-        build_router(state)
+        let state = inject_sink(
+            AppState::new(
+                Config::load_from(&env).unwrap(),
+                SqliteOutcome {
+                    sqlite_ok: true,
+                    sqlite_error: None,
+                    db_path: PathBuf::from("/tmp/x.sqlite"),
+                },
+            )
+            .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked())),
+            InjectSink::success(),
+        );
+        (build_router(state.clone()), state)
     }
 
     async fn serve_and_client(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -138,7 +147,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(reg.status().as_u16(), 200);
+        assert_eq!(reg.status().as_u16(), 202);
 
         let cred = client
             .post(format!("{base}/credential"))
@@ -170,7 +179,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(revoke.status().as_u16(), 200);
+        assert_eq!(revoke.status().as_u16(), 202);
 
         let emergency = client
             .post(format!("{base}/revoke/emergency"))
@@ -528,8 +537,12 @@ mod tests {
     async fn register_caller_go_shape_superset() {
         // GO/D8.3：Go 形态请求（`name/script_path/script_hash/entries/allow_mode`）
         // 注册成功；响应提供加性超集（顶层 + `registration` 内可解析），
-        // 既有字段不删、重名 409 语义不变。
-        let (base, handle) = serve_and_client(test_app(&[])).await;
+        // 既有字段不删、重名 409 语义不变。C1/D1：注册经审批链，阻塞模式下批准后返回。
+        let (app, state) = test_app_with_state(&[
+            ("CREDENTIAL_BLOCK_WAIT", "1"),
+            ("APPROVAL_WHITELIST", "@admin:example.com"),
+        ]);
+        let (base, handle) = serve_and_client(app).await;
         let client = reqwest::Client::new();
         let body = serde_json::json!({
             "name": "check-mail",
@@ -538,12 +551,32 @@ mod tests {
             "entries": {"网易": ["授权码"]},
             "allow_mode": "true",
         });
-        let resp = client
-            .post(format!("{base}/register-caller"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
+        let request_client = client.clone();
+        let request_body = body.clone();
+        let request_base = base.clone();
+        let request = tokio::spawn(async move {
+            request_client
+                .post(format!("{request_base}/register-caller"))
+                .json(&request_body)
+                .send()
+                .await
+        });
+        let event_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ids = state.approval.pending_event_ids().await;
+                if let Some(id) = ids.into_iter().next() {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("注册审批建单超时");
+        state
+            .approval
+            .resolve(&event_id, "@admin:example.com", true)
+            .await;
+        let resp = request.await.unwrap().unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["ok"], true);

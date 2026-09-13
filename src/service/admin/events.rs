@@ -60,6 +60,42 @@ mod tests {
         assert!(admin_token_eq("", ""));
     }
 
+    /// A18/D18：旧 `range` 键映射新 `granularity`，且三档桶跨度与旧窗口数值等价
+    /// （1h=12×five_min、1d=24×hourly=288×five_min、1d=daily 单桶）。
+    #[test]
+    fn metrics_series_timeframe_mapping() {
+        use crate::service::metrics::aggregate::{day_key, five_min_key, hour_key};
+        for (range, gran) in [
+            ("1h", "five_min"),
+            ("24h", "hourly"),
+            ("7d", "daily"),
+            ("30d", "daily"),
+        ] {
+            assert_eq!(compat_granularity_for_range(range), Some(gran), "{range}");
+        }
+        let base = 1_234_567_890_i64.div_euclid(86_400) * 86_400;
+        let five_in_hour: std::collections::BTreeSet<String> = (0..3_600)
+            .step_by(300)
+            .map(|d| five_min_key(base + d))
+            .collect();
+        assert_eq!(five_in_hour.len(), 12, "1h 须恰 12 个 five_min 桶");
+        let hours_in_day: std::collections::BTreeSet<String> = (0..86_400)
+            .step_by(3_600)
+            .map(|d| hour_key(base + d))
+            .collect();
+        assert_eq!(hours_in_day.len(), 24, "24h 须恰 24 个 hourly 桶");
+        let five_in_day: std::collections::BTreeSet<String> = (0..86_400)
+            .step_by(300)
+            .map(|d| five_min_key(base + d))
+            .collect();
+        assert_eq!(five_in_day.len(), 288, "24h 须恰 288 个 five_min 桶");
+        let daily: std::collections::BTreeSet<String> = (0..86_400)
+            .step_by(3_600)
+            .map(|d| day_key(base + d))
+            .collect();
+        assert_eq!(daily.len(), 1, "24h 须恰 1 个 daily 桶");
+    }
+
     #[test]
     fn legacy_range_maps_to_new_granularity() {
         assert_eq!(compat_granularity_for_range("1h"), Some("five_min"));

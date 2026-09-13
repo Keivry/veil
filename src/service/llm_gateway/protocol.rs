@@ -51,6 +51,24 @@ fn strict_match(path: &str) -> Option<Protocol> {
     None
 }
 
+/// `T5`/D5：官方子资源排除。尾后缀的一层额外路径段若命中官方子资源，MUST NOT
+/// 判为对话协议（`lenient_match` 返回 `None` ⇒ `NonDialog` 字节透传），避免请求被
+/// 改写、响应被注入占位符或触发审计后处理：
+/// - Anthropic `v1/messages/{count_tokens|batches}`：独立端点，body 与响应形态均不同；
+/// - Responses `v1/responses/{任意单段}`：均为响应对象检索（`.cancel`/`.input_items`
+///   为两段后缀，`strict_match` 已不命中，天然 `NonDialog`，无需另列）。
+///
+/// Chat 无同类官方子资源，保留一层宽容（`/v1/chat/completions/extra` 仍命中）。
+fn is_official_subresource(proto: Protocol, seg: &str) -> bool {
+    match proto {
+        Protocol::Anthropic => {
+            seg.eq_ignore_ascii_case("count_tokens") || seg.eq_ignore_ascii_case("batches")
+        }
+        Protocol::Responses => true,
+        Protocol::Chat | Protocol::NonDialog => false,
+    }
+}
+
 fn lenient_match(path: &str) -> Option<(Protocol, String)> {
     let p = strip_query(path);
     let trimmed = p.strip_suffix('/').unwrap_or(p);
@@ -67,6 +85,9 @@ fn lenient_match(path: &str) -> Option<(Protocol, String)> {
             if let Some(proto) = strict_match(parent) {
                 let rest = &p[slash + 1..];
                 if !rest.is_empty() && !rest.contains('/') {
+                    if is_official_subresource(proto, rest) {
+                        return None;
+                    }
                     return Some((proto, proto.as_tail().to_string()));
                 }
             }
@@ -194,6 +215,41 @@ mod tests {
         assert_eq!(m.lenient_count("chat/completions"), 2);
         let (hit3, _) = is_chat_tail("/v1/chat/completions/a/b", Some(&m));
         assert!(!hit3);
+    }
+
+    #[test]
+    fn official_subresources_are_nondialog() {
+        // T5：官方子资源一层后缀须 NonDialog，且不得记宽容计数。
+        let m = GatewayMetrics::default();
+        for path in [
+            "/v1/messages/count_tokens",
+            "/v1/messages/batches",
+            "/v1/responses/abc123",
+            "/v1/responses/abc123/cancel",
+            "/v1/responses/abc123/input_items",
+        ] {
+            let (hit, proto) = is_chat_tail(path, Some(&m));
+            assert!(!hit && proto == Protocol::NonDialog, "{path} 须 NonDialog");
+        }
+        assert_eq!(m.lenient_count("v1/messages"), 0, "官方子资源不得记宽容");
+        assert_eq!(m.lenient_count("v1/responses"), 0, "官方子资源不得记宽容");
+    }
+
+    #[test]
+    fn protocol_lenient_regression() {
+        // T5：排除官方子资源后，既有严格/尾斜杠/一层宽容语义不回退。
+        let m = GatewayMetrics::default();
+        for (path, want) in [
+            ("/v1/chat/completions/", Protocol::Chat),
+            ("/v1/chat/completions/extra", Protocol::Chat),
+            ("/v1/messages/", Protocol::Anthropic),
+            ("/v1/messages/legacy-one-seg", Protocol::Anthropic),
+            ("/v1/responses/", Protocol::Responses),
+        ] {
+            let (hit, proto) = is_chat_tail(path, Some(&m));
+            assert!(hit && proto == want, "{path} 须 {want:?}");
+        }
+        assert!(!is_chat_tail("/v1/models", Some(&m)).0);
     }
 
     #[test]

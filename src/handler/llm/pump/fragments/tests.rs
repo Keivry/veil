@@ -126,7 +126,9 @@ fn responses_delta_carries_sequence_and_done_is_full() {
     let frags2 = extract_tool_fragments(P::Responses, &done);
     assert_eq!(frags2.len(), 1);
     assert_eq!(frags2[0].2.as_deref(), Some("run"));
-    assert!(AuditHold::is_complete_event(&done));
+    // D2：`.done` 是槽级完成，不置全局完成。
+    assert!(AuditHold::is_responses_slot_complete_event(&done));
+    assert!(!AuditHold::is_complete_event(&done));
 }
 
 #[test]
@@ -339,6 +341,10 @@ fn tool_extract_parity() {
             P::Anthropic,
             serde_json::json!({"delta":{"type":"tool_use","partial_json":"{\"a\":"}}),
         ),
+        (
+            P::Responses,
+            serde_json::json!({"output":[{"type":"web_search_call","action":{"type":"search","query":"veil audit"}}]}),
+        ),
     ];
     for (proto, v) in cases {
         let frags = extract_tool_fragments(proto, &v);
@@ -427,4 +433,24 @@ fn tool_bucket_parity() {
     }
     assert_eq!(frags2[0].0, 0);
     assert_eq!(frags2[1].0, 1);
+}
+
+#[test]
+fn web_search_action_audit_both_paths() {
+    // T11/10.2：官方 `action` 查询经流式分片与非流 `extract_tool_calls`
+    // 均进入审计参数（不漏审）。
+    use crate::service::llm_gateway::{Protocol as P, extract_tool_calls};
+    let nonstream = serde_json::json!({"output":[{"type":"web_search_call","id":"ws1",
+        "action":{"type":"search","query":"veil audit"}}]});
+    let calls = extract_tool_calls(P::Responses, &nonstream);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name.as_deref(), Some("web_search"));
+    assert!(calls[0].args.contains("veil audit"), "{:?}", calls[0]);
+    let stream = serde_json::json!({"type":"response.output_item.done","output_index":0,
+        "item":{"type":"web_search_call","id":"ws1",
+            "action":{"type":"search","query":"veil audit"}}});
+    let frags = extract_tool_fragments(P::Responses, &stream);
+    assert_eq!(frags.len(), 1);
+    assert_eq!(frags[0].2.as_deref(), Some("web_search"));
+    assert!(frags[0].3.contains("veil audit"), "{:?}", frags[0]);
 }

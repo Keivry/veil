@@ -19,52 +19,12 @@
 //! | 12 | usage 递减乱序按列取 max（与 gateway 实现对应，此处验收） | 移植 | `usage递减乱序取max` |
 
 use {
-    std::{collections::HashMap, path::PathBuf, sync::Arc},
-    veil::{
-        config::Config,
-        router::build_router,
-        service::llm_gateway::{Protocol, accumulate_usage, extract_usage_stream},
-        state::SqliteOutcome,
-    },
+    common::{serve, test_app_db},
+    std::path::PathBuf,
+    veil::service::llm_gateway::{Protocol, accumulate_usage, extract_usage_stream},
 };
 
-fn test_app(extra: &[(&str, &str)], db: &str) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(db),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
+mod common;
 
 async fn mock_upstream(frames: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
     let app = axum::Router::new().route(
@@ -127,7 +87,7 @@ async fn thinking_signature_single_frame_byte_identical() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-01.sqlite",
     ))
@@ -149,7 +109,7 @@ async fn display_omitted_empty_thinking_passthrough() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-02.sqlite",
     ))
@@ -175,7 +135,7 @@ async fn redacted_thinking_opaque_passthrough() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-03.sqlite",
     ))
@@ -202,7 +162,7 @@ async fn tool_use_fragments_passthrough_ordered_until_stop() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-04.sqlite",
     ))
@@ -236,7 +196,7 @@ async fn fallback_block_without_delta_not_misjudged() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-05.sqlite",
     ))
@@ -259,7 +219,7 @@ async fn cr_only_and_lf_paths_match() {
     let cr_frames: Vec<String> = lf_frames.iter().map(|f| f.replace('\n', "\r")).collect();
     for (tag, frames) in [("lf", lf_frames), ("cr", cr_frames)] {
         let (upstream, uhandle) = mock_upstream(frames).await;
-        let (base, handle) = serve(test_app(
+        let (base, handle) = serve(test_app_db(
             &[("LLM_UPSTREAM", upstream.as_str())],
             &format!("/tmp/veil-sdk-06-{tag}.sqlite"),
         ))
@@ -281,7 +241,7 @@ async fn error_overloaded_interrupts_stream() {
         "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"synthetic overload\"}}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-07.sqlite",
     ))
@@ -320,7 +280,7 @@ async fn stop_sequence_echoed() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-09.sqlite",
     ))
@@ -342,7 +302,7 @@ async fn unknown_event_skipped() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-10.sqlite",
     ))
@@ -365,7 +325,7 @@ async fn ping_ignored() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
     let (upstream, uhandle) = mock_upstream(frames).await;
-    let (base, handle) = serve(test_app(
+    let (base, handle) = serve(test_app_db(
         &[("LLM_UPSTREAM", upstream.as_str())],
         "/tmp/veil-sdk-11.sqlite",
     ))
@@ -451,7 +411,7 @@ async fn responses_cr_only_and_lf_gateway_outputs_match() {
     let mut outputs = Vec::new();
     for (tag, frames) in [("lf", lf_frames), ("cr", cr_frames)] {
         let (upstream, uhandle) = mock_upstream(frames).await;
-        let (base, handle) = serve(test_app(
+        let (base, handle) = serve(test_app_db(
             &[("LLM_UPSTREAM", upstream.as_str())],
             &format!("/tmp/veil-sdk-06r-{tag}.sqlite"),
         ))

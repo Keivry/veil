@@ -5,60 +5,14 @@
 //! 闭环，且不修改 `veil-hardening` 任何文件。
 
 use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-        time::Duration,
-    },
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
+    common::{serve, test_app_router},
+    std::time::Duration,
 };
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
+mod common;
 
-const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
 const GET_HASH: &str = "gethash1";
 const GET_SECRET: &str = "s3cr3t";
-
-fn test_app(extra: &[(&str, &str)]) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            ADMIN_TOKEN.to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), GET_SECRET.to_string()),
-        ("GET_BINARY_HASH".to_string(), GET_HASH.to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(format!("/tmp/veil-e2e-go-interop-{n}.sqlite")),
-        },
-    )
-    .with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
 
 /// POST /credential：可选头 + 纯 JSON body，返回 (状态码, JSON 体)。
 async fn cred_post(
@@ -96,7 +50,7 @@ async fn go_shaped_credential_body_only_rejected() {
     //（`error` 非 string），锁定「Go 不可直接解析」根因契约；
     // 同时锁定 `body.auth.get_binary_hash`/`get_binary_secret` 与 `body.secret`
     // 被采纳为等价头（`auth.rs::effective_*`）的行为。
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
 
     let (status, body) = cred_post(&client, &base, &[], auth_body("go-h1", "/srv/go1.sh")).await;
@@ -162,7 +116,7 @@ async fn go_three_factor_matrix() {
     // GO/D5-2（对应 `veil-hardening` 5.2）：齐全（头体一致）→ 放行；
     // 缺哈希头 / 缺密钥头 / 缺 `body.auth.*` / 冒用 caller_hash==GET_BINARY_HASH
     // 各 → 403 明确诊断；冒用为 `token:false` 原始取用的拒止口径。
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
 
     // 齐全（头体一致）→ 放行。
@@ -306,7 +260,7 @@ async fn go_blocked_stream_terminates() {
     // anthropic `message_stop` + `content_block_stop`、responses `response.failed`；
     // 危险参数零泄漏、无重试/挂起。
     let (upstream, uhandle) = mock_upstream_block().await;
-    let (base, handle) = serve(test_app(&[
+    let (base, handle) = serve(test_app_router(&[
         ("LLM_UPSTREAM", upstream.as_str()),
         ("AUDIT_MODE", "block"),
         ("AUDIT_HOLD_MAX_BYTES", "16"),

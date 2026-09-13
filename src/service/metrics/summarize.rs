@@ -94,6 +94,7 @@ pub(crate) mod test_support {
             prompt_tokens: p,
             completion_tokens: c,
             total_tokens: t,
+            total_explicit: true,
             cached_read: 0,
             cached_write: 0,
         }

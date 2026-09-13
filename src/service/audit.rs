@@ -19,9 +19,10 @@ pub mod log;
 pub mod normalize;
 pub mod policy;
 pub mod rules;
+pub mod sink;
 pub mod verdict;
 
-pub use {hold::*, log::*, normalize::*, policy::*, rules::*, verdict::*};
+pub use {hold::*, log::*, normalize::*, policy::*, rules::*, sink::*, verdict::*};
 
 /// 单测专用：非空审批白名单（T2/D2 调用点统一口径；空白名单降级用例显式传 `&[]`，
 /// 生产不可达由启动门禁保证，见 `src/config/env_parse.rs:307-310`）。

@@ -15,6 +15,8 @@ use {
 pub const SSE_MAX_PER_IP: usize = 5;
 /// SSE 保活 ping 间隔（60s）。
 pub const SSE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// A11/D10：SSE 流内 `event: metrics` 快照周期（15s）。
+pub const SSE_METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 /// SSE 强制重连（5min，服务端主动关闭）。
 pub const SSE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
 

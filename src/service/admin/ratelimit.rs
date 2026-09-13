@@ -23,6 +23,27 @@ pub fn admin_rate_exempt_paths() -> [&'static str; 1] { ["/_admin/health"] }
 /// 是否豁免限流（health 恒 true）。
 pub fn is_rate_exempt(path: &str) -> bool { admin_rate_exempt_paths().contains(&path) }
 
+/// 纯函数限流判定（G8.4 时钟注入）：按给定 `now` 剔除出窗命中、判阈值并返回
+/// `Retry-After` 秒数；放行时把 `now` 记入 `hits`。生产语义与原内联逻辑逐字一致。
+fn decide_rate_limit(
+    hits: &mut Vec<Instant>,
+    now: Instant,
+    limit: usize,
+    window: Duration,
+) -> Result<(), u64> {
+    hits.retain(|t| now.duration_since(*t) < window);
+    if hits.len() >= limit {
+        let oldest = hits.iter().min().copied().unwrap_or(now);
+        let retry = window
+            .saturating_sub(now.duration_since(oldest))
+            .as_secs()
+            .max(1);
+        return Err(retry);
+    }
+    hits.push(now);
+    Ok(())
+}
+
 impl AdminState {
     /// 通用限流（10/min/IP）：超限返回 `Retry-After` 秒数。
     pub fn check_rate(&self, ip: IpAddr) -> Result<(), u64> {
@@ -30,17 +51,7 @@ impl AdminState {
         let now = Instant::now();
         let window = Duration::from_secs(ADMIN_RATE_WINDOW_SECS);
         let hits = guard.entry(ip).or_default();
-        hits.retain(|t| now.duration_since(*t) < window);
-        if hits.len() >= ADMIN_RATE_LIMIT {
-            let oldest = hits.iter().min().copied().unwrap_or(now);
-            let retry = window
-                .saturating_sub(now.duration_since(oldest))
-                .as_secs()
-                .max(1);
-            return Err(retry);
-        }
-        hits.push(now);
-        Ok(())
+        decide_rate_limit(hits, now, ADMIN_RATE_LIMIT, window)
     }
 }
 
@@ -61,7 +72,10 @@ mod tests {
             },
             *,
         },
-        std::net::IpAddr,
+        std::{
+            net::IpAddr,
+            time::{Duration, Instant},
+        },
     };
 
     #[test]
@@ -72,9 +86,43 @@ mod tests {
             assert!(st.check_rate(test_ip()).is_ok());
         }
         let retry = st.check_rate(test_ip()).unwrap_err();
-        assert!(retry >= 1);
+        assert!(
+            (1..=ADMIN_RATE_WINDOW_SECS).contains(&retry),
+            "第 11 次须 429 且 Retry-After 落在 1..=窗口秒数: {retry}"
+        );
+        // 超限后继续请求恒拒绝（不因再次调用被放行）。
+        assert!(st.check_rate(test_ip()).is_err());
         // 不同 IP 不受影响（不读代理头：伪造 XFF 无法逃逸——本函数只收直连 IP）。
         assert!(st.check_rate(IpAddr::from([10, 0, 0, 2])).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_window_rollover_and_retry_after_value() {
+        // G8.4：注入时钟（纯函数）精确断言阈值、Retry-After 取值与窗口滚动。
+        let window = Duration::from_secs(ADMIN_RATE_WINDOW_SECS);
+        let base = Instant::now();
+        let mut hits: Vec<Instant> = Vec::new();
+        for _ in 0..ADMIN_RATE_LIMIT {
+            assert!(decide_rate_limit(&mut hits, base, ADMIN_RATE_LIMIT, window).is_ok());
+        }
+        assert_eq!(hits.len(), ADMIN_RATE_LIMIT, "窗口内命中须满阈值");
+        // 同一 now 第 11 次拒绝：oldest 未老化，Retry-After 取满窗秒数。
+        assert_eq!(
+            decide_rate_limit(&mut hits, base, ADMIN_RATE_LIMIT, window).unwrap_err(),
+            ADMIN_RATE_WINDOW_SECS,
+            "同刻 oldest 无老化，Retry-After 取满窗"
+        );
+        // 出窗前一刻（59s）仍拒绝，Retry-After 精确收敛到 1s。
+        let just_before = base + window - Duration::from_secs(1);
+        assert_eq!(
+            decide_rate_limit(&mut hits, just_before, ADMIN_RATE_LIMIT, window).unwrap_err(),
+            1,
+            "临近出窗 Retry-After 须收敛到 1"
+        );
+        // 满窗时刻 oldest 出窗，放行且仅保留新一轮命中。
+        let rollover = base + window;
+        assert!(decide_rate_limit(&mut hits, rollover, ADMIN_RATE_LIMIT, window).is_ok());
+        assert_eq!(hits.len(), 1, "滚动后仅新一轮命中存留");
     }
 
     #[test]
@@ -120,7 +168,11 @@ mod tests {
         for _ in 0..ADMIN_RATE_LIMIT {
             assert!(st.check_rate(test_ip()).is_ok());
         }
-        assert!(st.check_rate(test_ip()).is_err());
+        let retry = st.check_rate(test_ip()).unwrap_err();
+        assert!(
+            (1..=ADMIN_RATE_WINDOW_SECS).contains(&retry),
+            "速率超限须带有效 Retry-After: {retry}"
+        );
         let mut guards = Vec::new();
         for _ in 0..SSE_MAX_PER_IP {
             guards.push(st.acquire_sse(test_ip()).unwrap());

@@ -116,6 +116,21 @@ pub fn retrieval_args(obj: &serde_json::Map<String, Value>) -> String {
             }
         }
     }
+    // T11/D10：官方 Responses 检索条目查询在 `action` 对象内
+    // （`{"type":"search","query":...}`）；`query` 字符串直取、`queries`
+    // 数组/其他非 null 值序列化。`results` 仍排除（体量风险）。
+    if let Some(action) = obj.get("action").and_then(|v| v.as_object()) {
+        for key in ["query", "queries"] {
+            if let Some(v) = action.get(key)
+                && !v.is_null()
+            {
+                match v {
+                    Value::String(s) => return s.clone(),
+                    other => return serde_json::to_string(other).unwrap_or_default(),
+                }
+            }
+        }
+    }
     for key in ["queries", "query"] {
         if let Some(v) = obj.get(key)
             && !v.is_null()

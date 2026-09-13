@@ -2,7 +2,8 @@
 //!
 //! 子模块划分（D2 四桶映射）：`spawn` 主泵循环（透传臂/空流守门/hold 分支装配），
 //! `event` 终止/次要事件判定 + SSE 响应装配，`toolbuf` tool 分桶缓冲与入口钳位，
-//! `fragments` tool 分片提取；旧路径经重导出兼容，对外 `handler::*` 不变。
+//! `fragments` tool 分片提取，`synth_flush` 合成终端前边界滞留帧 flush（`S3` 保序）；
+//! 旧路径经重导出兼容，对外 `handler::*` 不变。
 
 use {
     crate::{
@@ -19,13 +20,17 @@ use {
     std::{path::PathBuf, sync::Arc, time::Instant},
 };
 
+pub mod carry;
 pub mod event;
 pub mod fragments;
 pub mod spawn;
+pub mod synth_flush;
 pub mod toolbuf;
 
 pub mod decide;
 
+#[cfg(test)]
+mod responses_audit_tests;
 #[cfg(test)]
 mod spawn_tests;
 
@@ -38,6 +43,8 @@ pub struct StreamPumpCtx {
     pub audit_mode: AuditMode,
     pub audit_policy_file: Option<PathBuf>,
     pub approval_whitelist: Vec<String>,
+    /// A1/D1：审计落盘单例（verdict 命中/放行经 `spawn_blocking` 写 JSONL）。
+    pub audit_sink: Arc<crate::service::audit::AuditSink>,
     pub hold_max: usize,
     pub gateway_metrics: Arc<GatewayMetrics>,
     pub admin_metrics: Arc<MetricsStore>,

@@ -132,10 +132,7 @@ fn with_admin_cookie(mut resp: Response, headers: &HeaderMap, expected: &str) ->
         tracing::warn!("拒绝签发 Cookie：X-Admin-Token 含非法 cookie-octet 字符");
         return resp;
     }
-    let https = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+    let https = cookie_https(headers);
     let value = if https {
         format!("__Host-admin_token={got}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600")
     } else {
@@ -145,6 +142,34 @@ fn with_admin_cookie(mut resp: Response, headers: &HeaderMap, expected: &str) ->
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
+}
+
+/// A16/D15：https 双判据——`X-Forwarded-Proto: https` 或 RFC 7239 `Forwarded`
+/// 内 `proto=https`（大小写不敏感）任一命中即为 https（Secure Cookie 判据）。
+fn cookie_https(headers: &HeaderMap) -> bool {
+    let xfp = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("https"));
+    if xfp {
+        return true;
+    }
+    headers
+        .get_all("forwarded")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(forwarded_proto_https)
+}
+
+/// RFC 7239 `Forwarded` 单头解析：逗号/分号分隔元素与参数，仅取 `proto` 值比对 https。
+fn forwarded_proto_https(raw: &str) -> bool {
+    raw.split([',', ';']).any(|part| {
+        let lower = part.trim().to_ascii_lowercase();
+        match lower.strip_prefix("proto=") {
+            Some(v) => v.trim().trim_matches('"') == "https",
+            None => false,
+        }
+    })
 }
 
 /// 超限响应（自 `service::admin::ratelimit` 搬入）：429 + `Retry-After`（秒）
@@ -217,9 +242,12 @@ pub async fn admin_health(
         return r;
     }
     let health = crate::service::health_status(&state);
-    let body = Json(
-        json!({"ok": true, "sqlite_ok": health.sqlite_ok, "sqlite_error": health.sqlite_error}),
-    )
+    let body = Json(json!({
+        "ok": true,
+        "sqlite_ok": health.sqlite_ok,
+        "sqlite_error": health.sqlite_error,
+        "pii_custom_disabled": state.detector.disabled_snapshot().len(),
+    }))
     .into_response();
     with_admin_cookie(body, &headers, &state.config().observability_admin_token)
 }
@@ -430,11 +458,85 @@ pub async fn admin_events(
     with_admin_cookie(resp, &headers, &state.config().observability_admin_token)
 }
 
+/// A11/D10：SSE 周期快照 payload 六键 `{range, model, upstream, metrics, series, health}`。
+/// 取数复用 `/_admin/metrics`、`/_admin/series`、`/_admin/health` 服务口径；
+/// `series` 取数失败降级 `{"error":"series_unavailable"}`，不中断事件推送与 60s ping。
+pub(crate) async fn build_metrics_sse_payload(
+    state: &AppState,
+    filter: &admin::SseFilter,
+    range: Option<&str>,
+    granularity: &str,
+) -> serde_json::Value {
+    let snap = state.admin_state().metrics.snapshot();
+    let gm = state.gateway_metrics();
+    let metrics = json!({
+        "ok": true,
+        "is_precise": snap.is_precise,
+        "requests": snap.requests,
+        "tokens": {
+            "prompt": snap.prompt_tokens,
+            "completion": snap.completion_tokens,
+            "total": snap.total_tokens,
+            "cached_read": snap.cached_read,
+            "cached_write": snap.cached_write,
+            "unknown": snap.unknown,
+        },
+        "per_protocol": snap.per_protocol,
+        "per_model": snap.per_model,
+        "latency_buckets": snap.latency_buckets,
+        "p95_ms": snap.p95_ms,
+        "truncated": {
+            "silent_discard": snap.truncated_silent_discard,
+            "open_ended": snap.truncated_open_ended,
+            "synthesized_failed": snap.truncated_synthesized_failed,
+        },
+        "sse_events": gm.sse_event_total(),
+        "ring_len": snap.ring_len,
+        "dropped": snap.dropped,
+    });
+    let series = match state
+        .admin_state()
+        .metrics
+        .query_series(granularity, None, None)
+        .await
+    {
+        Ok(points) => json!(points),
+        Err(e) => {
+            tracing::warn!("SSE metrics 快照 series 取数失败，降级为 series_unavailable: {e}");
+            json!({"error": "series_unavailable"})
+        }
+    };
+    let health = crate::service::health_status(state);
+    let health = json!({
+        "ok": true,
+        "sqlite_ok": health.sqlite_ok,
+        "sqlite_error": health.sqlite_error,
+        "pii_custom_disabled": state.detector.disabled_snapshot().len(),
+    });
+    json!({
+        "range": range,
+        "model": filter.model.clone(),
+        "upstream": filter.upstream.clone(),
+        "metrics": metrics,
+        "series": series,
+        "health": health,
+    })
+}
+
+/// A11：生产 15s 周期；单测缩短以在快速窗口验证周期推送（集成测试走非 test lib，恒 15s）。
+fn sse_metrics_interval() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(80)
+    } else {
+        admin::SSE_METRICS_INTERVAL
+    }
+}
+
 /// `GET /_admin/events/stream`：SSE 实时推送（query 鉴权仅此路由有效；
 /// 建连 `?model=&upstream=` 过滤维度生效，见 `service::admin::SseFilter`）。
 ///
-/// 推送节奏：事件驱动直推（广播即到），不按 15s/2s 快照节流；网关接线人
-/// 若需严格节奏，在订阅循环加节流窗。
+/// 推送节奏：事件驱动直推（广播即到）+ 每 15s `event: metrics` 周期快照
+/// （A11/D10，取数失败降级不中断）。
 pub async fn admin_events_stream(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -466,6 +568,15 @@ pub async fn admin_events_stream(
     let admin = state.admin_state().clone();
     // 建连过滤维度（model/upstream）；近环回放与实时流同过滤。
     let filter = admin::SseFilter::from_query(&query);
+    let range = query.get("range").cloned();
+    let granularity = match query.get("granularity") {
+        Some(g) if matches!(g.as_str(), "daily" | "hourly" | "five_min" | "5min") => g.clone(),
+        _ => range
+            .as_deref()
+            .and_then(admin::compat_granularity_for_range)
+            .unwrap_or("hourly")
+            .to_string(),
+    };
     // 近环回放（最近 20 条，已脱敏）。
     let backlog: Vec<String> = admin
         .query_events(None, None, 20)
@@ -474,6 +585,14 @@ pub async fn admin_events_stream(
         .filter_map(|e| serde_json::to_string(&e).ok())
         .filter(|s| filter.passes(s))
         .collect();
+    let metrics_state = state.clone();
+    let metrics_filter = filter.clone();
+    let metrics_range = range.clone();
+    let mut metrics_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + sse_metrics_interval(),
+        sse_metrics_interval(),
+    );
+    metrics_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let stream = async_stream::stream! {
         let _sse_guard = sse_guard;
         for item in backlog {
@@ -482,18 +601,35 @@ pub async fn admin_events_stream(
         let mut rx = rx;
         let deadline = tokio::time::Instant::now() + admin::SSE_MAX_AGE;
         loop {
-            let timeout = tokio::time::timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), rx.recv()).await;
-            match timeout {
-                Ok(Ok(msg)) => {
-                    if filter.passes(&msg) {
-                        yield Ok::<_, anyhow::Error>(axum::response::sse::Event::default().data(msg).event("message"));
-                    }
-                }
-                Ok(Err(_)) => break,
-                Err(_) => break,
-            }
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 break;
+            }
+            let until_deadline = deadline.saturating_duration_since(now);
+            tokio::select! {
+                _ = metrics_ticker.tick() => {
+                    let payload = build_metrics_sse_payload(
+                        &metrics_state,
+                        &metrics_filter,
+                        metrics_range.as_deref(),
+                        &granularity,
+                    )
+                    .await;
+                    yield Ok::<_, anyhow::Error>(
+                        axum::response::sse::Event::default()
+                            .event("metrics")
+                            .data(payload.to_string()),
+                    );
+                }
+                recv = rx.recv() => match recv {
+                    Ok(msg) => {
+                        if filter.passes(&msg) {
+                            yield Ok::<_, anyhow::Error>(axum::response::sse::Event::default().data(msg).event("message"));
+                        }
+                    }
+                    Err(_) => break,
+                },
+                _ = tokio::time::sleep(until_deadline) => break,
             }
         }
         // 5min 强制重连：服务端关闭流，客户端按 retry 重连。

@@ -3,64 +3,20 @@
 //! 每个用例独立建 app（sqlite 隔离 + 限流器隔离），经真 HTTP 回环，无外网依赖。
 
 use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-    },
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
+    common::{TestOpts, serve, test_app_router},
+    std::{path::PathBuf, sync::atomic::AtomicU64},
 };
 
+mod common;
+
 static APP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn test_app(extra: &[(&str, &str)]) -> axum::Router {
-    test_app_with_token(extra, "observability-admin-token-0123456789")
-}
-
-fn test_app_with_token(extra: &[(&str, &str)], token: &str) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        ("OBSERVABILITY_ADMIN_TOKEN".to_string(), token.to_string()),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-        ("GET_BINARY_HASH".to_string(), "gethash1".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let keepass = Arc::new(veil::keepass::MockKeePass::unlocked());
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(format!("/tmp/veil-e2e-admin-matrix-{n}.sqlite")),
-        },
-    )
-    .with_keepass(keepass);
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
 
 const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
 
 // B1.1：三凭证齐全且 header 有效时按 header 放行（SSE 面，query 仅 SSE 生效）。
 #[tokio::test]
 async fn b1_header_beats_cookie_and_query_on_sse() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!(
@@ -86,7 +42,7 @@ async fn b1_header_beats_cookie_and_query_on_sse() {
 // B1.1：header 有效时低优先级无效凭证被忽略（Cookie/Query 错值不影响放行）。
 #[tokio::test]
 async fn b1_valid_header_ignores_invalid_cookie_and_query() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{base}/_admin/metrics?access_token=wrong-query"))
@@ -115,7 +71,7 @@ async fn b1_valid_header_ignores_invalid_cookie_and_query() {
 // B1.1：仅 Cookie 有效且无 header 时按 Cookie 放行（含 http 兼容名）。
 #[tokio::test]
 async fn b1_cookie_only_without_header_ok() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     for cookie in [
         format!("__Host-admin_token={ADMIN_TOKEN}"),
@@ -135,7 +91,7 @@ async fn b1_cookie_only_without_header_ok() {
 // B1.1：仅 query 有效时非 SSE 恒 401 而 SSE 放行。
 #[tokio::test]
 async fn b1_query_only_sse_ok_non_sse_401() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let non_sse = client
         .get(format!("{base}/_admin/metrics?access_token={ADMIN_TOKEN}"))
@@ -159,7 +115,7 @@ async fn b1_query_only_sse_ok_non_sse_401() {
 // 对应单测锁定的 `auth_priority_header_cookie_query_and_401`（头无效直接 401）。
 #[tokio::test]
 async fn b1_header_present_invalid_blocks_cookie_downgrade_401() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{base}/_admin/metrics"))
@@ -182,7 +138,7 @@ async fn b1_header_present_invalid_blocks_cookie_downgrade_401() {
 // B1.2：非 SSE 带 query 恒 401，与 token 值正确性无关。
 #[tokio::test]
 async fn b1_non_sse_query_401_regardless_of_token_value() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     for token in [ADMIN_TOKEN, "wrong-token", ""] {
         let resp = client
@@ -198,10 +154,16 @@ async fn b1_non_sse_query_401_regardless_of_token_value() {
 // B1.2：环境变量 token 各 app 独立生效，无串扰。
 #[tokio::test]
 async fn b1_env_token_isolation_no_crosstalk() {
-    let (base_a, handle_a) =
-        serve(test_app_with_token(&[], "env-token-aaaa-0123456789abcdef")).await;
-    let (base_b, handle_b) =
-        serve(test_app_with_token(&[], "env-token-bbbb-0123456789abcdef")).await;
+    let (base_a, handle_a) = serve(test_app_router(TestOpts::default().set(
+        "OBSERVABILITY_ADMIN_TOKEN",
+        "env-token-aaaa-0123456789abcdef",
+    )))
+    .await;
+    let (base_b, handle_b) = serve(test_app_router(TestOpts::default().set(
+        "OBSERVABILITY_ADMIN_TOKEN",
+        "env-token-bbbb-0123456789abcdef",
+    )))
+    .await;
     let client = reqwest::Client::new();
     let ok_a = client
         .get(format!("{base_a}/_admin/metrics"))
@@ -242,7 +204,11 @@ async fn b1_env_token_independent_of_admin_token_file() {
     // 缺文件：DATA_DIR 下无 admin_token。
     let dir_missing = temp_data_dir("nofile");
     assert!(!dir_missing.join("admin_token").exists());
-    let (base, handle) = serve(test_app(&[("DATA_DIR", dir_missing.to_str().unwrap())])).await;
+    let (base, handle) = serve(test_app_router(&[(
+        "DATA_DIR",
+        dir_missing.to_str().unwrap(),
+    )]))
+    .await;
     let ok = client
         .get(format!("{base}/_admin/metrics"))
         .header("X-Admin-Token", ADMIN_TOKEN)
@@ -254,7 +220,11 @@ async fn b1_env_token_independent_of_admin_token_file() {
     // 空文件：admin_token 存在但为空，环境变量仍独立生效（文件不覆写环境）。
     let dir_empty = temp_data_dir("emptyfile");
     std::fs::write(dir_empty.join("admin_token"), "").unwrap();
-    let (base2, handle2) = serve(test_app(&[("DATA_DIR", dir_empty.to_str().unwrap())])).await;
+    let (base2, handle2) = serve(test_app_router(&[(
+        "DATA_DIR",
+        dir_empty.to_str().unwrap(),
+    )]))
+    .await;
     let ok2 = client
         .get(format!("{base2}/_admin/metrics"))
         .header("X-Admin-Token", ADMIN_TOKEN)
@@ -270,7 +240,7 @@ async fn b1_env_token_independent_of_admin_token_file() {
 // B1.3：OBSERVABILITY_DISABLE=1 时管理面全 404，与 token 有效性无关。
 #[tokio::test]
 async fn b1_disable_all_admin_404_regardless_of_token() {
-    let (base, handle) = serve(test_app(&[("OBSERVABILITY_DISABLE", "1")])).await;
+    let (base, handle) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", "1")])).await;
     let client = reqwest::Client::new();
     for path in ["/_admin/metrics", "/_admin/events/stream", "/_admin/health"] {
         let authed = client
@@ -292,7 +262,7 @@ async fn b1_disable_all_admin_404_regardless_of_token() {
 // B1.3：取消置位后恢复正常鉴权；值非 1 时不触发全 404。
 #[tokio::test]
 async fn b1_disable_off_recovers_and_non_one_no_effect() {
-    let (base, handle) = serve(test_app(&[])).await;
+    let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let ok = client
         .get(format!("{base}/_admin/metrics"))
@@ -303,7 +273,7 @@ async fn b1_disable_off_recovers_and_non_one_no_effect() {
     assert_eq!(ok.status().as_u16(), 200);
     handle.abort();
     for value in ["true", "yes", "0", "2"] {
-        let (base_v, handle_v) = serve(test_app(&[("OBSERVABILITY_DISABLE", value)])).await;
+        let (base_v, handle_v) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", value)])).await;
         let resp = client
             .get(format!("{base_v}/_admin/metrics"))
             .header("X-Admin-Token", ADMIN_TOKEN)
@@ -313,4 +283,27 @@ async fn b1_disable_off_recovers_and_non_one_no_effect() {
         assert_eq!(resp.status().as_u16(), 200, "value={value}");
         handle_v.abort();
     }
+}
+
+// G4/P11：未鉴权 /_admin/metrics 恒 401，响应体不得泄漏 pii_value_samples 采样桶。
+#[tokio::test]
+async fn pii_value_sample_401_no_leak() {
+    let (base, handle) = serve(test_app_router(&[("PII_VALUE_SAMPLE_ENABLED", "1")])).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/_admin/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("pii_value_samples"),
+        "401 响应体不得泄漏采样桶: {body}"
+    );
+    assert!(
+        body.contains("E_UNAUTHORIZED"),
+        "须为标准未鉴权错误体: {body}"
+    );
+    handle.abort();
 }

@@ -247,6 +247,18 @@ impl CredentialVault {
     /// 映射是否为空。
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
+    /// 全清映射（`lock`/`forget` 语义配套），返回清理条数并废止快照缓存。
+    pub fn clear(&self) -> usize {
+        let mut inner = write_inner(&self.inner);
+        let cleared = inner.pwd_to_token.len();
+        inner.pwd_to_token.clear();
+        inner.token_to_pwd.clear();
+        inner.order.clear();
+        inner.p2t_cache = None;
+        inner.seq += 1;
+        cleared
+    }
+
     /// 明文→token 快照（PII 凭据优先判定用，不暴露可变引用）。
     pub fn snapshot_p2t(&self) -> HashMap<String, String> {
         read_inner(&self.inner).pwd_to_token.clone()

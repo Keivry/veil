@@ -366,3 +366,28 @@ mod ipv6_parity_tests {
         );
     }
 }
+
+#[test]
+fn pii_partial_narrowed() {
+    // D7 收窄（P6）：仅剥离确证残缺续段；无序号 hex 形与合法正文不剥。
+    assert_eq!(
+        strip_pii_partials("值 __PII_AB 后"),
+        "值 __PII_AB 后",
+        "无序号 hex 形须原样保留"
+    );
+    assert_eq!(
+        strip_pii_partials("__PIXEL__ 与 __PII_DATA__"),
+        "__PIXEL__ 与 __PII_DATA__",
+        "后随合法单词字符的正文须原样保留"
+    );
+    // 带序号的确证残缺续段剥离。
+    assert!(
+        !strip_pii_partials("半截 __PII_12_ 结尾").contains("__PII_12_"),
+        "带序号残段须被剥离"
+    );
+    // 完整形态原样保留。
+    assert_eq!(
+        strip_pii_partials("完整 __PII_1_ab12cd34__ 保留"),
+        "完整 __PII_1_ab12cd34__ 保留"
+    );
+}

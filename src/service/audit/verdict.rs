@@ -190,7 +190,28 @@ mod verdict_tests {
     }
 
     #[test]
-    fn legacy_audit_enabled() {
+    fn approve_empty_whitelist_degrades() {
+        // G3.2/A7：判定入口防御——approve + 空白名单降级 Block，审计仍启用
+        // （危险工具按 Block 处理、安全调用按 Allow），error 日志由
+        // `evaluate_with_whitelist` 降级分支发出；A7 定启动门禁口径，本用例只锁判定入口。
+        let p = policy();
+        assert!(matches!(
+            evaluate_with_whitelist(AuditMode::Approve, "exec", "rm -rf /", &p, &[]),
+            AuditVerdict::Block { .. }
+        ));
+        assert_eq!(
+            evaluate_with_whitelist(AuditMode::Approve, "exec", "echo ok", &p, &[]),
+            AuditVerdict::Allow
+        );
+        let wl = vec!["@admin:example.com".to_string()];
+        assert!(matches!(
+            evaluate_with_whitelist(AuditMode::Approve, "exec", "rm -rf /", &p, &wl),
+            AuditVerdict::NeedApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn audit_enabled_compat_table() {
         for raw in ["1", "true", "yes", "on", " TRUE ", " On "] {
             let env = HashMap::from([("AUDIT_ENABLED".to_string(), raw.to_string())]);
             assert_eq!(audit_enabled_compat(&env), Some(AuditMode::Block), "{raw}");

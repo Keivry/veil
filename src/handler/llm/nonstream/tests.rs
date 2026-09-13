@@ -17,7 +17,7 @@ fn file_len_under_800_or_split() {
 }
 
 use {
-    super::{NonstreamCtx, NonstreamOutcome, serve_nonstream},
+    super::{NonstreamCtx, NonstreamOutcome, serve_nondialog_passthrough, serve_nonstream},
     crate::{
         approval::PendingApprovals,
         config::{AuditMode, Config},
@@ -67,6 +67,7 @@ fn test_ctx(protocol: Protocol) -> NonstreamCtx {
         audit_mode: AuditMode::Off,
         audit_policy_file: None,
         approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
         pending: Arc::new(PendingApprovals::default()),
         nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
     }
@@ -115,6 +116,37 @@ async fn loopback_server(
         }
     });
     (url, handle)
+}
+
+#[tokio::test]
+async fn nondialog_passthrough_single_entry_returns_response() {
+    // H11/D11：专用透传入口返回 `Response`（类型无 `Stream` 臂）；上游意外回
+    // SSE 亦按字节透传、不解析，计数照常。
+    let up_body = b"data: {\"x\":1}\n\n".to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", up_body.clone()).await;
+    let client = reqwest::Client::new();
+    let metrics = Arc::new(llm_gateway::GatewayMetrics::default());
+    let resp = serve_nondialog_passthrough(
+        &client,
+        reqwest::Method::GET,
+        &url,
+        axum::http::HeaderMap::new(),
+        Vec::new(),
+        Protocol::NonDialog,
+        &metrics,
+    )
+    .await;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("响应体须可读");
+    assert_eq!(
+        body.as_ref(),
+        up_body.as_slice(),
+        "NonDialog 透传须字节一致"
+    );
+    assert_eq!(metrics.nondialog_passthrough_count(), 1, "透传须计数");
+    server.abort();
 }
 
 #[test]
@@ -220,6 +252,9 @@ fn llm_empty_7_nondialog_exempt_from_empty_mapping() {
 }
 
 mod f2;
+mod headers;
+mod restore;
+mod t4_bounded;
 #[tokio::test]
 async fn llm_empty_e2e_upstream_empty_body_returns_502() {
     // T2-E2E：上游空体经 serve_nonstream 返回 502（回环，无外网）。
@@ -487,50 +522,6 @@ fn nonstream_restore_retry_stripped_gives_up_on_quote_break() {
 }
 
 #[tokio::test]
-async fn nonstream_restore_fallback_records_metrics_e5() {
-    // E5/D3 回退可观测：引号破裂回退原文且记 `restore_fallback == 1`。
-    let metrics = Arc::new(llm_gateway::GatewayMetrics::default());
-    let scope = Arc::new(Scope::new());
-    let vault = Arc::new(CredentialVault::new());
-    let detector = Arc::new(PiiDetector::new());
-    let plain = "ab\"cd-ef";
-    let token = vault.register(plain).expect("测试凭据须注册成功");
-    let up_body = format!(
-        "{{\"id\":\"x\",\"choices\":[{{\"message\":{{\"content\":\"{token}\"}}}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}"
-    );
-    let (url, server) =
-        loopback_server(200, "application/json", up_body.clone().into_bytes()).await;
-    let client = reqwest::Client::new();
-    let mut ctx = test_ctx(Protocol::Chat);
-    ctx.scope = scope;
-    ctx.vault = vault;
-    ctx.detector = detector;
-    ctx.gateway_metrics = metrics.clone();
-    let outcome = serve_nonstream(
-        &client,
-        reqwest::Method::POST,
-        &url,
-        axum::http::HeaderMap::new(),
-        br#"{"model":"m","messages":[]}"#.to_vec(),
-        ctx,
-    )
-    .await;
-    server.abort();
-    let NonstreamOutcome::Responded(resp) = outcome else {
-        panic!("JSON 上游不得转流泵");
-    };
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .expect("响应体须可读");
-    assert_eq!(body.as_ref(), up_body.as_bytes(), "破裂还原须回退上游原文");
-    assert_eq!(
-        metrics.restore_fallback_count(),
-        1,
-        "回退须记 restore_fallback 计数"
-    );
-}
-
-#[tokio::test]
 async fn nonstream_400_json_traverses_post_processing_e6() {
     // E6/D4：400 系 JSON 走完整后处理（用量记录 + 状态保留），非字节等价有意为之。
     let admin = Arc::new(MetricsStore::new(std::path::PathBuf::from(
@@ -697,4 +688,40 @@ async fn error_status_non_json() {
             "status={status} 正文字节须一致"
         );
     }
+}
+
+#[tokio::test]
+async fn web_search_action_audit_hold_nonstream() {
+    // F11/D11：`web_search_call.action.query` 经非流完整审计 hold 进入判定，与流式同结论。
+    let client = reqwest::Client::new();
+    let body = br#"{"output":[{"type":"web_search_call","id":"ws-bad","action":{"type":"search","query":"rm -rf /"}}]}"#.to_vec();
+    let (url, server) = loopback_server(200, "application/json", body).await;
+    let mut ctx = test_ctx(Protocol::Responses);
+    ctx.audit_mode = AuditMode::Block;
+    let outcome = serve_nonstream(
+        &client,
+        reqwest::Method::POST,
+        &url,
+        axum::http::HeaderMap::new(),
+        br#"{"model":"m","input":"hi"}"#.to_vec(),
+        ctx,
+    )
+    .await;
+    server.abort();
+    let NonstreamOutcome::Responded(resp) = outcome else {
+        panic!("阻断须直接响应");
+    };
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("阻断体须可读");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("[blocked:"),
+        "危险检索查询须合成阻断体: {text}"
+    );
+    assert!(
+        !text.contains("rm -rf"),
+        "危险查询明文不得出现在下游: {text}"
+    );
 }

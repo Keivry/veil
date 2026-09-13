@@ -32,6 +32,9 @@ impl RateTable {
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool { self.hits.is_empty() }
+
+    #[cfg(test)]
+    pub fn clear(&mut self) { self.hits.clear(); }
 }
 
 impl Default for RateTable {
@@ -121,6 +124,41 @@ mod tests {
         assert_eq!(
             limited.status_code(),
             axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_rate_per_caller() {
+        // C11/D11：限流按调用方维度（`caller_path:caller_hash`）独立计数。
+        // 同一调用方窗口内第二次 429。
+        let env = cred_env(&[]);
+        let state = cred_state(&env);
+        handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("rl-a", "/s/rl-a.sh", None),
+        )
+        .await
+        .unwrap();
+        let err = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("rl-a", "/s/rl-a.sh", None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        // 另一调用方不受该调用方限流影响（跨方隔离）。
+        let out = handle_credential(
+            &state,
+            &headers("gethash", Some("s3cr3t")),
+            &body("rl-b", "/s/rl-b.sh", None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            credential_value(&out).starts_with("__VG_CRED_"),
+            "另一调用方须正常取用，不受 A 的限流影响"
         );
     }
 

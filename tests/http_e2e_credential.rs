@@ -1,67 +1,15 @@
 //! 凭据 E2E（T6）：三因子/health/加解锁/限流/终端直调 403/注册吊销审批链。
 //! 每个用例独立建 app（sqlite 隔离 + 限流器隔离），经真 HTTP 回环，无外网依赖。
 
-use {
-    std::{
-        collections::HashMap,
-        path::PathBuf,
-        sync::{Arc, atomic::AtomicU64},
-    },
-    veil::{config::Config, router::build_router, state::SqliteOutcome},
-};
+use common::{TestOpts, serve, test_app, test_app_router};
 
-static APP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn test_app(extra: &[(&str, &str)], locked: bool) -> axum::Router {
-    let mut env = HashMap::from([
-        (
-            "HOMESERVER".to_string(),
-            "https://matrix.example.com".to_string(),
-        ),
-        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-        (
-            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-            "observability-admin-token-0123456789".to_string(),
-        ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-        ("GET_BINARY_HASH".to_string(), "gethash1".to_string()),
-    ]);
-    for (k, v) in extra {
-        env.insert((*k).to_string(), (*v).to_string());
-    }
-    let n = APP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let keepass = Arc::new(if locked {
-        veil::keepass::MockKeePass::locked()
-    } else {
-        veil::keepass::MockKeePass::unlocked()
-    });
-    let state = veil::state::AppState::new(
-        Config::load_from(&env).unwrap(),
-        SqliteOutcome {
-            sqlite_ok: true,
-            sqlite_error: None,
-            db_path: PathBuf::from(format!("/tmp/veil-e2e-credential-{n}.sqlite")),
-        },
-    )
-    .with_keepass(keepass);
-    build_router(state)
-}
-
-async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), handle)
-}
+mod common;
 
 const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
 
 #[tokio::test]
 async fn t6_health_no_auth_superset_fields() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let resp = client.get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
@@ -75,7 +23,7 @@ async fn t6_health_no_auth_superset_fields() {
 
 #[tokio::test]
 async fn t6_three_factor_missing_403() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let no_auth = client
         .post(format!("{base}/credential"))
@@ -102,7 +50,7 @@ async fn t6_three_factor_missing_403() {
 
 #[tokio::test]
 async fn t6_wrong_secret_403() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
@@ -121,7 +69,7 @@ async fn t6_wrong_secret_403() {
 
 #[tokio::test]
 async fn t6_unenrolled_compat_allow_with_valid_secret() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
@@ -142,7 +90,7 @@ async fn t6_unenrolled_compat_allow_with_valid_secret() {
 
 #[tokio::test]
 async fn t6_raw_terminal_call_rejected_403() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
@@ -169,7 +117,7 @@ async fn t6_raw_terminal_call_rejected_403() {
 
 #[tokio::test]
 async fn t6_register_use_flow_200() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
@@ -182,7 +130,7 @@ async fn t6_register_use_flow_200() {
         .send()
         .await
         .unwrap();
-    assert_eq!(reg.status().as_u16(), 200);
+    assert_eq!(reg.status().as_u16(), 202, "C1：注册默认转审批");
     let pre = client
         .post(format!("{base}/credential"))
         .header("X-Get-Binary-Hash", "gethash1")
@@ -222,7 +170,7 @@ async fn t6_register_use_flow_200() {
 
 #[tokio::test]
 async fn t6_duplicate_register_409() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
         "caller_path": "/srv/dup.sh",
@@ -236,7 +184,7 @@ async fn t6_duplicate_register_409() {
         .send()
         .await
         .unwrap();
-    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(first.status().as_u16(), 202);
     let second = client
         .post(format!("{base}/register-caller"))
         .json(&payload)
@@ -249,7 +197,12 @@ async fn t6_duplicate_register_409() {
 
 #[tokio::test]
 async fn t6_revoke_then_use_403() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    // C2：常规吊销经审批——批准前条目保持可用，批准后 `revoked` 生效。
+    let (app, state) = test_app(TestOpts::from(&[(
+        "APPROVAL_WHITELIST",
+        "@admin:example.com",
+    )]));
+    let (base, handle) = serve(app).await;
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
@@ -262,32 +215,88 @@ async fn t6_revoke_then_use_403() {
         .send()
         .await
         .unwrap();
-    assert_eq!(reg.status().as_u16(), 200);
+    assert_eq!(reg.status().as_u16(), 202);
+    let enable = client
+        .post(format!("{base}/approve-hash-change"))
+        .json(&serde_json::json!({
+            "caller_path": "/srv/gone.sh",
+            "new_hash": "h-gone-1"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enable.status().as_u16(), 200);
+    let cred_body = serde_json::json!({
+        "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"},
+        "entry": "网易", "field": "授权码"
+    });
+    let before = state.approval.pending_event_ids().await;
     let rev = client
         .post(format!("{base}/revoke"))
         .json(&serde_json::json!({"caller_path": "/srv/gone.sh"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(rev.status().as_u16(), 200);
+    assert_eq!(rev.status().as_u16(), 202, "常规吊销须转审批");
+    let use_before = client
+        .post(format!("{base}/credential"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&cred_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(use_before.status().as_u16(), 200, "批准前条目保持原状");
+    let event_id = wait_new_event_id(&state, &before).await;
+    state
+        .approval
+        .resolve(&event_id, "@admin:example.com", true)
+        .await;
+    wait_until_revoked(&state, "/srv/gone.sh").await;
     let use_resp = client
         .post(format!("{base}/credential"))
         .header("X-Get-Binary-Hash", "gethash1")
         .header("X-Get-Binary-Secret", "s3cr3t")
-        .json(&serde_json::json!({
-            "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"},
-            "entry": "网易", "field": "授权码"
-        }))
+        .json(&cred_body)
         .send()
         .await
         .unwrap();
-    assert_eq!(use_resp.status().as_u16(), 403);
+    assert_eq!(use_resp.status().as_u16(), 403, "批准吊销后取用须拒绝");
     handle.abort();
+}
+
+async fn wait_new_event_id(state: &veil::state::AppState, before: &[String]) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let ids = state.approval.pending_event_ids().await;
+        if let Some(id) = ids.into_iter().find(|id| !before.contains(id)) {
+            return id;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "审批建单超时");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_until_revoked(state: &veil::state::AppState, path: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if state
+            .registry
+            .read()
+            .await
+            .lookup_by_path(path)
+            .is_some_and(|e| e.revoked)
+        {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "吊销落定超时");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
 async fn t6_locked_backend_health_and_credential() {
-    let (base, handle) = serve(test_app(&[], true)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default().locked(true))).await;
     let client = reqwest::Client::new();
     let health = client.get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(health.status().as_u16(), 200);
@@ -310,7 +319,7 @@ async fn t6_locked_backend_health_and_credential() {
 
 #[tokio::test]
 async fn t6_admin_rate_limit_429_with_retry_after() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let mut last = 200;
     for _ in 0..11 {
@@ -332,7 +341,7 @@ async fn t6_admin_rate_limit_429_with_retry_after() {
 
 #[tokio::test]
 async fn t6_registrations_require_admin_token() {
-    let (base, handle) = serve(test_app(&[], false)).await;
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let anon = client
         .get(format!("{base}/registrations"))
@@ -347,5 +356,161 @@ async fn t6_registrations_require_admin_token() {
         .await
         .unwrap();
     assert_eq!(authed.status().as_u16(), 200);
+    handle.abort();
+}
+
+// C5：未吊销重名注册 409（与既有 `t6_duplicate_register_409` 的 path 判重区分）。
+#[tokio::test]
+async fn t6_register_duplicate_name_409() {
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("{base}/register-caller"))
+        .json(&serde_json::json!({
+            "caller_path": "/srv/name1.sh",
+            "caller_hash": "h-name-1",
+            "name": "named-job",
+            "entry": "网易"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status().as_u16(), 202);
+    let second = client
+        .post(format!("{base}/register-caller"))
+        .json(&serde_json::json!({
+            "caller_path": "/srv/name2.sh",
+            "caller_hash": "h-name-2",
+            "name": "named-job",
+            "entry": "网易"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status().as_u16(), 409, "未吊销重名注册须 409");
+    handle.abort();
+}
+
+// C5：`{"name":...}` 按名吊销命中，且吊销后同名可复用。
+#[tokio::test]
+async fn t6_revoke_by_name_and_reuse() {
+    let (app, state) = test_app(TestOpts::from(&[(
+        "APPROVAL_WHITELIST",
+        "@admin:example.com",
+    )]));
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let reg = client
+        .post(format!("{base}/register-caller"))
+        .json(&serde_json::json!({
+            "caller_path": "/srv/byname-a.sh",
+            "caller_hash": "h-byname-a",
+            "name": "check-mail",
+            "source": "e2e-byname-a",
+            "entry": "网易"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg.status().as_u16(), 202);
+    let enable = client
+        .post(format!("{base}/approve-hash-change"))
+        .json(&serde_json::json!({
+            "caller_path": "/srv/byname-a.sh",
+            "new_hash": "h-byname-a"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enable.status().as_u16(), 200);
+    let before = state.approval.pending_event_ids().await;
+    let rev = client
+        .post(format!("{base}/revoke"))
+        .json(&serde_json::json!({"name": "check-mail"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rev.status().as_u16(), 202, "按名吊销须转审批");
+    let event_id = wait_new_event_id(&state, &before).await;
+    state
+        .approval
+        .resolve(&event_id, "@admin:example.com", true)
+        .await;
+    wait_until_revoked(&state, "/srv/byname-a.sh").await;
+    let reuse = client
+        .post(format!("{base}/register-caller"))
+        .json(&serde_json::json!({
+            "caller_path": "/srv/byname-b.sh",
+            "caller_hash": "h-byname-b",
+            "name": "check-mail",
+            "source": "e2e-byname-b",
+            "entry": "网易"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reuse.status().as_u16(), 202, "吊销后同名须可复用");
+    handle.abort();
+}
+
+// C15：`/credential` 成功信封形状锁定 `{"ok":true,"credential":{...}}`（README §5）。
+#[tokio::test]
+async fn t6_credential_envelope_ok_credential() {
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/credential"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "auth": {"caller_hash": "h-env-1", "caller_path": "/srv/env1.sh"},
+            "entry": "网易", "field": "授权码"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true, "成功信封须含 ok=true");
+    assert!(
+        body["credential"].is_object(),
+        "成功信封须含 credential 对象"
+    );
+    assert!(
+        body["credential"]["value"].is_string(),
+        "credential.value 须为字符串"
+    );
+    handle.abort();
+}
+
+// C16：三因子双必填口径——缺 `caller_path` 或缺 `caller_hash` 各 403（有意收紧，README §6.8）。
+#[tokio::test]
+async fn t6_caller_path_required_403() {
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
+    let client = reqwest::Client::new();
+    let no_path = client
+        .post(format!("{base}/credential"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "auth": {"caller_hash": "h-nopath-1"},
+            "entry": "网易", "field": "授权码"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_path.status().as_u16(), 403, "缺 caller_path 须 403");
+    let no_hash = client
+        .post(format!("{base}/credential"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "auth": {"caller_path": "/srv/nohash.sh"},
+            "entry": "网易", "field": "授权码"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_hash.status().as_u16(), 403, "缺 caller_hash 须 403");
     handle.abort();
 }

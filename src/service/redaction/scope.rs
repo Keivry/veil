@@ -280,48 +280,58 @@ impl Scope {
         }
         let mut spans: Vec<(usize, usize)> = skip
             .iter()
-            .filter(|(s, e)| *s < *e && *s <= text.len() && *e <= text.len())
+            .filter(|(s, e)| {
+                *s < *e
+                    && *e <= text.len()
+                    && text.is_char_boundary(*s)
+                    && text.is_char_boundary(*e)
+            })
             .copied()
             .collect();
         if spans.is_empty() {
             return self.redact_response_new_pii(vault, detector, text).await;
         }
         spans.sort_unstable();
-        let replaced = std::cell::Cell::new(false);
-        let mut out = String::with_capacity(text.len());
-        let mut cursor = 0;
+        // T8/D8：跳过区间以唯一占位符代位，还原文本保持整体 JSON 结构，
+        // `process_text` 因此可递归 walk 嵌套 stringified JSON（工具参数等，
+        // 含与还原切分点错位的段）；完成 JSON-aware 新 PII 检测后再把占位符
+        // 原位换回还原明文——跳过区间既不被扫描也不被改写（字节级原样）。
+        let mut masked = String::with_capacity(text.len());
+        let mut restorations: Vec<(String, &str)> = Vec::new();
+        let mut cursor = 0usize;
         for (s, e) in spans {
             if s < cursor {
                 continue;
             }
-            if s > cursor {
-                let (seg, seg_replaced) = self
-                    .redact_response_new_pii_tracked(vault, detector, &text[cursor..s])
-                    .await;
-                if seg_replaced {
-                    replaced.set(true);
-                }
-                out.push_str(&seg);
-            }
-            // 跳过段原样保留：还原出的请求明文不得二次掩码。
-            out.push_str(&text[s..e]);
-            cursor = e.max(cursor);
+            masked.push_str(&text[cursor..s]);
+            let sentinel = skip_sentinel(restorations.len(), text);
+            masked.push_str(&sentinel);
+            restorations.push((sentinel, &text[s..e]));
+            cursor = e;
         }
-        if cursor < text.len() {
-            let (seg, seg_replaced) = self
-                .redact_response_new_pii_tracked(vault, detector, &text[cursor..])
-                .await;
-            if seg_replaced {
-                replaced.set(true);
-            }
-            out.push_str(&seg);
+        if restorations.is_empty() {
+            return self.redact_response_new_pii(vault, detector, text).await;
         }
-        if replaced.get() {
-            strip_partials(&out)
-        } else {
-            strip_partials(text)
+        masked.push_str(&text[cursor..]);
+        let (scanned, _) = self
+            .redact_response_new_pii_tracked(vault, detector, &masked)
+            .await;
+        let mut out = scanned;
+        for (sentinel, original) in restorations {
+            out = out.replace(&sentinel, original);
         }
+        out
     }
+}
+
+/// 跳过区间代位占位符（T8/D8）：纯 ASCII 且不落入 `__VG_`/`__PII_` 残缺
+/// 剥离前缀；与原文冲突时追加下划线直至全局唯一。
+fn skip_sentinel(idx: usize, text: &str) -> String {
+    let mut s = format!("__VEILSKIP{idx:08}__");
+    while text.contains(&s) {
+        s.push('_');
+    }
+    s
 }
 
 /// 凭据 token 逐 token 直查重建（B2/D2）：仅对 `scan_token_forms` 命中的完整形态

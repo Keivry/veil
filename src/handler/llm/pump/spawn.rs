@@ -5,9 +5,9 @@ use {
         super::protocol_header_value,
         PumpOutcome,
         StreamPumpCtx,
+        carry::TokenCarry,
         decide::{self, ResponsesAction, StickyAction},
         event::{
-            chat_finish_reason_seen,
             extract_responses_seq,
             is_anthropic_opaque_event,
             is_minor_event,
@@ -17,10 +17,10 @@ use {
             responses_error_object,
             responses_failed_incomplete,
             responses_synth_conv_id,
-            should_synthesize_empty_stream,
             sticky_terminal_event,
         },
         fragments::extract_tool_fragments,
+        synth_flush::flush_pre_terminal,
         toolbuf::{clamp_pump_limits, take_pending_tool_inputs},
     },
     crate::{
@@ -30,32 +30,20 @@ use {
             audit::{self, AuditHold, AuditPolicy, RequestKeepalive},
             block_inject,
             json_walk::strip_bom,
-            llm_gateway::{self, GatewayMetrics, Protocol},
+            llm_gateway::{self, Protocol},
             metrics::ChatRecord,
-            redaction::{BoundaryHold, marker_cross_spans},
-            sse::{Speed, SseParser, classify_residue, is_done_payload, set_truncated},
+            redaction::{BoundaryHold, PrefixHold, marker_cross_spans},
+            sse::{Speed, SseParser, is_done_payload},
         },
     },
     serde_json::Value,
     std::sync::Arc,
 };
 
-/// H2/D1 兜底回退：还原后帧 `jloads` 校验（BOM 感知）；失败时回退**还原前占位符帧**
-/// （fail-closed，token 形态保留、不破帧），记 warn + `restore_fallback` 计数，
-/// 对齐非流 `retry_stripped` 回退语义（`nonstream.rs::retry_stripped`）。
-pub(crate) fn guard_restored_frame(
-    restored: String,
-    placeholder_frame: &str,
-    metrics: &GatewayMetrics,
-) -> String {
-    if serde_json::from_str::<Value>(strip_bom(&restored)).is_ok() {
-        return restored;
-    }
-    tracing::warn!("流式还原后 JSON 校验失败，已回退还原前占位符帧（fail-closed）");
-    metrics.record_restore_fallback();
-    placeholder_frame.to_string()
-}
-
+mod frame_feed;
+mod terminal;
+pub(crate) use frame_feed::guard_restored_frame;
+use frame_feed::{drain_prefix_hold, feed_output_frame};
 /// 2.3 `spawn_stream_pump`：把上游字节流泵为下游 SSE 帧流，保证终止闭合；
 /// 阻断或合成终止时注入终止标记。`upstream` 所有权移入 task，不解析业务语义之外的状态。
 pub fn spawn_stream_pump(
@@ -72,6 +60,7 @@ pub fn spawn_stream_pump(
             audit_mode,
             audit_policy_file,
             approval_whitelist,
+            audit_sink,
             hold_max,
             gateway_metrics: metrics,
             admin_metrics,
@@ -86,6 +75,10 @@ pub fn spawn_stream_pump(
         // 永不导致未定义行为。
         let (hold_max, pii_boundary_chars) = clamp_pump_limits(hold_max, pii_boundary_chars);
         let mut boundary = BoundaryHold::new(pii_boundary_chars);
+        // P1/D2：自定义规则跨帧前缀 hold（无自定义规则/字典时 hint 为空，直通）。
+        let mut prefix_hold = PrefixHold::new(resp_detector.partial_prefix_hints());
+        // D4/S4：请求级跨帧占位符 carry（残缺前缀不落盘，续段拼回还原明文）。
+        let mut carry = TokenCarry::new();
         let boundary_spans = |window: &str, seam: usize| {
             let cred_map = resp_vault.p2t_snapshot();
             let mut spans: Vec<(usize, usize)> = resp_detector
@@ -99,21 +92,11 @@ pub fn spawn_stream_pump(
         let mut conv_id = init_conv;
         // E9：流内首见 `id`（合成截断帧优先采用，下游可关联）。
         let mut stream_first_id: Option<String> = conv_id.clone();
-        let hold_gate = Arc::new(std::sync::atomic::AtomicBool::new(!matches!(
-            audit_mode,
-            AuditMode::Off
-        )));
+        // D1：门控极性 true=抑制；初始无 pending 分片 → 保活开放。
+        let hold_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let keepalive = RequestKeepalive::spawn_gated(tx.clone(), hold_gate.clone());
-        let audit_policy = match audit_policy_file.clone() {
-            Some(path) => match AuditPolicy::load_from_file(Some(path.as_path())) {
-                Ok(policy) => policy,
-                Err(err) => {
-                    tracing::warn!("审计策略文件加载失败，使用默认策略: {err}");
-                    AuditPolicy::default_policy()
-                }
-            },
-            None => AuditPolicy::default_policy(),
-        };
+        // H3/D3：运行时加载并捕获进程 env 快照（判定纯逻辑零 env 直读）。
+        let audit_policy = AuditPolicy::load_for_runtime(audit_policy_file.as_deref());
         let mut upstream = upstream;
         let pump_tx = tx.clone();
         let speed = if matches!(audit_mode, AuditMode::Off) {
@@ -139,8 +122,8 @@ pub fn spawn_stream_pump(
         let mut audit_blocked = false;
         // 终端去重（§2.6 流式等价）：每协议恰一终止帧，多余 `[DONE]/message_stop/completed` 丢弃。
         let mut terminal_sent = false;
-        // B3/P2-2：Chat 已见非 null `finish_reason`（soft-terminal）但流末缺 `[DONE]`。
-        let mut saw_finish_reason = false;
+        // B3/P2-2：Chat 已见非 null `finish_reason`（soft-terminal）不再单独跟踪，
+        // 断流补发统一由 D6 收尾路径按「未终端且已发帧」判定。
         let mut stream_usage: Option<llm_gateway::Usage> = None;
         // C13 模型分桶：跟踪上游回显 `model`（首见为准，缺失归
         // `unknown_model`），随 `record_chat` 落快照。
@@ -159,11 +142,26 @@ pub fn spawn_stream_pump(
         // `take_pending_tool_inputs` 按槽取出、重放进边界 hold）；两者无双重持有，
         // 去向以本注释与取出函数文档为准，单测 `dual_buffer_slot_handoff_e10` 锁定。
         let mut pending_tool_frames: Vec<(Vec<u32>, String, String)> = Vec::new();
-        while let Ok(chunk) = upstream.chunk().await {
-            let bytes = match chunk {
-                Some(b) => b,
-                None => break,
+        // D5/S5：传输错误显式分支——`Err` 记 warn（错误 + 已读字节）后按 D6
+        // 终端策略收尾；`Ok(None)` 为正常 EOF。二者不再混同，不静默退出。
+        let mut received_bytes: usize = 0;
+        let mut transport_error = false;
+        loop {
+            let bytes = match upstream.chunk().await {
+                Ok(Some(b)) => b,
+                Ok(None) => break,
+                Err(e) => {
+                    transport_error = true;
+                    tracing::warn!(
+                        forwarded,
+                        received_bytes,
+                        error = %e,
+                        "流式上游传输错误（chunk Err），按断流终端策略收尾"
+                    );
+                    break;
+                }
             };
+            received_bytes += bytes.len();
             if bytes.is_empty() {
                 continue;
             }
@@ -191,9 +189,6 @@ pub fn spawn_stream_pump(
                     && !is_done_payload(&ev.data)
                     && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
                 {
-                    if protocol == Protocol::Chat && chat_finish_reason_seen(&v) {
-                        saw_finish_reason = true;
-                    }
                     if let Some(id) = llm_gateway::extract_conv_id(&v) {
                         if stream_first_id.is_none() {
                             stream_first_id = Some(id.clone());
@@ -211,7 +206,7 @@ pub fn spawn_stream_pump(
                     );
                 }
                 _gate.store(
-                    hold.held() && !matches!(audit_mode, AuditMode::Off),
+                    !matches!(audit_mode, AuditMode::Off) && hold.has_pending_fragments(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if rejected_sticky {
@@ -261,24 +256,41 @@ pub fn spawn_stream_pump(
                             // `output_index` 序列；`incomplete` 不在此列——原样透传并作为
                             // 唯一终端（保留 `incomplete_details`，由 `is_terminal_event` 置位）。
                             responses_failed_sent = true;
-                            terminal_sent = true;
                             let fid = responses_synth_conv_id(
                                 stream_first_id.as_deref(),
                                 conv_id.as_deref(),
                                 &metrics,
                             );
                             let err_obj = responses_error_object(&ev.data);
+                            // D3/S3：合成终端前先 flush 边界滞留帧，保证末段增量先下行。
+                            drain_prefix_hold(
+                                &mut prefix_hold,
+                                &mut boundary,
+                                &boundary_spans,
+                                &mut agg,
+                            );
+                            if flush_pre_terminal(&mut boundary, &mut agg, &pump_tx, &metrics).await
+                            {
+                                forwarded += 1;
+                                any_frame_sent = true;
+                            }
+                            // D9/S9：合成 failed 帧 send 成功才置位终端，下游早断不撒谎。
+                            let mut terminal_ok = false;
                             for f in block_inject::ensure_event_lines(vec![
                                 block_inject::responses_failed_frame(&fid, err_obj.as_ref()),
                             ]) {
-                                metrics.add_sse_event();
-                                forwarded += 1;
-                                any_frame_sent = true;
                                 if pump_tx.send(f).await.is_err() {
                                     break;
                                 }
+                                metrics.add_sse_event();
+                                forwarded += 1;
+                                any_frame_sent = true;
+                                terminal_ok = true;
                             }
-                            block_inject::mark_terminal(&mut meta);
+                            if terminal_ok {
+                                terminal_sent = true;
+                                block_inject::mark_terminal(&mut meta);
+                            }
                             terminated = true;
                             continue;
                         }
@@ -306,27 +318,44 @@ pub fn spawn_stream_pump(
                         if rejected_sticky && is_tool_event {
                             continue;
                         }
+                        // F3/D3：Responses 槽完成（`response.output_item.done`/
+                        // `response.function_call_arguments.done`）视同按槽完成——既触发
+                        // 该槽缓冲分片重放，又使本帧不被缓冲（其审计/释放由
+                        // `responses_slot_complete` 承载）。
+                        let responses_slot_complete =
+                            AuditHold::is_responses_slot_complete_event(&v);
+                        let is_index_complete =
+                            AuditHold::is_index_complete_event(&v) || responses_slot_complete;
                         // P0-3.1：完成事件先放行此前缓冲的残缺分片（到达序重放进
                         // 边界 hold，保证缝合时序），再处理本帧；全局完成全放行，
-                        // 按槽完成只放行对应槽（他槽残缺继续缓冲）。
+                        // 按槽完成只放行对应槽（他槽残缺继续缓冲）。F3/D3：Responses
+                        // 工具分片纳入 hold（先审后放），未完成分片缓冲至槽 `.done`。
                         let audit_hold_on = !matches!(audit_mode, AuditMode::Off)
-                            && matches!(protocol, Protocol::Chat | Protocol::Anthropic);
+                            && matches!(
+                                protocol,
+                                Protocol::Chat | Protocol::Anthropic | Protocol::Responses
+                            );
                         if audit_hold_on {
                             let slot = decide::tool_replay_slot(
                                 protocol,
                                 &v,
                                 AuditHold::is_complete_event(&v),
-                                AuditHold::is_index_complete_event(&v),
+                                is_index_complete,
                             );
                             if let Some(slot) = slot {
                                 for (b_prefix, b_data) in
                                     take_pending_tool_inputs(&mut pending_tool_frames, slot)
                                 {
-                                    let (op, od) = boundary.push(b_prefix, b_data, boundary_spans);
-                                    if !od.is_empty() || !boundary.has_held() {
-                                        agg.push_str(&op);
-                                        agg.push_str(&format!("data: {od}\n\n"));
-                                    }
+                                    feed_output_frame(
+                                        &mut prefix_hold,
+                                        &mut boundary,
+                                        &resp_detector,
+                                        &resp_vault,
+                                        &boundary_spans,
+                                        &mut agg,
+                                        (b_prefix, b_data),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -336,7 +365,7 @@ pub fn spawn_stream_pump(
                             audit_hold_on,
                             is_tool_event,
                             AuditHold::is_complete_event(&v),
-                            AuditHold::is_index_complete_event(&v),
+                            is_index_complete,
                         );
                         let tool_buckets: Vec<u32> = frags.iter().map(|f| f.0).collect();
                         let mut reject_reason: Option<String> = None;
@@ -358,7 +387,7 @@ pub fn spawn_stream_pump(
                                     reject_reason = Some("audit-hold-overflow".to_string());
                                     break;
                                 }
-                                if AuditHold::is_complete_event(&v) {
+                                if AuditHold::is_responses_slot_complete_event(&v) {
                                     hold.mark_responses_done(&key, Some(&frag.3));
                                 }
                             }
@@ -376,20 +405,25 @@ pub fn spawn_stream_pump(
                                 }
                             }
                         }
+                        // D2：Responses per-item `.done` 走槽级审计，与全局完成解耦。
                         let mut approve_held = false;
                         if reject_reason.is_none()
                             && !hold.is_rejected()
-                            && AuditHold::is_complete_event(&v)
+                            && (AuditHold::is_complete_event(&v) || responses_slot_complete)
                             && !matches!(audit_mode, AuditMode::Off)
                         {
                             for (idx, name, args) in hold.tool_triples() {
-                                match audit::evaluate_with_whitelist(
-                                    audit_mode,
-                                    &name,
-                                    &args,
-                                    &audit_policy,
-                                    &approval_whitelist,
-                                ) {
+                                match audit_sink
+                                    .evaluate_and_record(
+                                        audit_mode,
+                                        &name,
+                                        &args,
+                                        &audit_policy,
+                                        &approval_whitelist,
+                                        Some(protocol_header_value(protocol)),
+                                    )
+                                    .await
+                                {
                                     audit::AuditVerdict::Block { .. } => {
                                         hold.mark_rejected();
                                         reject_reason = Some("audit-policy-block".to_string());
@@ -418,13 +452,17 @@ pub fn spawn_stream_pump(
                             for (_, name, args) in
                                 hold.tool_triples().into_iter().filter(|(i, ..)| *i == idx)
                             {
-                                match audit::evaluate_with_whitelist(
-                                    audit_mode,
-                                    &name,
-                                    &args,
-                                    &audit_policy,
-                                    &approval_whitelist,
-                                ) {
+                                match audit_sink
+                                    .evaluate_and_record(
+                                        audit_mode,
+                                        &name,
+                                        &args,
+                                        &audit_policy,
+                                        &approval_whitelist,
+                                        Some(protocol_header_value(protocol)),
+                                    )
+                                    .await
+                                {
                                     audit::AuditVerdict::Block { .. } => {
                                         hold.mark_rejected();
                                         reject_reason = Some("audit-policy-block".to_string());
@@ -441,12 +479,21 @@ pub fn spawn_stream_pump(
                             }
                             hold.clear_index(idx);
                         }
+                        // D1：完成事件审计（Allow/NeedApproval 均算已判定）后释放
+                        // 作用域出抑制集，后续帧据此恢复逐帧增量；拒绝态已清理。
+                        if reject_reason.is_none()
+                            && !hold.is_rejected()
+                            && (AuditHold::is_complete_event(&v) || responses_slot_complete)
+                        {
+                            hold.release_audited();
+                        }
                         if let Some(reason) = reject_reason {
                             rejected_sticky = true;
                             audit_blocked = true;
                             terminal_sent = true;
                             agg.clear();
                             boundary.clear();
+                            prefix_hold.clear();
                             // P0-3.1：阻断丢弃缓冲（阻断非截断，不记截断计数）。
                             pending_tool_frames.clear();
                             if !block_injected {
@@ -492,8 +539,9 @@ pub fn spawn_stream_pump(
                                     .restore_response_with_spans_json(&resp_vault, &ev.data);
                                 guard_restored_frame(restored, &ev.data, &metrics)
                             } else {
+                                let cleaned = carry.prepare(&ev.data);
                                 let (restored, spans) = resp_scope
-                                    .restore_response_with_spans_json(&resp_vault, &ev.data);
+                                    .restore_response_with_spans_json(&resp_vault, &cleaned);
                                 let scanned = resp_scope
                                     .redact_response_new_pii_with_skip(
                                         &resp_vault,
@@ -504,7 +552,7 @@ pub fn spawn_stream_pump(
                                     .await;
                                 guard_restored_frame(
                                     crate::service::sse::json_aware_line(&scanned, |s| s),
-                                    &ev.data,
+                                    &cleaned,
                                     &metrics,
                                 )
                             };
@@ -523,16 +571,21 @@ pub fn spawn_stream_pump(
                             pending_tool_frames.push((tool_buckets, prefix, restored_data));
                             continue;
                         }
-                        let (out_prefix, out_data) =
-                            boundary.push(prefix, restored_data, boundary_spans);
-                        if !out_data.is_empty() || !boundary.has_held() {
-                            agg.push_str(&out_prefix);
-                            agg.push_str(&format!("data: {out_data}\n\n"));
-                        }
+                        let emitted = feed_output_frame(
+                            &mut prefix_hold,
+                            &mut boundary,
+                            &resp_detector,
+                            &resp_vault,
+                            &boundary_spans,
+                            &mut agg,
+                            (prefix, restored_data),
+                        )
+                        .await;
                         if decide::should_suppress_held_output(
+                            audit_hold_on,
+                            hold.has_pending_fragments(),
+                            !emitted,
                             minor,
-                            hold.held(),
-                            !out_data.is_empty(),
                         ) {
                             continue;
                         }
@@ -556,11 +609,16 @@ pub fn spawn_stream_pump(
                             .as_ref()
                             .map(|t| format!("event: {t}\n"))
                             .unwrap_or_default();
-                        let (out_prefix, out_data) = boundary.push(prefix, scanned, boundary_spans);
-                        if !out_data.is_empty() || !boundary.has_held() {
-                            agg.push_str(&out_prefix);
-                            agg.push_str(&format!("data: {out_data}\n\n"));
-                        }
+                        feed_output_frame(
+                            &mut prefix_hold,
+                            &mut boundary,
+                            &resp_detector,
+                            &resp_vault,
+                            &boundary_spans,
+                            &mut agg,
+                            (prefix, scanned),
+                        )
+                        .await;
                     }
                 } else if ev.data.is_empty() {
                     // L17：空 `data:` 心跳帧丢弃不透传（不计数、不参与终端判定；
@@ -573,6 +631,7 @@ pub fn spawn_stream_pump(
                         continue;
                     }
                     terminal_sent = true;
+                    drain_prefix_hold(&mut prefix_hold, &mut boundary, &boundary_spans, &mut agg);
                     if let Some((fp, fd)) = boundary.flush() {
                         agg.push_str(&fp);
                         agg.push_str(&format!("data: {fd}\n\n"));
@@ -597,161 +656,29 @@ pub fn spawn_stream_pump(
                 break;
             }
         }
-        // P0-3.1/TSS-03：截断丢弃未完成 tool 分片（对标 Python `_synthesize_truncation`
-        // TSS-03 分支）：缓冲帧永不透传下游，记 `truncated_tool_dropped` 并 warn；
-        // 置 `terminal_sent` 跳过空流二次合成（open-ended，以已透传块收尾）。
-        if !pending_tool_frames.is_empty() {
-            let dropped = pending_tool_frames.len() as u64;
-            pending_tool_frames.clear();
-            metrics.record_truncated_tool_dropped(dropped);
-            tracing::warn!("LLM 截断丢弃残缺 tool 分片: {dropped} 帧");
-            // P0-3.2：截断合成（responses 出 failed，chat/anthropic open-ended
-            // 空实现）；与 C8 空流合成联动：此处已置 `terminal_sent`，下游空流
-            // 守门不再二次合成，恒恰一终止语义。
-            let tid = conv_id.clone().unwrap_or_else(|| {
-                llm_gateway::resolve_conv_id(
-                    None,
-                    &serde_json::Value::Null,
-                    Some(&metrics),
-                    "truncated",
-                )
-                .0
-            });
-            for f in block_inject::ensure_event_lines(block_inject::synthesize_truncation(
-                protocol, &tid,
-            )) {
-                metrics.add_sse_event();
-                forwarded += 1;
-                any_frame_sent = true;
-                if pump_tx.send(f).await.is_err() {
-                    break;
-                }
-            }
-            terminal_sent = true;
-            let _ = crate::service::sse::set_truncated(
-                &mut meta,
-                protocol,
-                if protocol == Protocol::Responses {
-                    crate::service::sse::TruncatedMode::SynthesizedFailed
-                } else {
-                    crate::service::sse::TruncatedMode::OpenEnded
-                },
-                Some(&metrics),
-            );
-        }
-        if let Some((fp, fd)) = boundary.flush() {
-            agg.push_str(&fp);
-            agg.push_str(&format!("data: {fd}\n\n"));
-        }
-        if !agg.is_empty() {
-            metrics.add_sse_event();
-            let _ = pump_tx.send(std::mem::take(&mut agg)).await;
-            forwarded += 1;
-            any_frame_sent = true;
-        }
-        let residual = parser.residual_json_aware();
-        // 残余分类（§2.6）：None 直接丢弃，不得 `data:` 直发；
-        // BOM/`[DONE]`/空白同样归入丢弃，终端去重已处理。
-        if let Some(classified) = classify_residue(&residual) {
-            let (restored, spans) =
-                resp_scope.restore_response_with_spans(&resp_vault, &classified);
-            let scanned = resp_scope
-                .redact_response_new_pii_with_skip(&resp_vault, &resp_detector, &restored, &spans)
-                .await;
-            if !scanned.is_empty() {
-                let (op, od) = boundary.push(String::new(), scanned, boundary_spans);
-                let _ = op;
-                if !od.is_empty() {
-                    let _ = pump_tx.send(format!("data: {od}\n\n")).await;
-                    any_frame_sent = true;
-                }
-                if let Some((fp, fd)) = boundary.flush() {
-                    let _ = pump_tx.send(format!("{fp}data: {fd}\n\n")).await;
-                    any_frame_sent = true;
-                }
-            }
-        }
-        // P1/D2：Chat 已见非 null `finish_reason` 却未收到 `[DONE]`（上游异常收尾）：
-        // flush 边界后补发恰一 `data: [DONE]` 并置终端；`finish_reason` 后的 usage
-        // 尾帧此前已透传，不提前截断。`truncated_mode=open_ended` 观测保留
-        //（如实描述上游截断形态，不新增枚举）。置于空流守门前：补发后
-        // `terminal_sent` 已置位，守门自然跳过，恒恰一终端。
-        if decide::should_backfill_chat_done(
+        terminal::finalize(terminal::TerminalCtx {
             protocol,
+            conv_id: &conv_id,
+            transport_error,
             terminal_sent,
-            saw_finish_reason,
-            meta.truncated_mode.is_some(),
-        ) {
-            if let Some((fp, fd)) = boundary.flush() {
-                agg.push_str(&fp);
-                agg.push_str(&format!("data: {fd}\n\n"));
-            }
-            agg.push_str(&block_inject::chat_done_frame());
-            if !agg.is_empty() {
-                metrics.add_sse_event();
-                forwarded += 1;
-                any_frame_sent = true;
-                let _ = pump_tx.send(std::mem::take(&mut agg)).await;
-            }
-            terminal_sent = true;
-            block_inject::mark_terminal(&mut meta);
-            let _ = set_truncated(
-                &mut meta,
-                protocol,
-                crate::service::sse::TruncatedMode::OpenEnded,
-                Some(&metrics),
-            );
-            tracing::warn!(
-                "Chat 流已见 finish_reason 但缺 [DONE]，已补发 [DONE] 收尾（open-ended 观测保留）"
-            );
-        }
-        // D4：空流合成守门以终端/任意帧状态位为准（残余 `send` 即记位），
-        // 不依赖 `forwarded` 计数器；真空流（三位全假）仍合成三协议恰一终端帧。
-        if should_synthesize_empty_stream(terminal_sent, any_frame_sent, block_injected) {
-            let proto_name = protocol_header_value(protocol);
-            let tid = conv_id.clone().unwrap_or_else(|| {
-                llm_gateway::resolve_conv_id(
-                    None,
-                    &serde_json::Value::Null,
-                    Some(&metrics),
-                    "truncated",
-                )
-                .0
-            });
-            // C8 open-ended：真空流 chat/anthropic 为空帧集（不伪造成功终止，
-            // 仅记 open-ended 可观测，不置 block_injected）；Responses 合成 failed。
-            // 与 P0-3.2 截断合成共用 `terminal_sent` 守门：此处仅真空（终端未发、
-            // 无帧、无阻断）才进入，恒恰一语义不变。
-            let frames = block_inject::ensure_event_lines(block_inject::empty_stream_frames(
-                proto_name, &tid,
-            ));
-            if frames.is_empty() {
-                let _ = set_truncated(
-                    &mut meta,
-                    protocol,
-                    crate::service::sse::TruncatedMode::OpenEnded,
-                    Some(&metrics),
-                );
-            } else {
-                block_injected = true;
-                for f in frames {
-                    let _ = pump_tx.send(f).await;
-                }
-                let _ = set_truncated(
-                    &mut meta,
-                    protocol,
-                    if protocol == Protocol::Responses {
-                        crate::service::sse::TruncatedMode::SynthesizedFailed
-                    } else {
-                        crate::service::sse::TruncatedMode::OpenEnded
-                    },
-                    Some(&metrics),
-                );
-                block_inject::mark_terminal(&mut meta);
-            }
-            terminated = true;
-        }
-        let _ = terminated;
+            any_frame_sent,
+            forwarded: &mut forwarded,
+            block_injected: &mut block_injected,
+            pending_tool_frames: &mut pending_tool_frames,
+            metrics: &metrics,
+            prefix_hold: &mut prefix_hold,
+            boundary: &mut boundary,
+            boundary_spans: &boundary_spans,
+            agg: &mut agg,
+            pump_tx: &pump_tx,
+            resp_scope: &resp_scope,
+            resp_vault: &resp_vault,
+            resp_detector: &resp_detector,
+            parser: &mut parser,
+            meta: &mut meta,
+            carry: &mut carry,
+        })
+        .await;
         _gate.store(false, std::sync::atomic::Ordering::Relaxed);
         admin_metrics.record_chat(ChatRecord {
             protocol,

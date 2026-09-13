@@ -25,6 +25,9 @@ struct ResponsesSlot {
 }
 
 impl ResponsesSlot {
+    /// S7/D8：本槽已计入 `total_bytes` 的活跃分片字节（`done_args` 不重复计数）。
+    fn held_bytes(&self) -> usize { self.frags.values().map(|s| s.len()).sum() }
+
     fn full_args(&self) -> String {
         if let Some(done) = self.done_args.as_deref() {
             return done.to_string();
@@ -88,6 +91,7 @@ impl AuditHold {
         self.total_bytes += args_delta.len();
         if self.total_bytes > self.max_bytes {
             self.rejected = true;
+            self.total_bytes = 0;
             self.args_by_index.clear();
             self.name_by_index.clear();
             self.id_by_index.clear();
@@ -136,12 +140,17 @@ impl AuditHold {
             n
         });
         slot.next_seq = slot.next_seq.max(seq_no + 1);
-        slot.frags
-            .entry(seq_no)
-            .or_insert_with(|| args_delta.to_string());
-        self.total_bytes += args_delta.len();
+        let added_bytes = match slot.frags.entry(seq_no) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(args_delta.to_string());
+                args_delta.len()
+            }
+            std::collections::btree_map::Entry::Occupied(_) => 0,
+        };
+        self.total_bytes += added_bytes;
         if self.total_bytes > self.max_bytes {
             self.rejected = true;
+            self.total_bytes = 0;
             self.args_by_index.clear();
             self.name_by_index.clear();
             self.id_by_index.clear();
@@ -180,11 +189,14 @@ impl AuditHold {
             .collect()
     }
 
-    /// 全局完成事件判定（§2.5）：仅 `message_stop`/`completed` 类事件触发
-    /// 全局 `mark_completed`；`content_block_stop`/`item_done` 只清对应
+    /// 全局完成事件判定（§2.5 / D2）：仅 `message_stop`/`response.completed`/
+    /// `response.failed`/`response.incomplete` 与 Chat `finish_reason=tool_calls`
+    /// 触发全局 `mark_completed`。`content_block_stop`/`item_done` 只清对应
     /// index 槽（见 [`AuditHold::is_index_complete_event`] +
-    /// [`AuditHold::clear_index`]），此处恒为 false，避免第一块 stop 后
-    /// 第二块 tool 直接 Approved 逃逸。
+    /// [`AuditHold::clear_index`]）；Responses 的 `response.output_item.done`/
+    /// `response.function_call_arguments.done` 为**槽级**完成（见
+    /// [`AuditHold::is_responses_slot_complete_event`]），不得标记全局完成，
+    /// 否则首个 item done 后后续 item 的分片既不累积也不审计（危险参数逃逸）。
     pub fn is_complete_event(payload: &Value) -> bool {
         if payload
             .get("type")
@@ -217,21 +229,29 @@ impl AuditHold {
         {
             return true;
         }
-        // §2.5：`content_block_stop`/`item_done` 只清对应 index 槽，
-        // 不得标记全局完成；全局完成仅由 `message_stop`/`completed` 触发。
+        // §2.5 / D2：全局完成仅由 `message_stop` 与 Responses 官方三元
+        //（`completed`/`failed`/`incomplete`）触发；per-item `.done` 是槽级完成。
         if let Some(t) = payload.get("type").and_then(|v| v.as_str())
             && matches!(
                 t,
-                "message_stop"
-                    | "response.completed"
-                    | "response.failed"
-                    | "response.output_item.done"
-                    | "response.function_call_arguments.done"
+                "message_stop" | "response.completed" | "response.failed" | "response.incomplete"
             )
         {
             return true;
         }
         false
+    }
+
+    /// D2 槽级完成事件判定：`response.output_item.done`/
+    /// `response.function_call_arguments.done` 只完成对应 item 槽，
+    /// 由调用方审计并清理该槽，不影响全局完成。
+    pub fn is_responses_slot_complete_event(payload: &Value) -> bool {
+        payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| {
+                t == "response.output_item.done" || t == "response.function_call_arguments.done"
+            })
     }
 
     /// 按 index 完成事件判定（§2.5）：`content_block_stop`/`item_done`
@@ -246,16 +266,22 @@ impl AuditHold {
     /// 按 index 清槽（§2.5）：移除该 index 的累积参数/名/id，
     /// 全局 `completed`/`rejected` 状态不动，后续 index 照常累积审计。
     pub fn clear_index(&mut self, index: u32) {
-        self.args_by_index.remove(&index);
+        if let Some(args) = self.args_by_index.remove(&index) {
+            self.total_bytes = self.total_bytes.saturating_sub(args.len());
+        }
         self.name_by_index.remove(&index);
         self.id_by_index.remove(&index);
     }
 
-    pub fn mark_completed(&mut self) { self.completed = true; }
+    pub fn mark_completed(&mut self) {
+        self.completed = true;
+        self.total_bytes = 0;
+    }
 
     /// 审计命中拒绝：置粘性拒绝态并清理持仓（fail-closed，不透出参数）。
     pub fn mark_rejected(&mut self) {
         self.rejected = true;
+        self.total_bytes = 0;
         self.args_by_index.clear();
         self.name_by_index.clear();
         self.id_by_index.clear();
@@ -282,6 +308,38 @@ impl AuditHold {
 
     pub fn held(&self) -> bool { !self.completed && !self.rejected }
 
+    /// D1 pending 判据：Chat/Anthropic 存在未释放的 `args_by_index` 分片；
+    /// Responses 存在 `!done_seen` 的槽。用于把抑制/keepalive 门控从流级
+    /// 「未完成」（`held()` 在流开头即为真）收窄为「确有分片被持有」。
+    pub fn has_pending_fragments(&self) -> bool {
+        !self.args_by_index.is_empty() || self.responses_slots.values().any(|s| !s.done_seen)
+    }
+
+    /// D1 释放入口：完成事件审计（Allow 或 `NeedApproval` 建单，均算已判定）
+    /// 后把已判定作用域移出抑制集——Chat/Anthropic 清空分片累积，Responses
+    /// 移除 `done_seen` 槽。拒绝态 fail-closed 不释放。
+    pub fn release_audited(&mut self) {
+        if self.rejected {
+            return;
+        }
+        let released: usize = self
+            .args_by_index
+            .values()
+            .map(String::len)
+            .chain(
+                self.responses_slots
+                    .values()
+                    .filter(|slot| slot.done_seen)
+                    .map(ResponsesSlot::held_bytes),
+            )
+            .sum();
+        self.total_bytes = self.total_bytes.saturating_sub(released);
+        self.args_by_index.clear();
+        self.name_by_index.clear();
+        self.id_by_index.clear();
+        self.responses_slots.retain(|_, slot| !slot.done_seen);
+    }
+
     pub fn is_rejected(&self) -> bool { self.rejected }
 
     pub fn accumulated(&self, index: u32) -> Option<&str> {
@@ -289,6 +347,8 @@ impl AuditHold {
     }
 }
 
+/// D1/H7 锁序不变量：keepalive gate 仅经 `Arc<AtomicBool>` 无锁读写，**不获取
+/// 任何 hold 锁**，故不存在与 hold/审计锁的逆序获取；不得改为持锁路径。
 #[derive(Debug)]
 pub struct RequestKeepalive {
     live: Arc<AtomicBool>,
@@ -297,24 +357,39 @@ pub struct RequestKeepalive {
 
 impl RequestKeepalive {
     pub fn spawn(tx: tokio::sync::mpsc::Sender<String>) -> Self {
-        Self::spawn_gated(tx, Arc::new(AtomicBool::new(true)))
+        Self::spawn_gated(tx, Arc::new(AtomicBool::new(false)))
     }
 
     pub fn spawn_gated(tx: tokio::sync::mpsc::Sender<String>, gate: Arc<AtomicBool>) -> Self {
+        Self::spawn_gated_with_interval(tx, gate, super::super::sse::KEEPALIVE_INTERVAL)
+    }
+
+    /// D1 门控极性：`gate=true` 为**抑制**信号（存在未完成 tool 分片），
+    /// `false` 时保活帧按周期发送。与 `spawn.rs` 的 `has_pending_fragments()`
+    /// 判据同源；`interval` 供单测注入小周期，生产恒用 `KEEPALIVE_INTERVAL`。
+    pub fn spawn_gated_with_interval(
+        tx: tokio::sync::mpsc::Sender<String>,
+        gate: Arc<AtomicBool>,
+        interval: std::time::Duration,
+    ) -> Self {
         let live = Arc::new(AtomicBool::new(true));
         let flag = live.clone();
         let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(super::super::sse::KEEPALIVE_INTERVAL);
+            let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
                 if !flag.load(Ordering::Relaxed) {
                     break;
                 }
-                if !gate.load(Ordering::Relaxed) {
+                if gate.load(Ordering::Relaxed) {
                     continue;
                 }
-                if tx.send(super::super::sse::keepalive_frame()).await.is_err() {
+                if tx
+                    .send(crate::service::sse::keepalive_frame())
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -337,386 +412,6 @@ impl Drop for RequestKeepalive {
     }
 }
 
-/// D3 hold 单测（自 `audit_hold.rs` 随实现体并入，语义不变）。
+/// D3 hold 单测（自 `audit_hold.rs` 随实现体并入，语义不变；用例见 `hold/tests.rs`）。
 #[cfg(test)]
-mod audit_hold_tests {
-    use super::*;
-
-    #[test]
-    fn file_len_under_800_or_split() {
-        // 红线看护（口径=文件总行，含测试与注释，见 hygiene-round4 模板）：
-        // 超 800 即失败，须按模板拆分，不得只改数字放行。
-        const SELF_SRC: &str = include_str!("hold.rs");
-        let lines = SELF_SRC.lines().count();
-        assert!(
-            lines <= 800,
-            "hold.rs {lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-        );
-    }
-
-    #[test]
-    fn responses_three_fragments_ordered_single_flush_no_audit_during_delta() {
-        let mut hold = AuditHold::new(1024);
-        let key = AuditHold::responses_key(Some("item-7"), 1);
-        assert_eq!(
-            hold.push_responses_fragment(&key, 1, Some(2), Some("item-7"), Some("run"), "1}"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            hold.push_responses_fragment(&key, 1, Some(0), None, None, "{\"x\":"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            hold.push_responses_fragment(&key, 1, Some(1), None, None, ""),
-            HoldVerdict::Approved
-        );
-        assert!(
-            hold.tool_triples().is_empty(),
-            "done 到达前不得有可审计三元组"
-        );
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{\"x\":"})
-        ));
-        hold.mark_responses_done(&key, None);
-        assert!(hold.is_responses_complete(&key));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"type":"response.function_call_arguments.done"})
-        ));
-        let triples = hold.tool_triples();
-        assert_eq!(triples.len(), 1, "三分片单 flush 为一条三元组");
-        assert_eq!(triples[0].0, 1);
-        assert_eq!(triples[0].1, "run");
-        assert_eq!(triples[0].2, "{\"x\":1}");
-    }
-
-    #[test]
-    fn tool_deltas_accumulate_by_index_without_flush_until_complete() {
-        let mut hold = AuditHold::new(1024);
-        assert_eq!(
-            hold.push_fragment(0, Some("a"), Some("run"), "{\"x\":"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            hold.push_fragment(0, None, None, "1}"),
-            HoldVerdict::Approved
-        );
-        assert!(hold.held());
-        assert_eq!(hold.accumulated(0), Some("{\"x\":1}"));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"delta":"hi"})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"finish_reason":"tool_calls"})
-        ));
-        // §2.5：stop/item_done 只触发按 index 清理，不标记全局完成。
-        assert!(AuditHold::is_index_complete_event(
-            &serde_json::json!({"type":"content_block_stop"})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"type":"content_block_stop"})
-        ));
-        assert!(AuditHold::is_index_complete_event(
-            &serde_json::json!({"type":"item_done"})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"type":"item_done"})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"type":"message_stop"})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[{"message":{"finish_reason":"tool_calls"}}]})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[]})
-        ));
-        hold.mark_completed();
-        assert!(!hold.held());
-    }
-
-    #[test]
-    fn overflow_fail_closed_and_clears_pending() {
-        let mut hold = AuditHold::new(4);
-        assert_eq!(
-            hold.push_fragment(0, None, None, "ab"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            hold.push_fragment(0, None, None, "cde"),
-            HoldVerdict::Rejected
-        );
-        assert!(hold.is_rejected());
-        assert_eq!(hold.accumulated(0), None);
-    }
-
-    #[test]
-    fn mid_abort_and_early_close_cleanup_fail_closed_without_hang() {
-        let mut hold = AuditHold::new(1024);
-        assert_eq!(
-            hold.push_fragment(0, Some("a"), Some("run"), "{\"x\":"),
-            HoldVerdict::Approved
-        );
-        hold.mark_rejected();
-        assert!(hold.is_rejected());
-        assert!(!hold.held(), "abort 后不得再挂起等待");
-        assert_eq!(
-            hold.push_fragment(0, None, None, "1}"),
-            HoldVerdict::Rejected,
-            "abort 后续分片一律拒绝"
-        );
-        let mut early = AuditHold::new(1024);
-        assert_eq!(
-            early.push_fragment(1, Some("b"), Some("run"), "{\"y\":"),
-            HoldVerdict::Approved
-        );
-        early.mark_completed();
-        assert!(!early.held(), "早断完成即清理，不残留挂起");
-    }
-
-    #[test]
-    fn dual_index_independent_accumulation_without_crosstalk() {
-        let mut hold = AuditHold::new(1024);
-        assert_eq!(
-            hold.push_fragment(0, Some("a"), Some("run_a"), "{\"x\":"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            hold.push_fragment(1, Some("b"), Some("run_b"), "{\"y\":"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(hold.accumulated(0), Some("{\"x\":"));
-        assert_eq!(hold.accumulated(1), Some("{\"y\":"));
-        hold.clear_index(0);
-        assert_eq!(hold.accumulated(0), None);
-        assert_eq!(hold.accumulated(1), Some("{\"y\":"), "清槽不得污染他槽");
-        assert!(hold.held(), "单槽清理后整体仍挂起审计");
-    }
-
-    #[test]
-    fn timeout_disconnect_race_window_constants_locked() {
-        assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MIN, 110);
-        assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MAX, 130);
-        assert_eq!(crate::config::AUDIT_TIMEOUT_DEFAULT, 90);
-    }
-
-    #[test]
-    fn completion_check_without_duplicate_branches() {
-        // `response.output_item.done` 仅走 matches! 主分支，不再有尾部重复条件。
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"type": "response.output_item.done", "item": {"id": "x"}})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"item": {"id": "x"}, "type": "other"})
-        ));
-    }
-
-    #[test]
-    fn message_delta_after_slot_stop_does_not_duplicate_audit() {
-        // B5.1：`message_delta` 非按槽完成事件，仅 `content_block_stop`/`item_done`
-        // 触发槽清理（`is_index_complete_event`）；同帧到达不得重复审计/清理。
-        let mut hold = AuditHold::new(1024);
-        assert_eq!(
-            hold.push_fragment(0, Some("c1"), Some("exec"), "{\"command\":\"rm -rf /\"}"),
-            HoldVerdict::Approved
-        );
-        let stop0 = serde_json::json!({"type":"content_block_stop","index":0});
-        assert!(AuditHold::is_index_complete_event(&stop0));
-        assert_eq!(hold.tool_triples().len(), 1, "槽完成须恰可审计一次");
-        hold.clear_index(0);
-        let md = serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}});
-        assert!(
-            !AuditHold::is_index_complete_event(&md),
-            "message_delta 非按槽清理事件"
-        );
-        assert!(
-            !AuditHold::is_complete_event(&md),
-            "message_delta 非全局完成事件"
-        );
-        assert!(
-            hold.tool_triples().is_empty(),
-            "message_delta 不得重复审计/清理"
-        );
-    }
-
-    #[tokio::test]
-    async fn keepalive_handle_per_request_independent_with_first_packet_hold() {
-        let (tx1, _rx1) = tokio::sync::mpsc::channel::<String>(8);
-        let (tx2, _rx2) = tokio::sync::mpsc::channel::<String>(8);
-        let h1 = RequestKeepalive::spawn(tx1);
-        let h2 = RequestKeepalive::spawn(tx2);
-        assert!(h1.is_live() && h2.is_live());
-        assert!(!std::ptr::eq(&h1, &h2));
-        drop(h1);
-        assert!(h2.is_live());
-    }
-
-    #[test]
-    fn audit_approve_stream_approve_injects_completion_and_allows() {
-        let mut hold = AuditHold::new(1024);
-        assert_eq!(
-            hold.push_fragment(0, Some("c1"), Some("run"), "{\"x\":"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            hold.push_fragment(0, None, None, "1}"),
-            HoldVerdict::Approved
-        );
-        assert!(hold.held());
-        let triples = hold.tool_triples();
-        assert_eq!(triples.len(), 1);
-        assert_eq!(triples[0].2, "{\"x\":1}");
-        hold.mark_completed();
-        assert!(!hold.held());
-        assert!(!hold.is_rejected());
-    }
-
-    #[test]
-    fn audit_approve_stream_reject_and_expiry_inject_cleanup() {
-        let mut deny = AuditHold::new(1024);
-        deny.push_fragment(0, Some("c1"), Some("rm"), "{\"p\":");
-        deny.mark_rejected();
-        assert!(deny.is_rejected());
-        assert!(deny.tool_triples().is_empty());
-        assert_eq!(deny.accumulated(0), None);
-        let mut expired = AuditHold::new(1024);
-        expired.push_fragment(0, Some("c9"), Some("run"), "{\"y\":2}");
-        expired.mark_rejected();
-        assert!(expired.is_rejected());
-        assert!(expired.tool_triples().is_empty());
-        assert_eq!(
-            expired.push_fragment(0, None, None, "x"),
-            HoldVerdict::Rejected
-        );
-    }
-
-    #[test]
-    fn audit_approve_stream_anthropic_precheck_three_events() {
-        // §2.5：stop/item_done 只清对应 index 槽；全局完成仅 message_stop。
-        assert!(AuditHold::is_index_complete_event(
-            &serde_json::json!({"type":"content_block_stop"})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"type":"content_block_stop"})
-        ));
-        assert!(AuditHold::is_index_complete_event(
-            &serde_json::json!({"type":"item_done"})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"type":"item_done"})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"type":"message_stop"})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
-        ));
-        assert!(AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]})
-        ));
-        assert!(!AuditHold::is_complete_event(
-            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
-        ));
-    }
-
-    #[test]
-    fn second_tool_block_preserves_global_state_and_audits_normally() {
-        let mut hold = AuditHold::new(1024);
-        assert_eq!(
-            hold.push_fragment(0, Some("a0"), Some("run"), "{\"x\":1}"),
-            HoldVerdict::Approved
-        );
-        // 第一块 stop：只清 index 0，不标记全局完成。
-        let stop0 = serde_json::json!({"type":"content_block_stop","index":0});
-        assert!(AuditHold::is_index_complete_event(&stop0));
-        assert!(!AuditHold::is_complete_event(&stop0));
-        hold.clear_index(0);
-        assert!(hold.held(), "全局完成须保持未标记");
-        assert_eq!(hold.accumulated(0), None);
-        assert!(hold.tool_triples().is_empty());
-        // 第二块到达照常累积可审计，不直接 Approved 逃逸。
-        assert_eq!(
-            hold.push_fragment(1, Some("a1"), Some("run"), "{\"y\":2}"),
-            HoldVerdict::Approved
-        );
-        assert!(hold.held());
-        let triples = hold.tool_triples();
-        assert_eq!(triples.len(), 1);
-        assert_eq!(triples[0].0, 1);
-        assert_eq!(triples[0].2, "{\"y\":2}");
-    }
-
-    #[test]
-    fn audit_approve_stream_overflow_fail_closed_both_paths() {
-        let mut chat_hold = AuditHold::new(4);
-        assert_eq!(
-            chat_hold.push_fragment(0, None, None, "ab"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            chat_hold.push_fragment(0, None, None, "cde"),
-            HoldVerdict::Rejected
-        );
-        assert!(chat_hold.is_rejected());
-        assert!(chat_hold.tool_triples().is_empty());
-        let mut resp_hold = AuditHold::new(4);
-        let key = AuditHold::responses_key(Some("item-o"), 0);
-        assert_eq!(
-            resp_hold.push_responses_fragment(&key, 0, Some(0), None, None, "ab"),
-            HoldVerdict::Approved
-        );
-        assert_eq!(
-            resp_hold.push_responses_fragment(&key, 0, Some(1), None, None, "cde"),
-            HoldVerdict::Rejected
-        );
-        assert!(resp_hold.is_rejected());
-        assert!(resp_hold.responses_triples().is_empty());
-    }
-
-    #[test]
-    fn audit_approve_stream_abort_mid_toolcall_sticky_reject() {
-        let mut hold = AuditHold::new(1024);
-        hold.push_fragment(0, Some("c1"), Some("run"), "{\"a\":");
-        hold.mark_rejected();
-        assert_eq!(
-            hold.push_fragment(0, None, None, "1}"),
-            HoldVerdict::Rejected
-        );
-        let key = AuditHold::responses_key(Some("item-a"), 1);
-        assert_eq!(
-            hold.push_responses_fragment(&key, 1, Some(0), None, None, "z"),
-            HoldVerdict::Rejected
-        );
-        hold.mark_completed();
-        assert!(hold.is_rejected());
-        assert!(hold.tool_triples().is_empty());
-    }
-
-    #[tokio::test]
-    async fn audit_approve_stream_timeout_disconnect_race_with_early_close_cleanup() {
-        let (tx1, _rx1) = tokio::sync::mpsc::channel::<String>(8);
-        let (tx2, _rx2) = tokio::sync::mpsc::channel::<String>(8);
-        let gate_closed = std::sync::Arc::new(AtomicBool::new(false));
-        let gated = RequestKeepalive::spawn_gated(tx1, gate_closed);
-        assert!(gated.is_live());
-        drop(gated);
-        let h1 = RequestKeepalive::spawn(tx2);
-        assert!(h1.is_live());
-        drop(h1);
-        let (tx3, _rx3) = tokio::sync::mpsc::channel::<String>(8);
-        let (tx4, _rx4) = tokio::sync::mpsc::channel::<String>(8);
-        let keep_a = RequestKeepalive::spawn(tx3);
-        let keep_b = RequestKeepalive::spawn(tx4);
-        assert!(keep_a.is_live() && keep_b.is_live());
-        drop(keep_a);
-        assert!(keep_b.is_live());
-    }
-}
+mod tests;

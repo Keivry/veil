@@ -127,3 +127,42 @@ fn pii_dict_file_alias_equivalent_hits_and_redaction() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn custom_inline_alias_fail_closed_and_overlay() {
+    // P8/D9：无 `_FILE` 后缀短名槽（内联登记）与文件变量同加载器，非法值一律 fail-closed
+    // 且报错含变量名。
+    for var in ["PII_CUSTOM_RULES", "PII_CUSTOM_PATTERNS", "PII_CUSTOM_DICT"] {
+        let mut env = base_env();
+        env.insert(var.to_string(), "{不是 json".to_string());
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains(var), "变量 {var} 报错须指明变量名");
+    }
+    for var in ["PII_CUSTOM_RULES", "PII_CUSTOM_PATTERNS", "PII_CUSTOM_DICT"] {
+        let mut env = base_env();
+        env.insert(
+            var.to_string(),
+            "/nonexistent/veil-inline-缺失.json".to_string(),
+        );
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains(var), "变量 {var} 缺失须报错含名");
+    }
+    // 短名槽 + 分离文件槽叠加生效（跨槽）。
+    let rules = custom_tmp_file("inline-rules.json", r#"[{"name":"x1","pattern":"X1\\d+"}]"#);
+    let dict = custom_tmp_file("inline-dict.json", r#"["张三"]"#);
+    let mut env = base_env();
+    env.insert(
+        "PII_CUSTOM_RULES".to_string(),
+        rules.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "PII_CUSTOM_DICT_FILE".to_string(),
+        dict.to_string_lossy().into_owned(),
+    );
+    let cfg = Config::load_from(&env).unwrap();
+    assert_eq!(cfg.pii_custom_rules_file.as_deref(), Some(rules.as_path()));
+    assert_eq!(cfg.pii_custom_dict_file.as_deref(), Some(dict.as_path()));
+    for p in [rules, dict] {
+        std::fs::remove_file(p).ok();
+    }
+}

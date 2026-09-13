@@ -22,9 +22,10 @@ pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
         "sqlite_ok": health.sqlite_ok,
         "sqlite_error": health.sqlite_error,
         "status": if health.sqlite_ok { "ok" } else { "degraded" },
-        "unlocked": state.keepass.is_unlocked(),
-        "pending": state.pending.len(),
-        "llm_secrets": state.vault.len(),
+        "unlocked": health.unlocked,
+        "pending": health.pending,
+        "llm_secrets": health.llm_secrets,
+        "pii_custom_disabled": state.detector.disabled_snapshot().len(),
     }))
 }
 
@@ -122,10 +123,7 @@ mod tests {
                 db_path: PathBuf::from("/tmp/x.sqlite"),
             },
         );
-        state
-            .pending
-            .insert(crate::approval::PendingRecord::new("k-health", "test"));
-        state.vault.register("health-secret-001").unwrap();
+        crate::service::credential::test_support::seed_health_fixtures(&state);
         let Json(body) = health_handler(State(state)).await;
         assert_eq!(body["pending"], 1, "pending 须为待审批数: {body}");
         assert!(body["pending"].is_u64(), "pending 须为数值: {body}");
@@ -140,5 +138,53 @@ mod tests {
         assert_eq!(body["sqlite_ok"], true);
         assert!(body["sqlite_error"].is_null());
         assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn health_pii_custom_disabled() {
+        // P2/D3：停用自定义规则计数只增字段，连续 3 次超时后在 health 可见。
+        let env = HashMap::from([
+            (
+                "HOMESERVER".to_string(),
+                "https://matrix.example.com".to_string(),
+            ),
+            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+            (
+                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+                "observability-admin-token-0123456789".to_string(),
+            ),
+        ]);
+        let state = AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: PathBuf::from("/tmp/x.sqlite"),
+            },
+        );
+        let Json(before) = health_handler(State(state.clone())).await;
+        assert_eq!(
+            before["pii_custom_disabled"], 0,
+            "无停用时计数须为 0: {before}"
+        );
+        for _ in 0..3 {
+            state.detector.account_rule("slow", true);
+        }
+        assert!(
+            state
+                .detector
+                .disabled_snapshot()
+                .contains(&"slow".to_string())
+        );
+        let Json(body) = health_handler(State(state)).await;
+        assert!(
+            body["pii_custom_disabled"].as_u64().unwrap_or(0) >= 1,
+            "停用后 health 须可见: {body}"
+        );
+        assert_eq!(body["ok"], true, "既有字段只增不改: {body}");
+        assert_eq!(body["sqlite_ok"], true);
+        assert!(body["status"].is_string());
+        assert!(body["llm_secrets"].is_u64());
     }
 }

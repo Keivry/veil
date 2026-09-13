@@ -78,6 +78,19 @@ fn http_client_defaults_and_overrides_ok() {
     assert_eq!(cfg.http_timeout_secs, 10);
     assert_eq!(cfg.http_pool_max_idle_per_host, 8);
     assert_eq!(cfg.http_pool_idle_timeout_secs, 60);
+    // G8.6 转发路径逐字段独立：仅覆盖一变量时其余保持默认（不串扰）。
+    let mut env = base_env();
+    env.insert("HTTP_TIMEOUT_SECS".to_string(), "7".to_string());
+    let cfg = Config::load_from(&env).unwrap();
+    assert_eq!(cfg.http_timeout_secs, 7);
+    assert_eq!(
+        cfg.http_pool_max_idle_per_host,
+        HTTP_POOL_MAX_IDLE_PER_HOST_DEFAULT
+    );
+    assert_eq!(
+        cfg.http_pool_idle_timeout_secs,
+        HTTP_POOL_IDLE_TIMEOUT_SECS_DEFAULT
+    );
 }
 
 #[test]
@@ -253,5 +266,29 @@ fn approval_block_wait_default_off() {
             !Config::load_from(&env).unwrap().credential_block_wait,
             "{raw}"
         );
+    }
+}
+
+#[test]
+fn hardening_toggle_matrix() {
+    // G6/P13：默认关/真值开/非真值关三态；非真值不拒启动为 Rust 现行行为（登记见 design D6）。
+    assert!(
+        !Config::load_from(&base_env())
+            .unwrap()
+            .pii_detection_hardening
+    );
+    for raw in ["1", "true", "yes", "on", " ON "] {
+        let mut env = base_env();
+        env.insert("PII_DETECTION_HARDENING".to_string(), raw.to_string());
+        assert!(
+            Config::load_from(&env).unwrap().pii_detection_hardening,
+            "真值 {raw:?} 须开启"
+        );
+    }
+    for raw in ["0", "false", "no", "off", "2", "bogus"] {
+        let mut env = base_env();
+        env.insert("PII_DETECTION_HARDENING".to_string(), raw.to_string());
+        let cfg = Config::load_from(&env).expect("非真值不得拒启动（Rust 现行口径）");
+        assert!(!cfg.pii_detection_hardening, "非真值 {raw:?} 须关闭");
     }
 }

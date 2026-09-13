@@ -4,7 +4,6 @@
 
 mod acl;
 mod entry;
-#[cfg(test)]
 mod migrate;
 mod store;
 
@@ -17,7 +16,7 @@ pub(crate) use store::{
 };
 pub use {
     acl::AuthorizationDecision,
-    entry::{CallerEntry, OLD_HASH_GRACE_SECS, RegisterParams},
+    entry::{CallerEntry, HashChangeOutcome, OLD_HASH_GRACE_SECS, RegisterParams},
     store::{
         BIND_SCRIPT_MAX_BYTES,
         CallerRegistry,

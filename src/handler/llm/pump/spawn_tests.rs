@@ -8,14 +8,14 @@ use {
             ResponsesAction,
             StickyAction,
             responses_control_action,
-            should_backfill_chat_done,
+            should_apply_midstream_terminal,
             should_buffer_tool_frame,
             should_suppress_held_output,
             sticky_suppress_action,
             tool_replay_slot,
         },
         event::should_synthesize_empty_stream,
-        spawn::guard_restored_frame,
+        spawn::{guard_restored_frame, spawn_stream_pump},
     },
     crate::{
         config::AuditMode,
@@ -91,56 +91,79 @@ fn spawn_decision_responses_control_truth_table() {
 }
 
 #[test]
-fn spawn_decision_backfill_chat_done_truth_table() {
-    // 决策点 P1（穷举协议 × 三布尔共 24 组合对拍公式）：仅
-    // 「Chat 且未终端且见 finish_reason 且未置截断」为真。
+fn spawn_decision_midstream_terminal_gate_truth_table() {
+    // D6/S11 决策点：穷举协议 × 四布尔（未终端/未阻断/已发帧/截断信号）对拍公式。
+    // 未终端且未阻断，且「已发帧或有截断信号」才注入；Responses 零帧（未发帧）
+    // 例外——保持真空流最小终止，不进本策略。
     for protocol in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
         for terminal_sent in [false, true] {
-            for saw_finish_reason in [false, true] {
-                for truncated_mode_set in [false, true] {
-                    let expected = protocol == Protocol::Chat
-                        && !terminal_sent
-                        && saw_finish_reason
-                        && !truncated_mode_set;
-                    assert_eq!(
-                        should_backfill_chat_done(
-                            protocol,
-                            terminal_sent,
-                            saw_finish_reason,
-                            truncated_mode_set
-                        ),
-                        expected,
-                        "组合 proto={protocol:?} terminal={terminal_sent} \
-                         saw={saw_finish_reason} truncated={truncated_mode_set}"
-                    );
+            for block_injected in [false, true] {
+                for any_frame_sent in [false, true] {
+                    for stream_truncated in [false, true] {
+                        let expected = !terminal_sent
+                            && !block_injected
+                            && (any_frame_sent || stream_truncated)
+                            && (protocol != Protocol::Responses || any_frame_sent);
+                        assert_eq!(
+                            should_apply_midstream_terminal(
+                                protocol,
+                                terminal_sent,
+                                block_injected,
+                                any_frame_sent,
+                                stream_truncated
+                            ),
+                            expected,
+                            "组合 proto={protocol:?} terminal={terminal_sent} \
+                             blocked={block_injected} sent={any_frame_sent} \
+                             truncated={stream_truncated}"
+                        );
+                    }
                 }
             }
         }
     }
-    // 正例锚点：唯一真组合。
-    assert!(should_backfill_chat_done(
+    // 正例锚点：Chat 已发帧 / Chat 有截断信号（零帧）。
+    assert!(should_apply_midstream_terminal(
         Protocol::Chat,
+        false,
         false,
         true,
         false
     ));
-    // 负例锚点：四条件逐一破坏。
-    assert!(!should_backfill_chat_done(
+    assert!(should_apply_midstream_terminal(
+        Protocol::Chat,
+        false,
+        false,
+        false,
+        true
+    ));
+    // 负例锚点：已终端 / 已阻断 / 真空无信号 / Responses 零帧例外。
+    assert!(!should_apply_midstream_terminal(
         Protocol::Chat,
         true,
+        false,
         true,
+        true
+    ));
+    assert!(!should_apply_midstream_terminal(
+        Protocol::Chat,
+        false,
+        true,
+        true,
+        true
+    ));
+    assert!(!should_apply_midstream_terminal(
+        Protocol::Chat,
+        false,
+        false,
+        false,
         false
     ));
-    assert!(!should_backfill_chat_done(
-        Protocol::Chat,
+    assert!(!should_apply_midstream_terminal(
+        Protocol::Responses,
         false,
         false,
-        false
-    ));
-    assert!(!should_backfill_chat_done(
-        Protocol::Chat,
         false,
-        true,
         true
     ));
 }
@@ -221,26 +244,63 @@ fn spawn_decision_tool_replay_slot_truth_table() {
 
 #[test]
 fn spawn_decision_suppress_held_output_truth_table() {
-    // 决策点边界 hold 抑制（穷举 8 组合对拍公式）：非次要 + hold 有滞留 +
-    // 本帧有输出 才继续持有。
-    for minor in [false, true] {
-        for hold_held in [false, true] {
+    // 决策点边界 hold 抑制（穷举 16 组合对拍新公式 D1）：审计开启 + 确有未完成
+    // 分片 + 本帧有输出 + 非次要 才继续持有；流级 held() 不再参与。
+    for audit_hold_on in [false, true] {
+        for has_pending in [false, true] {
             for out_data_nonempty in [false, true] {
-                let expected = !minor && hold_held && out_data_nonempty;
-                assert_eq!(
-                    should_suppress_held_output(minor, hold_held, out_data_nonempty),
-                    expected,
-                    "组合 minor={minor} held={hold_held} nonempty={out_data_nonempty}"
-                );
+                for minor in [false, true] {
+                    let expected = audit_hold_on && has_pending && out_data_nonempty && !minor;
+                    assert_eq!(
+                        should_suppress_held_output(
+                            audit_hold_on,
+                            has_pending,
+                            out_data_nonempty,
+                            minor
+                        ),
+                        expected,
+                        "组合 on={audit_hold_on} pending={has_pending} \
+                         nonempty={out_data_nonempty} minor={minor}"
+                    );
+                }
             }
         }
     }
     // 正例锚点：唯一真组合。
-    assert!(should_suppress_held_output(false, true, true));
-    // 负例锚点：次要 / 无滞留 / 空输出逐一破坏。
-    assert!(!should_suppress_held_output(true, true, true));
-    assert!(!should_suppress_held_output(false, false, true));
-    assert!(!should_suppress_held_output(false, true, false));
+    assert!(should_suppress_held_output(true, true, true, false));
+    // 负例锚点：审计关 / 无 pending / 空输出 / 次要 逐一破坏。
+    assert!(!should_suppress_held_output(false, true, true, false));
+    assert!(!should_suppress_held_output(true, false, true, false));
+    assert!(!should_suppress_held_output(true, true, false, false));
+    assert!(!should_suppress_held_output(true, true, true, true));
+}
+
+#[test]
+fn suppress_gate_pending_only() {
+    use crate::service::audit::{AuditHold, HoldVerdict};
+    // pending 判据（D1）：流开头无分片不得视为持有。
+    let mut hold = AuditHold::new(1024);
+    assert!(!hold.has_pending_fragments(), "流开头不得视为持有");
+    assert_eq!(
+        hold.push_fragment(0, Some("c1"), Some("run"), "{\"x\":"),
+        HoldVerdict::Approved
+    );
+    assert!(hold.has_pending_fragments(), "累积分片后须 pending");
+    hold.mark_completed();
+    hold.release_audited();
+    assert!(!hold.has_pending_fragments(), "完成审计释放后须非 pending");
+    // Responses：未 done 槽为 pending，done + 释放后归 false。
+    let mut resp = AuditHold::new(1024);
+    let key = AuditHold::responses_key(Some("item-1"), 0);
+    resp.push_responses_fragment(&key, 0, Some(0), Some("item-1"), Some("run"), "{}");
+    assert!(resp.has_pending_fragments());
+    resp.mark_responses_done(&key, None);
+    resp.release_audited();
+    assert!(!resp.has_pending_fragments());
+    // 默认 AUDIT_MODE=off（audit_hold_on=false）抑制恒 false。
+    assert!(!should_suppress_held_output(false, true, true, false));
+    // 有未完成分片且三条件齐备才抑制。
+    assert!(should_suppress_held_output(true, true, true, false));
 }
 
 #[test]
@@ -311,14 +371,13 @@ fn spawn_decision_empty_stream_gate_call_order() {
     assert!(!should_synthesize_empty_stream(true, false, false));
     assert!(!should_synthesize_empty_stream(false, true, false));
     assert!(!should_synthesize_empty_stream(false, false, true));
-    // 调用序不变量（P1 在守门前）：Chat 缺 [DONE] 补发后 terminal_sent 已置，
-    // 守门必假——不会在补发后再二次合成终端。
-    let backfill = should_backfill_chat_done(Protocol::Chat, false, true, false);
-    assert!(backfill, "补发条件须成立");
-    let terminal_sent_after_backfill = true;
+    // 调用序不变量（D6 在守门前）：断流收尾置终端后 terminal_sent/any_frame_sent
+    // 已置，守门必假——不会在收尾后再二次合成终端。
+    let tail_gate = should_apply_midstream_terminal(Protocol::Chat, false, false, true, false);
+    assert!(tail_gate, "断流收尾条件须成立");
     assert!(
-        !should_synthesize_empty_stream(terminal_sent_after_backfill, true, false),
-        "补发置终端后空流守门不得再触发"
+        !should_synthesize_empty_stream(true, true, false),
+        "断流收尾置终端后空流守门不得再触发"
     );
 }
 
@@ -494,5 +553,232 @@ data: [DONE]
         0,
         "阻断清缓冲非截断，不得记截断丢弃"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn sse_incremental_default_off() {
+    // 1.2 回归：默认 AUDIT_MODE=off，多帧文本须在终止帧前逐帧到达（非终止时
+    // 一次性拼接），且到达序与上游投递序一致。
+    let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"segment-A\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"segment-B\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"segment-C\"}}]}\n\ndata: [DONE]\n\n"
+        .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (_outcome, frames) =
+        collect_pump(upstream, pump_ctx(Protocol::Chat, scope, vault, detector)).await;
+    let done_idx = frames
+        .iter()
+        .position(|f| f.contains("[DONE]"))
+        .expect("须有 [DONE] 终止帧");
+    let content_before = frames
+        .iter()
+        .take(done_idx)
+        .filter(|f| f.contains("\"content\""))
+        .count();
+    assert!(
+        content_before >= 2,
+        "终止帧前须收到 ≥2 个独立内容帧（非单帧拼接）: {frames:?}"
+    );
+    let at = |needle: &str| {
+        frames
+            .iter()
+            .position(|f| f.contains(needle))
+            .unwrap_or_else(|| panic!("缺 {needle}: {frames:?}"))
+    };
+    let (a, b, c) = (at("segment-A"), at("segment-B"), at("segment-C"));
+    assert!(a < b && b < c, "帧到达序须与上游投递序一致: {frames:?}");
+    let joined = frames.join("");
+    let (ja, jb, jc) = (
+        joined.find("segment-A").expect("A"),
+        joined.find("segment-B").expect("B"),
+        joined.find("segment-C").expect("C"),
+    );
+    let jdone = joined.find("[DONE]").expect("[DONE]");
+    assert!(
+        ja < jb && jb < jc && jc < jdone,
+        "内容序须 A→B→C→[DONE]: {joined}"
+    );
+    assert!(
+        !frames[a].contains("segment-B"),
+        "内容帧不得被合并为单帧: {frames:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn responses_multi_item_block() {
+    // 2.2/S2 回归：item0 良性 done 后 item1 危险调用（block 模式）——槽级审计与
+    // 全局完成隔离，item1 仍累积并被阻断；危险参数零透传。
+    let sse = br#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"call-0","name":"run","arguments":"{\"x\":1}"}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"call-1","name":"exec","arguments":"{\"command\":\"rm -rf /\"}"}}
+
+data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}
+
+"#
+    .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+    ctx.audit_mode = AuditMode::Block;
+    let (outcome, frames) = collect_pump(upstream, ctx).await;
+    let joined = frames.join("");
+    assert!(outcome.block_injected, "item1 危险调用须被阻断: {joined}");
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "阻断终端恰一: {joined}"
+    );
+    assert!(!joined.contains("rm -rf /"), "危险参数不得透传: {joined}");
+    assert!(
+        !joined.contains("call-1"),
+        "危险 item id 不得透传: {joined}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn synth_terminal_flush_order() {
+    // 3.1/S3/D3：`type:"error"` 合成 `response.failed` 前须先 flush 边界滞留的
+    // delta A，下游先收内容帧、再收恰一失败终端（滞留帧不得拖到终端之后）。
+    let sse = br#"data: {"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"A"}
+
+data: {"type":"error","error":{"message":"boom"}}
+
+"#
+    .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (_outcome, frames) = collect_pump(
+        upstream,
+        pump_ctx(Protocol::Responses, scope, vault, detector),
+    )
+    .await;
+    let joined = frames.join("");
+    let a_at = joined
+        .find("\"delta\":\"A\"")
+        .unwrap_or_else(|| panic!("delta A 须先落下: {joined}"));
+    let failed_at = joined
+        .find("response.failed")
+        .unwrap_or_else(|| panic!("须合成 response.failed: {joined}"));
+    assert!(
+        a_at < failed_at,
+        "滞留内容须先于合成终端 A→failed: {joined}"
+    );
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "终端恰一: {joined}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn synth_terminal_single() {
+    // 3.2/S3 回归：合成终端恰一（`response.failed` 计数为 1），且终端帧之后
+    // 不再出现任何数据帧。
+    let sse = br#"data: {"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"A"}
+
+data: {"type":"error","error":{"message":"boom"}}
+
+"#
+    .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (_outcome, frames) = collect_pump(
+        upstream,
+        pump_ctx(Protocol::Responses, scope, vault, detector),
+    )
+    .await;
+    let failed = frames
+        .iter()
+        .filter(|f| f.contains("response.failed"))
+        .count();
+    assert_eq!(failed, 1, "response.failed 须恰一: {frames:?}");
+    let term_idx = frames
+        .iter()
+        .position(|f| f.contains("response.failed"))
+        .expect("终端帧须存在");
+    for f in frames.iter().skip(term_idx + 1) {
+        assert!(
+            !f.contains("data:") || f.trim().is_empty(),
+            "终端后不得再有数据帧: {f:?}"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn truncation_terminal_flush_order() {
+    // 3.1/S3/D3：截断合成路径（`pending_tool_frames` 非空）前须先 flush 边界
+    // 滞留帧——滞留内容按到达序落下，残缺 tool 分片丢弃且不伪造成功终端。
+    let sse = br#"data: {"choices":[{"index":0,"delta":{"content":"held-A"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"held-B"}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-t","function":{"name":"get_weather","arguments":"{\"city\":\""}}]}}]}
+
+"#
+    .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
+    ctx.audit_mode = AuditMode::Block;
+    ctx.gateway_metrics = metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    let joined = frames.join("");
+    let a = joined.find("held-A").expect("滞留段 A 须落下");
+    let b = joined
+        .find("held-B")
+        .expect("滞留段 B 须在截断收尾前 flush 落下");
+    assert!(a < b, "滞留帧须按到达序落下 A→B: {joined}");
+    assert_eq!(
+        metrics.truncated_tool_dropped_count(),
+        1,
+        "残缺 tool 分片须丢弃并计数"
+    );
+    assert_eq!(
+        joined.matches("data: [DONE]").count(),
+        1,
+        "D6：Chat 截断收尾须补恰一 [DONE]: {joined}"
+    );
+    assert!(!joined.contains("call-t"), "残缺 tool 不得透传: {joined}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn truncation_send_failure_guard() {
+    // S9/D9：下游早断（receiver 已 drop）时截断合成 send 全失败——泵不悬挂、
+    // 不 panic，terminal_sent 不强制置位，PumpOutcome 如实反映未注入终端。
+    let sse =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"held-A\"}}]}\n\n".to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    drop(rx);
+    let ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
+    let handle = spawn_stream_pump(upstream, tx, ctx);
+    let outcome = handle.await.expect("下游早断时泵不得 panic");
+    assert!(
+        !outcome.terminal_injected,
+        "合成终端未实际下行，terminal_injected 不得置位"
+    );
+    assert!(!outcome.block_injected, "下游早断不得伪造阻断");
     server.abort();
 }

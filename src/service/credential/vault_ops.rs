@@ -2,13 +2,25 @@
 //!
 //! H3.1 owner 声明：查询与运维归本文件；token 映射实体归
 //! `service::credential_vault`（取值经其 token 化）；两处互不垫片。
+//!
+//! H7/D7 锁序不变量：写路径统一序 **`registry_save_lock → registry().write()`**，
+//! 任何写锁必须在 `registry_save_lock` 全序点之后获取；流内 keepalive gate 不得
+//! 逆序获取 hold 锁（见 `service::audit::hold::RequestKeepalive`）。审查清单真源见
+//! design D7，源码扫描守护见 `service::declaration_lock::lock_order_invariants`。
 
 use {
     super::{
         super::matrix,
         AppStateParts,
         RegistrationView,
-        approval::{notify_hash_change, record_pending},
+        approval::{
+            AutoPolicy,
+            ClosureLane,
+            approval_decision_closure,
+            clear_terminal_pending,
+            notify_hash_change,
+            submit_pending_with_branch,
+        },
         ratelimit::check_rate,
         registration_view,
     },
@@ -16,9 +28,10 @@ use {
         auth::{ct_eq, is_private_ip, secret_eq},
         config::{EntryMode, REGISTER_RATE_WINDOW_SECS},
         error::{Result, VeilError},
-        registry::RegisterParams,
+        registry::{HashChangeOutcome, RegisterParams},
         service::credential_vault,
     },
+    std::time::Duration,
 };
 
 fn tokenize_field(
@@ -120,17 +133,10 @@ pub async fn query_keepass(
 }
 
 fn notify_keepass_failure(state: &impl AppStateParts, entry: &str, detail: &str) {
-    let bot = matrix::MatrixBot::with_client(
-        state.config().homeserver.clone(),
-        state.config().room_id.clone(),
-        state.config().matrix_access_token.clone(),
-        state.http_client().as_ref().clone(),
-    );
+    let spool = state.notify();
     let summary = format!("KeePass 查询失败 :: {entry} :: {detail}");
-    let text = bot.format_approval(matrix::MatrixBranch::Credential, Some(false), &summary);
-    tokio::spawn(async move {
-        let _ = bot.send_text(&text).await;
-    });
+    let text = spool.format_approval(matrix::MatrixBranch::Credential, Some(false), &summary);
+    spool.notify_text(text);
 }
 
 pub async fn list_registrations(
@@ -190,9 +196,12 @@ pub async fn register_caller_extended(
     }
     {
         let registry = state.registry().read().await;
-        if registry.lookup_by_path(params.caller_path.trim()).is_some()
-            || registry.lookup_by_hash(params.caller_hash.trim()).is_some()
-        {
+        let name = params.name.trim();
+        let name_conflict =
+            !name.is_empty() && registry.lookup_by_name(name).is_some_and(|e| !e.revoked);
+        // 注册判重口径（`F17`，`veil-oracle-followup-fix`）：全局 hash 去重已移除
+        // （内容相同双脚本可各自注册）；判重仍按 `caller_path` 与未吊销 `name`。
+        if registry.lookup_by_path(params.caller_path.trim()).is_some() || name_conflict {
             return Err(VeilError::Conflict {
                 message: format!("调用方已注册: {}", params.caller_path.trim()),
             });
@@ -211,6 +220,7 @@ pub async fn register_caller_extended(
     )
     .await;
     // B1/D1：全序点 → 写锁内改内存并取 bytes → 释放写锁 → spawn_blocking 落盘。
+    // H7/D7 锁序：`registry_save_lock` 必须先于 `registry().write()` 获取。
     let save_guard = state.registry_save_lock().lock().await;
     let (view, bytes) = {
         let mut registry = state.registry().write().await;
@@ -221,6 +231,182 @@ pub async fn register_caller_extended(
     persist_registry_bytes(state.registry_path(), bytes).await;
     drop(save_guard);
     Ok(view)
+}
+
+fn approval_timeout(state: &impl AppStateParts) -> Duration {
+    Duration::from_secs(state.config().credential_approval_timeout_secs.max(1) as u64)
+}
+
+/// C1/D1 三态落定：`🔓 (true, true)` 保持 `disabled`；`✅ (true, false)` 启用；
+/// `❎ (false, _)` 与 `None`（超时）置 `revoked=true`。落定后原子落盘。
+async fn apply_register_approval(
+    state: &impl AppStateParts,
+    caller_path: &str,
+    decision: Option<(bool, bool)>,
+) {
+    let save_guard = state.registry_save_lock().lock().await;
+    let bytes = {
+        let mut registry = state.registry().write().await;
+        match decision {
+            Some((true, true)) => {}
+            Some((true, false)) => {
+                if let Err(e) = registry.set_enabled(caller_path, true) {
+                    tracing::warn!("注册审批启用失败 {caller_path}: {e}");
+                }
+            }
+            _ => {
+                if let Err(e) = registry.revoke(caller_path) {
+                    tracing::warn!("注册审批吊销失败 {caller_path}: {e}");
+                }
+            }
+        }
+        registry.to_file_bytes()
+    };
+    persist_registry_bytes(state.registry_path(), bytes).await;
+    drop(save_guard);
+}
+
+/// C1/D1：注册审批链。先落盘中立条目（`disabled`），再建 `Register` 审批单，
+/// 复用双模：默认 `202` 抛单（后台等待落定回写），`CREDENTIAL_BLOCK_WAIT=1`
+/// 阻塞至 `300s`。三态落定见 [`apply_register_approval`]。
+pub async fn register_caller_with_approval(
+    state: &(impl AppStateParts + Clone + Send + Sync + 'static),
+    params: &RegisterParams,
+    source: &str,
+) -> Result<RegistrationView> {
+    let view = register_caller_extended(state, params, source).await?;
+    let caller_path = view.caller_path.clone();
+    let reg_id = if view.script_hash.is_empty() {
+        caller_path.clone()
+    } else {
+        view.script_hash.clone()
+    };
+    let reason = format!("register审批 :: {reg_id} :: {caller_path}");
+    let event_id = submit_pending_with_branch(
+        state,
+        &caller_path,
+        &reason,
+        matrix::MatrixBranch::Register,
+        "",
+        None,
+    )
+    .await?;
+    if !state.config().credential_block_wait {
+        let owned = (*state).clone();
+        let path_for_task = caller_path.clone();
+        tokio::task::spawn(async move {
+            let timeout = approval_timeout(&owned);
+            let decision = owned.approval().ask(&event_id, timeout).await;
+            let auto = owned
+                .approval()
+                .applied_auto(&event_id)
+                .await
+                .unwrap_or(false);
+            apply_register_approval(&owned, &path_for_task, decision.map(|ok| (ok, auto))).await;
+            clear_terminal_pending(&owned, &path_for_task, &event_id).await;
+        });
+        return Err(VeilError::PendingApproval {
+            message: format!("注册已转 Matrix 人工审批: {caller_path}"),
+        });
+    }
+    let decision = state
+        .approval()
+        .ask(&event_id, approval_timeout(state))
+        .await;
+    let auto = state
+        .approval()
+        .applied_auto(&event_id)
+        .await
+        .unwrap_or(false);
+    apply_register_approval(state, &caller_path, decision.map(|ok| (ok, auto))).await;
+    clear_terminal_pending(state, &caller_path, &event_id).await;
+    match decision {
+        Some(true) => {
+            let registry = state.registry().read().await;
+            let entry =
+                registry
+                    .lookup_by_path(&caller_path)
+                    .ok_or_else(|| VeilError::Storage {
+                        message: "注册审批后回读失败".to_string(),
+                    })?;
+            Ok(registration_view(entry))
+        }
+        Some(false) => Err(VeilError::Auth {
+            message: "注册审批被拒绝".to_string(),
+        }),
+        None => Err(VeilError::Auth {
+            message: "注册审批超时，已按吊销处理".to_string(),
+        }),
+    }
+}
+
+/// C2/D2：常规吊销审批链。仅 `✅ (true, false)` 执行吊销；`❎`（含 `🔓`）与
+/// 超时保持条目原状（不做破坏性动作）。默认 `202` 抛单，阻塞模式同
+/// `CREDENTIAL_BLOCK_WAIT` 口径。
+pub async fn revoke_caller_with_approval(
+    state: &(impl AppStateParts + Clone + Send + Sync + 'static),
+    key: &str,
+) -> Result<RegistrationView> {
+    let caller_path = {
+        let registry = state.registry().read().await;
+        registry
+            .lookup_by_path(key)
+            .or_else(|| registry.lookup_by_hash(key))
+            .or_else(|| registry.lookup_by_name(key))
+            .map(|entry| entry.caller_path.clone())
+            .ok_or_else(|| VeilError::BadRequest {
+                message: format!("调用方不存在: {key}"),
+            })?
+    };
+    let reason = format!("revoke审批 :: {caller_path}");
+    let event_id = submit_pending_with_branch(
+        state,
+        &caller_path,
+        &reason,
+        matrix::MatrixBranch::Register,
+        "",
+        None,
+    )
+    .await?;
+    if !state.config().credential_block_wait {
+        let owned = (*state).clone();
+        let path_for_task = caller_path.clone();
+        tokio::task::spawn(async move {
+            let timeout = approval_timeout(&owned);
+            let decision = owned.approval().ask(&event_id, timeout).await;
+            let auto = owned
+                .approval()
+                .applied_auto(&event_id)
+                .await
+                .unwrap_or(false);
+            if decision == Some(true)
+                && !auto
+                && let Err(e) = revoke_caller(&owned, &path_for_task).await
+            {
+                tracing::warn!("吊销审批落定失败 {path_for_task}: {e}");
+            }
+            clear_terminal_pending(&owned, &path_for_task, &event_id).await;
+        });
+        return Err(VeilError::PendingApproval {
+            message: format!("吊销已转 Matrix 人工审批: {caller_path}"),
+        });
+    }
+    let decision = state
+        .approval()
+        .ask(&event_id, approval_timeout(state))
+        .await;
+    let auto = state
+        .approval()
+        .applied_auto(&event_id)
+        .await
+        .unwrap_or(false);
+    clear_terminal_pending(state, &caller_path, &event_id).await;
+    if decision == Some(true) && !auto {
+        return revoke_caller(state, &caller_path).await;
+    }
+    Err(VeilError::Auth {
+        message: "吊销未获确认，条目保持原状".to_string(),
+    })
 }
 
 pub async fn revoke_caller(state: &impl AppStateParts, key: &str) -> Result<RegistrationView> {
@@ -237,7 +423,7 @@ pub async fn revoke_caller(state: &impl AppStateParts, key: &str) -> Result<Regi
 }
 
 pub async fn emergency_revoke(
-    state: &impl AppStateParts,
+    state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     key: &str,
     admin_token: Option<&str>,
     peer_ip: Option<&str>,
@@ -254,13 +440,29 @@ pub async fn emergency_revoke(
     if admin_ok || file_present || net_ok {
         return revoke_caller(state, key).await;
     }
-    Err(record_pending(state, key, "emergency_revoke转常规审批").await)
+    // `S1`/D1：转常规审批不再裸建单，改走同一决策闭环（批准动作 = 吊销注册）。
+    // 决策键由吊销定位键派生，同一请求重试命中同一票；未决不重复建单。
+    let pending_key = format!("revoke:{key}");
+    approval_decision_closure(
+        state,
+        &pending_key,
+        "emergency_revoke转常规审批",
+        "",
+        None,
+        ClosureLane {
+            label: "吊销",
+            auto_policy: AutoPolicy::Reject,
+        },
+        || revoke_caller(state, key),
+    )
+    .await
 }
 
 pub async fn approve_hash_change(
     state: &impl AppStateParts,
-    caller_path: &str,
+    key: &str,
     new_hash: &str,
+    outcome: HashChangeOutcome,
 ) -> Result<RegistrationView> {
     if state.config().entry_mode != EntryMode::Full {
         tracing::warn!(
@@ -271,24 +473,33 @@ pub async fn approve_hash_change(
             message: "轻量入口 approve 已降级为阻断".to_string(),
         });
     }
-    if caller_path.is_empty() || new_hash.is_empty() {
+    if key.is_empty() || new_hash.is_empty() {
         return Err(VeilError::BadRequest {
-            message: "caller_path 与 new_hash 均必填".to_string(),
+            message: "reg_id/caller_path 与 new_hash 均必填".to_string(),
         });
     }
+    // `C3`/D3：落定入口以 `reg_id`（或回退 `caller_path`）定位条目，支持
+    // path/hash 两种键；解析在取写锁前完成。
+    let caller_path = {
+        let registry = state.registry().read().await;
+        registry
+            .resolve_path(key)
+            .ok_or_else(|| VeilError::BadRequest {
+                message: format!("调用方不存在: {key}"),
+            })?
+    };
     // B5/D5：脚本哈希读取在取全序点/写锁前于阻塞池完成，锁内零文件 I/O。
-    let script_sha256 = crate::registry::bind_script_sha256_async(
-        caller_path.trim().to_string(),
-        new_hash.trim().to_string(),
-    )
-    .await;
+    let script_sha256 =
+        crate::registry::bind_script_sha256_async(caller_path.clone(), new_hash.trim().to_string())
+            .await;
     let save_guard = state.registry_save_lock().lock().await;
     let (view, bytes) = {
         let mut registry = state.registry().write().await;
         let entry = registry.approve_hash_change_with_script_sha256(
-            caller_path,
+            &caller_path,
             new_hash,
             script_sha256,
+            outcome,
         )?;
         let view = registration_view(entry);
         (view, registry.to_file_bytes())
@@ -297,246 +508,11 @@ pub async fn approve_hash_change(
     drop(save_guard);
     notify_hash_change(
         state,
-        caller_path,
+        &caller_path,
         "approve_hash_change 已生效，旧哈希进入3600s宽限",
     );
     Ok(view)
 }
 
 #[cfg(test)]
-mod tests {
-    use {
-        super::register_caller_extended,
-        crate::{
-            config::Config,
-            registry::RegisterParams,
-            service::credential::{AppStateParts, handle_credential, test_support::*},
-            state::{AppState, SqliteOutcome},
-        },
-        std::{path::PathBuf, sync::Arc},
-    };
-
-    fn unique_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "veil-vault-ops-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn state_with_registry_path(path: &std::path::Path) -> AppState {
-        let path_str = path.to_string_lossy().into_owned();
-        cred_state(&cred_env(&[("CALLER_REGISTRY_PATH", path_str.as_str())]))
-    }
-
-    fn params(path: &str, hash: &str) -> RegisterParams {
-        RegisterParams {
-            caller_path: path.to_string(),
-            caller_hash: hash.to_string(),
-            ..RegisterParams::default()
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn slow_save_not_blocking_reads() {
-        use std::sync::atomic::Ordering;
-        let dir = unique_dir("slow-save");
-        let path = dir.join("caller_registry.json");
-        let state = state_with_registry_path(&path);
-        crate::registry::SAVE_TEST_DELAY_MS.store(500, Ordering::SeqCst);
-        let starts_before = crate::registry::SAVE_TEST_WRITE_STARTS.load(Ordering::SeqCst);
-        let s = state.clone();
-        let handle = tokio::spawn(async move {
-            register_caller_extended(&s, &params("/s/slow.sh", "slow-h1"), "slow-save-test").await
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while crate::registry::SAVE_TEST_WRITE_STARTS.load(Ordering::SeqCst) == starts_before {
-            assert!(std::time::Instant::now() < deadline, "落盘未在超时内开始");
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let t0 = std::time::Instant::now();
-        let guard = state.registry().read().await;
-        let waited = t0.elapsed();
-        drop(guard);
-        crate::registry::SAVE_TEST_DELAY_MS.store(0, Ordering::SeqCst);
-        assert!(
-            waited < std::time::Duration::from_millis(250),
-            "读路径等待 {waited:?}，疑似被落盘/写锁阻塞"
-        );
-        handle.await.unwrap().unwrap();
-        let loaded = crate::registry::CallerRegistry::load_from(&path).unwrap();
-        assert_eq!(loaded.len(), 1, "落盘完成后文件须可加载");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn save_order_preserved() {
-        let dir = unique_dir("save-order");
-        let path = dir.join("caller_registry.json");
-        let state = state_with_registry_path(&path);
-        let mut set = tokio::task::JoinSet::new();
-        for i in 0..8 {
-            let s = state.clone();
-            set.spawn(async move {
-                register_caller_extended(
-                    &s,
-                    &params(&format!("/s/order-{i}.sh"), &format!("order-h{i}")),
-                    &format!("order-test-{i}"),
-                )
-                .await
-            });
-        }
-        while let Some(r) = set.join_next().await {
-            r.expect("任务不得 panic").expect("注册须成功");
-        }
-        let loaded = crate::registry::CallerRegistry::load_from(&path).unwrap();
-        assert_eq!(loaded.len(), 8, "全序点须保证终态落盘含全部并发写");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn register_offlock_hash() {
-        use std::sync::atomic::Ordering;
-        let dir = unique_dir("offlock");
-        let script = dir.join("job.sh");
-        std::fs::write(&script, b"#!/bin/sh\necho hi\n").unwrap();
-        let registry_path = dir.join("caller_registry.json");
-        let state = state_with_registry_path(&registry_path);
-        crate::registry::BIND_READ_DELAY_MS.store(500, Ordering::SeqCst);
-        crate::registry::BIND_READ_ENTERED.store(false, Ordering::SeqCst);
-        let s = state.clone();
-        let script_path = script.to_string_lossy().into_owned();
-        let script_path_for_task = script_path.clone();
-        let handle = tokio::spawn(async move {
-            register_caller_extended(
-                &s,
-                &params(&script_path_for_task, "offlock-h"),
-                "offlock-test",
-            )
-            .await
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !crate::registry::BIND_READ_ENTERED.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "脚本读取未在超时内开始"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let t0 = std::time::Instant::now();
-        let guard = state.registry().write().await;
-        let waited = t0.elapsed();
-        drop(guard);
-        crate::registry::BIND_READ_DELAY_MS.store(0, Ordering::SeqCst);
-        assert!(
-            waited < std::time::Duration::from_millis(250),
-            "写锁被读盘阻塞 {waited:?}，读取须在锁外"
-        );
-        handle.await.unwrap().unwrap();
-        let loaded = crate::registry::CallerRegistry::load_from(&registry_path).unwrap();
-        let entry = loaded.lookup_by_path(&script_path).expect("注册条目须在");
-        assert_eq!(
-            entry.script_sha256,
-            crate::registry::script_sha256_of_bytes(b"#!/bin/sh\necho hi\n"),
-            "锁外完成后写入的 script_sha256 须为真实文件哈希"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn save_failure_observable() {
-        let dir = unique_dir("save-fail");
-        let blocker = dir.join("blocker");
-        std::fs::write(&blocker, b"not a dir").unwrap();
-        let path = blocker.join("caller_registry.json");
-        let state = state_with_registry_path(&path);
-        let view = register_caller_extended(&state, &params("/s/fail.sh", "fail-h1"), "fail-test")
-            .await
-            .expect("落盘失败不得使注册接口失败（best-effort）");
-        assert_eq!(view.caller_path, "/s/fail.sh");
-        assert!(
-            state
-                .registry()
-                .read()
-                .await
-                .lookup_by_path("/s/fail.sh")
-                .is_some(),
-            "内存态须保留"
-        );
-        assert!(!path.exists(), "失败不得产生落盘文件");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn real_backend_missing_entry_returns_404() {
-        use zeroize::Zeroizing;
-        let dir = std::env::temp_dir().join(format!(
-            "veil-service-keepass-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("svc.kdbx");
-        crate::keepass::build_test_kdbx(&db_path, b"svc-pw", &[("网易", "u", "s", "", vec![])]);
-        let provider: crate::keepass::PasswordProvider =
-            std::sync::Arc::new(|| Ok(Zeroizing::new(b"svc-pw".to_vec())));
-        let env = cred_env(&[]);
-        let state = AppState::new(
-            Config::load_from(&env).unwrap(),
-            crate::state::SqliteOutcome {
-                sqlite_ok: true,
-                sqlite_error: None,
-                db_path: dir.join("x.sqlite"),
-            },
-        )
-        .with_keepass(Arc::new(crate::keepass::RealKeePass::new(
-            db_path, None, provider,
-        )));
-        let mut missing = body("svc1", "/s/svc.sh", None);
-        missing.entry = Some("不存在".to_string());
-        let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &missing)
-            .await
-            .unwrap_err();
-        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
-        assert!(err.to_string().contains("不存在"));
-        let mut ok_body = body("svc2", "/s/svc2.sh", None);
-        ok_body.field = None;
-        ok_body.fields = None;
-        let ok = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &ok_body)
-            .await
-            .unwrap();
-        assert_eq!(ok.get("title").and_then(|v| v.as_str()), Some("网易"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn locked_returns_503() {
-        let env = cred_env(&[]);
-        let locked = AppState::new(
-            Config::load_from(&env).unwrap(),
-            SqliteOutcome {
-                sqlite_ok: true,
-                sqlite_error: None,
-                db_path: PathBuf::from("/tmp/x.sqlite"),
-            },
-        );
-        let err = handle_credential(
-            &locked,
-            &headers("gethash", Some("s3cr3t")),
-            &body("k1", "/s/k.sh", None),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            err.status_code(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-}
+mod tests;

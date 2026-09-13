@@ -45,6 +45,7 @@ impl PendingRecord {
 #[derive(Debug, Default)]
 pub struct PendingApprovals {
     inner: Mutex<HashMap<String, PendingRecord>>,
+    sweeper_spawns: std::sync::atomic::AtomicUsize,
 }
 
 /// 孤儿 pending 存活上限（秒）；超限由清扫器回收，保证内存有界。
@@ -96,7 +97,16 @@ impl PendingApprovals {
             .unwrap_or(0)
     }
 
+    /// F9/D9：清扫任务启动次数（可观测证据）。构造/建单/手工 sweep 均不启动任务，
+    /// 仅显式 [`Self::spawn_sweeper`] 使其递增。
+    pub fn sweeper_spawn_count(&self) -> usize {
+        self.sweeper_spawns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn spawn_sweeper(self: &std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.sweeper_spawns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let me = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker =
@@ -173,6 +183,44 @@ mod tests {
         assert_eq!(table.clear_all(), 2);
         assert!(table.is_empty());
         assert_eq!(table.clear_all(), 0);
+    }
+
+    #[test]
+    fn init_no_sync_sweeper_observable() {
+        // F9/D9：结构化断言——构造/建单/手工 sweep 不自启清扫任务，仅显式 spawn_sweeper 递增计数；
+        // 并锁定生产 init 序（`src/main.rs`：先 AppState::new 构造，后显式 spawn_sweeper）。
+        let table = PendingApprovals::default();
+        table.insert(PendingRecord::new("sync", "hash_mismatch"));
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.sweeper_spawn_count(),
+            0,
+            "同步构造/建单不得启动清扫任务"
+        );
+        assert_eq!(table.sweep_expired(), 0, "同步 sweep 无任务依赖");
+        assert_eq!(
+            table.sweeper_spawn_count(),
+            0,
+            "手工 sweep 不得启动后台任务"
+        );
+        // 正向对照：显式 spawn_sweeper 方使计数可观测 +1（证明钩子有效，非空断言）。
+        let rt = tokio::runtime::Runtime::new().expect("测试 runtime");
+        let spawned = std::sync::Arc::new(PendingApprovals::default());
+        let handle = {
+            let _guard = rt.enter();
+            spawned.spawn_sweeper()
+        };
+        assert_eq!(spawned.sweeper_spawn_count(), 1, "显式 spawn 须可观测");
+        handle.abort();
+        // F9：生产 init 路径结构断言——main 仅显式 spawn 清扫器，默认构造阶段不自启。
+        let main_src = include_str!("main.rs");
+        let constructed = main_src
+            .find("AppState::new(config, outcome)")
+            .expect("main 生产构造点");
+        let spawned = main_src
+            .find("state.approval.spawn_sweeper()")
+            .expect("main 显式审批清扫任务启动点");
+        assert!(constructed < spawned, "默认构造须先于显式 spawn_sweeper");
     }
 
     #[test]
