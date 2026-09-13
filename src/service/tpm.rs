@@ -142,12 +142,14 @@ impl RealTpm {
             Some(dir) => dir.join(program),
             None => PathBuf::from(program),
         };
-        let mut child = std::process::Command::new(&executable)
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("TPM 子进程启动失败 {program}: {e}"))?;
+        let mut child = retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
+            std::process::Command::new(&executable)
+                .args(args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        })
+        .map_err(|e| anyhow::anyhow!("TPM 子进程启动失败 {program}: {e}"))?;
         let timeout = self.timeout;
         let start = std::time::Instant::now();
         loop {
@@ -194,6 +196,33 @@ impl RealTpm {
     }
 }
 
+const EXEC_MAX_ATTEMPTS: u32 = 5;
+
+/// ETXTBSY（可执行文件忙）有界重试：仅瞬态忙时重试，其他错误立即透传。
+/// 上限 `EXEC_MAX_ATTEMPTS` 次、退避 10/20/30/40ms（总上界 100ms）；
+/// 仅用于 `spawn` 阶段，不影响子进程超时语义。
+fn retry_on_exec_busy<T>(
+    max_attempts: u32,
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_executable_file_busy(&err) && attempt < max_attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// ETXTBSY 判定：Linux 下映射为 `ExecutableFileBusy`，裸错误码 26 兜底。
+fn is_executable_file_busy(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::ExecutableFileBusy || err.raw_os_error() == Some(26)
+}
+
 impl Default for RealTpm {
     fn default() -> Self { Self::new() }
 }
@@ -204,10 +233,12 @@ impl TpmUnlock for RealTpm {
     /// 探测只回答“TPM 硬件/守护进程是否在位”，密封模板回放正确性由 `unseal`
     /// 首次调用的真实错误透出，不在探测阶段预演（避免启动期双倍耗时与临时目录残留）。
     fn is_available(&self) -> bool {
-        std::process::Command::new("tpm2_pcrread")
-            .arg("sha256:0")
-            .output()
-            .is_ok_and(|o| o.status.success())
+        retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
+            std::process::Command::new("tpm2_pcrread")
+                .arg("sha256:0")
+                .output()
+        })
+        .is_ok_and(|o| o.status.success())
     }
 
     fn unseal(&self) -> anyhow::Result<Vec<u8>> {
@@ -396,6 +427,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_on_exec_busy_transient_busy_then_ok() {
+        let mut calls = 0u32;
+        let out = retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from_raw_os_error(26))
+            } else {
+                Ok(calls)
+            }
+        })
+        .expect("瞬态忙后须成功");
+        assert_eq!(out, 3);
+        assert_eq!(calls, 3, "忙碌两次后第三次成功：尝试次数须为 3");
+    }
+
+    #[test]
+    fn retry_on_exec_busy_non_busy_error_passthrough() {
+        let mut calls = 0u32;
+        let err = retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
+            calls += 1;
+            Err::<u32, _>(std::io::Error::from_raw_os_error(2))
+        })
+        .expect_err("非忙错误须透传");
+        assert_eq!(calls, 1, "非 ETXTBSY 不得重试");
+        assert_eq!(err.raw_os_error(), Some(2));
+    }
+
+    #[test]
+    fn retry_on_exec_busy_exhausts_and_returns_last() {
+        let mut calls = 0u32;
+        let err = retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
+            calls += 1;
+            Err::<u32, _>(std::io::Error::from_raw_os_error(26))
+        })
+        .expect_err("持续忙须达上限后报错");
+        assert_eq!(calls, EXEC_MAX_ATTEMPTS, "尝试次数须恰为上限");
+        assert_eq!(err.raw_os_error(), Some(26));
+    }
+
     fn unique_test_base(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -409,7 +480,11 @@ mod tests {
 
     fn write_executable(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(path, body).unwrap();
+        // sync_all 让写者尽快落定，缩小 exec 与写入的竞争窗口（兜底见 retry_on_exec_busy）。
+        let mut file = std::fs::File::create(path).unwrap();
+        std::io::Write::write_all(&mut file, body.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         let mut perm = std::fs::metadata(path).unwrap().permissions();
         perm.set_mode(0o755);
         std::fs::set_permissions(path, perm).unwrap();
