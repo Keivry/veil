@@ -44,9 +44,9 @@
 
 ### Requirement: ENV 回环免 token 声明闭合
 
-`ENV=dev` / `ALLOW_LOOPBACK_NO_TOKEN` 回环免 token 未迁移 SHALL 以 README §6.6 BREAKING 与 §7.4 表行声明；§6 首句 SHALL 由「五处」更新为「六处」。
+`ENV=dev` / `ALLOW_LOOPBACK_NO_TOKEN` 回环免 token 未迁移 SHALL 以 README §6.6 BREAKING 与 §7.4 表行声明；§6 首句计数 SHALL 与 README 当前口径一致（现为「十处」，`veil-docs-test-parity` 同步）。
 
 #### Scenario: 声明可查
 
 - **WHEN** 查阅 README §6.6 与 §7.4
-- **THEN** 均含「回环免 token 未迁移」条目；§6 首句为「六处」
+- **THEN** 均含「回环免 token 未迁移」条目；§6 首句为「十处」

@@ -59,7 +59,7 @@ README 相对原仓（Python `credential-proxy`）的差异陈述 SHALL 以锁�
 #### Scenario: 等价项不列为 BREAKING
 
 - **WHEN** 核查凭据/PII 淘汰策略
-- **THEN** README §6.3 为「容量分表确认（非 BREAKING）」并附 Python 基线 commit 与 `_token.py` 真 LRU（`:231`、`:523-538`）、容量（`:102`、`:141`）证据；§6 引言同步为「六处」BREAKING（§6 共 7 小节，§6.3 为非 BREAKING 容量分表确认）
+- **THEN** README §6.3 为「容量分表确认（非 BREAKING）」并附 Python 基线 commit 与 `_token.py` 真 LRU（`:231`、`:523-538`）、容量（`:102`、`:141`）证据；§6 引言同步为「十处」BREAKING（§6 共 11 小节，§6.3 为非 BREAKING 容量分表确认）
 
 #### Scenario: HOP 对照精确
 

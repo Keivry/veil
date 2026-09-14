@@ -7,7 +7,7 @@
 
 ### Requirement: 非流对话响应体上限声明
 
-系统 SHALL 支持 `NONSTREAM_MAX_BYTES` 配置（默认 `8388608`，即 8MB），对非流对话响应体（chat/completions、v1/messages、v1/responses 尾缀）执行上限检查；当上游状态非错误（`status < 400`）且响应体长度严格大于上限时 SHALL 返回 `502`，JSON 体 SHALL 为 `{"error":{"message":"response too large","type":"response_too_large"}}` 且 `Content-Type: application/json`（对齐 Python `_llm.py:2942`）；上游状态为错误（`status >= 400`）时该上限 SHALL NOT 改写响应，非 JSON 错误体按状态码与正文字节原样透传、错误 JSON 走调用方完整后处理链。显式设置但非整数或小于 `1` 时系统 SHALL 拒绝启动（fail-closed）。非对话（`Protocol::NonDialog`）透传路径 SHALL NOT 受该上限约束。该上限与非流路径既有 502/401 错误体处理、空体分类的先后语义 SHALL 与 Python 对齐：先判空体，再判超限。
+系统 SHALL 支持 `NONSTREAM_MAX_BYTES` 配置（默认 `8388608`，即 8MB），对非流对话响应体（chat/completions、v1/messages、v1/responses 尾缀）执行上限检查；当上游状态非错误（`status < 400`）且响应体长度严格大于上限时 SHALL 返回 `502`，JSON 体 SHALL 为 `{"error":{"message":"response too large","type":"response_too_large"}}` 且 `Content-Type: application/json`（对齐 Python `_llm.py:2951-2961`）；上游状态为错误（`status >= 400`）时该上限 SHALL NOT 改写响应，非 JSON 错误体按状态码与正文字节原样透传、错误 JSON 走调用方完整后处理链。显式设置但非整数或小于 `1` 时系统 SHALL 拒绝启动（fail-closed）。非对话（`Protocol::NonDialog`）透传路径 SHALL NOT 受该上限约束。该上限与非流路径既有 502/401 错误体处理、空体分类的先后语义 SHALL 与 Python 对齐：先判空体，再判超限。
 
 #### Scenario: 超限命中
 
