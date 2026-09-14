@@ -25,8 +25,14 @@ struct ResponsesSlot {
 }
 
 impl ResponsesSlot {
-    /// S7/D8：本槽已计入 `total_bytes` 的活跃分片字节（`done_args` 不重复计数）。
-    fn held_bytes(&self) -> usize { self.frags.values().map(|s| s.len()).sum() }
+    /// S7/D8：本槽已计入 `total_bytes` 的字节（RED-6：完整 `.done` 参数优先，
+    /// 与 [`ResponsesSlot::full_args`] 同口径，保证释放时归还一致）。
+    fn held_bytes(&self) -> usize {
+        match self.done_args.as_deref() {
+            Some(done) => done.len(),
+            None => self.frags.values().map(|s| s.len()).sum(),
+        }
+    }
 
     fn full_args(&self) -> String {
         if let Some(done) = self.done_args.as_deref() {
@@ -161,11 +167,30 @@ impl AuditHold {
     }
 
     pub fn mark_responses_done(&mut self, item_key: &str, full_args: Option<&str>) {
-        if let Some(slot) = self.responses_slots.get_mut(item_key) {
-            slot.done_seen = true;
-            if let Some(args) = full_args {
-                slot.done_args = Some(args.to_string());
-            }
+        let Some(slot) = self.responses_slots.get_mut(item_key) else {
+            return;
+        };
+        slot.done_seen = true;
+        // RED-4：空 `.done` 载荷（四类工具 delta 的 done 不携完整参数）不得
+        // 覆盖已累积参数；只有非空完整参数才作为判定文本。
+        let Some(args) = full_args.filter(|a| !a.is_empty()) else {
+            return;
+        };
+        // RED-6：完整参数替代已累积分片文本，字节只计一次（先归还分片计数）。
+        let old: usize = slot.frags.values().map(|s| s.len()).sum();
+        slot.done_args = Some(args.to_string());
+        slot.frags.clear();
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(old)
+            .saturating_add(args.len());
+        if self.total_bytes > self.max_bytes {
+            self.rejected = true;
+            self.total_bytes = 0;
+            self.args_by_index.clear();
+            self.name_by_index.clear();
+            self.id_by_index.clear();
+            self.responses_slots.clear();
         }
     }
 
@@ -189,10 +214,12 @@ impl AuditHold {
             .collect()
     }
 
-    /// 全局完成事件判定（§2.5 / D2）：仅 `message_stop`/`response.completed`/
-    /// `response.failed`/`response.incomplete` 与 Chat `finish_reason=tool_calls`
-    /// 触发全局 `mark_completed`。`content_block_stop`/`item_done` 只清对应
-    /// index 槽（见 [`AuditHold::is_index_complete_event`] +
+    /// RED-5 全局完成判定（语义收窄）：仅 `message_stop`/`response.completed`/
+    /// `response.failed`/`response.incomplete` 触发全局 `mark_completed`。
+    /// Chat `finish_reason`（含 `tool_calls`）不再置全局完成——晚到 tool 分片
+    /// 继续累积入槽并受审计（审计到期见 [`AuditHold::is_audit_due_event`]）。
+    /// `content_block_stop`/`item_done` 只清对应 index 槽（见
+    /// [`AuditHold::is_index_complete_event`] +
     /// [`AuditHold::clear_index`]）；Responses 的 `response.output_item.done`/
     /// `response.function_call_arguments.done` 为**槽级**完成（见
     /// [`AuditHold::is_responses_slot_complete_event`]），不得标记全局完成，
@@ -205,52 +232,51 @@ impl AuditHold {
         {
             return false;
         }
-        if payload.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls") {
-            return true;
-        }
-        if payload
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .is_some_and(|choices| {
-                choices.iter().any(|ch| {
-                    ch.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls")
-                        || ch
-                            .get("delta")
-                            .and_then(|d| d.get("finish_reason"))
-                            .and_then(|v| v.as_str())
-                            == Some("tool_calls")
-                        || ch
-                            .get("message")
-                            .and_then(|m| m.get("finish_reason"))
-                            .and_then(|v| v.as_str())
-                            == Some("tool_calls")
-                })
+        payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| {
+                matches!(
+                    t,
+                    "message_stop"
+                        | "response.completed"
+                        | "response.failed"
+                        | "response.incomplete"
+                )
             })
-        {
-            return true;
+    }
+
+    /// RED-5 审计到期判定（与全局完成分离）：Chat 任意非空 `finish_reason`
+    /// （顶层、`choices[].finish_reason`、`delta.finish_reason`、`message.finish_reason`，
+    /// `tool_calls` 在内）触发该轮 tool 参数审计评估与 `block` 阻断；非 Chat 以
+    /// 官方完成事件为审计到期点（槽级/按 index 完成另经
+    /// [`AuditHold::is_responses_slot_complete_event`]/[`AuditHold::is_index_complete_event`]）。
+    pub fn is_audit_due_event(
+        protocol: crate::service::llm_gateway::Protocol,
+        payload: &Value,
+    ) -> bool {
+        if protocol == crate::service::llm_gateway::Protocol::Chat {
+            return has_nonempty_finish_reason(payload);
         }
-        // §2.5 / D2：全局完成仅由 `message_stop` 与 Responses 官方三元
-        //（`completed`/`failed`/`incomplete`）触发；per-item `.done` 是槽级完成。
-        if let Some(t) = payload.get("type").and_then(|v| v.as_str())
-            && matches!(
-                t,
-                "message_stop" | "response.completed" | "response.failed" | "response.incomplete"
-            )
-        {
-            return true;
-        }
-        false
+        Self::is_complete_event(payload)
     }
 
     /// D2 槽级完成事件判定：`response.output_item.done`/
     /// `response.function_call_arguments.done` 只完成对应 item 槽，
     /// 由调用方审计并清理该槽，不影响全局完成。
+    /// RED-4：四类工具 delta 的 `.done`（code_interpreter/shell/mcp/custom_tool）
+    /// 同属槽级完成，使四类审计可达。
     pub fn is_responses_slot_complete_event(payload: &Value) -> bool {
         payload
             .get("type")
             .and_then(|v| v.as_str())
             .is_some_and(|t| {
-                t == "response.output_item.done" || t == "response.function_call_arguments.done"
+                t == "response.output_item.done"
+                    || t == "response.function_call_arguments.done"
+                    || t == "response.code_interpreter_call_code.done"
+                    || t == "response.shell_call_command.done"
+                    || t == "response.mcp_call_arguments.done"
+                    || t == "response.custom_tool_call_input.done"
             })
     }
 
@@ -345,6 +371,24 @@ impl AuditHold {
     pub fn accumulated(&self, index: u32) -> Option<&str> {
         self.args_by_index.get(&index).map(|s| s.as_str())
     }
+}
+
+/// RED-5：Chat 任意非空 `finish_reason`（四处载体）判定，供审计到期使用。
+fn has_nonempty_finish_reason(payload: &Value) -> bool {
+    let nonempty = |v: Option<&Value>| v.and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty());
+    if nonempty(payload.get("finish_reason")) {
+        return true;
+    }
+    payload
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .is_some_and(|choices| {
+            choices.iter().any(|ch| {
+                nonempty(ch.get("finish_reason"))
+                    || nonempty(ch.get("delta").and_then(|d| d.get("finish_reason")))
+                    || nonempty(ch.get("message").and_then(|m| m.get("finish_reason")))
+            })
+        })
 }
 
 /// D1/H7 锁序不变量：keepalive gate 仅经 `Arc<AtomicBool>` 无锁读写，**不获取

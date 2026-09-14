@@ -27,10 +27,16 @@ pub struct PendingRecord {
     pub key: String,
     pub reason: String,
     pub created_ms: u128,
+    /// 本记录的清扫 TTL（秒，`AUTH-9`）：缺省 `PENDING_TTL_SECS`（60s，空闲/审计/解锁类）；
+    /// 凭据/注册/哈希变更类阻塞票由建单侧以 300s 覆盖，使其不被 60s 空闲清扫误收。
+    ttl_secs: u64,
 }
 
 impl PendingRecord {
-    pub fn new(key: &str, reason: &str) -> Self {
+    pub fn new(key: &str, reason: &str) -> Self { Self::with_ttl(key, reason, PENDING_TTL_SECS) }
+
+    /// 指定清扫 TTL 的构造（`AUTH-9`）：凭据类阻塞票传 `300`，其余沿用 `PENDING_TTL_SECS`。
+    pub fn with_ttl(key: &str, reason: &str, ttl_secs: u64) -> Self {
         Self {
             key: key.to_string(),
             reason: reason.to_string(),
@@ -38,6 +44,7 @@ impl PendingRecord {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0),
+            ttl_secs,
         }
     }
 }
@@ -81,17 +88,19 @@ impl PendingApprovals {
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
+    /// `AUTH-9`：按记录自身 `ttl_secs` 清扫——凭据类阻塞票 300s，空闲/审计/解锁类 60s。
     pub fn sweep_expired(&self) -> usize {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let ttl_ms = u128::from(PENDING_TTL_SECS) * 1000;
         self.inner
             .lock()
             .map(|mut g| {
                 let before = g.len();
-                g.retain(|_, r| now_ms.saturating_sub(r.created_ms) < ttl_ms);
+                g.retain(|_, r| {
+                    now_ms.saturating_sub(r.created_ms) < u128::from(r.ttl_secs) * 1000
+                });
                 before - g.len()
             })
             .unwrap_or(0)
@@ -183,6 +192,36 @@ mod tests {
         assert_eq!(table.clear_all(), 2);
         assert!(table.is_empty());
         assert_eq!(table.clear_all(), 0);
+    }
+
+    #[test]
+    fn credential_pending_survives_past_idle_ttl() {
+        // AUTH-9：凭据阻塞票（300s TTL）不被 60s 空闲清扫回收。
+        let table = PendingApprovals::default();
+        let mut blocking = PendingRecord::with_ttl(
+            "cred-key",
+            "hash_mismatch",
+            crate::service::matrix::CREDENTIAL_TIMEOUT_SECS,
+        );
+        blocking.created_ms = blocking
+            .created_ms
+            .saturating_sub(u128::from(PENDING_TTL_SECS) * 1000 + 1);
+        table.insert(blocking);
+        assert_eq!(table.sweep_expired(), 0, "凭据阻塞票不得被 60s 空闲清扫");
+        assert_eq!(table.len(), 1, "票须保留至 300s 阻塞超时");
+    }
+
+    #[test]
+    fn idle_orphan_swept_at_60s() {
+        // AUTH-9：无等待者孤儿票按 60s 上限回收，内存有界。
+        let table = PendingApprovals::default();
+        let mut orphan = PendingRecord::new("idle-key", "unlock");
+        orphan.created_ms = orphan
+            .created_ms
+            .saturating_sub(u128::from(PENDING_TTL_SECS) * 1000 + 1);
+        table.insert(orphan);
+        assert_eq!(table.sweep_expired(), 1, "空闲孤儿票 60s 须回收");
+        assert!(table.is_empty());
     }
 
     #[test]

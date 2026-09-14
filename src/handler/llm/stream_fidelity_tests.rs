@@ -14,12 +14,13 @@ use {
             metrics::MetricsStore,
             pii::PiiDetector,
             redaction::Scope,
+            sse::SseParser,
         },
     },
+    axum::http::StatusCode,
     serde_json::Value,
     std::{sync::Arc, time::Instant},
 };
-
 /// H2/D1 断言辅助：注册指定明文凭据，回放单帧 JSON 响应并收集下游帧与指标。
 async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetrics>) {
     let vault = Arc::new(CredentialVault::new());
@@ -35,7 +36,7 @@ async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetric
         vault,
         detector: Arc::new(PiiDetector::new()),
         audit_mode: AuditMode::Off,
-        audit_policy_file: None,
+        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
         approval_whitelist: Vec::new(),
         audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
@@ -226,7 +227,7 @@ async fn pump_sse_with_vault(
         vault,
         detector: Arc::new(PiiDetector::new()),
         audit_mode: AuditMode::Off,
-        audit_policy_file: None,
+        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
         approval_whitelist: Vec::new(),
         audit_sink: crate::service::audit::AuditSink::test_arc(),
         hold_max: 1_048_576,
@@ -313,7 +314,8 @@ async fn go_sse_terminal_transparent() {
     use crate::service::block_inject;
     let chat = block_inject::ensure_event_lines(block_inject::chat_block_frames("audit"));
     assert_eq!(block_inject::count_done(&chat), 1, "Chat 恰一 [DONE]");
-    let anthropic = block_inject::ensure_event_lines(block_inject::anthropic_block_frames("audit"));
+    let anthropic =
+        block_inject::ensure_event_lines(block_inject::anthropic_block_frames("audit", 0));
     assert_eq!(
         anthropic
             .iter()
@@ -429,5 +431,269 @@ data: [DONE]
     assert!(
         frames.iter().all(|f| !f.contains("__VG")),
         "下游任何帧不得含残缺/token: {frames:?}"
+    );
+}
+
+async fn pump_raw_sse_with_metrics(
+    protocol: Protocol,
+    sse: Vec<u8>,
+) -> (Vec<String>, Arc<GatewayMetrics>) {
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let ctx = StreamPumpCtx {
+        protocol,
+        scope,
+        vault,
+        detector,
+        audit_mode: AuditMode::Off,
+        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+        approval_whitelist: Vec::new(),
+        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        hold_max: 1_048_576,
+        pii_boundary_chars: 64,
+        gateway_metrics: metrics.clone(),
+        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+            "/tmp/veil-gateway-units-test.sqlite",
+        ))),
+        sqlite_precise: false,
+        req_start: Instant::now(),
+        pending: Arc::new(PendingApprovals::default()),
+        init_conv: None,
+        normalized_out: false,
+    };
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    server.abort();
+    (frames, metrics)
+}
+
+#[tokio::test]
+async fn sse_envelope_id_retry_passthrough() {
+    // TRN-1：上游 `id:`/`retry:` 须在出口透出，非数字 `retry` 不透出。
+    let sse = b"id: 42\nretry: 3000\ndata: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec();
+    let (frames, _m) = pump_raw_sse_with_metrics(Protocol::Chat, sse).await;
+    let joined = frames.join("");
+    assert!(joined.contains("id: 42"), "id 须透出: {joined}");
+    assert!(joined.contains("retry: 3000"), "retry 须透出: {joined}");
+    let bad = b"retry: 3x\ndata: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec();
+    let (bad_frames, _m2) = pump_raw_sse_with_metrics(Protocol::Chat, bad).await;
+    assert!(
+        !bad_frames.join("").contains("retry:"),
+        "非数字 retry 不得透出: {bad_frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn sse_id_sequence_passthrough() {
+    // TRN-1：多事件流 `id` 值逐个透出、顺序与上游一致。
+    let sse =
+        b"id: 1\ndata: {\"a\":1}\n\nid: 2\ndata: {\"b\":2}\n\nid: 3\ndata: {\"c\":3}\n\ndata: [DONE]\n\n"
+            .to_vec();
+    let (frames, _m) = pump_raw_sse_with_metrics(Protocol::Chat, sse).await;
+    let mut ids: Vec<String> = Vec::new();
+    for f in &frames {
+        let mut cur: Option<String> = None;
+        for line in f.lines() {
+            if let Some(id) = line.strip_prefix("id: ") {
+                cur = Some(id.to_string());
+            } else if let Some(d) = line.strip_prefix("data: ")
+                && d.trim() != "[DONE]"
+                && let Some(id) = cur.take()
+            {
+                ids.push(id);
+            }
+        }
+    }
+    assert_eq!(ids, ["1", "2", "3"], "id 序列须与上游投递一致: {frames:?}");
+}
+
+#[tokio::test]
+async fn sse_split_envelope_counters_unchanged() {
+    // TRN-1：分块信封流与同内容同块流的事件计数、`add_sse_event()` 与转发帧数逐一致。
+    let split: &[u8] =
+        b"event: x\n\ndata: {\"a\":1}\n\nevent: y\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n";
+    let whole: &[u8] =
+        b"event: x\ndata: {\"a\":1}\n\nevent: y\ndata: {\"b\":2}\n\ndata: [DONE]\n\n";
+    let parse_count = |raw: &[u8]| {
+        let mut p = SseParser::new();
+        let mut emitted = 0;
+        for chunk in raw.chunks(3) {
+            emitted += p.push_bytes(chunk).len();
+        }
+        (emitted, p.sse_event_count)
+    };
+    assert_eq!(
+        parse_count(split),
+        parse_count(whole),
+        "sse_event_count 须一致"
+    );
+    let (split_frames, split_metrics) =
+        pump_raw_sse_with_metrics(Protocol::Chat, split.to_vec()).await;
+    let (whole_frames, whole_metrics) =
+        pump_raw_sse_with_metrics(Protocol::Chat, whole.to_vec()).await;
+    assert_eq!(
+        split_frames.len(),
+        whole_frames.len(),
+        "forwarded 帧数须一致"
+    );
+    assert_eq!(
+        split_metrics.sse_event_total(),
+        whole_metrics.sse_event_total(),
+        "add_sse_event 计数须一致"
+    );
+    assert_eq!(
+        split_frames.join(""),
+        whole_frames.join(""),
+        "下游字节须一致"
+    );
+}
+
+async fn loopback_server_with_headers(
+    status: u16,
+    content_type: &str,
+    extra_headers: Vec<(&'static str, &'static str)>,
+    body: Vec<u8>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("回环监听须成功");
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("回环地址须可读")
+    );
+    let reason = match status {
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        _ => "OK",
+    };
+    let mut head = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in extra_headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 65536];
+            let _ = sock.read(&mut buf).await;
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                continue;
+            }
+            if sock.write_all(&body).await.is_err() {
+                continue;
+            }
+            let _ = sock.shutdown().await;
+        }
+    });
+    (url, handle)
+}
+
+async fn passthrough_response(
+    status: u16,
+    content_type: &str,
+    extra_headers: Vec<(&'static str, &'static str)>,
+    body: Vec<u8>,
+    max_bytes: usize,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let (url, server) =
+        loopback_server_with_headers(status, content_type, extra_headers, body).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let metrics = GatewayMetrics::default();
+    let resp = super::dispatch::stream_upstream_passthrough(
+        upstream,
+        false,
+        Protocol::Chat,
+        max_bytes,
+        &metrics,
+    )
+    .await;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("下游体须可读")
+        .to_vec();
+    server.abort();
+    (status, headers, bytes)
+}
+
+#[tokio::test]
+async fn stream_passthrough_oversize_bounded() {
+    // TRN-3：非错误状态超限 => 502 response_too_large，不转发超限字节。
+    let body = vec![b'x'; 64];
+    let (status, _h, got) = passthrough_response(200, "application/json", vec![], body, 8).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "非错误超限须 502");
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.contains("response_too_large"), "{text}");
+}
+
+#[tokio::test]
+async fn stream_passthrough_error_oversize_passthrough_unchanged() {
+    // TRN-3：4xx/5xx 错误体超限仍保状态保字节透传，不改写为 502。
+    let body = vec![b'e'; 64];
+    let (status, _h, got) =
+        passthrough_response(500, "application/json", vec![], body.clone(), 8).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "错误状态须保原码"
+    );
+    assert_eq!(got, body, "错误正文字节须逐字节一致");
+}
+
+#[tokio::test]
+async fn stream_passthrough_within_limit_bytes() {
+    // TRN-3：上限内状态与正文字节逐字节一致。
+    let body = b"{\"ok\":true}".to_vec();
+    let (status, _h, got) =
+        passthrough_response(200, "application/json", vec![], body.clone(), 64).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, body, "上限内字节须逐一致");
+}
+
+#[tokio::test]
+async fn stream_passthrough_strips_internal_headers() {
+    // TRN-4：上游注入 `x-veil-debug` 不出现于下游。
+    let body = b"{}".to_vec();
+    let (status, headers, _got) = passthrough_response(
+        200,
+        "application/json",
+        vec![("x-veil-debug", "leak")],
+        body,
+        64,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get("x-veil-debug").is_none(),
+        "上游内部头不得泄漏: {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn stream_passthrough_internal_header_override() {
+    // TRN-4：上游伪 `x-veil-protocol` 被剔除，下游为网关自置值。
+    let body = b"{}".to_vec();
+    let (_status, headers, _got) = passthrough_response(
+        200,
+        "application/json",
+        vec![("x-veil-protocol", "forged")],
+        body,
+        64,
+    )
+    .await;
+    assert_eq!(
+        headers.get("x-veil-protocol").and_then(|v| v.to_str().ok()),
+        Some("chat"),
+        "须为网关自置值: {headers:?}"
     );
 }

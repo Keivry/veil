@@ -11,7 +11,7 @@ use {
         config::Config,
         error::{Result, VeilError},
         keepass::{CustomProp, EntrySnapshot, KeePassBackend},
-        service::credential::{handle_credential, test_support::*},
+        service::credential::{AppStateParts, handle_credential, test_support::*},
         state::{AppState, SqliteOutcome},
     },
     axum::http::StatusCode,
@@ -40,10 +40,10 @@ async fn wait_event_id(state: &AppState) -> String {
     .expect("审批须先建单")
 }
 
-async fn wait_slot(key: &str, want: DecisionSlot) {
+async fn wait_slot(state: &AppState, key: &str, want: DecisionSlot) {
     let reached = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if credential_decision_slot(key) == Some(want) {
+            if credential_decision_slot(state, key) == Some(want) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -81,8 +81,9 @@ fn timeout_state() -> AppState {
 #[tokio::test]
 async fn async_202_decision_table() {
     let (k_ok, k_no, k_to) = ("/s/dec-ok.sh:h", "/s/dec-no.sh:h", "/s/dec-to.sh:h");
+    let state = async_state();
     {
-        let mut table = super::super::decisions().lock().expect("决策表锁可获取");
+        let mut table = state.decisions().lock().expect("决策表锁可获取");
         assert_eq!(table.begin(k_ok), BeginOutcome::Reserved);
         assert_eq!(table.slot(k_ok), Some(DecisionSlot::Pending), "占位即未决");
         assert_eq!(
@@ -112,7 +113,6 @@ async fn async_202_decision_table() {
         assert_eq!(table.slot(k_to), Some(DecisionSlot::TimedOut));
     }
 
-    let state = async_state();
     enrolled_with_entries(
         &state,
         "/s/dec-wait.sh",
@@ -134,7 +134,7 @@ async fn async_202_decision_table() {
         .approval
         .resolve(&event_id, "@admin:example.com", true)
         .await;
-    wait_slot(key, DecisionSlot::Approved).await;
+    wait_slot(&state, key, DecisionSlot::Approved).await;
 }
 
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn async_202_e2e_approve_returns_credential() {
         .approval
         .resolve(&event_id, "@admin:example.com", true)
         .await;
-    wait_slot(key, DecisionSlot::Approved).await;
+    wait_slot(&state, key, DecisionSlot::Approved).await;
 
     clear_rate(&state).await;
     let out = handle_credential(
@@ -243,7 +243,7 @@ async fn async_202_e2e_deny_returns_403() {
         .approval
         .resolve(&event_id, "@admin:example.com", false)
         .await;
-    wait_slot(key, DecisionSlot::Denied).await;
+    wait_slot(&state, key, DecisionSlot::Denied).await;
 
     clear_rate(&state).await;
     let err = handle_credential(
@@ -317,7 +317,7 @@ async fn async_202_e2e_timeout_returns_403() {
     .await
     .unwrap_err();
     assert_eq!(err.status_code(), StatusCode::ACCEPTED);
-    wait_slot(key, DecisionSlot::TimedOut).await;
+    wait_slot(&state, key, DecisionSlot::TimedOut).await;
 
     clear_rate(&state).await;
     let err = handle_credential(
@@ -398,8 +398,11 @@ fn flaky_state(fail_times: usize) -> AppState {
 async fn approved_decision_fetch_failure_retry() {
     let state = flaky_state(1);
     let key = "/s/fetch-retry.sh:badhash";
-    record_credential_decision(key, Some(true));
-    assert_eq!(credential_decision_slot(key), Some(DecisionSlot::Approved));
+    record_credential_decision(&state, key, Some(true));
+    assert_eq!(
+        credential_decision_slot(&state, key),
+        Some(DecisionSlot::Approved)
+    );
 
     let err = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
         .await
@@ -410,7 +413,7 @@ async fn approved_decision_fetch_failure_retry() {
         "首次取库失败须透传 503"
     );
     assert_eq!(
-        credential_decision_slot(key),
+        credential_decision_slot(&state, key),
         Some(DecisionSlot::Approved),
         "取库失败后决策槽位仍为 Approved"
     );
@@ -419,14 +422,18 @@ async fn approved_decision_fetch_failure_retry() {
         .await
         .expect("重试成功返回凭据");
     assert!(credential_value(&out).starts_with("__MOCK_CRED_"));
-    assert_eq!(credential_decision_slot(key), None, "成功后决策被消费");
+    assert_eq!(
+        credential_decision_slot(&state, key),
+        None,
+        "成功后决策被消费"
+    );
 }
 
 #[tokio::test]
 async fn approved_decision_not_lost_on_fetch_error() {
     let state = flaky_state(2);
     let key = "/s/fetch-lost.sh:badhash";
-    record_credential_decision(key, Some(true));
+    record_credential_decision(&state, key, Some(true));
 
     for attempt in 0..2 {
         let err = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
@@ -438,7 +445,7 @@ async fn approved_decision_not_lost_on_fetch_error() {
             "第 {attempt} 次瞬时失败"
         );
         assert_eq!(
-            credential_decision_slot(key),
+            credential_decision_slot(&state, key),
             Some(DecisionSlot::Approved),
             "失败不得丢批准（第 {attempt} 次）"
         );
@@ -448,7 +455,7 @@ async fn approved_decision_not_lost_on_fetch_error() {
         .await
         .expect("第三次取库成功");
     assert!(credential_value(&out).starts_with("__MOCK_CRED_"));
-    assert_eq!(credential_decision_slot(key), None, "成功即消费");
+    assert_eq!(credential_decision_slot(&state, key), None, "成功即消费");
 
     let after = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
         .await

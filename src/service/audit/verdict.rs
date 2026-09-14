@@ -41,7 +41,8 @@ pub fn audit_enabled_compat(env: &HashMap<String, String>) -> Option<AuditMode> 
 /// 审计判定唯一公开入口（T2/D2 单入口收敛）：按审计模式给出最终 verdict，
 /// 含 MXID 白名单校验——`approve` 模式须配非空白名单，否则降级为 `block`
 /// （对标 Python 防御性校验，防“空白名单跳过校验致任何房间成员可审批”）；
-/// `approve` 空白名单的生产不可达由启动门禁保证（`src/config/env_parse.rs:307-310`）。
+/// `approve` 空白名单的生产不可达由启动门禁保证（`src/config/env_parse.rs:469-478`
+/// 的 `validate_approve_whitelist` 与 `src/main.rs:45` 的 `preflight_whitelist`）。
 /// R5 收敛声明：判定单核为 `is_dangerous` + `evaluate_inner`；流式、非流与测试
 /// 调用点统一走本函数，不得新增绕过白名单的公开判定入口。
 /// 网关接线人注意：allow 名单命中与默认放行的区分（`allow-list` vs 默认事件）

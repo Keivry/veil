@@ -223,6 +223,8 @@ fn head_window(s: &str, n_chars: usize) -> &str {
 /// 字节区间掩码（等字符数 `*` 替换）：越界/非字符边界拒绝；
 /// D5 逐字符豁免：信封字符（`{ } " [ ]`）位原样保留，仅掩码其余位，
 /// 含信封的跨缝命中不再整段漏掩，JSON 结构恒完整可解析。
+/// RED-2：豁免集扩充至含 `,`/`:` 的结构符集——跨缝区间覆盖结构符时不得掩为 `*`，
+/// 否则帧 JSON 结构被破坏（`filter_window` 已在窗口空间过滤 `,`，掩码回写同口径）。
 fn mask_span_bytes(text: &mut String, start: usize, end: usize) {
     if start >= end || end > text.len() {
         return;
@@ -233,7 +235,7 @@ fn mask_span_bytes(text: &mut String, start: usize, end: usize) {
     let masked: String = text[start..end]
         .chars()
         .map(|c| {
-            if matches!(c, '{' | '}' | '"' | '[' | ']') {
+            if matches!(c, '{' | '}' | '"' | '[' | ']' | ',' | ':') {
                 c
             } else {
                 '*'
@@ -295,7 +297,7 @@ mod seam_tests {
         assert_eq!((p.as_str(), d.as_str()), ("e\n", "{\"a\":1}"));
         let mut t = "{\"a\":1}".to_string();
         mask_span_bytes(&mut t, 0, 7);
-        assert_eq!(t, "{\"*\"**}", "信封位保留、其余位逐字掩码");
+        assert_eq!(t, "{\"*\":*}", "结构符（含 `:`）保留、其余位逐字掩码");
         let mut t2 = "13812345678".to_string();
         mask_span_bytes(&mut t2, 0, 11);
         assert_eq!(t2, "***********");
@@ -315,6 +317,26 @@ mod seam_tests {
         mask_span_bytes(&mut u, 0, 5);
         assert_eq!(u, "**{\"*");
         let _ = serde_json::json!({"ok": true});
+    }
+
+    #[test]
+    fn mask_span_envelope_roundtrip_valid() {
+        // RED-2：跨缝待掩码区间覆盖 `,`/`:` 结构符时，结构符原样保留、仅非结构位掩码，
+        // 掩码后帧仍可 `serde_json::from_str` 解析。
+        let mut t = "{\"a\":1,\"b\":2}".to_string();
+        let (start, end) = (
+            t.find(',').expect("逗号须在"),
+            t.rfind(':').expect("冒号须在") + 1,
+        );
+        mask_span_bytes(&mut t, start, end);
+        assert!(t.contains(','), "逗号须保留: {t}");
+        assert!(t.contains(':'), "冒号须保留: {t}");
+        let v: serde_json::Value = serde_json::from_str(&t).expect("覆盖结构符掩码后须合法 JSON");
+        assert_eq!(v["a"], 1);
+        assert!(
+            v.as_object().is_some_and(|m| m.values().any(|x| *x == 2)),
+            "另一取值须保留: {t}"
+        );
     }
 
     #[test]

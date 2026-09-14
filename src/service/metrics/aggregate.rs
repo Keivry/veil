@@ -6,11 +6,23 @@ use {
         store::MetricsStore,
     },
     crate::fs_perm::open_wal,
-    std::{collections::HashMap, path::Path},
+    std::{
+        collections::HashMap,
+        path::Path,
+        sync::atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// 内存环容量（最近 10k 样本）。
 pub const RING_CAP: usize = 10_000;
+/// `aggs` retention 保留窗数（与 `purge_retention_blocking` 同口径）。
+pub(crate) const AGGS_DAILY_KEEP: usize = 32;
+/// `aggs` retention 保留窗数（hourly）。
+pub(crate) const AGGS_HOURLY_KEEP: usize = 170;
+/// `aggs` retention 保留窗数（five_min 每协议只留最新窗口）。
+pub(crate) const AGGS_FIVE_MIN_KEEP: usize = 1;
+/// `aggs` 硬上限（LRU 驱逐兜底，防异常键无界膨胀）。
+pub(crate) const AGGS_MAX_ENTRIES: usize = 4096;
 /// 延迟桶边界（毫秒），对标原仓 12 桶 Python 边界；11 条边界 → 12 桶（含上溢桶）。
 pub const LATENCY_BOUNDS_MS: [u64; 11] = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
 /// 延迟桶数（硬性 12）。
@@ -163,6 +175,66 @@ pub(crate) struct WindowAgg {
     pub(crate) t_silent: u64,
     pub(crate) t_open: u64,
     pub(crate) t_synth: u64,
+    /// 最近更新序号（LRU 驱逐依据；越小越旧）。
+    pub(crate) updated: u64,
+}
+
+/// 窗口键 `d{days}`/`h{hours}`/`m{win}` 的整数序（解析失败视为最旧）。
+fn window_ord(window: &str) -> i64 {
+    window
+        .get(1..)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(i64::MIN)
+}
+
+/// `aggs` 有界（D2）：先按 retention 口径驱逐过期窗口，再按 `updated` 最小 LRU
+/// 驱逐至 `AGGS_MAX_ENTRIES` 以内；驱逐计入 `evicted`。仅作用内存，sqlite 已刷盘
+/// 数据不受影响（重启回填可恢复）。
+pub(crate) fn enforce_agg_bounds(aggs: &mut HashMap<AggKey, WindowAgg>, evicted: &AtomicU64) {
+    if aggs.is_empty() {
+        return;
+    }
+    let mut by_group: HashMap<(Granularity, String), Vec<(i64, AggKey)>> = HashMap::new();
+    for key in aggs.keys() {
+        by_group
+            .entry((key.granularity, key.protocol.clone()))
+            .or_default()
+            .push((window_ord(&key.window), key.clone()));
+    }
+    let mut removals: Vec<AggKey> = Vec::new();
+    for ((gran, _proto), mut windows) in by_group {
+        let keep = match gran {
+            Granularity::Daily => AGGS_DAILY_KEEP,
+            Granularity::Hourly => AGGS_HOURLY_KEEP,
+            Granularity::FiveMin => AGGS_FIVE_MIN_KEEP,
+        };
+        if windows.len() <= keep {
+            continue;
+        }
+        windows.sort_by_key(|w| std::cmp::Reverse(w.0));
+        for (_, key) in windows.into_iter().skip(keep) {
+            removals.push(key);
+        }
+    }
+    for key in removals {
+        if aggs.remove(&key).is_some() {
+            evicted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    while aggs.len() > AGGS_MAX_ENTRIES {
+        let victim = aggs
+            .iter()
+            .min_by_key(|(_, agg)| agg.updated)
+            .map(|(key, _)| key.clone());
+        match victim {
+            Some(key) => {
+                if aggs.remove(&key).is_some() {
+                    evicted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            None => break,
+        }
+    }
 }
 
 pub(crate) fn day_key(ts_secs: i64) -> String {
@@ -202,6 +274,8 @@ pub struct MetricsSnapshot {
     pub is_precise: bool,
     pub ring_len: usize,
     pub dropped: u64,
+    /// `aggs` 驱逐累计（retention + LRU，可观测）。
+    pub aggs_evicted: u64,
 }
 
 /// 时序点（`/_admin/series` 行）。
@@ -296,6 +370,7 @@ impl MetricsStore {
             },
             ring_len: count as usize,
             dropped: self.dropped_total(),
+            aggs_evicted: self.aggs_evicted_total(),
         }
     }
 
@@ -307,7 +382,8 @@ impl MetricsStore {
             .map_err(|e| anyhow::anyhow!("metrics 回填任务异常: {e}"))??;
         let n = rows.len();
         if let Ok(mut aggs) = self.aggs.lock() {
-            for (key, agg) in rows {
+            for (key, mut agg) in rows {
+                agg.updated = self.agg_tick.fetch_add(1, Ordering::Relaxed);
                 aggs.insert(key, agg);
             }
         }
@@ -435,6 +511,7 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
                     t_open: row.get::<_, i64>(13)? as u64,
                     t_synth: row.get::<_, i64>(14)? as u64,
                     buckets,
+                    updated: 0,
                 },
             ))
         })?;

@@ -118,10 +118,18 @@ pub fn parse_register_allow_mode(
     auto: Option<bool>,
 ) -> Option<crate::config::AutoApprove> {
     use std::str::FromStr as _;
-    if let Some(raw) = allow_mode.map(str::trim).filter(|s| !s.is_empty())
-        && let Ok(mode) = crate::config::AutoApprove::from_str(raw)
-    {
-        return Some(mode);
+    if let Some(raw) = allow_mode.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(mode) = crate::config::AutoApprove::from_str(raw) {
+            return Some(mode);
+        }
+        // `AUTH-10`：与 Go `get register --auto` / Python 默认 `manual` 契约对齐。
+        match raw.to_lowercase().as_str() {
+            "auto" => return Some(crate::config::AutoApprove::Allow),
+            "manual" => return Some(crate::config::AutoApprove::Pending),
+            _ => {
+                tracing::warn!("未知 allow_mode {raw:?}，按兼容回退 auto 布尔/None 处理（AUTH-10）")
+            }
+        }
     }
     auto.map(|a| {
         if a {
@@ -245,5 +253,31 @@ mod tests {
         );
         assert_eq!(parse_register_allow_mode(None, None), None);
         assert_eq!(parse_register_allow_mode(Some("bogus"), None), None);
+    }
+
+    #[test]
+    fn register_allow_mode_accepts_auto_and_manual() {
+        // AUTH-10：`auto`→放行、`manual`→审批，大小写不敏感且优先于布尔回退。
+        assert_eq!(
+            parse_register_allow_mode(Some("auto"), None),
+            Some(AutoApprove::Allow)
+        );
+        assert_eq!(
+            parse_register_allow_mode(Some(" AUTO "), None),
+            Some(AutoApprove::Allow)
+        );
+        assert_eq!(
+            parse_register_allow_mode(Some("manual"), None),
+            Some(AutoApprove::Pending)
+        );
+        assert_eq!(
+            parse_register_allow_mode(Some("Manual"), None),
+            Some(AutoApprove::Pending)
+        );
+        assert_eq!(
+            parse_register_allow_mode(Some("auto"), Some(false)),
+            Some(AutoApprove::Allow),
+            "auto 须优先于布尔回退"
+        );
     }
 }

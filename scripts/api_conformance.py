@@ -16,6 +16,7 @@
 # NON_GOAL 豁免：独立 admin.html 静态控制台不在本仓交付（见 README 管理控制台说明），
 # 本脚本不覆盖其前端行为（静态页/CSP/Chart），仅覆盖后端管理面 API。
 
+import hashlib
 import json
 import os
 import socket
@@ -137,6 +138,37 @@ def anth_stream_tool(dangerous=False):
             + anth_frame("message_stop", {"type": "message_stop"}))
 
 
+def anth_stream_error():
+    # TST-9：Anthropic `error` 事件即终端，其后不注入 `message_stop`（README §7.2/§8.6）。
+    return anth_frame("error", {"type": "error",
+                                "error": {"type": "overloaded_error",
+                                          "message": "Overloaded"}})
+
+
+def anth_stream_cr():
+    # TST-9：CR-only 分块——以 `\r` 作行终止（WHATWG SSE），绕开 `anth_frame` 的 `\n` 拼接。
+    return anth_stream_normal().replace(b"\n", b"\r")
+
+
+def anth_stream_thinking():
+    # TST-9：extended thinking 帧（`thinking_delta` + `signature_delta`）。
+    return (anth_frame("message_start", ANTH_START)
+            + anth_frame("content_block_start", {"type": "content_block_start", "index": 0,
+                                                 "content_block": {"type": "thinking",
+                                                                   "thinking": ""}})
+            + anth_frame("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "thinking_delta",
+                                                           "thinking": "step by step"}})
+            + anth_frame("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "signature_delta",
+                                                           "signature": "sig-abc"}})
+            + anth_frame("content_block_stop", {"type": "content_block_stop", "index": 0})
+            + anth_frame("message_delta", {"type": "message_delta",
+                                           "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                           "usage": {"output_tokens": 3}})
+            + anth_frame("message_stop", {"type": "message_stop"}))
+
+
 def anth_message(tool=False):
     if tool:
         content = [{"type": "tool_use", "id": "toolu_1", "name": "get_weather",
@@ -233,8 +265,15 @@ class MockUpstream(BaseHTTPRequestHandler):
                 self._send(chat_completion(tool=tool), "application/json")
         elif path.endswith("/v1/messages") or path.endswith("/messages"):
             if stream:
-                self._send(anth_stream_tool(dangerous) if (tool or dangerous)
-                           else anth_stream_normal(), "text/event-stream")
+                if "ERROR_TEST" in text:
+                    self._send(anth_stream_error(), "text/event-stream")
+                elif "CR_TEST" in text:
+                    self._send(anth_stream_cr(), "text/event-stream")
+                elif "THINKING_TEST" in text:
+                    self._send(anth_stream_thinking(), "text/event-stream")
+                else:
+                    self._send(anth_stream_tool(dangerous) if (tool or dangerous)
+                               else anth_stream_normal(), "text/event-stream")
             else:
                 self._send(anth_message(tool=tool), "application/json")
         elif path.endswith("/v1/responses") or path.endswith("/responses"):
@@ -313,9 +352,47 @@ def normalize_entry_strings(entry):
             el.append(s)
 
 
+def _caller_entry(caller_path, caller_hash):
+    # 与 Rust `RegisterParams` 默认 + `enabled=true` 同构；`script_sha256` 走
+    # 派生回退 `sha256(expected_hash:caller_path)`（脚本路径不存在时）。
+    derived = hashlib.sha256(("%s:%s" % (caller_hash, caller_path)).encode("utf-8")).hexdigest()
+    return {
+        "caller_path": caller_path,
+        "expected_hash": caller_hash,
+        "script_sha256": derived,
+        "enabled": True,
+        "revoked": False,
+        "auto_approve": None,
+        "name": caller_path,
+        "description": "",
+        "entries": {"不存在": ["授权码"], "网易": ["授权码"]},
+        "allow_mode": None,
+        "old_hash": None,
+        "old_hash_expires_at": None,
+    }
+
+
+def seed_registry(path, tags):
+    # AUTH-4 后未 enrolled 调用方默认转 Matrix 审批，无 Matrix 上游时 fail-closed 403；
+    # 取用相须预置已启用调用方（完整性 sha256 与 Rust `integrity_of` 同口径）。
+    entries = {}
+    for tag in sorted(tags):
+        caller_path = "/srv/conformance-%s.sh" % tag
+        caller_hash = "conformance-caller-%s" % tag
+        entries[caller_path] = _caller_entry(caller_path, caller_hash)
+    canonical = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    payload = {"entries": entries,
+               "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
 def run_credential_phase(mock_port):
     from pykeepass import create_database
     work = tempfile.mkdtemp(prefix="veil-conformance-kdbx-")
+    reg_path = seed_registry(os.path.join(work, "caller_registry.json"),
+                             ["full", "single", "raw", "missing", "selector", "nodb"])
     master = "veil-dev-mock-tpm-seal"
     kp = create_database(os.path.join(work, "ci.kdbx"), password=master)
     entry = kp.add_entry(kp.root_group, "网易", "mail-user", "mail-secret-001",
@@ -360,6 +437,7 @@ def run_credential_phase(mock_port):
         assert status == 400, (status, body)
 
     veil = start_veil({"DB_DIR": work,
+                       "CALLER_REGISTRY_PATH": reg_path,
                        "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port})
     try:
         for name, fn in [("取用 整条目", full_entry), ("取用 单字段脱敏", single_protected),
@@ -375,6 +453,7 @@ def run_credential_phase(mock_port):
         assert status == 503, (status, body)
 
     veil_nodb = start_veil({"DB_DIR": os.path.join(work, "empty"),
+                            "CALLER_REGISTRY_PATH": reg_path,
                             "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port})
     try:
         os.makedirs(os.path.join(work, "empty"), exist_ok=True)
@@ -554,12 +633,60 @@ def run_normal_phase():
         assert calls and calls[0].name == "get_weather", r
         assert json.loads(calls[0].arguments) == {"city": "Paris"}
 
+    def anth_error_stream():
+        raised = None
+        try:
+            s = ant.messages.create(model="m", max_tokens=64,
+                                    messages=[{"role": "user", "content": "ERROR_TEST run"}],
+                                    stream=True)
+            for _ in s:
+                pass
+        except Exception as e:  # SDK 对 error 事件须报错而非静默成功
+            raised = e
+        assert raised is not None, "error 事件须使 SDK 报错"
+        assert "verload" in str(raised).lower(), raised
+        raw = raw_post("/v1/messages", {"model": "m", "max_tokens": 64,
+                                        "messages": [{"role": "user", "content": "ERROR_TEST run"}],
+                                        "stream": True})
+        assert "overloaded" in raw, raw
+        assert "message_stop" not in raw, "Anthropic error 即终端，不得补 message_stop"
+
+    def anth_cr_stream():
+        text = ""
+        with ant.messages.stream(model="m", max_tokens=64,
+                                 messages=[{"role": "user", "content": "CR_TEST run"}]) as s:
+            for _ in s.text_stream:
+                pass
+            text = s.get_final_message().content[0].text
+        assert "hello veil" in text, text
+
+    def anth_thinking_stream():
+        think, sig, types = [], "", []
+        s = ant.messages.create(model="m", max_tokens=64,
+                                messages=[{"role": "user", "content": "THINKING_TEST run"}],
+                                stream=True)
+        for e in s:
+            t = getattr(e, "type", "")
+            types.append(t)
+            if t == "content_block_delta":
+                d = getattr(e, "delta", None)
+                dt = getattr(d, "type", "")
+                if dt == "thinking_delta":
+                    think.append(getattr(d, "thinking", ""))
+                elif dt == "signature_delta":
+                    sig = getattr(d, "signature", "")
+        assert "step by step" in "".join(think), (think, types)
+        assert sig == "sig-abc", (sig, types)
+
     for name, fn in [("chat 非流式", chat_nonstream), ("chat 流式", chat_stream),
                      ("chat tool 非流式", chat_tool_nonstream),
                      ("chat tool 流式", chat_tool_stream),
                      ("anthropic 非流式", anth_nonstream), ("anthropic 流式", anth_stream),
                      ("anthropic tool 非流式", anth_tool_nonstream),
                      ("anthropic tool 流式", anth_tool_stream),
+                     ("anthropic error 事件", anth_error_stream),
+                     ("anthropic CR-only 分块", anth_cr_stream),
+                     ("anthropic thinking", anth_thinking_stream),
                      ("responses 非流式", resp_nonstream), ("responses 流式", resp_stream),
                      ("responses tool 非流式", resp_tool_nonstream)]:
         check(name, fn)

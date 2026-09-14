@@ -111,8 +111,8 @@ pub fn classify_segment(segment: &str, policy: &AuditPolicy) -> Option<String> {
     if (lower.contains("curl") || lower.contains("wget")) && piped_to_shell(&lower) {
         return Some("危险 shell: 网络拉取管道进解释器".to_string());
     }
-    // 2) 敏感路径写入：重定向 / 常见写命令触及敏感前缀。
-    if touches_sensitive_path(segment, policy) {
+    // 2) 敏感路径写入：写入口（写命令/重定向）且触及敏感前缀才判（`POL-8`/D8）。
+    if is_sensitive_path_write(segment, policy) {
         return Some("敏感路径写入".to_string());
     }
     // 3) 网络外传：外发关键字 + 远程目标形态。
@@ -136,7 +136,7 @@ fn word_after_command<'a>(lower: &'a str, word: &str) -> Option<&'a str> {
         b.is_ascii_whitespace()
             || matches!(
                 b,
-                b';' | b'|' | b'&' | b'(' | b')' | b'"' | b'\'' | b'=' | b'$'
+                b';' | b'|' | b'&' | b'(' | b')' | b'"' | b'\'' | b'=' | b'$' | b'/'
             )
     };
     let post_ok = |b: u8| {
@@ -244,6 +244,32 @@ fn piped_to_shell(lower: &str) -> bool {
         || lower.contains("| dash")
 }
 
+/// `POL-8`/D8 写入口集合（对照 Python `_audit.py:518` 逐字）：`write_file`/`patch`/
+/// `echo`/`cat`/`tee`/`cp`/`mv`，叠加本仓既有写类工具名 `edit`/`write`/`apply_patch`/`save_file`。
+const WRITE_COMMANDS: &[&str] = &[
+    "write_file",
+    "patch",
+    "echo",
+    "cat",
+    "tee",
+    "cp",
+    "mv",
+    "edit",
+    "write",
+    "apply_patch",
+    "save_file",
+];
+
+/// `POL-8`/D8：写入意图判定——输出重定向（`>`）或写入口命令词命中。
+fn has_write_intent(lower: &str) -> bool {
+    lower.contains('>') || WRITE_COMMANDS.iter().any(|cmd| is_command_word(lower, cmd))
+}
+
+/// `POL-8`/D8：敏感路径写入＝写入意图 + 触及敏感前缀；纯只读命令触及敏感前缀不判。
+pub fn is_sensitive_path_write(segment: &str, policy: &AuditPolicy) -> bool {
+    has_write_intent(&segment.to_lowercase()) && touches_sensitive_path(segment, policy)
+}
+
 /// 敏感路径命中：O(n) 子串定位 + 词法 `..` 归一，禁全文正则回溯。
 pub fn touches_sensitive_path(segment: &str, policy: &AuditPolicy) -> bool {
     let lowered = segment.to_lowercase();
@@ -297,9 +323,27 @@ fn is_exfiltration(lower: &str) -> bool {
         || is_command_word(lower, "ssh")
         || (lower.contains("curl") && (lower.contains("--data") || lower.contains(" -d ")))
         || (lower.contains("wget") && lower.contains("--post-data"))
-        || lower.contains("nc ")
-        || lower.contains("ncat ")
+        || is_command_word(lower, "nc")
+        || is_command_word(lower, "ncat")
         || lower.contains("/dev/tcp/")
+        || is_bare_fetch_exfil(lower)
+}
+
+/// `POL-6`/D6：裸 `curl`/`wget` 外传——命令词边界命中且后随远程目标形态
+/// （`http(s)://`/`ftp://`，或 `-o`/`--output`/`>` 输出重定向）时判网络外传。
+/// 命中外部 host 由 `is_dangerous` 的内网豁免分支放行（`internal_suffixes`）。
+fn is_bare_fetch_exfil(lower: &str) -> bool {
+    let has_remote_target = |rest: &str| {
+        rest.contains("http://")
+            || rest.contains("https://")
+            || rest.contains("ftp://")
+            || rest.contains("-o ")
+            || rest.contains("--output")
+            || rest.contains('>')
+    };
+    ["curl", "wget"]
+        .iter()
+        .any(|verb| word_after_command(lower, verb).is_some_and(has_remote_target))
 }
 
 /// 从 tool 参数提取网络目标 host（URL 或 `curl/wget/nc` 裸目标），不做 DNS 解析。

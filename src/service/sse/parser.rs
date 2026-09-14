@@ -11,7 +11,7 @@ use {
         config::{EVENT_IDLE_TIMEOUT, LINE_LIMIT_BYTES},
         service::{json_walk, redaction},
     },
-    std::time::Instant,
+    std::{collections::VecDeque, time::Instant},
 };
 
 #[derive(Debug, Default)]
@@ -85,6 +85,14 @@ pub struct SseParser {
     /// N3：上一块以孤立 `\r` 结尾，下一块首字节为 `\n` 时按 `\r\n`
     /// 合并吞掉，不产生空行/提前分发。
     swallow_lf: bool,
+    /// TRN-1：跨块暂存——「有 `event` 无 `data`」块的 `event` 按 FIFO 待配对
+    /// 下一含 `data` 块，出口同块重建，不产生孤立 `event:` 块。
+    pending_events: VecDeque<String>,
+    /// TRN-1：无 `data` 块暂存的 `retry`，随下一含 `data` 块同块透出。
+    pending_retry: Option<u64>,
+    /// TRN-1：WHATWG last-event-id——最近一次出现的 `id`（空值重置）对后续
+    /// 无 `id` 事件持续有效。
+    last_event_id: Option<String>,
 }
 
 impl Default for SseParser {
@@ -105,6 +113,9 @@ impl SseParser {
             truncated_line_dropped_bytes: 0,
             block_truncated: false,
             swallow_lf: false,
+            pending_events: VecDeque::new(),
+            pending_retry: None,
+            last_event_id: None,
         }
     }
 
@@ -257,8 +268,36 @@ impl SseParser {
         ev.data = data_parts.join("\n");
         self.line_bytes = 0;
         self.event_start = None;
-        if ev.event_type.is_none() && ev.data.is_empty() && ev.id.is_none() && ev.retry.is_none() {
+        // TRN-1：维护 last-event-id（空值按 WHATWG 重置）。
+        match ev.id.as_deref() {
+            Some("") => {
+                self.last_event_id = None;
+                ev.id = None;
+            }
+            Some(id) => self.last_event_id = Some(id.to_string()),
+            None => {}
+        }
+        // TRN-1：无 `data` 的纯信封块不产出事件、不计事件数——`event` 入 FIFO、
+        // `retry` 暂存，待下一含 `data` 块同块重建（计数与出口帧数保真）。
+        if ev.data.is_empty() {
+            if ev.event_type.is_some() || ev.retry.is_some() {
+                if let Some(t) = ev.event_type.take() {
+                    self.pending_events.push_back(t);
+                }
+                if ev.retry.is_some() {
+                    self.pending_retry = ev.retry.take();
+                }
+            }
             return None;
+        }
+        if ev.event_type.is_none() {
+            ev.event_type = self.pending_events.pop_front();
+        }
+        if ev.retry.is_none() {
+            ev.retry = self.pending_retry.take();
+        }
+        if ev.id.is_none() {
+            ev.id = self.last_event_id.clone();
         }
         self.sse_event_count += 1;
         Some(ev)

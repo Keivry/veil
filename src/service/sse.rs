@@ -495,6 +495,75 @@ mod tests {
         assert_eq!(c.len(), 1, "注释帧须透传");
         assert!(c[0].is_comment_only);
     }
+
+    #[test]
+    fn sse_cross_block_event_pairs_with_data() {
+        // TRN-1：`event:` 与 `data:` 分块时暂存 event，与后续 data 同事件配对，
+        // 不产生空 data 的孤立 event 块。
+        let mut p = SseParser::new();
+        assert!(
+            p.push_bytes(b"event: content_block_delta\n\n").is_empty(),
+            "无 data 的 event 块不得单独分发"
+        );
+        let evs = p.push_bytes(b"data: {\"type\":\"content_block_delta\"}\n\n");
+        assert_eq!(evs.len(), 1, "配对后恰一事件: {evs:?}");
+        assert_eq!(evs[0].event_type.as_deref(), Some("content_block_delta"));
+        assert_eq!(evs[0].data, "{\"type\":\"content_block_delta\"}");
+    }
+
+    #[test]
+    fn sse_cross_block_event_fifo() {
+        // TRN-1：多个无 data 的 `event:` 块按 FIFO 与后续 data 块逐次配对。
+        let mut p = SseParser::new();
+        assert!(p.push_bytes(b"event: a\n\nevent: b\n\n").is_empty());
+        let evs = p.push_bytes(b"data: 1\n\ndata: 2\n\n");
+        assert_eq!(evs.len(), 2, "两 data 块各得一暂存 event: {evs:?}");
+        assert_eq!(evs[0].event_type.as_deref(), Some("a"));
+        assert_eq!(evs[1].event_type.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn sse_last_event_id_persists() {
+        // TRN-1：WHATWG last-event-id——最近 `id` 对后续无 `id` 事件持续生效，
+        // 空值 `id:` 重置。
+        let mut p = SseParser::new();
+        let evs = p.push_bytes(b"id: 42\ndata: a\n\n");
+        assert_eq!(evs[0].id.as_deref(), Some("42"));
+        let evs = p.push_bytes(b"data: b\n\n");
+        assert_eq!(evs[0].id.as_deref(), Some("42"), "最近 id 须持续透出");
+        let evs = p.push_bytes(b"id:\ndata: c\n\n");
+        assert_eq!(evs[0].id, None, "空 id 须重置 last-event-id");
+        let evs = p.push_bytes(b"data: d\n\n");
+        assert_eq!(evs[0].id, None, "重置后不得回填旧 id");
+    }
+
+    #[test]
+    fn sse_split_envelope_parser_count_unchanged() {
+        // TRN-1：分块信封流与同内容同块流的事件计数逐一致。
+        let split: &[u8] = b"event: x\n\ndata: {\"a\":1}\n\ndata: {\"b\":2}\n\n";
+        let whole: &[u8] = b"event: x\ndata: {\"a\":1}\n\ndata: {\"b\":2}\n\n";
+        let count = |raw: &[u8]| {
+            let mut p = SseParser::new();
+            let mut emitted = 0;
+            for chunk in raw.chunks(4) {
+                emitted += p.push_bytes(chunk).len();
+            }
+            (emitted, p.sse_event_count)
+        };
+        assert_eq!(count(split), count(whole), "分块须与非分块逐一致");
+        assert_eq!(count(split), (2, 2), "恰两事件且计数为二");
+    }
+
+    #[test]
+    fn sse_id_and_retry_fields_captured() {
+        // TRN-1：出口重建依赖解析侧 `id`/`retry` 完整捕获，非数字 retry 丢弃。
+        let mut p = SseParser::new();
+        let evs = p.push_bytes(b"id: 42\nretry: 3000\ndata: {\"a\":1}\n\n");
+        assert_eq!(evs[0].id.as_deref(), Some("42"));
+        assert_eq!(evs[0].retry, Some(3000));
+        let bad = p.push_bytes(b"retry: 3x\ndata: v\n\n");
+        assert_eq!(bad[0].retry, None, "非数字 retry 不得解析");
+    }
 }
 
 /// T4 快慢径/delta 切分回补：`select_emit` 两档语义 + 解析器分包等价。

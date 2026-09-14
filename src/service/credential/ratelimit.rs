@@ -88,6 +88,7 @@ mod tests {
     async fn credential_rate_limit_2s_returns_429_with_retry_after() {
         let env = cred_env(&[]);
         let state = cred_state(&env);
+        enroll_allow(&state, "/s/rl.sh", "rlhash").await;
         handle_credential(
             &state,
             &headers("gethash", Some("s3cr3t")),
@@ -133,6 +134,8 @@ mod tests {
         // 同一调用方窗口内第二次 429。
         let env = cred_env(&[]);
         let state = cred_state(&env);
+        enroll_allow(&state, "/s/rl-a.sh", "rl-a").await;
+        enroll_allow(&state, "/s/rl-b.sh", "rl-b").await;
         handle_credential(
             &state,
             &headers("gethash", Some("s3cr3t")),

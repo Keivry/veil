@@ -174,6 +174,10 @@ pub struct Config {
     /// 置位时网关入口拒绝管理面（`/_admin` 全 404，与 token 有效性无关）。
     pub observability_disabled: bool,
     pub audit_mode: AuditMode,
+    /// `POL-2`/D2：审计模式是否由环境来源显式给出（`AUDIT_MODE` 非空或 `AUDIT_ENABLED`
+    /// 真值回退）。 用于区分「显式 `AUDIT_MODE=off`」与「未设置」，决定策略文件 `mode`
+    /// 是否生效。
+    pub audit_mode_explicit: bool,
     pub audit_timeout_secs: i64,
     pub approval_whitelist: Vec<String>,
     pub pii_hold_max: i64,
@@ -296,6 +300,7 @@ impl Config {
         } = load_limits(&get)?;
         let AuditParts {
             audit_mode,
+            audit_mode_explicit,
             audit_timeout_secs,
             approval_whitelist,
             audit_policy_file,
@@ -348,6 +353,7 @@ impl Config {
             observability_admin_token,
             observability_disabled,
             audit_mode,
+            audit_mode_explicit,
             audit_timeout_secs,
             approval_whitelist,
             pii_hold_max,
@@ -454,20 +460,35 @@ fn load_limits(get: &dyn Fn(&str) -> Option<String>) -> Result<LimitParts> {
 /// 审计域（A2）：模式（含遗留 `AUDIT_ENABLED` 回退）/超时/白名单/策略文件。
 struct AuditParts {
     audit_mode: AuditMode,
+    audit_mode_explicit: bool,
     audit_timeout_secs: i64,
     approval_whitelist: Vec<String>,
     audit_policy_file: Option<PathBuf>,
+}
+
+/// `POL-9`/D9：`approve` + 空白名单的启动门禁（env 与文件两来源共用）。
+pub fn validate_approve_whitelist(mode: AuditMode, whitelist: &[String]) -> Result<()> {
+    if mode == AuditMode::Approve && whitelist.is_empty() {
+        return Err(config_error(
+            "APPROVAL_WHITELIST",
+            "AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id），否则拒绝启动",
+        ));
+    }
+    Ok(())
 }
 
 fn load_audit(
     env: &HashMap<String, String>,
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AuditParts> {
-    let audit_mode: AuditMode = match get("AUDIT_MODE") {
-        Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-            var: "AUDIT_MODE".to_string(),
-            message,
-        })?,
+    let (audit_mode, audit_mode_explicit): (AuditMode, bool) = match get("AUDIT_MODE") {
+        Some(v) if !v.is_empty() => (
+            v.parse().map_err(|message| VeilError::Config {
+                var: "AUDIT_MODE".to_string(),
+                message,
+            })?,
+            true,
+        ),
         // X1/D1 遗留兼容回退（fail-closed）：`AUDIT_MODE` 缺失/空白时读
         // `AUDIT_ENABLED`（真值 `1/true/yes/on` → `block`），显式非空优先。
         _ => match audit_enabled_compat(env) {
@@ -476,24 +497,20 @@ fn load_audit(
                     "AUDIT_MODE 缺失或空白，采用遗留 AUDIT_ENABLED 兼容回退：audit_mode={mode:?}\
                     （fail-closed；如需关闭请显式设置 AUDIT_MODE=off）"
                 );
-                mode
+                (mode, true)
             }
-            None => AuditMode::Off,
+            None => (AuditMode::Off, false),
         },
     };
     let audit_timeout_secs = parse_audit_timeout(get)?;
     let approval_whitelist = parse_whitelist(get)?;
-    if audit_mode == AuditMode::Approve && approval_whitelist.is_empty() {
-        return Err(config_error(
-            "APPROVAL_WHITELIST",
-            "AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id），否则拒绝启动",
-        ));
-    }
+    validate_approve_whitelist(audit_mode, &approval_whitelist)?;
     let audit_policy_file = get("AUDIT_POLICY_FILE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     Ok(AuditParts {
         audit_mode,
+        audit_mode_explicit,
         audit_timeout_secs,
         approval_whitelist,
         audit_policy_file,

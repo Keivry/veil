@@ -200,13 +200,19 @@ impl Scope {
         if spans.is_empty() {
             return (restored, spans);
         }
+        // RED-1：按明文实际所在 JSON 字符串嵌套深度转义写回。工具参数常为
+        // stringified JSON（字符串值本身是 JSON 文档），内层明文需比外层多一层
+        // 转义；仅按外层单层转义会以内层视角产生非法裸 `"`、破内层结构。
+        let depths = token_restore_depths(text, |tok| self.restore_response_one(vault, tok));
         let mut out = String::with_capacity(restored.len());
         let mut escaped_spans: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
         let mut cursor = 0usize;
         for (s, e) in spans {
             out.push_str(&restored[cursor..s]);
             let start = out.len();
-            out.push_str(&json_escape_plain(&restored[s..e]));
+            let plain = &restored[s..e];
+            let depth = depths.get(plain).copied().unwrap_or(1);
+            out.push_str(&escape_json_depth(plain, depth));
             escaped_spans.push((start, out.len()));
             cursor = e;
         }
@@ -380,6 +386,83 @@ fn json_escape_plain(s: &str) -> String {
         .strip_prefix('"')
         .and_then(|q| q.strip_suffix('"'))
         .map_or_else(|| s.to_string(), str::to_string)
+}
+
+/// RED-1：按 JSON 字符串嵌套深度转义明文（顶层字符串值=1，stringified JSON
+/// 内层每层 +1），保证「还原前可解析」的帧「还原后仍可解析」。
+fn escape_json_depth(plain: &str, depth: u32) -> String {
+    let mut out = plain.to_string();
+    for _ in 0..depth.max(1) {
+        out = json_escape_plain(&out);
+    }
+    out
+}
+
+/// RED-1：统计各还原明文在 JSON 帧中的字符串嵌套深度（明文 → 最大深度），
+/// 供 [`Scope::restore_response_with_spans_json`] 按层转义。`plain_of` 返回
+/// token 还原明文；非 token 明文不计入（默认单层）。
+fn token_restore_depths(
+    text: &str,
+    plain_of: impl Fn(&str) -> String,
+) -> std::collections::HashMap<String, u32> {
+    let mut depths: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    if let Ok(v) = json_walk::jloads(json_walk::strip_bom(text))
+        && matches!(
+            v,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        )
+    {
+        collect_token_depths(&v, 1, &plain_of, &mut depths);
+    }
+    if depths.is_empty() {
+        for (_, _, tok) in scan_token_forms(text) {
+            let plain = plain_of(&tok);
+            if !plain.is_empty() && plain != tok {
+                depths.entry(plain).or_insert(1);
+            }
+        }
+    }
+    depths
+}
+
+fn collect_token_depths(
+    value: &serde_json::Value,
+    depth: u32,
+    plain_of: &impl Fn(&str) -> String,
+    depths: &mut std::collections::HashMap<String, u32>,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            for (_, _, tok) in scan_token_forms(s) {
+                let plain = plain_of(&tok);
+                if !plain.is_empty() && plain != tok {
+                    let slot = depths.entry(plain).or_insert(depth);
+                    *slot = (*slot).max(depth);
+                }
+            }
+            let inner = json_walk::strip_bom(s).trim();
+            if (inner.starts_with('{') || inner.starts_with('['))
+                && let Ok(v) = json_walk::jloads(inner)
+                && matches!(
+                    v,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                )
+            {
+                collect_token_depths(&v, depth + 1, plain_of, depths);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_token_depths(v, depth, plain_of, depths);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                collect_token_depths(v, depth, plain_of, depths);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 全出口残缺清理：凭据 + PII 两套半截形态统一入口。

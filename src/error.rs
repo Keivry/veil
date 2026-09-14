@@ -74,7 +74,7 @@ pub enum VeilError {
     #[error("未找到: {message}")]
     NotFound { message: String },
 
-    /// keepass-real：自动放行路径 KDBX 查询失败 → 500（消息对外可见）。
+    /// keepass-real：自动放行路径 KDBX 查询失败 → 500（`AUTH-8`：对外脱敏，细节仅日志）。
     #[error("KeePass 内部错误: {message}")]
     KeePass { message: String },
 }
@@ -138,12 +138,14 @@ impl VeilError {
             | Self::PendingApproval { message }
             | Self::Unavailable { message }
             | Self::NotFound { message }
-            | Self::KeePass { message }
             | Self::BadRequest { message } => message.clone(),
             Self::RateLimited { retry_after_secs } => {
                 format!("请求过于频繁，请 {retry_after_secs}s 后重试")
             }
-            Self::Storage { .. } | Self::Internal(_) => "内部错误".to_string(),
+            // AUTH-8：KeePass 与其它 5xx 同口径脱敏——固定文案，内部细节仅进日志。
+            Self::KeePass { .. } | Self::Storage { .. } | Self::Internal(_) => {
+                "内部错误".to_string()
+            }
         }
     }
 }
@@ -244,6 +246,51 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!format!("{response:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn keepass_error_public_message_is_generic() {
+        // AUTH-8：KeePass 500 对外仅固定文案，不回传 KDBX 路径/异常细节；错误码保留 E_KEEPASS。
+        let err = VeilError::KeePass {
+            message: "库文件 /data/db/secret.kdbx 解密失败".to_string(),
+        };
+        assert_eq!(err.code(), "E_KEEPASS");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "E_KEEPASS");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("/data/db"), "响应体不得含 KDBX 路径: {text}");
+        assert!(!text.contains("解密失败"), "响应体不得含异常细节: {text}");
+    }
+
+    #[tokio::test]
+    async fn keepass_internal_error_logged_not_exposed() {
+        // AUTH-8 回归：500 仍记 error 日志（可排障），响应体不含内部细节。
+        let detail = "/data/db/vault.kdbx 解密失败";
+        let capture = LevelCapture::default();
+        let sink = capture.0.clone();
+        let response = tracing::subscriber::with_default(capture, || {
+            VeilError::KeePass {
+                message: detail.to_string(),
+            }
+            .into_response()
+        });
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            sink.lock().unwrap().clone(),
+            vec![tracing::Level::ERROR],
+            "500 须记 error 日志"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("/data/db"), "响应体不得含 KDBX 路径");
+        assert!(!text.contains("解密失败"), "响应体不得含异常细节");
     }
 
     #[test]

@@ -68,7 +68,8 @@ async fn t6_wrong_secret_403() {
 }
 
 #[tokio::test]
-async fn t6_unenrolled_compat_allow_with_valid_secret() {
+async fn t6_unenrolled_defaults_to_pending() {
+    // AUTH-4：未注册调用方默认转审批（202 + E_PENDING），不再兼容放行。
     let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let resp = client
@@ -82,9 +83,9 @@ async fn t6_unenrolled_compat_allow_with_valid_secret() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.status().as_u16(), 202);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["ok"], true);
+    assert_eq!(body["error"]["code"], "E_PENDING");
     handle.abort();
 }
 
@@ -121,11 +122,14 @@ async fn t6_register_use_flow_200() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/flow.sh",
             "caller_hash": "h-flow-1",
             "name": "flow-job",
-            "entry": "网易", "field": "授权码"
+            "entry": "网易", "field": "授权码",
+            "auth": {"caller_hash": "h-flow-1", "caller_path": "/srv/flow.sh"}
         }))
         .send()
         .await
@@ -145,9 +149,12 @@ async fn t6_register_use_flow_200() {
     assert_eq!(pre.status().as_u16(), 403, "审批启用前须拒绝");
     let approve = client
         .post(format!("{base}/approve-hash-change"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/flow.sh",
-            "new_hash": "h-flow-1"
+            "new_hash": "h-flow-1",
+            "auth": {"caller_hash": "h-flow-1", "caller_path": "/srv/flow.sh"}
         }))
         .send()
         .await
@@ -158,13 +165,30 @@ async fn t6_register_use_flow_200() {
         .header("X-Get-Binary-Hash", "gethash1")
         .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
-            "auth": {"caller_hash": "h-flow-2", "caller_path": "/srv/flow2.sh"},
+            "auth": {"caller_hash": "h-flow-1", "caller_path": "/srv/flow.sh"},
             "entry": "网易", "field": "授权码"
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(use_resp.status().as_u16(), 200);
+    assert_eq!(use_resp.status().as_u16(), 200, "批准后已注册调用方须可用");
+    // TST-1 负例：审批仅对同一 caller 闭环生效——未注册 caller 不得借用他人审批放行。
+    let other = client
+        .post(format!("{base}/credential"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "auth": {"caller_hash": "h-flow-neg-1", "caller_path": "/srv/flow-neg.sh"},
+            "entry": "网易", "field": "授权码"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        other.status().as_u16(),
+        200,
+        "未注册 caller 不得借用他人审批闭环放行（TST-1 负例）"
+    );
     handle.abort();
 }
 
@@ -176,10 +200,13 @@ async fn t6_duplicate_register_409() {
         "caller_path": "/srv/dup.sh",
         "caller_hash": "h-dup-1",
         "name": "dup-job",
-        "entry": "网易"
+        "entry": "网易",
+        "auth": {"caller_hash": "h-dup-1", "caller_path": "/srv/dup.sh"}
     });
     let first = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&payload)
         .send()
         .await
@@ -187,6 +214,8 @@ async fn t6_duplicate_register_409() {
     assert_eq!(first.status().as_u16(), 202);
     let second = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&payload)
         .send()
         .await
@@ -206,11 +235,14 @@ async fn t6_revoke_then_use_403() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/gone.sh",
             "caller_hash": "h-gone-1",
             "name": "gone-job",
-            "entry": "网易"
+            "entry": "网易",
+            "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"}
         }))
         .send()
         .await
@@ -218,9 +250,12 @@ async fn t6_revoke_then_use_403() {
     assert_eq!(reg.status().as_u16(), 202);
     let enable = client
         .post(format!("{base}/approve-hash-change"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/gone.sh",
-            "new_hash": "h-gone-1"
+            "new_hash": "h-gone-1",
+            "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"}
         }))
         .send()
         .await
@@ -233,7 +268,12 @@ async fn t6_revoke_then_use_403() {
     let before = state.approval.pending_event_ids().await;
     let rev = client
         .post(format!("{base}/revoke"))
-        .json(&serde_json::json!({"caller_path": "/srv/gone.sh"}))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/gone.sh",
+            "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"}
+        }))
         .send()
         .await
         .unwrap();
@@ -296,7 +336,9 @@ async fn wait_until_revoked(state: &veil::state::AppState, path: &str) {
 
 #[tokio::test]
 async fn t6_locked_backend_health_and_credential() {
-    let (base, handle) = serve(test_app_router(TestOpts::default().locked(true))).await;
+    let (app, state) = test_app(TestOpts::default().locked(true));
+    let (base, handle) = serve(app).await;
+    common::enroll_allow(&state, "/srv/lock1.sh", "h-lock-1").await;
     let client = reqwest::Client::new();
     let health = client.get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(health.status().as_u16(), 200);
@@ -313,7 +355,7 @@ async fn t6_locked_backend_health_and_credential() {
         .send()
         .await
         .unwrap();
-    assert!(resp.status().as_u16() == 503 || resp.status().as_u16() == 403);
+    assert_eq!(resp.status().as_u16(), 503, "已注册调用方在锁定后端须 503");
     handle.abort();
 }
 
@@ -366,11 +408,14 @@ async fn t6_register_duplicate_name_409() {
     let client = reqwest::Client::new();
     let first = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/name1.sh",
             "caller_hash": "h-name-1",
             "name": "named-job",
-            "entry": "网易"
+            "entry": "网易",
+            "auth": {"caller_hash": "h-name-1", "caller_path": "/srv/name1.sh"}
         }))
         .send()
         .await
@@ -378,11 +423,14 @@ async fn t6_register_duplicate_name_409() {
     assert_eq!(first.status().as_u16(), 202);
     let second = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/name2.sh",
             "caller_hash": "h-name-2",
             "name": "named-job",
-            "entry": "网易"
+            "entry": "网易",
+            "auth": {"caller_hash": "h-name-2", "caller_path": "/srv/name2.sh"}
         }))
         .send()
         .await
@@ -402,12 +450,15 @@ async fn t6_revoke_by_name_and_reuse() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-a.sh",
             "caller_hash": "h-byname-a",
             "name": "check-mail",
             "source": "e2e-byname-a",
-            "entry": "网易"
+            "entry": "网易",
+            "auth": {"caller_hash": "h-byname-a", "caller_path": "/srv/byname-a.sh"}
         }))
         .send()
         .await
@@ -415,9 +466,12 @@ async fn t6_revoke_by_name_and_reuse() {
     assert_eq!(reg.status().as_u16(), 202);
     let enable = client
         .post(format!("{base}/approve-hash-change"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-a.sh",
-            "new_hash": "h-byname-a"
+            "new_hash": "h-byname-a",
+            "auth": {"caller_hash": "h-byname-a", "caller_path": "/srv/byname-a.sh"}
         }))
         .send()
         .await
@@ -426,7 +480,12 @@ async fn t6_revoke_by_name_and_reuse() {
     let before = state.approval.pending_event_ids().await;
     let rev = client
         .post(format!("{base}/revoke"))
-        .json(&serde_json::json!({"name": "check-mail"}))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "name": "check-mail",
+            "auth": {"caller_hash": "h-byname-a", "caller_path": "/srv/byname-a.sh"}
+        }))
         .send()
         .await
         .unwrap();
@@ -439,12 +498,15 @@ async fn t6_revoke_by_name_and_reuse() {
     wait_until_revoked(&state, "/srv/byname-a.sh").await;
     let reuse = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-b.sh",
             "caller_hash": "h-byname-b",
             "name": "check-mail",
             "source": "e2e-byname-b",
-            "entry": "网易"
+            "entry": "网易",
+            "auth": {"caller_hash": "h-byname-b", "caller_path": "/srv/byname-b.sh"}
         }))
         .send()
         .await
@@ -456,7 +518,9 @@ async fn t6_revoke_by_name_and_reuse() {
 // C15：`/credential` 成功信封形状锁定 `{"ok":true,"credential":{...}}`（README §5）。
 #[tokio::test]
 async fn t6_credential_envelope_ok_credential() {
-    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
+    let (app, state) = test_app(TestOpts::default());
+    let (base, handle) = serve(app).await;
+    common::enroll_allow(&state, "/srv/env1.sh", "h-env-1").await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))

@@ -1,3 +1,10 @@
+//! 路由装配与入口中间件。
+//!
+//! `build_router` 将凭据 API（`/credential`、`/registrations`、注册/吊销/哈希变更）与 LLM
+//! 代理通配路由（`/{*tail}` + fallback）及 `/_admin` 管理面装配到同一 `Router`；
+//! `observability_gate` 中间件按 `OBSERVABILITY_DISABLE` 对 `/_admin*` 全返回 `404`
+//! （与 token 有效性无关）。入口三态与监听端口语义见 `src/main.rs` 与 README §1。
+
 use {
     crate::{
         handler::{self, admin},
@@ -137,12 +144,16 @@ mod tests {
             .unwrap();
         assert_eq!(regs_auth.status().as_u16(), 200);
 
+        // 三因子齐备的注册作为后续吊销/哈希变更的装配（未鉴权拒绝见
+        // `router_credential_write_endpoints_require_auth`）。
         let reg = client
             .post(format!("{base}/register-caller"))
+            .header("X-Get-Binary-Secret", "s3cr3t")
             .json(&serde_json::json!({
                 "caller_path": "/srv/job.sh",
                 "caller_hash": "routehash1",
                 "source": "route-test-1",
+                "auth": {"caller_hash": "routehash1", "caller_path": "/srv/job.sh"},
             }))
             .send()
             .await
@@ -161,7 +172,8 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(cred.status().as_u16(), 200);
+        // AUTH-4：未注册 `/credential` 默认转审批（202），不再兼容放行。
+        assert_eq!(cred.status().as_u16(), 202);
 
         let cred_bad = client
             .post(format!("{base}/credential"))
@@ -179,7 +191,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(revoke.status().as_u16(), 202);
+        assert_eq!(revoke.status().as_u16(), 403);
 
         let emergency = client
             .post(format!("{base}/revoke/emergency"))
@@ -199,8 +211,58 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(approve.status().as_u16(), 200);
+        assert_eq!(approve.status().as_u16(), 403);
 
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn router_credential_write_endpoints_require_auth() {
+        // AUTH-1/AUTH-3：三写端点未鉴权一律非 2xx，且不落任何动作。
+        let (app, state) = test_app_with_state(&[]);
+        let (base, handle) = serve_and_client(app).await;
+        let client = reqwest::Client::new();
+        for (path, body) in [
+            (
+                "/approve-hash-change",
+                serde_json::json!({"caller_path": "/srv/x.sh", "new_hash": "nx"}),
+            ),
+            (
+                "/register-caller",
+                serde_json::json!({"caller_path": "/srv/x.sh", "caller_hash": "nx"}),
+            ),
+        ] {
+            let resp = client
+                .post(format!("{base}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                resp.status().as_u16() == 401 || resp.status().as_u16() == 403,
+                "{path} 未鉴权须 401/403，实得 {}",
+                resp.status()
+            );
+        }
+        let revoke = client
+            .post(format!("{base}/revoke"))
+            .json(&serde_json::json!({"caller_path": "/srv/x.sh"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            revoke.status().as_u16() == 401 || revoke.status().as_u16() == 403,
+            "revoke 未鉴权须 401/403"
+        );
+        assert!(
+            state
+                .registry
+                .read()
+                .await
+                .lookup_by_path("/srv/x.sh")
+                .is_none(),
+            "未鉴权不得落注册条目"
+        );
         handle.abort();
     }
 
@@ -340,7 +402,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(first.status().as_u16(), 200);
+        assert_eq!(first.status().as_u16(), 202, "AUTH-4：未注册转审批");
         let second = client
             .post(format!("{base}/credential"))
             .header("X-Get-Binary-Hash", "rlhash1")
@@ -374,7 +436,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(go_ok.status().as_u16(), 200);
+        assert_eq!(go_ok.status().as_u16(), 202, "AUTH-4：未注册转审批");
 
         let no_entry = client
             .post(format!("{base}/credential"))
@@ -550,6 +612,7 @@ mod tests {
             "script_hash": "gohash-shape-1",
             "entries": {"网易": ["授权码"]},
             "allow_mode": "true",
+            "auth": {"caller_hash": "gohash-shape-1", "caller_path": "/srv/go-shape.sh"},
         });
         let request_client = client.clone();
         let request_body = body.clone();
@@ -557,6 +620,7 @@ mod tests {
         let request = tokio::spawn(async move {
             request_client
                 .post(format!("{request_base}/register-caller"))
+                .header("X-Get-Binary-Secret", "s3cr3t")
                 .json(&request_body)
                 .send()
                 .await
@@ -604,6 +668,7 @@ mod tests {
         assert_eq!(v["allow_mode"], "true");
         let dup = client
             .post(format!("{base}/register-caller"))
+            .header("X-Get-Binary-Secret", "s3cr3t")
             .json(&body)
             .send()
             .await

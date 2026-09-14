@@ -17,6 +17,7 @@ fn file_len_under_800_or_split() {
 }
 
 mod async202;
+mod decision_cap;
 mod f1;
 
 use {
@@ -135,7 +136,6 @@ async fn emergency_revoke_exemptions_and_approval_flow() {
         "/s/a.sh",
         Some("observability-admin-token-0123456789"),
         None,
-        false,
     )
     .await
     .unwrap();
@@ -143,7 +143,7 @@ async fn emergency_revoke_exemptions_and_approval_flow() {
     register_caller(&state, "/s/b.sh", "h2", "src-b")
         .await
         .unwrap();
-    let err = emergency_revoke(&state, "/s/b.sh", None, Some("203.0.113.9"), false)
+    let err = emergency_revoke(&state, "/s/b.sh", None, Some("203.0.113.9"))
         .await
         .unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
@@ -611,6 +611,7 @@ async fn raw_context_and_tracked_send_failure() {
         other => panic!("终端直调 raw 须鉴权拒绝，实得: {other:?}"),
     }
     let state = cred_state(&cred_env(&[]));
+    enroll_allow(&state, "/s/raw-script.sh", "raw-script-h").await;
     let mut script = body("raw-script-h", "/s/raw-script.sh", None);
     script.token = Some(false);
     let out = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &script)
@@ -699,7 +700,7 @@ async fn emergency_revoke_auto_reaction_rejected() {
         .await
         .unwrap();
     state.registry.write().await.set_enabled(key, true).unwrap();
-    let err = emergency_revoke(&state, key, None, Some("203.0.113.9"), false)
+    let err = emergency_revoke(&state, key, None, Some("203.0.113.9"))
         .await
         .unwrap_err();
     assert_eq!(err.status_code(), StatusCode::ACCEPTED);
@@ -727,19 +728,35 @@ async fn emergency_revoke_auto_reaction_rejected() {
     );
     let pending_key = format!("revoke:{key}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while credential_decision_slot(&pending_key) != Some(DecisionSlot::Denied) {
+    while credential_decision_slot(&state, &pending_key) != Some(DecisionSlot::Denied) {
         assert!(
             std::time::Instant::now() < deadline,
             "🔓 落定后决策表须为拒绝，实得 {:?}",
-            credential_decision_slot(&pending_key)
+            credential_decision_slot(&state, &pending_key)
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let denied = emergency_revoke(&state, key, None, Some("203.0.113.9"), false)
+    let denied = emergency_revoke(&state, key, None, Some("203.0.113.9"))
         .await
         .unwrap_err();
     assert_eq!(denied.status_code(), StatusCode::FORBIDDEN);
     let registry = state.registry.read().await;
     let entry = registry.lookup_by_path(key).unwrap();
     assert!(entry.enabled && !entry.revoked, "🔓 不得吊销，条目须原状");
+}
+
+#[tokio::test]
+async fn pending_count_zeroes_on_terminal_state() {
+    // AUTH-9 回归：终态清理同批清内存/矩阵票，health.pending 即时归零。
+    let state = cred_state(&cred_env(&[("APPROVAL_WHITELIST", "@admin:example.com")]));
+    state
+        .pending
+        .insert(PendingRecord::new("/s/zero:h", "hash_mismatch"));
+    assert_eq!(crate::service::credential::health_status(&state).pending, 1);
+    clear_terminal_pending(&state, "/s/zero:h", "$evt-zero").await;
+    assert_eq!(
+        crate::service::credential::health_status(&state).pending,
+        0,
+        "终态须即时归零 health.pending"
+    );
 }

@@ -454,3 +454,127 @@ fn web_search_action_audit_both_paths() {
     assert_eq!(frags[0].2.as_deref(), Some("web_search"));
     assert!(frags[0].3.contains("veil audit"), "{:?}", frags[0]);
 }
+
+#[test]
+fn anthropic_empty_input_no_arg_pollution() {
+    // TRN-6：`content_block_start` 的 `input:{}` 占位不进累积，`partial_json`
+    // 拼接后无 `{}{` 前缀污染。
+    use crate::service::llm_gateway::Protocol as P;
+    let start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"run","input":{}}});
+    let frags = extract_tool_fragments(P::Anthropic, &start);
+    assert_eq!(frags.len(), 1);
+    assert_eq!(frags[0].3, "", "空占位 input 不得序列化为 {{}}");
+    let delta = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}});
+    let frags2 = extract_tool_fragments(P::Anthropic, &delta);
+    let mut hold = AuditHold::new(1_048_576);
+    for (idx, id, name, args) in frags.iter().chain(frags2.iter()) {
+        hold.push_fragment(*idx, id.as_deref(), name.as_deref(), args);
+    }
+    let triples = hold.tool_triples();
+    assert_eq!(triples[0].2, "{\"cmd\":\"ls\"}", "参数须为纯增量拼接");
+    assert!(!triples[0].2.starts_with("{}{"), "不得有花括号前缀污染");
+}
+
+#[test]
+fn anthropic_nonempty_input_seed() {
+    // TRN-6：非空完整 `input` 仍可一次性种子（非流形态），不被占位规则吞掉。
+    use crate::service::llm_gateway::Protocol as P;
+    let start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"run","input":{"cmd":"ls"}}});
+    let frags = extract_tool_fragments(P::Anthropic, &start);
+    assert_eq!(frags.len(), 1);
+    assert_eq!(frags[0].3, "{\"cmd\":\"ls\"}", "非空 input 须保留");
+}
+
+#[test]
+fn responses_four_delta_kinds_accumulate() {
+    // RED-4：code_interpreter/shell/mcp/custom_tool 四类 Responses 工具 delta
+    // 均建槽累积参数分片，`.done` 后 `tool_triples` 可见。
+    use crate::service::{audit::AuditHold, llm_gateway::Protocol as P};
+    let cases = [
+        (
+            "response.code_interpreter_call_code",
+            "code_interpreter",
+            "{\"code\":\"print(1)\"}",
+        ),
+        (
+            "response.shell_call_command",
+            "shell",
+            "{\"command\":\"rm -rf /\"}",
+        ),
+        (
+            "response.mcp_call_arguments",
+            "mcp",
+            "{\"query\":\"rm -rf /\"}",
+        ),
+        (
+            "response.custom_tool_call_input",
+            "custom_tool",
+            "{\"input\":\"rm -rf /\"}",
+        ),
+    ];
+    for (i, (base, want_name, delta)) in cases.iter().enumerate() {
+        let v = serde_json::json!({
+            "type": format!("{base}.delta"),
+            "item_id": format!("call-{i}"),
+            "output_index": i,
+            "delta": delta,
+        });
+        let frags = extract_tool_fragments(P::Responses, &v);
+        assert_eq!(frags.len(), 1, "{base}.delta 须产分片");
+        assert_eq!(frags[0].0, i as u32, "{base} 槽号按 output_index");
+        assert_eq!(frags[0].2.as_deref(), Some(*want_name), "{base} 派生工具名");
+        assert_eq!(frags[0].3, *delta, "{base} delta 入参");
+        let mut hold = AuditHold::new(1024);
+        let key = AuditHold::responses_key(frags[0].1.as_deref(), frags[0].0);
+        hold.push_responses_fragment(
+            &key,
+            frags[0].0,
+            Some(0),
+            frags[0].1.as_deref(),
+            frags[0].2.as_deref(),
+            &frags[0].3,
+        );
+        let done = serde_json::json!({
+            "type": format!("{base}.done"),
+            "item_id": format!("call-{i}"),
+            "output_index": i,
+        });
+        assert!(
+            AuditHold::is_responses_slot_complete_event(&done),
+            "{base}.done 须为槽级完成"
+        );
+        hold.mark_responses_done(&key, None);
+        let triples = hold.tool_triples();
+        assert_eq!(triples.len(), 1, "{base} 分片须 tool_triples 可见");
+        assert_eq!(triples[0].2, *delta);
+    }
+}
+
+#[test]
+fn chat_bucket_declared_index() {
+    // RED-7：`choices[].index` 乱序/跳号时，各 choice 分片按声明 index 归入各自槽。
+    use crate::service::llm_gateway::{Protocol as P, chat_bucket};
+    let v = serde_json::json!({"choices":[
+        {"index":2,"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"a","arguments":"{\"x\":2}"}}]}},
+        {"index":0,"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"b","arguments":"{\"x\":0}"}}]}},
+        {"index":5,"delta":{"tool_calls":[{"index":0,"id":"c5","function":{"name":"c","arguments":"{\"x\":5}"}}]}}
+    ]});
+    let frags = extract_tool_fragments(P::Chat, &v);
+    assert_eq!(frags.len(), 3);
+    assert_eq!(frags[0].0, chat_bucket(2, 0), "声明 index 2 槽");
+    assert_eq!(frags[1].0, chat_bucket(0, 0), "声明 index 0 槽");
+    assert_eq!(frags[2].0, chat_bucket(5, 0), "声明 index 5 槽");
+    assert_ne!(frags[0].0, frags[2].0);
+}
+
+#[test]
+fn chat_bucket_single_choice_unchanged() {
+    // RED-7 回归：单 choice（index=0，位置 0）分桶键与旧实现等值。
+    use crate::service::llm_gateway::{Protocol as P, chat_bucket};
+    assert_eq!(chat_bucket(0, 0), 0, "单 choice index 0 键值不变");
+    let v = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"a","arguments":"{\"x\":1}"}}]}}]});
+    let frags = extract_tool_fragments(P::Chat, &v);
+    assert_eq!(frags.len(), 1);
+    assert_eq!(frags[0].0, chat_bucket(0, 0));
+    assert_eq!(frags[0].3, "{\"x\":1}");
+}

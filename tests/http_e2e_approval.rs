@@ -15,9 +15,9 @@ fn cred_body(hash: &str, path: &str) -> serde_json::Value {
     })
 }
 
-// B8.1：AUTO_APPROVE=true 未注册调用方放行 200。
+// AUTH-4/B8.1：AUTO_APPROVE=true 也未注册者不放行——默认转审批 202。
 #[tokio::test]
-async fn b8_auto_approve_true_allows_unenrolled() {
+async fn b8_auto_approve_true_unenrolled_still_pends() {
     let (base, handle) = serve(test_app_router(&[("AUTO_APPROVE", "true")])).await;
     let client = reqwest::Client::new();
     let resp = client
@@ -28,7 +28,9 @@ async fn b8_auto_approve_true_allows_unenrolled() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.status().as_u16(), 202, "未注册不得因全局默认放行");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "E_PENDING");
     handle.abort();
 }
 
@@ -108,12 +110,15 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
         let client = reqwest::Client::new();
         let reg = client
             .post(format!("{base}/register-caller"))
+            .header("X-Get-Binary-Hash", "gethash1")
+            .header("X-Get-Binary-Secret", "s3cr3t")
             .json(&serde_json::json!({
                 "caller_path": "/srv/b8deg.sh",
                 "caller_hash": "h-b8-deg-A",
                 "name": "b8deg-job",
                 "entry": "网易",
-                "field": "授权码"
+                "field": "授权码",
+                "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
             }))
             .send()
             .await
@@ -121,9 +126,12 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
         assert_eq!(reg.status().as_u16(), 202, "{mode}");
         let approve = client
             .post(format!("{base}/approve-hash-change"))
+            .header("X-Get-Binary-Hash", "gethash1")
+            .header("X-Get-Binary-Secret", "s3cr3t")
             .json(&serde_json::json!({
                 "caller_path": "/srv/b8deg.sh",
-                "new_hash": "h-b8-deg-B"
+                "new_hash": "h-b8-deg-B",
+                "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
             }))
             .send()
             .await
@@ -153,12 +161,15 @@ async fn b8_enrolled_tamper_turns_to_pending_202() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/b8tamper.sh",
             "caller_hash": "hash-aaa-b8",
             "name": "b8tamper-job",
             "entry": "网易",
-            "field": "授权码"
+            "field": "授权码",
+            "auth": {"caller_hash": "hash-aaa-b8", "caller_path": "/srv/b8tamper.sh"}
         }))
         .send()
         .await

@@ -249,10 +249,13 @@ async fn tampered_credential_turns_to_pending_202() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/e2e-approve.sh",
             "caller_hash": "hash-aaa-e2e",
             "source": "e2e-approve",
+            "auth": {"caller_hash": "hash-aaa-e2e", "caller_path": "/srv/e2e-approve.sh"},
         }))
         .send()
         .await

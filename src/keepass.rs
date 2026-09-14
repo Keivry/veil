@@ -46,6 +46,8 @@ pub trait KeePassBackend: Send + Sync + std::fmt::Debug {
     ) -> Pin<Box<dyn Future<Output = Result<EntrySnapshot>> + Send + '_>>;
     fn open_count(&self) -> usize { 0 }
     fn clear_cache(&self) {}
+    /// `AUTH-5`：清除并零化 TPM 派生主密码缓存；无该缓存的实现默认 no-op。
+    fn clear_master_password(&self) -> bool { false }
 }
 
 #[derive(Debug, Default)]
@@ -107,11 +109,48 @@ impl KeePassBackend for MockKeePass {
 pub type PasswordProvider =
     std::sync::Arc<dyn Fn() -> anyhow::Result<Zeroizing<Vec<u8>>> + Send + Sync>;
 
+/// TPM 派生主密码缓存的可清理句柄（`AUTH-5`）：`lock` 经此清除并以 `Zeroizing`
+/// 零化缓存，使再次解锁必须重新经 TPM 解封。
+#[derive(Clone, Default)]
+pub struct MasterPasswordCache {
+    slot: std::sync::Arc<Mutex<Option<Zeroizing<Vec<u8>>>>>,
+}
+
+impl std::fmt::Debug for MasterPasswordCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasterPasswordCache")
+            .field("has_cached", &self.has_cached())
+            .finish()
+    }
+}
+
+impl MasterPasswordCache {
+    /// 清除并零化缓存；返回原本是否存在缓存值。
+    pub fn clear(&self) -> bool {
+        self.slot
+            .lock()
+            .map(|mut slot| slot.take().is_some())
+            .unwrap_or(false)
+    }
+
+    /// 缓存是否非空（观测/测试用）。
+    pub fn has_cached(&self) -> bool { self.slot.lock().is_ok_and(|slot| slot.is_some()) }
+}
+
 pub fn tpm_password_provider(tpm_dir: PathBuf, allow_mock: bool) -> PasswordProvider {
-    let cache: std::sync::Arc<Mutex<Option<Zeroizing<Vec<u8>>>>> =
-        std::sync::Arc::new(Mutex::new(None));
-    std::sync::Arc::new(move || {
-        if let Ok(guard) = cache.lock()
+    tpm_password_provider_with_cache(tpm_dir, allow_mock).0
+}
+
+/// 带可清理句柄的 TPM 主密码 provider（`AUTH-5`）：缓存经 [`MasterPasswordCache`]
+/// 暴露，`lock` 清除后再次取用重新经 TPM 解封。
+pub fn tpm_password_provider_with_cache(
+    tpm_dir: PathBuf,
+    allow_mock: bool,
+) -> (PasswordProvider, MasterPasswordCache) {
+    let cache = MasterPasswordCache::default();
+    let shared = cache.clone();
+    let provider: PasswordProvider = std::sync::Arc::new(move || {
+        if let Ok(guard) = shared.slot.lock()
             && let Some(cached) = guard.as_ref()
         {
             return Ok(cached.clone());
@@ -125,11 +164,12 @@ pub fn tpm_password_provider(tpm_dir: PathBuf, allow_mock: bool) -> PasswordProv
             anyhow::bail!("TPM 解封返回的密码过短（{} 字符）", sealed.len());
         }
         let guarded = Zeroizing::new(sealed);
-        if let Ok(mut slot) = cache.lock() {
+        if let Ok(mut slot) = shared.slot.lock() {
             *slot = Some(guarded.clone());
         }
         Ok(guarded)
-    })
+    });
+    (provider, cache)
 }
 
 pub struct RealKeePass {
@@ -138,6 +178,7 @@ pub struct RealKeePass {
     password_provider: PasswordProvider,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     cache: Mutex<Option<keepass::Database>>,
+    password_cache: Option<MasterPasswordCache>,
     open_count: AtomicUsize,
 }
 
@@ -163,8 +204,15 @@ impl RealKeePass {
             password_provider,
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             cache: Mutex::new(None),
+            password_cache: None,
             open_count: AtomicUsize::new(0),
         }
+    }
+
+    /// `AUTH-5`：挂接 TPM 主密码缓存可清理句柄，使 `lock` 可清除并零化该缓存。
+    pub fn with_master_password_cache(mut self, cache: MasterPasswordCache) -> Self {
+        self.password_cache = Some(cache);
+        self
     }
 
     pub fn db_path(&self) -> &std::path::Path { &self.db_path }
@@ -251,6 +299,12 @@ impl KeePassBackend for RealKeePass {
         if let Ok(mut guard) = self.cache.lock() {
             *guard = None;
         }
+    }
+
+    fn clear_master_password(&self) -> bool {
+        self.password_cache
+            .as_ref()
+            .is_some_and(MasterPasswordCache::clear)
     }
 }
 
@@ -541,6 +595,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn unlock_after_lock_rederives_via_tpm() {
+        // AUTH-5：`lock` 清除缓存后再次取用须重新经 TPM 解封，值一致（mock seal 确定性）。
+        let dir = unique_temp_dir("tpm-reunlock");
+        let (provider, cache) = tpm_password_provider_with_cache(dir.clone(), true);
+        let first = provider().expect("首次 TPM 解封须成功");
+        assert!(cache.has_cached(), "解封后须有缓存");
+        assert!(cache.clear(), "lock 清除须报告原缓存存在");
+        assert!(!cache.has_cached(), "清除后缓存须为空");
+        let second = provider().expect("清除后须重新经 TPM 解封");
+        assert!(cache.has_cached(), "重新解封后缓存须回填");
+        assert_eq!(first.as_slice(), second.as_slice(), "同一 seal 解封值稳定");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn duplicate_titles_return_first_without_sorting() {
         let dir = unique_temp_dir("first");
@@ -604,6 +673,114 @@ mod tests {
         backend.fetch_entry("网易".to_string()).await.unwrap();
         assert_eq!(backend.open_count(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlock_chain_tpm_unseal_failure_no_fallback() {
+        // TST-5(a)：TPM 解封失败（无 seal 文件）→ 解锁失败 500，不回落软件明文。
+        let dir = unique_temp_dir("chain-a");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(&db_path, b"any-master", &[("网易", "u", "s", "", vec![])]);
+        let (provider, _cache) = tpm_password_provider_with_cache(dir.clone(), false);
+        assert!(provider().is_err(), "无 seal 文件须解封失败");
+        let backend = RealKeePass::new(db_path, None, provider);
+        let err = backend.fetch_entry("网易".to_string()).await.unwrap_err();
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            err.to_string().contains("主密码派生失败"),
+            "须报主密码派生失败而非放行: {err}"
+        );
+        assert!(!backend.is_cached(), "解封失败不得缓存库");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlock_chain_wrong_master_password_returns_500() {
+        // TST-5(b)：TPM 解封成功但主密码与库不匹配 → 500，不误判成功。
+        let dir = unique_temp_dir("chain-b");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(
+            &db_path,
+            b"not-the-mock-seal",
+            &[("网易", "u", "s", "", vec![])],
+        );
+        let (provider, _cache) = tpm_password_provider_with_cache(dir.clone(), true);
+        let backend = RealKeePass::new(db_path, None, provider);
+        let err = backend.fetch_entry("网易".to_string()).await.unwrap_err();
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!backend.is_cached(), "解密失败不得缓存半开库");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlock_chain_concurrent_cold_single_unseal() {
+        // TST-5(c)：并发冷启动经 tpm_password_provider 单开——provider 只解封一次。
+        let dir = unique_temp_dir("chain-c");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(
+            &db_path,
+            b"veil-dev-mock-tpm-seal",
+            &[("网易", "u", "s", "", vec![])],
+        );
+        let (tpm_provider, cache) = tpm_password_provider_with_cache(dir.clone(), true);
+        let unseals = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting: PasswordProvider = {
+            let inner = tpm_provider.clone();
+            let counter = unseals.clone();
+            std::sync::Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                inner()
+            })
+        };
+        let backend = std::sync::Arc::new(
+            RealKeePass::new(db_path, None, counting).with_master_password_cache(cache),
+        );
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let backend = backend.clone();
+            handles.push(tokio::spawn(async move {
+                backend.fetch_entry("网易".to_string()).await.unwrap()
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.unwrap().password, "s");
+        }
+        assert_eq!(unseals.load(Ordering::SeqCst), 1, "并发冷启动须只解封一次");
+        assert_eq!(backend.open_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlock_chain_lock_clears_cache_and_reunseals() {
+        // TST-5(d)：`lock` 清库缓存 + 主密码缓存后，取用须重新经 TPM 解封（缓存已清零）。
+        let dir = unique_temp_dir("chain-d");
+        let db_path = dir.join("vault.kdbx");
+        build_test_kdbx(
+            &db_path,
+            b"veil-dev-mock-tpm-seal",
+            &[("网易", "u", "s", "", vec![])],
+        );
+        let (provider, cache) = tpm_password_provider_with_cache(dir.clone(), true);
+        let backend =
+            RealKeePass::new(db_path, None, provider).with_master_password_cache(cache.clone());
+        backend.fetch_entry("网易".to_string()).await.unwrap();
+        assert!(cache.has_cached(), "解封后主密码须缓存");
+        backend.clear_cache();
+        assert!(
+            backend.clear_master_password(),
+            "lock 须清除并报告原缓存存在"
+        );
+        assert!(!cache.has_cached(), "lock 后主密码缓存须清零");
+        backend.fetch_entry("网易".to_string()).await.unwrap();
+        assert!(cache.has_cached(), "重解锁须重新解封回填缓存");
+        assert_eq!(backend.open_count(), 2, "lock 后须重开库");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

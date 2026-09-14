@@ -226,7 +226,9 @@ pub fn mask_pii_value(kind: &str, value: &str) -> String {
                     format!("***@***.{suffix}")
                 }
             }
-            _ => short(value),
+            // RED-3：含 `@` 但域名无 `.` 归 `***@***`（对齐原仓 `_pii.py`）。
+            Some(_) => "***@***".to_string(),
+            None => short(value),
         },
         "bank_card" | "bankcard" | "id_card" => {
             let chars: Vec<char> = value.chars().collect();
@@ -244,15 +246,18 @@ pub fn mask_pii_value(kind: &str, value: &str) -> String {
             if parts.len() == 4 {
                 format!("{}.{}.**.**", parts[0], parts[1])
             } else {
+                // RED-3：非 4 段按原仓 `<8` → 首 1/尾 1、`>=8` → 前 4/后 4。
                 let chars: Vec<char> = value.chars().collect();
-                if (6..=7).contains(&chars.len()) {
+                if chars.len() >= 8 {
                     format!(
                         "{}****{}",
                         chars[..4].iter().collect::<String>(),
                         chars[chars.len() - 4..].iter().collect::<String>()
                     )
+                } else if chars.len() >= 2 {
+                    format!("{}****{}", chars[0], chars[chars.len() - 1])
                 } else {
-                    short(value)
+                    "***".to_string()
                 }
             }
         }

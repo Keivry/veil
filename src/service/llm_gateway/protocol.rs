@@ -150,8 +150,10 @@ pub fn should_inject_stream_options(protocol: Protocol, body: &Value) -> bool {
         // 键内合并语义（对齐 Python setdefault）：整键缺失或
         // `include_usage` 缺失即需注入，保留用户自带其他键。
         None => true,
+        // TRN-5：`null` 是用户显式第三态，原样保留、不注入不替换。
+        Some(Value::Null) => false,
         Some(Value::Object(opts)) => opts.get("include_usage").is_none(),
-        // 非对象形态视为缺失，由 inject 整体替换 + warn。
+        // 非对象非 null（畸形）视为缺失，由 inject 整体替换 + warn。
         Some(_) => true,
     }
 }
@@ -163,6 +165,8 @@ pub fn inject_stream_options(body: &mut Value) {
                 opts.entry("include_usage".to_string())
                     .or_insert(serde_json::json!(true));
             }
+            // TRN-5：显式 `null` 不动（不注入、不替换、不告警）。
+            Some(Value::Null) => {}
             Some(slot) => {
                 tracing::warn!("stream_options 非对象形态，已整体替换为 include_usage");
                 *slot = serde_json::json!({"include_usage": true});
@@ -336,5 +340,45 @@ mod tests {
         inject_stream_options(&mut present);
         assert_eq!(present["stream_options"]["include_usage"], true);
         assert_eq!(present["stream_options"]["other"], 2);
+    }
+
+    #[test]
+    fn stream_options_three_state_matrix() {
+        // TRN-5：三态——缺失注入 / null 保留 / 对象按 key 合并 / 含 include_usage 保留（含 false）。
+        let missing = serde_json::json!({"stream":true});
+        assert!(should_inject_stream_options(Protocol::Chat, &missing));
+        let null = serde_json::json!({"stream":true,"stream_options":null});
+        assert!(
+            !should_inject_stream_options(Protocol::Chat, &null),
+            "null 不得视为缺失"
+        );
+        let partial = serde_json::json!({"stream":true,"stream_options":{"other":1}});
+        assert!(should_inject_stream_options(Protocol::Chat, &partial));
+        let has_false = serde_json::json!({"stream":true,"stream_options":{"include_usage":false}});
+        assert!(!should_inject_stream_options(Protocol::Chat, &has_false));
+        let has_true = serde_json::json!({"stream":true,"stream_options":{"include_usage":true}});
+        assert!(!should_inject_stream_options(Protocol::Chat, &has_true));
+    }
+
+    #[test]
+    fn stream_options_null_preserved() {
+        // TRN-5：显式 null 在注入调用后仍为 null，不注入 include_usage。
+        let mut null = serde_json::json!({"stream":true,"stream_options":null});
+        inject_stream_options(&mut null);
+        assert!(null["stream_options"].is_null(), "null 须原样保留: {null}");
+    }
+
+    #[test]
+    fn stream_options_malformed_replaced() {
+        // TRN-5：字符串/数组畸形形态维持 warn + 整体替换，不静默丢键。
+        for bad in [
+            serde_json::json!({"stream":true,"stream_options":"yes"}),
+            serde_json::json!({"stream":true,"stream_options":[1,2]}),
+        ] {
+            assert!(should_inject_stream_options(Protocol::Chat, &bad));
+            let mut fixed = bad.clone();
+            inject_stream_options(&mut fixed);
+            assert_eq!(fixed["stream_options"]["include_usage"], true, "{fixed}");
+        }
     }
 }

@@ -74,36 +74,10 @@ fn mask_engine_diff_matrix_registered_relations() {
         // ipv4 四段与非四段短值（len<6）：等价。
         ("ipv4", "192.168.1.10", Same("192.168.**.**")),
         ("ipv4", "1.2.3", Same("1****3")),
-        // ipv4 非四段 6-7（P9/D10 对齐原仓后登记）：detector 前4后4，
-        // sample 走短值首末 —— 同族分叉的另一子例，以测试实测为准并入清单。
-        (
-            "ipv4",
-            "123456",
-            Diff {
-                detector: "1234****3456",
-                sample: "1****6",
-                reason: "非四段 6-7：detector 前4后4（重叠不裁剪）vs sample 短值首末",
-            },
-        ),
-        (
-            "ipv4",
-            "1234567",
-            Diff {
-                detector: "1234****4567",
-                sample: "1****7",
-                reason: "非四段 6-7：detector 前4后4（重叠不裁剪）vs sample 短值首末",
-            },
-        ),
-        // ipv4 非四段 len≥8（spec 登记差异）：detector 前3后3 vs sample 前4后4。
-        (
-            "ipv4",
-            "12345678",
-            Diff {
-                detector: "123****678",
-                sample: "1234****5678",
-                reason: "非四段 len≥8：detector short 前3后3 vs sample 前4后4",
-            },
-        ),
+        // ipv4 非四段 6-7 / len≥8：RED-3 对齐原仓后 detector 与 sample 等价。
+        ("ipv4", "123456", Same("1****6")),
+        ("ipv4", "1234567", Same("1****7")),
+        ("ipv4", "12345678", Same("1234****5678")),
         // bank 别名集：sample 识别 `bank`，detector 不识别（落 other）。
         (
             "bank",
@@ -161,34 +135,10 @@ fn mask_engine_diff_matrix_registered_relations() {
                 reason: "apikey 别名仅 detector 识别（sample 落 other 前3后3）",
             },
         ),
-        // email 无点域名回退（spec 登记差异）：detector short(value) vs sample `***@***`。
-        (
-            "email",
-            "a@b",
-            Diff {
-                detector: "a****b",
-                sample: "***@***",
-                reason: "无点域名：detector 回退 short(value) vs sample 恒 `***@***`",
-            },
-        ),
-        (
-            "email",
-            "user@domain",
-            Diff {
-                detector: "use****ain",
-                sample: "***@***",
-                reason: "无点域名：detector 回退 short(value) vs sample 恒 `***@***`",
-            },
-        ),
-        (
-            "email",
-            "abcde@f",
-            Diff {
-                detector: "abc****e@f",
-                sample: "***@***",
-                reason: "无点域名：detector 回退 short(value) vs sample 恒 `***@***`",
-            },
-        ),
+        // email 无点域名：RED-3 对齐原仓后 detector 与 sample 同归 `***@***`（等价）。
+        ("email", "a@b", Same("***@***")),
+        ("email", "user@domain", Same("***@***")),
+        ("email", "abcde@f", Same("***@***")),
     ];
 
     for (kind, value, rel) in cases {
@@ -276,14 +226,13 @@ fn mask_engine_diff_apikey_alias() {
 }
 
 #[test]
-fn mask_engine_diff_ipv4_non_quad_fallback() {
-    // 非四段 len≥8（spec 登记）：detector short 前3后3 vs sample 前4后4。
-    assert_eq!(mask_pii_value("ipv4", "12345678"), "123****678");
+fn mask_engine_diff_ipv4_non_quad_equivalent() {
+    // RED-3 对齐原仓后：非四段 6-7 / len≥8 两引擎同口径（等价）。
+    assert_eq!(mask_pii_value("ipv4", "12345678"), "1234****5678");
     assert_eq!(sample_mask("ipv4", "12345678"), "1234****5678");
-    // 非四段 6-7（P9/D10 对齐原仓）：detector 前4后4 vs sample 短值首末。
-    assert_eq!(mask_pii_value("ipv4", "123456"), "1234****3456");
+    assert_eq!(mask_pii_value("ipv4", "123456"), "1****6");
     assert_eq!(sample_mask("ipv4", "123456"), "1****6");
-    assert_eq!(mask_pii_value("ipv4", "1234567"), "1234****4567");
+    assert_eq!(mask_pii_value("ipv4", "1234567"), "1****7");
     assert_eq!(sample_mask("ipv4", "1234567"), "1****7");
     // 非四段 len<6：两引擎同走短值口径（等价）。
     assert_eq!(
@@ -293,11 +242,11 @@ fn mask_engine_diff_ipv4_non_quad_fallback() {
 }
 
 #[test]
-fn mask_engine_diff_email_no_dot_domain_fallback() {
-    // 无点域名（spec 登记差异）：detector 回退 short(value)；sample 恒 `***@***`。
-    assert_eq!(mask_pii_value("email", "a@b"), "a****b");
+fn mask_engine_diff_email_no_dot_domain_equivalent() {
+    // RED-3：无点域名 detector 与 sample 同归 `***@***`（等价）。
+    assert_eq!(mask_pii_value("email", "a@b"), "***@***");
     assert_eq!(sample_mask("email", "a@b"), "***@***");
-    assert_eq!(mask_pii_value("email", "user@domain"), "use****ain");
+    assert_eq!(mask_pii_value("email", "user@domain"), "***@***");
     assert_eq!(sample_mask("email", "user@domain"), "***@***");
     // 有点域名/空后缀：完全等价。
     for v in ["a@b.com", "a@b.c.d", "a@b.", "@b.com"] {

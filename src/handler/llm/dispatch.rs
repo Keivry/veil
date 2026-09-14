@@ -163,7 +163,7 @@ pub(crate) async fn gateway_serve(
     let sqlite_precise = state.sqlite_ok();
     let hold_max = state.config.audit_hold_max_bytes.max(1) as usize;
     let audit_mode = state.config.audit_mode;
-    let audit_policy_file = state.config.audit_policy_file.clone();
+    let audit_policy = state.audit_policy.clone();
     let approval_whitelist = state.config.approval_whitelist.clone();
     let pii_boundary_chars = if state.config.pii_response_side {
         state.config.pii_hold_max.max(1) as usize
@@ -205,7 +205,7 @@ pub(crate) async fn gateway_serve(
         vault: vault.clone(),
         detector: detector.clone(),
         audit_mode,
-        audit_policy_file: audit_policy_file.clone(),
+        audit_policy: audit_policy.clone(),
         approval_whitelist: approval_whitelist.clone(),
         audit_sink: state.audit_sink.clone(),
         hold_max,
@@ -269,7 +269,7 @@ pub(crate) async fn gateway_serve(
             sqlite_precise,
             req_start,
             audit_mode,
-            audit_policy_file: audit_policy_file.clone(),
+            audit_policy: audit_policy.clone(),
             approval_whitelist: approval_whitelist.clone(),
             audit_sink: state.audit_sink.clone(),
             pending: state.pending.clone(),
@@ -307,7 +307,7 @@ pub(crate) async fn gateway_serve(
 /// `x-veil-protocol`，对齐非流错误/非 JSON 透传口径；不进入 SSE 泵。
 /// 非错误状态严格超限走 502 `response_too_large`（与非流一致），4xx/5xx 错误体
 /// 不因体大改写。
-async fn stream_upstream_passthrough(
+pub(super) async fn stream_upstream_passthrough(
     up: reqwest::Response,
     normalized_out: bool,
     protocol: Protocol,
@@ -324,9 +324,23 @@ async fn stream_upstream_passthrough(
             resp_headers.insert(n, val);
         }
     }
+    // TRN-4：剔除上游 `x-veil-*` 内部头（大小写不敏感），网关自置头在剔除后写入，
+    // 上游同名声不得覆盖或泄漏。
+    let veil_keys: Vec<axum::http::HeaderName> = resp_headers
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-veil-"))
+        .cloned()
+        .collect();
+    for k in veil_keys {
+        resp_headers.remove(&k);
+    }
     let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
-    let bytes = up.bytes().await.unwrap_or_default();
-    if status_u16 < 400 && bytes.len() > max_bytes {
+    // TRN-3：先判 `content-length`（仅非错误状态），超限即 502 且不读 body。
+    if status_u16 < 400
+        && up
+            .content_length()
+            .is_some_and(|len| len > max_bytes as u64)
+    {
         return super::nonstream::oversize_response(protocol);
     }
     llm_gateway::filter_hop_headers_counted(
@@ -343,8 +357,22 @@ async fn stream_upstream_passthrough(
     if normalized_out {
         builder = builder.header("x-veil-normalized", "json-whitespace");
     }
+    let builder = builder.header("x-veil-protocol", super::protocol_header_value(protocol));
+    // TRN-3：`status >= 400` 错误体按透传语义保状态保字节，流式转发仅为内存安全，
+    // 不改写为 502、不缓冲放大。
+    if status_u16 >= 400 {
+        return builder
+            .body(Body::from_stream(up.bytes_stream()))
+            .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response());
+    }
+    // TRN-3：非错误状态有界读（至多 `max_bytes + 1`），严格超限 fail-closed 502。
+    let bytes = match super::nonstream::read_bounded_body(up, max_bytes, metrics).await {
+        super::nonstream::BoundedBody::Complete(b) => b,
+        super::nonstream::BoundedBody::Oversize => {
+            return super::nonstream::oversize_response(protocol);
+        }
+    };
     builder
-        .header("x-veil-protocol", super::protocol_header_value(protocol))
         .body(Body::from(bytes))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
 }

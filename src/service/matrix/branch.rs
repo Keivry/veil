@@ -49,10 +49,11 @@ impl MatrixBranch {
     pub fn is_known(&self) -> bool { !matches!(self, Self::Unknown) }
 }
 
-/// 白名单校验：MXID 精确成员匹配；任一相等即放行。
+/// 白名单校验（`POL-5`/D5）：空白名单＝不过滤（对标 Python `_matrix.py:235,254`）；
+/// 非空名单须精确成员匹配，任一相等即放行。
 /// 非法格式成员在启动期由 `Config::load_from` 拒绝，此处仅做相等比较。
 pub fn is_mxid_allowed(mxid: &str, whitelist: &[String]) -> bool {
-    whitelist.iter().any(|member| member == mxid)
+    whitelist.is_empty() || whitelist.iter().any(|member| member == mxid)
 }
 
 /// 启动期 MXID 格式显式门禁：须形如 `@user:server` 且不含空白。
@@ -232,6 +233,18 @@ mod branch_tests {
         assert!(!is_mxid_allowed("evil-@admin:example.comX", &wl));
         assert!(!is_mxid_allowed("@ADMIN:example.com", &wl));
         assert!(!is_mxid_allowed("@admin:example.com ", &wl));
+    }
+
+    #[test]
+    fn is_mxid_allowed_empty_whitelist_no_filter() {
+        // POL-5：空白名单＝不过滤；非空名单成员放行、非成员拒绝。
+        assert!(
+            is_mxid_allowed("@anyone:example.com", &[]),
+            "空白名单不过滤"
+        );
+        let wl = vec!["@admin:example.com".to_string()];
+        assert!(is_mxid_allowed("@admin:example.com", &wl));
+        assert!(!is_mxid_allowed("@ghost:example.com", &wl));
     }
 
     #[test]

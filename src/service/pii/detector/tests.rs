@@ -221,23 +221,43 @@ fn mask_six_branch_shapes_correct() {
 }
 
 #[test]
-fn mask_ipv4_edge_non_quad_six_seven_first4_last4() {
-    // P9/D10：非 4 段 6-7 字符 IPv4 形对齐原仓前 4/后 4（重叠不裁剪、逐字符）。
-    assert_eq!(mask_pii_value("ipv4", "123456"), "1234****3456");
-    assert_eq!(mask_pii_value("ipv4", "1234567"), "1234****4567");
-    // 非 4 段 <6 与 4 段分支不受影响。
+fn mask_pii_value_ipv4_non4_and_email_nodot_parity() {
+    // RED-3：非 4 段 IPv4 形按原仓 `<8` → 首 1/尾 1、`>=8` → 前 4/后 4；
+    // 含 `@` 但域名无 `.` 的 email 归 `***@***`。
+    assert_eq!(mask_pii_value("ipv4", "12345678"), "1234****5678");
+    assert_eq!(mask_pii_value("ipv4", "123456"), "1****6");
+    assert_eq!(mask_pii_value("ipv4", "1234567"), "1****7");
     assert_eq!(mask_pii_value("ipv4", "1.2.3"), "1****3");
     assert_eq!(mask_pii_value("ipv4", "8.8.8.8"), "8.8.**.**");
+    assert_eq!(mask_pii_value("email", "a@b"), "***@***");
+    assert_eq!(mask_pii_value("email", "a@b.com"), "***@***.com");
 }
 
 #[test]
-fn mask_kind_alias_bankcard_apikey_same_as_main() {
-    // P9/D10：bankcard/apikey 为已声明别名，行为与主名逐字一致。
+fn mask_edge_samples_readme_7_10() {
+    // §7.10 列举边缘样例：6/7 字符非 4 段 IPv4、无点 email、别名 kind。
+    assert_eq!(mask_pii_value("ipv4", "123456"), "1****6");
+    assert_eq!(mask_pii_value("ipv4", "1234567"), "1****7");
+    assert_eq!(mask_pii_value("email", "a@b"), "***@***");
+    assert_eq!(
+        mask_pii_value("id_card", "123456789012345678"),
+        "**** **** **** 5678"
+    );
+}
+
+#[test]
+fn mask_pii_value_alias_equivalent() {
+    // P9/D10 + RED-3：bankcard/apikey/id_card 为已声明别名，行为与主名逐字一致。
     for v in ["4532015112830366", "12345678", "1234"] {
         assert_eq!(
             mask_pii_value("bankcard", v),
             mask_pii_value("bank_card", v),
             "bankcard 别名须等价 bank_card: {v}"
+        );
+        assert_eq!(
+            mask_pii_value("id_card", v),
+            mask_pii_value("bank_card", v),
+            "id_card 别名须等价 bank_card: {v}"
         );
     }
     for v in ["abcd1234", "sk-abcdefgh12345678", "12345"] {

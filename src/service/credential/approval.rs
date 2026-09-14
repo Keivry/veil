@@ -12,7 +12,6 @@ use {
     },
     std::{
         collections::HashMap,
-        sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     },
 };
@@ -52,6 +51,17 @@ pub(crate) async fn submit_pending(
     submit_pending_with_branch(state, key, reason, branch, entry, field).await
 }
 
+/// `AUTH-9`：按分支取内存 pending 清扫 TTL（秒）——凭据/注册/哈希变更类阻塞票
+/// 保留至 300s 阻塞超时，空闲/审计/解锁类维持 60s 上限。
+fn pending_ttl_secs(branch: matrix::MatrixBranch) -> u64 {
+    match branch {
+        matrix::MatrixBranch::Register
+        | matrix::MatrixBranch::HashChange
+        | matrix::MatrixBranch::Credential => matrix::CREDENTIAL_TIMEOUT_SECS,
+        _ => PENDING_TTL_SECS,
+    }
+}
+
 /// 显式分支建单：C1/C2 注册/吊销复用 `Register` 分支，避免调用方路径内的
 /// 关键词（如 `unlock`/`credential`）经 `from_reason` 误判分支。
 ///
@@ -74,7 +84,11 @@ pub(crate) async fn submit_pending_with_branch(
             message: "审批发送失败，已按拒绝处理".to_string(),
         });
     };
-    state.pending().insert(PendingRecord::new(key, reason));
+    state.pending().insert(PendingRecord::with_ttl(
+        key,
+        reason,
+        pending_ttl_secs(branch),
+    ));
     state.approval().submit_branch(&event_id, branch).await;
     tracing::info!("审批已发送: event {event_id} 原因 {reason}");
     Ok(event_id)
@@ -118,6 +132,8 @@ pub(crate) enum AutoPolicy {
 pub(crate) struct ClosureLane {
     pub label: &'static str,
     pub auto_policy: AutoPolicy,
+    /// `AUTH-9`：建单分支——决定矩阵票与内存 pending 的 TTL 口径（凭据/注册类 300s）。
+    pub branch: matrix::MatrixBranch,
 }
 
 /// 决策表槽位（只读观测/测试用）：未决与三终态可区分。
@@ -149,17 +165,34 @@ enum DecisionEntry {
     },
 }
 
-/// `R2`/D2：进程内有界决策表（键 = `pending_key`）。`Decided` 条目 TTL 与
-/// `PendingApprovals::PENDING_TTL_SECS` 同口径；`InFlight` 由 waiter 落定/取消回收
-/// （其生命周期受等待超时约束），确保长轮询重试期间不因 TTL 误判而产生重复建单。
-#[derive(Debug, Default)]
-struct DecisionTable {
+/// `ARC-2`：审批决策表（键 = `pending_key`），由 `AppState` 以
+/// `Arc<Mutex<DecisionTable>>` 承载（进程级 `static` 已移除）。容量为**软上限**：
+/// 仅驱逐终态 `Decided`（按 `created` 升序，同刻以 key 字典序 tie-break），
+/// `InFlight` 永不驱逐；软上限不可满足时记 warn、递增 `overflow_count`
+/// （`approval_decision_overflow_total`）并允许暂时超出——`InFlight` 受 Matrix
+/// 审批票并发度约束，是软上限不被突破的最终 backstop。
+#[derive(Debug)]
+pub struct DecisionTable {
     entries: HashMap<String, DecisionEntry>,
+    max_entries: usize,
+    overflow_count: u64,
 }
 
 const DECISION_TABLE_MAX_ENTRIES: usize = 4096;
 
+impl Default for DecisionTable {
+    fn default() -> Self { Self::with_max_entries(DECISION_TABLE_MAX_ENTRIES) }
+}
+
 impl DecisionTable {
+    fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+            overflow_count: 0,
+        }
+    }
+
     /// 清扫过期已决条目（一次性消费语义的兜底）。
     fn sweep(&mut self, now: Instant) {
         self.entries.retain(|_, e| match e {
@@ -196,7 +229,39 @@ impl DecisionTable {
 
     fn cancel(&mut self, key: &str) { self.entries.remove(key); }
 
-    /// waiter 落定：写入终态；容量有界，挤出非当前键。
+    /// `ARC-2`：软上限驱逐——仅命中终态 `Decided`，按 `created` 升序（同刻以 key
+    /// 字典序 tie-break）驱逐最早者并循环至不超软上限；驱逐尽仍超限（仅余
+    /// `InFlight`）时不驱逐、记 warn 并递增 `overflow_count`。
+    fn enforce_soft_cap(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let victim = self
+                .entries
+                .iter()
+                .filter_map(|(k, e)| match e {
+                    DecisionEntry::Decided { created, .. } => Some((k.clone(), *created)),
+                    DecisionEntry::InFlight { .. } => None,
+                })
+                .min_by(|(ka, ca), (kb, cb)| ca.cmp(cb).then_with(|| ka.cmp(kb)))
+                .map(|(k, _)| k);
+            match victim {
+                Some(k) => {
+                    self.entries.remove(&k);
+                }
+                None => {
+                    self.overflow_count = self.overflow_count.saturating_add(1);
+                    tracing::warn!(
+                        entries = self.entries.len(),
+                        max = self.max_entries,
+                        metric = "approval_decision_overflow_total",
+                        "决策表仅余 InFlight，软上限暂时超出且不驱逐在途审批"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// waiter 落定：写入终态；容量按软上限驱逐终态条目（`InFlight` 永不驱逐）。
     fn resolve(&mut self, key: &str, decision: Option<bool>) {
         let decision = match decision {
             Some(true) => CredentialDecision::Approved,
@@ -210,11 +275,7 @@ impl DecisionTable {
                 created: Instant::now(),
             },
         );
-        if self.entries.len() > DECISION_TABLE_MAX_ENTRIES
-            && let Some(victim) = self.entries.keys().find(|k| k.as_str() != key).cloned()
-        {
-            self.entries.remove(&victim);
-        }
+        self.enforce_soft_cap();
     }
 
     #[cfg(test)]
@@ -228,30 +289,53 @@ impl DecisionTable {
             },
         })
     }
+
+    /// `ARC-2`：软上限溢出累计（只读观测）——`/_admin/metrics` 暴露为
+    /// `approval_decision_overflow_total`；`InFlight` 超限且无可驱逐终态时递增。
+    pub fn overflow_count(&self) -> u64 { self.overflow_count }
+
+    /// `ARC-2`：当前条目数（只读观测）——`/_admin/metrics` 暴露为
+    /// `decision_table_size`，使软上限占用状态可观测（含暂时超限的 `InFlight`）。
+    pub fn entry_count(&self) -> usize { self.entries.len() }
 }
 
-static DECISIONS: OnceLock<Mutex<DecisionTable>> = OnceLock::new();
-
-fn decisions() -> &'static Mutex<DecisionTable> {
-    DECISIONS.get_or_init(|| Mutex::new(DecisionTable::default()))
-}
-
-/// 后台 waiter 落定（`None` = 超时按拒绝）。
-pub(crate) fn record_credential_decision(key: &str, decision: Option<bool>) {
-    if let Ok(mut table) = decisions().lock() {
+/// `ARC-2`：后台 waiter 落定（`None` = 超时按拒绝）——经受管状态决策表写入终态。
+pub(crate) fn record_credential_decision(
+    state: &impl AppStateParts,
+    key: &str,
+    decision: Option<bool>,
+) {
+    if let Ok(mut table) = state.decisions().lock() {
         table.resolve(key, decision);
     }
 }
 
 /// 只读决策槽位（测试/观测用）。
 #[cfg(test)]
-pub(crate) fn credential_decision_slot(key: &str) -> Option<DecisionSlot> {
-    decisions().lock().ok().and_then(|table| table.slot(key))
+pub(crate) fn credential_decision_slot(
+    state: &impl AppStateParts,
+    key: &str,
+) -> Option<DecisionSlot> {
+    state
+        .decisions()
+        .lock()
+        .ok()
+        .and_then(|table| table.slot(key))
+}
+
+/// 只读决策表条目数（测试/观测用）。
+#[cfg(test)]
+pub(crate) fn credential_decision_len(state: &impl AppStateParts) -> usize {
+    state
+        .decisions()
+        .lock()
+        .map(|table| table.entries.len())
+        .unwrap_or(0)
 }
 
 /// 显式消费决策表终态（`S3`/D3）。
-fn consume_decision(key: &str) {
-    if let Ok(mut table) = decisions().lock() {
+fn consume_decision(state: &impl AppStateParts, key: &str) {
+    if let Ok(mut table) = state.decisions().lock() {
         table.consume(key);
     }
 }
@@ -281,24 +365,28 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let begin = decisions().lock().ok().map(|mut table| table.begin(key));
+    let begin = state
+        .decisions()
+        .lock()
+        .ok()
+        .map(|mut table| table.begin(key));
     match begin {
         None => return Err(record_pending(state, key, reason, entry, field).await),
         Some(BeginOutcome::Decided(CredentialDecision::Approved)) => {
             let result = approved().await;
             if result.is_ok() {
-                consume_decision(key);
+                consume_decision(state, key);
             }
             return result;
         }
         Some(BeginOutcome::Decided(CredentialDecision::Denied)) => {
-            consume_decision(key);
+            consume_decision(state, key);
             return Err(VeilError::Auth {
                 message: format!("{}审批被拒绝", lane.label),
             });
         }
         Some(BeginOutcome::Decided(CredentialDecision::TimedOut)) => {
-            consume_decision(key);
+            consume_decision(state, key);
             return Err(VeilError::Auth {
                 message: format!("{}审批超时，按拒绝处理", lane.label),
             });
@@ -306,9 +394,9 @@ where
         Some(BeginOutcome::Busy) => return Err(pending_error(reason)),
         Some(BeginOutcome::Reserved) => {}
     }
-    match submit_pending(state, key, reason, entry, field).await {
+    match submit_pending_with_branch(state, key, reason, lane.branch, entry, field).await {
         Ok(event_id) => {
-            if let Ok(mut table) = decisions().lock() {
+            if let Ok(mut table) = state.decisions().lock() {
                 table.set_event_id(key, &event_id);
             }
             let owned = (*state).clone();
@@ -330,12 +418,12 @@ where
                         decision
                     };
                 clear_terminal_pending(&owned, &key_owned, &event_id).await;
-                record_credential_decision(&key_owned, decision);
+                record_credential_decision(&owned, &key_owned, decision);
             });
             Err(pending_error(reason))
         }
         Err(err) => {
-            if let Ok(mut table) = decisions().lock() {
+            if let Ok(mut table) = state.decisions().lock() {
                 table.cancel(key);
             }
             Err(err)
@@ -362,6 +450,7 @@ async fn approval_async_202(
         ClosureLane {
             label: "凭据",
             auto_policy: AutoPolicy::Accept,
+            branch: matrix::MatrixBranch::Credential,
         },
         || query_keepass(state, entry, field, use_token),
     )
@@ -402,7 +491,15 @@ pub(crate) async fn approval_dual_mode(
     if !state.config().credential_block_wait {
         return approval_async_202(state, key, reason, entry, field, use_token).await;
     }
-    let event_id = submit_pending(state, key, reason, entry, field).await?;
+    let event_id = submit_pending_with_branch(
+        state,
+        key,
+        reason,
+        matrix::MatrixBranch::Credential,
+        entry,
+        field,
+    )
+    .await?;
     let timeout =
         Duration::from_secs(state.config().credential_approval_timeout_secs.max(1) as u64);
     let decision = state.approval().ask(&event_id, timeout).await;

@@ -387,3 +387,111 @@ mod observability_parity_tests {
         let _ = std::fs::remove_file(&db);
     }
 }
+
+#[test]
+fn aggs_retention_eviction() {
+    let store = MetricsStore::new(tmp_db("aggs-retention"));
+    let base = 86_400 * 100;
+    for i in 0..40 {
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            "m",
+            5,
+            None,
+            None,
+            true,
+            base + i * 86_400,
+        ));
+    }
+    let aggs = store.aggs.lock().expect("聚合锁无毒");
+    let daily = aggs
+        .keys()
+        .filter(|k| k.granularity == Granularity::Daily && k.protocol == "chat/completions")
+        .count();
+    assert!(daily >= 1, "保留窗内须有窗口");
+    assert!(
+        daily <= AGGS_DAILY_KEEP,
+        "daily 须按 retention 驱逐至 {AGGS_DAILY_KEEP}: {daily}"
+    );
+    let five = aggs
+        .keys()
+        .filter(|k| k.granularity == Granularity::FiveMin)
+        .count();
+    assert!(
+        five <= AGGS_FIVE_MIN_KEEP,
+        "five_min 每协议只留最新: {five}"
+    );
+}
+
+#[test]
+fn aggs_hard_cap_lru() {
+    let store = MetricsStore::new(tmp_db("aggs-cap"));
+    {
+        let mut aggs = store.aggs.lock().expect("聚合锁无毒");
+        for i in 0..(AGGS_MAX_ENTRIES + 64) {
+            let agg = WindowAgg {
+                updated: i as u64,
+                ..Default::default()
+            };
+            aggs.insert(
+                AggKey {
+                    granularity: Granularity::Daily,
+                    window: "d1".to_string(),
+                    protocol: format!("p{i}"),
+                },
+                agg,
+            );
+        }
+        enforce_agg_bounds(&mut aggs, &store.aggs_evicted);
+        assert!(
+            aggs.len() <= AGGS_MAX_ENTRIES,
+            "条目数不得超过硬上限: {}",
+            aggs.len()
+        );
+        assert!(
+            !aggs.contains_key(&AggKey {
+                granularity: Granularity::Daily,
+                window: "d1".to_string(),
+                protocol: "p0".to_string(),
+            }),
+            "最久未更新窗口须被 LRU 驱逐"
+        );
+    }
+    assert!(
+        store.aggs_evicted_total() >= 64,
+        "驱逐须计入可观测计数: {}",
+        store.aggs_evicted_total()
+    );
+}
+
+#[tokio::test]
+async fn aggs_eviction_keeps_sqlite_recoverable() {
+    let db = tmp_db("aggs-evict-recover");
+    let _ = std::fs::remove_file(&db);
+    let store = MetricsStore::new(db.clone());
+    let ts = now();
+    store.record_chat(chat_rec(
+        Protocol::Chat,
+        "m",
+        5,
+        Some(&usage(1, 1, 2)),
+        None,
+        true,
+        ts,
+    ));
+    store.flush().await.unwrap();
+    store.aggs.lock().expect("聚合锁无毒").clear();
+    let restarted = MetricsStore::new(db.clone());
+    let n = restarted.backfill_from_sqlite().await.unwrap();
+    assert!(n >= 3, "三粒度至少各一窗: {n}");
+    let pts = restarted
+        .query_series("daily", None, Some("chat/completions".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        pts.iter().map(|p| p.requests).sum::<u64>(),
+        1,
+        "内存驱逐后重启回填仍恢复已刷盘窗口"
+    );
+    let _ = std::fs::remove_file(&db);
+}

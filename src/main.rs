@@ -4,9 +4,13 @@ use {
     std::{process::ExitCode, sync::Arc},
     veil::{
         config::{Config, KeepassBackendKind, resolve_kdbx},
-        keepass::{RealKeePass, tpm_password_provider},
+        keepass::{RealKeePass, tpm_password_provider_with_cache},
         router::build_router,
-        service::tpm::{allow_mock_from_env, startup_tpm_in},
+        service::{
+            audit::AuditPolicy,
+            metrics::METRICS_FLUSH_INTERVAL_SECS,
+            tpm::{allow_mock_from_env, startup_tpm_in},
+        },
         state::{AppState, init_sqlite},
     },
 };
@@ -42,10 +46,54 @@ fn preflight_whitelist(whitelist: &[String]) -> Result<(), String> {
     veil::service::matrix::validate_whitelist_mxids(whitelist)
 }
 
+/// RUN-1/D1：关闭刷盘——优雅关闭后执行一次最终刷盘（短超时避免拖住退出）；
+/// 超时/失败仅 warn，不影响退出码。
+async fn flush_on_shutdown(store: Arc<veil::service::metrics::MetricsStore>) -> bool {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), store.flush()).await {
+        Ok(Ok(())) => {
+            tracing::info!("关闭刷盘完成");
+            true
+        }
+        Ok(Err(err)) => {
+            tracing::warn!("关闭刷盘失败（已周期刷盘的窗口仍在）: {err:#}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("关闭刷盘超时（5s），跳过最终刷盘");
+            false
+        }
+    }
+}
+
+/// RUN-1/D1：`SIGINT`/`SIGTERM` 优雅关闭信号，首个到达即触发。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!("SIGTERM 监听注册失败: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     lock_memory_linux();
-    let config = match Config::from_env() {
+    let mut config = match Config::from_env() {
         Ok(config) => config,
         Err(err) => {
             eprintln!("启动失败: {err}");
@@ -56,6 +104,26 @@ async fn main() -> ExitCode {
     // A15/D14：白名单显式门禁前移至 TPM/sqlite/KeePass/清扫/回填之前——
     // 校验失败在触盘/触网/触 TPM 前即退出。
     if let Err(err) = preflight_whitelist(&config.approval_whitelist) {
+        eprintln!("启动失败: {err}");
+        return ExitCode::from(1);
+    }
+
+    // `POL-1`/D1：启动期 fail-fast 加载审计策略并注入（早于 TPM/sqlite/后台任务等副作用点）；
+    // 损坏策略拒启动，不降级为默认空策略。
+    let audit_policy = match AuditPolicy::load_startup(config.audit_policy_file.as_deref()) {
+        Ok(policy) => policy,
+        Err(err) => {
+            eprintln!("启动失败: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    // `POL-2`/D2：合并 env 显式与文件 `mode`，把最终生效模式写回运行时配置。
+    audit_policy.apply_effective_mode(&mut config);
+    // `POL-9`/D9：空白名单门禁按合并后的最终生效模式判定（含文件来源 `approve`），
+    // 在策略加载/模式解析之后、副作用点之前拒绝启动。
+    if let Err(err) =
+        veil::config::validate_approve_whitelist(config.audit_mode, &config.approval_whitelist)
+    {
         eprintln!("启动失败: {err}");
         return ExitCode::from(1);
     }
@@ -101,6 +169,7 @@ async fn main() -> ExitCode {
     }
 
     let mut state = AppState::new(config, outcome);
+    state = state.with_audit_policy(Arc::new(audit_policy));
     if state.config.keepass_backend == KeepassBackendKind::Real {
         let resolved = resolve_kdbx(&state.config.db_dir);
         let (db_path, keyfile_path) = match &resolved {
@@ -113,8 +182,12 @@ async fn main() -> ExitCode {
                 (state.config.db_dir.join("veil.kdbx"), None)
             }
         };
-        let provider = tpm_password_provider(state.config.tpm_dir.clone(), allow_mock_tpm);
-        state = state.with_keepass(Arc::new(RealKeePass::new(db_path, keyfile_path, provider)));
+        let (provider, password_cache) =
+            tpm_password_provider_with_cache(state.config.tpm_dir.clone(), allow_mock_tpm);
+        state = state.with_keepass(Arc::new(
+            RealKeePass::new(db_path, keyfile_path, provider)
+                .with_master_password_cache(password_cache),
+        ));
     } else {
         tracing::warn!("VEIL_KEEPASS_BACKEND=mock：以 Mock KeePass 运行，禁止生产使用");
         state = state.with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
@@ -122,6 +195,11 @@ async fn main() -> ExitCode {
     let _orphan_sweeper = state.approval.spawn_sweeper();
     let _pending_sweeper = state.pending.spawn_sweeper();
     state.notify.start();
+    // RUN-1/D1：指标周期刷盘驱动（60s）+ 关闭时最终刷盘；当前此二路径是 flush 的唯一生产调用点。
+    let _metrics_flush = state
+        .admin
+        .metrics
+        .spawn_flush_driver(std::time::Duration::from_secs(METRICS_FLUSH_INTERVAL_SECS));
     // 指标重启回填：sqlite 聚合覆盖式恢复内存窗口；失败仅 warn（内存-only 照常服务）。
     match state.admin.metrics.backfill_from_sqlite().await {
         Ok(n) => tracing::info!("指标回填完成: {n} 个聚合窗口"),
@@ -146,7 +224,7 @@ async fn main() -> ExitCode {
         sync_token_file,
         start_ts_ms,
     );
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:8877").await {
         Ok(listener) => listener,
         Err(err) => {
@@ -158,17 +236,33 @@ async fn main() -> ExitCode {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     {
         eprintln!("服务异常退出: {err}");
         return ExitCode::from(1);
     }
+    let _ = flush_on_shutdown(state.admin.metrics.clone()).await;
     ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 mod tests {
-    use super::preflight_whitelist;
+    use super::{flush_on_shutdown, preflight_whitelist};
+
+    #[tokio::test]
+    async fn metrics_flush_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("veil-shutdown-flush-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let db = dir.join("metrics.sqlite");
+        let _ = std::fs::remove_file(&db);
+        let store = std::sync::Arc::new(veil::service::metrics::MetricsStore::new(db.clone()));
+        store.record_aux_counts(veil::service::llm_gateway::Protocol::Chat, 86_400, 0, 0, 1);
+        assert!(flush_on_shutdown(store.clone()).await, "关闭刷盘须成功");
+        let pts = store.query_series("daily", None, None).await.unwrap();
+        assert!(!pts.is_empty(), "关闭刷盘后 sqlite 须含窗口");
+        let _ = std::fs::remove_file(&db);
+    }
 
     /// A15/D14：真实门禁函数行为（非法拒绝/合法放行）+ 生产启动序不变量——门禁调用须早于
     /// TPM/sqlite/后台任务等副作用点；门禁纯校验零副作用，其失败即 fail-fast，不触盘/触
@@ -187,6 +281,13 @@ mod tests {
         let gate = src
             .find("preflight_whitelist(&config.approval_whitelist)")
             .expect("白名单门禁调用点");
+        let policy_load = src
+            .find("AuditPolicy::load_startup(")
+            .expect("策略 fail-fast 加载调用点");
+        assert!(
+            gate < policy_load,
+            "策略加载须在白名单门禁之后（启动序：配置 → 白名单 → 策略）"
+        );
         for after in [
             "startup_tpm_in(&config.tpm_dir",
             "init_sqlite(&config.data_dir)",
@@ -196,6 +297,7 @@ mod tests {
                 .find(after)
                 .unwrap_or_else(|| panic!("缺少启动点 {after}"));
             assert!(gate < at, "白名单门禁须早于 {after}");
+            assert!(policy_load < at, "策略加载须早于副作用点 {after}");
         }
     }
 }

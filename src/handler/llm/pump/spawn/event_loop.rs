@@ -1,0 +1,641 @@
+//! ARC-1：流泵主循环与单事件处理（自 `spawn.rs` 拆出，纯搬移行为不变）。
+
+use {
+    super::{
+        super::{
+            decide::{self, ResponsesAction, StickyAction},
+            event::{
+                extract_responses_seq,
+                is_anthropic_opaque_event,
+                is_minor_event,
+                is_terminal_event,
+                outer_event_index,
+                responses_error_object,
+                responses_failed_incomplete,
+                responses_synth_conv_id,
+                sticky_terminal_event,
+                stream_model_of,
+            },
+            fragments::extract_tool_fragments,
+            synth_flush::flush_pre_terminal,
+            toolbuf::take_pending_tool_inputs,
+        },
+        frame_feed::{drain_prefix_hold, feed_output_frame},
+        guard_restored_frame,
+        setup::{PumpEnv, PumpLoopState},
+    },
+    crate::{
+        approval::PendingRecord,
+        config::AuditMode,
+        handler::llm::protocol_header_value,
+        service::{
+            audit::{self, AuditHold},
+            block_inject,
+            json_walk::strip_bom,
+            llm_gateway::{self, Protocol},
+            sse::{SseEvent, SseParser, is_done_payload},
+        },
+    },
+    serde_json::Value,
+};
+
+/// 单事件处理的控制流：`Next` 继续下一事件；`BreakFor` 因下游发送失败中止本块事件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventFlow {
+    Next,
+    BreakFor,
+}
+
+/// TRN-1：SSE 出口信封重建——在既有 `event:` 重放基础上补齐解析侧已保留的
+/// `id:`（last-event-id，空值不透出）与合法整数 `retry:`，与 `data:` 同块写。
+fn envelope_prefix(ev: &SseEvent) -> String {
+    let mut prefix = String::new();
+    if let Some(t) = ev.event_type.as_ref() {
+        prefix.push_str(&format!("event: {t}\n"));
+    }
+    if let Some(id) = ev.id.as_deref().filter(|s| !s.is_empty()) {
+        prefix.push_str(&format!("id: {id}\n"));
+    }
+    if let Some(r) = ev.retry {
+        prefix.push_str(&format!("retry: {r}\n"));
+    }
+    prefix
+}
+
+/// ARC-1：主循环薄层——读取上游 chunk、喂入解析器并按事件驱动 [`handle_event`]。
+/// 返回是否为传输错误（供收尾按断流终端策略处置）。
+pub(super) async fn run_pump<F>(
+    upstream: &mut reqwest::Response,
+    parser: &mut SseParser,
+    state: &mut PumpLoopState,
+    env: &PumpEnv,
+    boundary_spans: &F,
+) -> bool
+where
+    F: Fn(&str, usize) -> Vec<(usize, usize)>,
+{
+    let mut received_bytes: usize = 0;
+    let mut transport_error = false;
+    loop {
+        let bytes = match upstream.chunk().await {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => {
+                transport_error = true;
+                tracing::warn!(
+                    forwarded = state.forwarded,
+                    received_bytes,
+                    error = %e,
+                    "流式上游传输错误（chunk Err），按断流终端策略收尾"
+                );
+                break;
+            }
+        };
+        received_bytes += bytes.len();
+        if bytes.is_empty() {
+            continue;
+        }
+        let events = parser.push_bytes(&bytes);
+        let line_dropped = parser.take_truncated_line_dropped_bytes();
+        if line_dropped > 0 {
+            env.metrics
+                .record_truncated_line_dropped_bytes(line_dropped);
+        }
+        for ev in events {
+            if handle_event(state, &ev, env, line_dropped, boundary_spans).await
+                == EventFlow::BreakFor
+            {
+                break;
+            }
+        }
+        if state.terminated {
+            break;
+        }
+    }
+    transport_error
+}
+
+/// ARC-1：单事件处理（原 `spawn_stream_pump` 循环体搬移，分支/顺序/等待点不变）。
+pub(super) async fn handle_event<F>(
+    state: &mut PumpLoopState,
+    ev: &SseEvent,
+    env: &PumpEnv,
+    line_dropped: u64,
+    boundary_spans: &F,
+) -> EventFlow
+where
+    F: Fn(&str, usize) -> Vec<(usize, usize)>,
+{
+    if ev.truncated {
+        tracing::warn!(
+            "SSE 超长行已截断（16KB），头部分发审计，尾部 {line_dropped} 字节已计数丢弃"
+        );
+    }
+    if ev.is_comment_only {
+        // E11/D6 空流守门：注释心跳透传但不置位 `any_frame_sent`
+        //（非内容帧），纯心跳流仍走真空合成，不断链不悬空。
+        let _ = env
+            .pump_tx
+            .send(format!(":{}\n\n", ev.comments.join("\n:")))
+            .await;
+        return EventFlow::Next;
+    }
+    if !ev.data.is_empty()
+        && !is_done_payload(&ev.data)
+        && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
+    {
+        if let Some(id) = llm_gateway::extract_conv_id(&v) {
+            if state.stream_first_id.is_none() {
+                state.stream_first_id = Some(id.clone());
+            }
+            state.conv_id = Some(id);
+        }
+        if state.stream_model.is_none()
+            && let Some(m) = stream_model_of(&v)
+        {
+            state.stream_model = Some(m.to_string());
+        }
+        llm_gateway::accumulate_usage(
+            &mut state.stream_usage,
+            llm_gateway::extract_usage_stream(env.protocol, &v),
+        );
+    }
+    env.hold_gate.store(
+        !matches!(env.audit_mode, AuditMode::Off) && state.hold.has_pending_fragments(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if state.rejected_sticky {
+        // 纯函数决策；短路求值与 metrics 副作用留调用点：
+        // 仅非空非 DONE 才解析/记 terminal_fallback（原语义不变）。
+        let data_empty = ev.data.is_empty();
+        let is_done = is_done_payload(&ev.data);
+        let is_terminal =
+            !data_empty && !is_done && sticky_terminal_event(env.protocol, &ev.data, &env.metrics);
+        let is_tool_or_complete = !data_empty
+            && !is_done
+            && serde_json::from_str::<Value>(strip_bom(&ev.data)).is_ok_and(|v| {
+                !extract_tool_fragments(env.protocol, &v).is_empty()
+                    || AuditHold::is_audit_due_event(env.protocol, &v)
+            });
+        if decide::sticky_suppress_action(
+            state.rejected_sticky,
+            data_empty,
+            is_done,
+            is_terminal,
+            is_tool_or_complete,
+        ) == StickyAction::Drop
+        {
+            return EventFlow::Next;
+        }
+    }
+    if env.protocol == Protocol::Responses && !ev.data.is_empty() {
+        // N1 守卫（T1/D1）：决策交纯函数 `responses_control_action`；
+        // 已发终端时保持原语义不解析（terminal_fallback 计数不漂移）。
+        let (is_failed, is_error) = if state.terminal_sent {
+            (false, false)
+        } else {
+            let (f, _, e) = responses_failed_incomplete(&ev.data, &env.metrics);
+            (f, e)
+        };
+        match decide::responses_control_action(
+            state.terminal_sent,
+            state.responses_failed_sent,
+            is_error,
+            is_failed,
+        ) {
+            ResponsesAction::Ignore => return EventFlow::Next,
+            ResponsesAction::SynthesizeFailed => {
+                // P4/D4：`error` 仅合成单帧 `response.failed`
+                //（`response.error.message` 携带上游 error 文案），不注入
+                // `output_index` 序列；`incomplete` 不在此列——原样透传并作为
+                // 唯一终端（保留 `incomplete_details`，由 `is_terminal_event` 置位）。
+                state.responses_failed_sent = true;
+                let fid = responses_synth_conv_id(
+                    state.stream_first_id.as_deref(),
+                    state.conv_id.as_deref(),
+                    &env.metrics,
+                );
+                let err_obj = responses_error_object(&ev.data);
+                // D3/S3：合成终端前先 flush 边界滞留帧，保证末段增量先下行。
+                drain_prefix_hold(
+                    &mut state.prefix_hold,
+                    &mut state.boundary,
+                    &boundary_spans,
+                    &mut state.agg,
+                );
+                if flush_pre_terminal(
+                    &mut state.boundary,
+                    &mut state.agg,
+                    &env.pump_tx,
+                    &env.metrics,
+                )
+                .await
+                {
+                    state.forwarded += 1;
+                    state.any_frame_sent = true;
+                }
+                // D9/S9：合成 failed 帧 send 成功才置位终端，下游早断不撒谎。
+                let mut terminal_ok = false;
+                for f in
+                    block_inject::ensure_event_lines(vec![block_inject::responses_failed_frame(
+                        &fid,
+                        err_obj.as_ref().map(|(v, _)| v),
+                        err_obj.as_ref().and_then(|(_, s)| *s),
+                    )])
+                {
+                    if env.pump_tx.send(f).await.is_err() {
+                        break;
+                    }
+                    env.metrics.add_sse_event();
+                    state.forwarded += 1;
+                    state.any_frame_sent = true;
+                    terminal_ok = true;
+                }
+                if terminal_ok {
+                    state.terminal_sent = true;
+                    block_inject::mark_terminal(&mut state.meta);
+                }
+                state.terminated = true;
+                return EventFlow::Next;
+            }
+            ResponsesAction::DuplicateFailed => {
+                state.terminated = true;
+                return EventFlow::Next;
+            }
+            ResponsesAction::Passthrough => {
+                if is_failed {
+                    state.responses_failed_sent = true;
+                }
+            }
+        }
+    }
+    if !ev.data.is_empty() && !is_done_payload(&ev.data) {
+        if let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data)) {
+            // 终端后不再透出任何数据帧：恰一终止帧且其后无内容。
+            if state.terminal_sent {
+                return EventFlow::Next;
+            }
+            let event_terminal = is_terminal_event(env.protocol, &v);
+            let frags = extract_tool_fragments(env.protocol, &v);
+            let is_tool_event = !frags.is_empty();
+            let minor = !is_tool_event && is_minor_event(env.protocol, &v);
+            if state.rejected_sticky && is_tool_event {
+                return EventFlow::Next;
+            }
+            // F3/D3：Responses 槽完成（`response.output_item.done`/
+            // `response.function_call_arguments.done`）视同按槽完成——既触发
+            // 该槽缓冲分片重放，又使本帧不被缓冲（其审计/释放由
+            // `responses_slot_complete` 承载）。
+            let responses_slot_complete = AuditHold::is_responses_slot_complete_event(&v);
+            let is_index_complete =
+                AuditHold::is_index_complete_event(&v) || responses_slot_complete;
+            // P0-3.1：完成事件先放行此前缓冲的残缺分片（到达序重放进
+            // 边界 hold，保证缝合时序），再处理本帧；全局完成全放行，
+            // 按槽完成只放行对应槽（他槽残缺继续缓冲）。F3/D3：Responses
+            // 工具分片纳入 hold（先审后放），未完成分片缓冲至槽 `.done`。
+            let audit_hold_on = !matches!(env.audit_mode, AuditMode::Off)
+                && matches!(
+                    env.protocol,
+                    Protocol::Chat | Protocol::Anthropic | Protocol::Responses
+                );
+            if audit_hold_on {
+                let slot = decide::tool_replay_slot(
+                    env.protocol,
+                    &v,
+                    AuditHold::is_audit_due_event(env.protocol, &v),
+                    is_index_complete,
+                );
+                if let Some(slot) = slot {
+                    for (b_prefix, b_data) in
+                        take_pending_tool_inputs(&mut state.pending_tool_frames, slot)
+                    {
+                        feed_output_frame(
+                            &mut state.prefix_hold,
+                            &mut state.boundary,
+                            &env.resp_detector,
+                            &env.resp_vault,
+                            &boundary_spans,
+                            &mut state.agg,
+                            (b_prefix, b_data),
+                        )
+                        .await;
+                    }
+                }
+            }
+            // P0-3.1：未完成 tool 分片缓冲不转发（hold-until-complete）；
+            // 本帧槽号组取自各分片桶号（到达序 flush 时保序）。
+            let buffer_tool_frame = decide::should_buffer_tool_frame(
+                audit_hold_on,
+                is_tool_event,
+                AuditHold::is_audit_due_event(env.protocol, &v),
+                is_index_complete,
+            );
+            let tool_buckets: Vec<u32> = frags.iter().map(|f| f.0).collect();
+            let mut reject_reason: Option<String> = None;
+            if minor {
+                // 次要事件透传且审计声明放行：不进 hold、不审计。
+            } else if env.protocol == Protocol::Responses {
+                let slot_complete = AuditHold::is_responses_slot_complete_event(&v);
+                for frag in &frags {
+                    let key = AuditHold::responses_key(frag.1.as_deref(), frag.0);
+                    if slot_complete {
+                        // RED-6：`.done` 完整参数经 `mark_responses_done`
+                        // 记账（去重），不以分片重复计入 `total_bytes`；
+                        // 空分片仅登记名/id。
+                        let _ = state.hold.push_responses_fragment(
+                            &key,
+                            frag.0,
+                            None,
+                            frag.1.as_deref(),
+                            frag.2.as_deref(),
+                            "",
+                        );
+                        state.hold.mark_responses_done(&key, Some(&frag.3));
+                        if state.hold.is_rejected() {
+                            reject_reason = Some("audit-hold-overflow".to_string());
+                            break;
+                        }
+                        continue;
+                    }
+                    let seq = extract_responses_seq(&v);
+                    let verdict = state.hold.push_responses_fragment(
+                        &key,
+                        frag.0,
+                        seq,
+                        frag.1.as_deref(),
+                        frag.2.as_deref(),
+                        &frag.3,
+                    );
+                    if verdict == crate::service::audit::HoldVerdict::Rejected {
+                        reject_reason = Some("audit-hold-overflow".to_string());
+                        break;
+                    }
+                }
+            } else {
+                for frag in &frags {
+                    if state.hold.push_fragment(
+                        frag.0,
+                        frag.1.as_deref(),
+                        frag.2.as_deref(),
+                        &frag.3,
+                    ) == crate::service::audit::HoldVerdict::Rejected
+                    {
+                        reject_reason = Some("audit-hold-overflow".to_string());
+                        break;
+                    }
+                }
+            }
+            // D2：Responses per-item `.done` 走槽级审计，与全局完成解耦。
+            let mut approve_held = false;
+            if reject_reason.is_none()
+                && !state.hold.is_rejected()
+                && (AuditHold::is_audit_due_event(env.protocol, &v) || responses_slot_complete)
+                && !matches!(env.audit_mode, AuditMode::Off)
+            {
+                for (idx, name, args) in state.hold.tool_triples() {
+                    match env
+                        .audit_sink
+                        .evaluate_and_record(
+                            env.audit_mode,
+                            &name,
+                            &args,
+                            &env.audit_policy,
+                            &env.approval_whitelist,
+                            Some(protocol_header_value(env.protocol)),
+                        )
+                        .await
+                    {
+                        audit::AuditVerdict::Block { .. } => {
+                            state.hold.mark_rejected();
+                            reject_reason = Some("audit-policy-block".to_string());
+                            break;
+                        }
+                        audit::AuditVerdict::NeedApproval { reason, summary } => {
+                            env.audit_pending.insert(PendingRecord::new(
+                                &format!("audit-hold-{idx}-{name}"),
+                                &format!("{reason}: {summary}"),
+                            ));
+                            approve_held = true;
+                        }
+                        audit::AuditVerdict::Allow => {}
+                    }
+                }
+            }
+            // §2.5 前置：stop/item_done 只审计并清理对应 index 的槽
+            //（外层序号），不得标记全局完成，后续块照常审计；
+            // 命中阻断落 reject_reason，走下方统一阻断臂注入。
+            if reject_reason.is_none()
+                && !state.hold.is_rejected()
+                && !matches!(env.audit_mode, AuditMode::Off)
+                && AuditHold::is_index_complete_event(&v)
+                && let Some(idx) = outer_event_index(env.protocol, &v)
+            {
+                for (_, name, args) in state
+                    .hold
+                    .tool_triples()
+                    .into_iter()
+                    .filter(|(i, ..)| *i == idx)
+                {
+                    match env
+                        .audit_sink
+                        .evaluate_and_record(
+                            env.audit_mode,
+                            &name,
+                            &args,
+                            &env.audit_policy,
+                            &env.approval_whitelist,
+                            Some(protocol_header_value(env.protocol)),
+                        )
+                        .await
+                    {
+                        audit::AuditVerdict::Block { .. } => {
+                            state.hold.mark_rejected();
+                            reject_reason = Some("audit-policy-block".to_string());
+                            break;
+                        }
+                        audit::AuditVerdict::NeedApproval { reason, summary } => {
+                            env.audit_pending.insert(PendingRecord::new(
+                                &format!("audit-hold-{idx}-{name}"),
+                                &format!("{reason}: {summary}"),
+                            ));
+                        }
+                        audit::AuditVerdict::Allow => {}
+                    }
+                }
+                state.hold.clear_index(idx);
+            }
+            // D1：完成事件审计（Allow/NeedApproval 均算已判定）后释放
+            // 作用域出抑制集，后续帧据此恢复逐帧增量；拒绝态已清理。
+            if reject_reason.is_none()
+                && !state.hold.is_rejected()
+                && (AuditHold::is_audit_due_event(env.protocol, &v) || responses_slot_complete)
+            {
+                state.hold.release_audited();
+            }
+            if let Some(reason) = reject_reason {
+                state.rejected_sticky = true;
+                state.audit_blocked = true;
+                state.terminal_sent = true;
+                state.agg.clear();
+                state.boundary.clear();
+                state.prefix_hold.clear();
+                // P0-3.1：阻断丢弃缓冲（阻断非截断，不记截断计数）。
+                state.pending_tool_frames.clear();
+                if !state.block_injected {
+                    state.block_injected = true;
+                    for f in block_inject::ensure_event_lines(match env.protocol {
+                        Protocol::Chat => block_inject::chat_block_frames(&reason),
+                        Protocol::Anthropic => {
+                            let idx = outer_event_index(env.protocol, &v).unwrap_or(0);
+                            block_inject::anthropic_block_frames(&reason, idx)
+                        }
+                        Protocol::Responses => {
+                            let bid = state.conv_id.clone().unwrap_or_else(|| {
+                                llm_gateway::resolve_conv_id(
+                                    None,
+                                    &serde_json::Value::Null,
+                                    Some(&env.metrics),
+                                    "block",
+                                )
+                                .0
+                            });
+                            block_inject::responses_block_frames(&bid)
+                        }
+                        Protocol::NonDialog => vec![],
+                    }) {
+                        let _ = env.pump_tx.send(f).await;
+                    }
+                    block_inject::mark_terminal(&mut state.meta);
+                }
+                if is_tool_event
+                    || AuditHold::is_audit_due_event(env.protocol, &v)
+                    || AuditHold::is_index_complete_event(&v)
+                {
+                    return EventFlow::Next;
+                }
+            } else if AuditHold::is_complete_event(&v) && !approve_held {
+                state.hold.mark_completed();
+            }
+            let restored_data =
+                if env.protocol == Protocol::Anthropic && is_anthropic_opaque_event(&v) {
+                    // M3/D6：opaque（signature/redacted/thinking）帧跳过响应侧
+                    // 新 PII 扫描与 `json_aware_line` 重序列化，仅做字节级还原
+                    //（JSON 转义变体保证不破帧）；审计 hold/次要判定维持现状。
+                    let (restored, _spans) = env
+                        .resp_scope
+                        .restore_response_with_spans_json(&env.resp_vault, &ev.data);
+                    guard_restored_frame(restored, &ev.data, &env.metrics)
+                } else {
+                    let cleaned = state.carry.prepare(&ev.data);
+                    let (restored, spans) = env
+                        .resp_scope
+                        .restore_response_with_spans_json(&env.resp_vault, &cleaned);
+                    let scanned = env
+                        .resp_scope
+                        .redact_response_new_pii_with_skip(
+                            &env.resp_vault,
+                            &env.resp_detector,
+                            &restored,
+                            &spans,
+                        )
+                        .await;
+                    guard_restored_frame(
+                        crate::service::sse::json_aware_line(&scanned, |s| s),
+                        &cleaned,
+                        &env.metrics,
+                    )
+                };
+            let prefix = envelope_prefix(ev);
+            if event_terminal {
+                state.terminal_sent = true;
+            }
+            // P0-3.1：未完成 tool 分片不进边界 hold、不进 `agg`
+            // （hold-until-complete），直接缓冲还原后输入；完成帧走
+            // 正常透传（此前缓冲已在本帧前重放进边界 hold）。
+            if buffer_tool_frame {
+                state
+                    .pending_tool_frames
+                    .push((tool_buckets, prefix, restored_data));
+                return EventFlow::Next;
+            }
+            let emitted = feed_output_frame(
+                &mut state.prefix_hold,
+                &mut state.boundary,
+                &env.resp_detector,
+                &env.resp_vault,
+                &boundary_spans,
+                &mut state.agg,
+                (prefix, restored_data),
+            )
+            .await;
+            if decide::should_suppress_held_output(
+                audit_hold_on,
+                state.hold.has_pending_fragments(),
+                !emitted,
+                minor,
+            ) {
+                return EventFlow::Next;
+            }
+        } else {
+            // 非 JSON 文本同样走 span 跳过还原，终端后不再透出。
+            if state.terminal_sent {
+                return EventFlow::Next;
+            }
+            let (restored, spans) = env
+                .resp_scope
+                .restore_response_with_spans(&env.resp_vault, &ev.data);
+            let scanned = env
+                .resp_scope
+                .redact_response_new_pii_with_skip(
+                    &env.resp_vault,
+                    &env.resp_detector,
+                    &restored,
+                    &spans,
+                )
+                .await;
+            let prefix = envelope_prefix(ev);
+            feed_output_frame(
+                &mut state.prefix_hold,
+                &mut state.boundary,
+                &env.resp_detector,
+                &env.resp_vault,
+                &boundary_spans,
+                &mut state.agg,
+                (prefix, scanned),
+            )
+            .await;
+        }
+    } else if ev.data.is_empty() {
+        // L17：空 `data:` 心跳帧丢弃不透传（不计数、不参与终端判定；
+        // 真空流保持 open-ended，见 C8）。
+        return EventFlow::Next;
+    } else {
+        // `[DONE]`（含 BOM 前缀）：恰一终止帧，多余去重。
+        // 滞留帧先于终止帧放行（保序：滞留内容属于终止前的数据）。
+        if state.terminal_sent {
+            return EventFlow::Next;
+        }
+        state.terminal_sent = true;
+        drain_prefix_hold(
+            &mut state.prefix_hold,
+            &mut state.boundary,
+            &boundary_spans,
+            &mut state.agg,
+        );
+        if let Some((fp, fd)) = state.boundary.flush() {
+            state.agg.push_str(&fp);
+            state.agg.push_str(&format!("data: {fd}\n\n"));
+        }
+        let prefix = envelope_prefix(ev);
+        state.agg.push_str(&format!("{prefix}data: [DONE]\n\n"));
+    }
+    if let Some(out) = crate::service::sse::select_emit(&mut state.agg, env.speed) {
+        env.metrics.add_sse_event();
+        state.forwarded += 1;
+        state.any_frame_sent = true;
+        if env.pump_tx.send(out).await.is_err() {
+            return EventFlow::BreakFor;
+        }
+    }
+    EventFlow::Next
+}

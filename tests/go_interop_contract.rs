@@ -5,7 +5,7 @@
 //! 闭环，且不修改 `veil-hardening` 任何文件。
 
 use {
-    common::{serve, test_app_router},
+    common::{serve, test_app, test_app_router},
     std::time::Duration,
 };
 
@@ -50,7 +50,10 @@ async fn go_shaped_credential_body_only_rejected() {
     //（`error` 非 string），锁定「Go 不可直接解析」根因契约；
     // 同时锁定 `body.auth.get_binary_hash`/`get_binary_secret` 与 `body.secret`
     // 被采纳为等价头（`auth.rs::effective_*`）的行为。
-    let (base, handle) = serve(test_app_router(&[])).await;
+    let (app, state) = test_app(&[]);
+    let (base, handle) = serve(app).await;
+    common::enroll_allow(&state, "/srv/go2.sh", "go-h2").await;
+    common::enroll_allow(&state, "/srv/go3.sh", "go-h3").await;
     let client = reqwest::Client::new();
 
     let (status, body) = cred_post(&client, &base, &[], auth_body("go-h1", "/srv/go1.sh")).await;
@@ -116,7 +119,9 @@ async fn go_three_factor_matrix() {
     // GO/D5-2（对应 `veil-hardening` 5.2）：齐全（头体一致）→ 放行；
     // 缺哈希头 / 缺密钥头 / 缺 `body.auth.*` / 冒用 caller_hash==GET_BINARY_HASH
     // 各 → 403 明确诊断；冒用为 `token:false` 原始取用的拒止口径。
-    let (base, handle) = serve(test_app_router(&[])).await;
+    let (app, state) = test_app(&[]);
+    let (base, handle) = serve(app).await;
+    common::enroll_allow(&state, "/srv/go-m1.sh", "go-m1").await;
     let client = reqwest::Client::new();
 
     // 齐全（头体一致）→ 放行。

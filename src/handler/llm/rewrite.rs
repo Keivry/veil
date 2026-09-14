@@ -235,6 +235,26 @@ mod rewrite_unit_tests {
     }
 
     #[tokio::test]
+    async fn rewrite_stream_options_null_preserved() {
+        // TRN-5：显式 null 不进注入分支，转发体保留 `"stream_options": null`。
+        let config = test_config(&[]);
+        let (scope, vault, detector) = fresh_arcs();
+        let raw = br#"{"model":"m","stream":true,"stream_options":null,"messages":[]}"#;
+        let out = request_rewrite(
+            raw.to_vec(),
+            Protocol::Chat,
+            &config,
+            scope,
+            vault,
+            detector,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&out.body).expect("转发体须为合法 JSON");
+        assert!(v["stream_options"].is_null(), "null 须保留: {v}");
+        assert!(!out.normalized_out, "未注入不得置位 normalized");
+    }
+
+    #[tokio::test]
     async fn rewrite_anthropic_never_injects_stream_options() {
         // T1：Anthropic 协议永不注入 stream_options。
         let config = test_config(&[]);

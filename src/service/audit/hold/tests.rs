@@ -135,7 +135,12 @@ fn tool_deltas_accumulate_by_index_without_flush_until_complete() {
     assert!(!AuditHold::is_complete_event(
         &serde_json::json!({"delta":"hi"})
     ));
-    assert!(AuditHold::is_complete_event(
+    // RED-5：Chat `tool_calls` 为审计到期但非全局完成。
+    assert!(AuditHold::is_audit_due_event(
+        crate::service::llm_gateway::Protocol::Chat,
+        &serde_json::json!({"finish_reason":"tool_calls"})
+    ));
+    assert!(!AuditHold::is_complete_event(
         &serde_json::json!({"finish_reason":"tool_calls"})
     ));
     // §2.5：stop/item_done 只触发按 index 清理，不标记全局完成。
@@ -154,15 +159,20 @@ fn tool_deltas_accumulate_by_index_without_flush_until_complete() {
     assert!(AuditHold::is_complete_event(
         &serde_json::json!({"type":"message_stop"})
     ));
-    assert!(AuditHold::is_complete_event(
-        &serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]})
-    ));
-    assert!(AuditHold::is_complete_event(
-        &serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]})
-    ));
-    assert!(AuditHold::is_complete_event(
-        &serde_json::json!({"choices":[{"message":{"finish_reason":"tool_calls"}}]})
-    ));
+    for tc in [
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}),
+        serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]}),
+        serde_json::json!({"choices":[{"message":{"finish_reason":"tool_calls"}}]}),
+    ] {
+        assert!(
+            AuditHold::is_audit_due_event(crate::service::llm_gateway::Protocol::Chat, &tc),
+            "Chat tool_calls 须审计到期"
+        );
+        assert!(
+            !AuditHold::is_complete_event(&tc),
+            "Chat tool_calls 不得置全局完成"
+        );
+    }
     assert!(!AuditHold::is_complete_event(
         &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
     ));
@@ -340,9 +350,26 @@ fn overflow_fail_closed_after_reclaim_long_stream() {
 
 #[test]
 fn timeout_disconnect_race_window_constants_locked() {
-    assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MIN, 110);
-    assert_eq!(crate::config::AUDIT_TIMEOUT_RACE_MAX, 130);
-    assert_eq!(crate::config::AUDIT_TIMEOUT_DEFAULT, 90);
+    // 竞态区间契约经 `validate` 校验入口行为覆盖（非仅比对常量）：
+    // `110..=130` 拒启动，区间外（`109`/`131`/`90`）通过。
+    let parse = |raw: &str| {
+        crate::config::parse_audit_timeout(&|k: &str| {
+            (k == "AUDIT_TIMEOUT").then(|| raw.to_string())
+        })
+    };
+    for rejected in ["110", "130"] {
+        assert!(
+            parse(rejected).is_err(),
+            "AUDIT_TIMEOUT={rejected} 落在竞态区间须被拒"
+        );
+    }
+    for accepted in ["109", "131", "90"] {
+        assert_eq!(
+            parse(accepted).unwrap(),
+            accepted.parse::<i64>().unwrap(),
+            "AUDIT_TIMEOUT={accepted} 在竞态区间外须通过"
+        );
+    }
 }
 
 #[test]
@@ -459,9 +486,13 @@ fn audit_approve_stream_anthropic_precheck_three_events() {
     assert!(!AuditHold::is_complete_event(
         &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
     ));
-    assert!(AuditHold::is_complete_event(
-        &serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]})
+    // RED-5：Chat `tool_calls` 审计到期、非全局完成。
+    let tc = serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]});
+    assert!(AuditHold::is_audit_due_event(
+        crate::service::llm_gateway::Protocol::Chat,
+        &tc
     ));
+    assert!(!AuditHold::is_complete_event(&tc));
     assert!(!AuditHold::is_complete_event(
         &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
     ));
@@ -593,4 +624,82 @@ async fn keepalive_gate_pending_only() {
         .expect("通道不得关闭");
     assert_eq!(resumed, crate::service::sse::keepalive_frame());
     drop(keep);
+}
+
+#[test]
+fn chat_tool_calls_still_audit_due() {
+    // RED-5：Chat 任意非空 finish_reason（含 tool_calls）触发审计到期；
+    // 空 finish_reason / 缺失 choices 不到期。
+    use crate::service::llm_gateway::Protocol::Chat;
+    for fr in ["tool_calls", "stop", "length", "content_filter"] {
+        let v = serde_json::json!({"choices":[{"index":0,"finish_reason":fr}]});
+        assert!(AuditHold::is_audit_due_event(Chat, &v), "{fr} 须审计到期");
+        assert!(!AuditHold::is_complete_event(&v), "{fr} 不得置全局完成");
+    }
+    for v in [
+        serde_json::json!({"finish_reason":"tool_calls"}),
+        serde_json::json!({"choices":[{"delta":{"finish_reason":"tool_calls"}}]}),
+        serde_json::json!({"choices":[{"message":{"finish_reason":"tool_calls"}}]}),
+    ] {
+        assert!(AuditHold::is_audit_due_event(Chat, &v));
+    }
+    assert!(!AuditHold::is_audit_due_event(
+        Chat,
+        &serde_json::json!({"choices":[{"finish_reason":""}]})
+    ));
+    assert!(!AuditHold::is_audit_due_event(
+        Chat,
+        &serde_json::json!({"choices":[]})
+    ));
+}
+
+#[test]
+fn chat_tool_calls_not_global_complete() {
+    // RED-5：仅 tool_calls 时全局完成未置位，后续分片照常累积入槽。
+    let mut hold = AuditHold::new(1024);
+    hold.push_fragment(0, Some("c0"), Some("run"), "{\"cmd\":\"echo ");
+    let tc = serde_json::json!({"choices":[{"index":0,"finish_reason":"tool_calls"}]});
+    if AuditHold::is_complete_event(&tc) {
+        hold.mark_completed();
+    }
+    assert!(hold.held(), "tool_calls 不得置全局完成");
+    assert_eq!(
+        hold.push_fragment(0, None, None, "rm -rf /\"}"),
+        HoldVerdict::Approved,
+        "晚到分片须照常累积"
+    );
+    assert_eq!(hold.accumulated(0), Some("{\"cmd\":\"echo rm -rf /\"}"));
+}
+
+#[test]
+fn responses_done_bytes_dedup() {
+    // RED-6：`.done` 完整参数不得与已累积分片双计 `total_bytes`。
+    let mut hold = AuditHold::new(16);
+    let key = AuditHold::responses_key(Some("item-d"), 0);
+    assert_eq!(
+        hold.push_responses_fragment(&key, 0, None, Some("item-d"), Some("run"), "01234568"),
+        HoldVerdict::Approved
+    );
+    assert_eq!(
+        hold.push_responses_fragment(&key, 0, None, None, None, "9abcdef"),
+        HoldVerdict::Approved
+    );
+    assert_eq!(hold.total_bytes, 15, "分片累计 15 字节");
+    hold.mark_responses_done(&key, Some("012345689abcdef"));
+    assert_eq!(hold.total_bytes, 15, "done 去重后仍只计一次");
+    assert!(!hold.is_rejected(), "去重不得误判溢出");
+}
+
+#[test]
+fn responses_dedup_keeps_audit_verdict() {
+    // RED-6：去重不改变 `tool_triples` 参数文本与审计结论。
+    let mut hold = AuditHold::new(1024);
+    let key = AuditHold::responses_key(Some("i"), 0);
+    hold.push_responses_fragment(&key, 0, None, Some("i"), Some("exec"), "{\"command\":\"rm ");
+    hold.push_responses_fragment(&key, 0, None, None, None, "-rf /\"}");
+    hold.mark_responses_done(&key, Some("{\"command\":\"rm -rf /\"}"));
+    let triples = hold.tool_triples();
+    assert_eq!(triples.len(), 1);
+    assert_eq!(triples[0].1, "exec");
+    assert_eq!(triples[0].2, "{\"command\":\"rm -rf /\"}");
 }

@@ -31,6 +31,24 @@ fn credential_headers(headers: &HeaderMap) -> CredentialHeaders {
     )
 }
 
+/// 写端点三因子守卫入口（`AUTH-1`/`AUTH-3`）：把头凭证与 DTO 的 `auth`/`secret`
+/// 归拢为 [`CredentialBody`] 后委派 [`service::verify_three_factor_write`]；三处写端点
+/// （`/approve-hash-change`、`/register-caller`、`/revoke`）与 `/credential` 同源，
+/// 且额外要求部署密钥已配置（`AUTH-11`，fail-closed；读路径不受影响）。
+async fn require_three_factor(
+    state: &AppState,
+    headers: &HeaderMap,
+    auth: Option<&service::AuthBlock>,
+    secret: Option<&str>,
+) -> Result<()> {
+    let body = CredentialBody {
+        secret: secret.map(str::to_string),
+        auth: auth.cloned(),
+        ..CredentialBody::default()
+    };
+    service::verify_three_factor_write(state, &credential_headers(headers), &body).await
+}
+
 pub async fn credential_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -77,6 +95,10 @@ pub struct RegisterBody {
     pub allow_mode: Option<String>,
     #[serde(default)]
     pub auto: Option<bool>,
+    #[serde(default)]
+    pub auth: Option<service::AuthBlock>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// Go 加性兼容（`veil-hardening` 5.x 网关侧补齐）：推导非空 `reg_id`。
@@ -102,6 +124,7 @@ pub async fn register_caller_handler(
     headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> Result<Json<Value>> {
+    require_three_factor(&state, &headers, body.auth.as_ref(), body.secret.as_deref()).await?;
     let source = body
         .source
         .clone()
@@ -157,6 +180,10 @@ pub struct RevokeBody {
     pub caller_hash: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub auth: Option<service::AuthBlock>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 fn revoke_key(body: &RevokeBody) -> Result<String> {
@@ -173,8 +200,10 @@ fn revoke_key(body: &RevokeBody) -> Result<String> {
 
 pub async fn revoke_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<RevokeBody>,
 ) -> Result<Json<Value>> {
+    require_three_factor(&state, &headers, body.auth.as_ref(), body.secret.as_deref()).await?;
     let view = service::revoke_caller_with_approval(&state, &revoke_key(&body)?).await?;
     Ok(Json(json!({ "ok": true, "registration": view })))
 }
@@ -189,8 +218,6 @@ pub struct EmergencyRevokeBody {
     pub caller_hash: Option<String>,
     #[serde(default)]
     pub admin_token: Option<String>,
-    #[serde(default)]
-    pub file_present: bool,
 }
 
 pub async fn emergency_revoke_handler(
@@ -204,6 +231,8 @@ pub async fn emergency_revoke_handler(
         caller_path: body.caller_path.clone(),
         caller_hash: body.caller_hash.clone(),
         name: None,
+        auth: None,
+        secret: None,
     })?;
     let admin_token = body
         .admin_token
@@ -212,14 +241,8 @@ pub async fn emergency_revoke_handler(
     // 安全契约（security-compat-fix）：紧急吊销只认 TCP 远端 `ConnectInfo`，
     // MUST NOT 回退 `X-Forwarded-For` 等代理头（伪造头可绕过内网豁免）。
     let peer_ip = peer.0.map(|ip| ip.to_string());
-    let view = service::emergency_revoke(
-        &state,
-        &key,
-        admin_token.as_deref(),
-        peer_ip.as_deref(),
-        body.file_present,
-    )
-    .await?;
+    let view =
+        service::emergency_revoke(&state, &key, admin_token.as_deref(), peer_ip.as_deref()).await?;
     Ok(Json(json!({ "ok": true, "registration": view })))
 }
 
@@ -233,12 +256,18 @@ pub struct ApproveHashChangeBody {
     pub reaction: Option<String>,
     #[serde(default)]
     pub new_hash: String,
+    #[serde(default)]
+    pub auth: Option<service::AuthBlock>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 pub async fn approve_hash_change_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<ApproveHashChangeBody>,
 ) -> Result<Json<Value>> {
+    require_three_factor(&state, &headers, body.auth.as_ref(), body.secret.as_deref()).await?;
     // C3/D3：`reg_id` 优先，缺省回退 `caller_path`；`reaction` 缺省按保持自动，
     // 未知非空值返回 400（对标 Python 显式校验）。
     let key = if body.reg_id.trim().is_empty() {
@@ -255,269 +284,4 @@ pub async fn approve_hash_change_handler(
 }
 
 #[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        crate::{
-            config::Config,
-            service,
-            state::{AppState, SqliteOutcome},
-        },
-        axum::{
-            Json,
-            extract::State,
-            http::{HeaderMap, StatusCode},
-        },
-        std::{collections::HashMap, path::PathBuf},
-    };
-
-    fn revoke_test_state() -> AppState {
-        let env = HashMap::from([
-            (
-                "HOMESERVER".to_string(),
-                "https://matrix.example.com".to_string(),
-            ),
-            ("ROOM_ID".to_string(), "!r:example.com".to_string()),
-            ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
-            (
-                "OBSERVABILITY_ADMIN_TOKEN".to_string(),
-                "observability-admin-token-0123456789".to_string(),
-            ),
-            ("CREDENTIAL_BLOCK_WAIT".to_string(), "1".to_string()),
-            (
-                "APPROVAL_WHITELIST".to_string(),
-                "@admin:example.com".to_string(),
-            ),
-        ]);
-        service::credential::test_support::inject_sink(
-            AppState::new(
-                Config::load_from(&env).unwrap(),
-                SqliteOutcome {
-                    sqlite_ok: true,
-                    sqlite_error: None,
-                    db_path: PathBuf::from("/tmp/x.sqlite"),
-                },
-            ),
-            service::credential::test_support::InjectSink::success(),
-        )
-    }
-
-    async fn wait_event_id(state: &AppState) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let ids = state.approval.pending_event_ids().await;
-                if let Some(id) = ids.into_iter().next() {
-                    return id;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("审批建单超时")
-    }
-
-    fn revoke_body(key: &str) -> Json<EmergencyRevokeBody> {
-        Json(EmergencyRevokeBody {
-            key: Some(key.to_string()),
-            caller_path: None,
-            caller_hash: None,
-            admin_token: None,
-            file_present: false,
-        })
-    }
-
-    #[tokio::test]
-    async fn register_caller_handler_response_carries_nonempty_reg_id_and_legacy_fields() {
-        // GO：`/register-caller` 加性超集——新增非空 `reg_id`（脚本哈希回显），
-        // 既有 `ok`/`registration`/`name`/`script_path`/`script_hash`/`entries`/`allow_mode` 不删。
-        let state = revoke_test_state();
-        let body = Json(RegisterBody {
-            caller_path: "/srv/reg-id.sh".to_string(),
-            caller_hash: "h-reg-id-1".to_string(),
-            source: Some("go-client".to_string()),
-            name: "reg-id-job".to_string(),
-            description: String::new(),
-            entries: Some(json!({"网易": ["授权码"]})),
-            entry: None,
-            fields: None,
-            field: None,
-            allow_mode: Some("true".to_string()),
-            auto: None,
-        });
-        let worker = state.clone();
-        let request = tokio::spawn(async move {
-            register_caller_handler(State(worker), HeaderMap::new(), body).await
-        });
-        let event_id = wait_event_id(&state).await;
-        state
-            .approval
-            .resolve(&event_id, "@admin:example.com", true)
-            .await;
-        let Json(resp) = request.await.unwrap().unwrap();
-        let reg_id = resp["reg_id"].as_str().unwrap_or("");
-        assert!(!reg_id.is_empty(), "reg_id 须非空: {resp}");
-        assert_eq!(reg_id, "h-reg-id-1", "reg_id 须稳定可取（脚本哈希回显）");
-        assert_eq!(resp["ok"], true);
-        let registration = &resp["registration"];
-        assert_eq!(registration["caller_path"], "/srv/reg-id.sh");
-        assert_eq!(resp["name"], "reg-id-job");
-        assert_eq!(resp["script_path"], "/srv/reg-id.sh");
-        assert_eq!(resp["script_hash"], "h-reg-id-1");
-        assert_eq!(resp["entries"]["网易"][0], "授权码");
-        assert_eq!(resp["allow_mode"], "true");
-    }
-
-    #[tokio::test]
-    async fn forged_proxy_headers_do_not_bypass_revoke_check() {
-        // 内网豁免只认 TCP 远端：公网对端携带伪造内网 XFF 仍转审批，不直接吊销。
-        let state = revoke_test_state();
-        service::register_caller(&state, "/s/xff.sh", "h-xff", "src-xff")
-            .await
-            .unwrap();
-        let mut forged = HeaderMap::new();
-        forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
-        let err = emergency_revoke_handler(
-            State(state.clone()),
-            PeerIp(Some("203.0.113.9".parse().unwrap())),
-            forged,
-            revoke_body("/s/xff.sh"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::ACCEPTED);
-        // 回环 TCP 对端无头时豁免路径仍可用。
-        let ok = emergency_revoke_handler(
-            State(state),
-            PeerIp(Some("127.0.0.1".parse().unwrap())),
-            HeaderMap::new(),
-            revoke_body("/s/xff.sh"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(ok.0["ok"], true);
-    }
-
-    #[tokio::test]
-    async fn emergency_revoke_network_ranges() {
-        // C13/D13：保留现有内网网段 + file_present 放行，只认 TCP 远端。
-        let state = revoke_test_state();
-        service::register_caller(&state, "/s/net.sh", "h-net", "src-net")
-            .await
-            .unwrap();
-        let private = [
-            "127.0.0.1",
-            "::1",
-            "10.1.2.3",
-            "172.20.0.1",
-            "192.168.0.5",
-            "169.254.10.20",
-            "100.64.0.1",
-            "fd00::1",
-            "fe80::1",
-        ];
-        assert!(
-            crate::auth::is_private_ip("localhost"),
-            "localhost 须判内网"
-        );
-        for ip in private {
-            assert!(crate::auth::is_private_ip(ip), "{ip} 须判内网");
-            let peer: std::net::IpAddr = ip.parse().unwrap();
-            let Json(resp) = emergency_revoke_handler(
-                State(state.clone()),
-                PeerIp(Some(peer)),
-                HeaderMap::new(),
-                revoke_body("/s/net.sh"),
-            )
-            .await
-            .unwrap();
-            assert_eq!(resp["ok"], true, "{ip} 须直接吊销（内网豁免）");
-        }
-        // 公网来源转常规审批（202），不直接吊销。
-        let public: std::net::IpAddr = "203.0.113.9".parse().unwrap();
-        let err = emergency_revoke_handler(
-            State(state.clone()),
-            PeerIp(Some(public)),
-            HeaderMap::new(),
-            revoke_body("/s/net.sh"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::ACCEPTED, "公网须转审批");
-        // 伪造内网 X-Forwarded-For 不改变 TCP 远端判定，仍转审批。
-        let mut forged = HeaderMap::new();
-        forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
-        let err = emergency_revoke_handler(
-            State(state),
-            PeerIp(Some(public)),
-            forged,
-            revoke_body("/s/net.sh"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::ACCEPTED, "XFF 伪造无效");
-    }
-
-    #[tokio::test]
-    async fn approve_hash_change_handler_contract() {
-        // C3/D3：缺 `reg_id`/`reaction` 按 `caller_path` + 保持自动落定并返回成功。
-        let state = revoke_test_state();
-        service::register_caller(&state, "/s/contract.sh", "c-old", "src-contract")
-            .await
-            .unwrap();
-        let Json(resp) = approve_hash_change_handler(
-            State(state.clone()),
-            Json(ApproveHashChangeBody {
-                caller_path: "/s/contract.sh".to_string(),
-                reg_id: String::new(),
-                reaction: None,
-                new_hash: "c-new".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp["ok"], true);
-        {
-            let registry = state.registry.read().await;
-            let e = registry.lookup_by_path("/s/contract.sh").unwrap();
-            assert_eq!(e.expected_hash, "c-new");
-            assert!(e.enabled && !e.revoked, "缺省 reaction 按保持自动并激活");
-            assert_eq!(e.allow_mode, None, "缺省 reaction 不得改动 allow_mode");
-        }
-        // `reg_id`（哈希）可定位：显式 `✅` 降级人工。
-        let Json(resp2) = approve_hash_change_handler(
-            State(state.clone()),
-            Json(ApproveHashChangeBody {
-                caller_path: String::new(),
-                reg_id: "c-new".to_string(),
-                reaction: Some("✅".to_string()),
-                new_hash: "c-next".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp2["ok"], true);
-        {
-            let registry = state.registry.read().await;
-            let e = registry.lookup_by_path("/s/contract.sh").unwrap();
-            assert_eq!(e.expected_hash, "c-next");
-            assert_eq!(
-                e.allow_mode,
-                Some(crate::config::AutoApprove::Pending),
-                "✅ 须降级人工"
-            );
-        }
-        // 未知 reaction 仍 400（不弱化显式校验）。
-        let err = approve_hash_change_handler(
-            State(state),
-            Json(ApproveHashChangeBody {
-                caller_path: "/s/contract.sh".to_string(),
-                reg_id: String::new(),
-                reaction: Some("👍".to_string()),
-                new_hash: "c-x".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
-    }
-}
+mod tests;

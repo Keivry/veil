@@ -36,7 +36,7 @@ use {
         response::{IntoResponse, Response},
     },
     serde_json::Value,
-    std::{path::PathBuf, sync::Arc, time::Instant},
+    std::{sync::Arc, time::Instant},
 };
 
 /// 2.2 `nonstream` 一发一收的上下文：显式传入的请求级依赖快照。
@@ -53,10 +53,11 @@ pub struct NonstreamCtx {
     pub sqlite_precise: bool,
     pub req_start: Instant,
     pub audit_mode: AuditMode,
-    pub audit_policy_file: Option<PathBuf>,
+    /// `POL-1`/D1：启动期注入的共享策略实例（请求路径零读盘、零 env 快照）。
+    pub audit_policy: Arc<AuditPolicy>,
     /// T1/P2-1：非流审计白名单（与流式 `StreamPumpCtx.approval_whitelist` 同口径，
     /// `AUDIT_MODE=approve` 空白名单降级 block；生产非空由启动门禁保证，
-    /// 见 `src/config/env_parse.rs:307-310`）。
+    /// 见 `src/config/env_parse.rs:469-478` 与 `src/main.rs:45`）。
     pub approval_whitelist: Vec<String>,
     /// A1/D1：审计落盘单例（verdict 命中/放行经 `spawn_blocking` 写 JSONL）。
     pub audit_sink: Arc<crate::service::audit::AuditSink>,
@@ -136,18 +137,29 @@ pub async fn serve_nonstream(
     // T4/D4：无 `content-length`/分块场景改用有界累计读取，累计超限即停读并 502；
     // `status>=400` 错误体维持既有全量透传语义（不受上限改写）。
     let bytes = if status_u16 < 400 {
-        match read_bounded_body(up, ctx.nonstream_max_bytes).await {
+        match read_bounded_body(up, ctx.nonstream_max_bytes, &ctx.gateway_metrics).await {
             BoundedBody::Complete(b) => b,
             BoundedBody::Oversize => {
                 return NonstreamOutcome::Responded(oversize_response(ctx.protocol));
             }
         }
     } else {
-        up.bytes().await.unwrap_or_default().to_vec()
+        match up.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    read_bytes = 0usize,
+                    "上游错误响应体读取失败，退化为空体透传"
+                );
+                ctx.gateway_metrics.record_upstream_read_error();
+                Vec::new()
+            }
+        }
     };
     let is_json = serde_json::from_slice::<Value>(&bytes).is_ok();
     // F2/D2：先定空体分类（对齐 Python 先算 `_is_empty`），再判超限
-    // （严格 `len > cap`，体形态对齐 `_llm.py:2942`），最后才落空体 502：
+    // （严格 `len > cap`，体形态对齐 `_llm.py:2951-2961`），最后才落空体 502：
     // 空体 len=0 恒不超限，非 JSON 超限体不落空体分支（与 Python 可观测结果一致）。
     // 精化：超限仅对非错误状态（`status < 400`）生效——4xx/5xx 错误体按 N2/D6
     // 语义透传或走完整链，不因体大被改写为 502。超限动作已由上方有界读取前置，
@@ -170,8 +182,6 @@ pub async fn serve_nonstream(
             ts_secs: now_secs(),
         });
         // 非流 tool 提取 + 审计（§2.3）：阻断时返回协议正确的 block 体代替上游响应。
-        // H3/D3：运行时加载并捕获进程 env 快照（判定纯逻辑零 env 直读）。
-        let audit_policy = AuditPolicy::load_for_runtime(ctx.audit_policy_file.as_deref());
         // A1/D1：非流逐 tool verdict 命中/放行经单例落盘（与流式同口径；
         // `Block` 即止，与紧随的 `evaluate_nonstream` 决策一致）。
         if !matches!(ctx.audit_mode, AuditMode::Off) {
@@ -184,7 +194,7 @@ pub async fn serve_nonstream(
                         ctx.audit_mode,
                         name,
                         &call.args,
-                        &audit_policy,
+                        &ctx.audit_policy,
                         &ctx.approval_whitelist,
                         Some(proto),
                     )
@@ -202,7 +212,7 @@ pub async fn serve_nonstream(
             ctx.protocol,
             &v,
             ctx.audit_mode,
-            &audit_policy,
+            &ctx.audit_policy,
             &conv_id,
             &ctx.approval_whitelist,
             &ctx.pending,
@@ -316,12 +326,11 @@ pub async fn serve_nondialog_passthrough(
     passthrough_upstream_response(up, metrics)
 }
 
-/// H11/D11：NonDialog 透传响应装配（计数 + hop 过滤 + 字节流），供专用入口与
-/// `serve_nonstream` 的 `is_passthrough` 兼容分支单一复用。
-fn passthrough_upstream_response(up: reqwest::Response, metrics: &GatewayMetrics) -> Response {
-    metrics.record_nondialog_passthrough();
-    let status = StatusCode::from_u16(up.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut builder = Response::builder().status(status);
+/// ARC-4/D4：上游响应头克隆 + 逐跳过滤单一 helper——downstream 方向克隆上游头，
+/// 按 `downstream_decode_enabled` 做解码配对剥头并记 `hop_filtered_total`。
+/// `passthrough_upstream_response` 与 `snapshot_downstream_headers` 共用本 helper；
+/// 调用方各自保留 `x-veil-*` 剔除与响应装配职责。
+fn clone_upstream_headers(up: &reqwest::Response, metrics: &GatewayMetrics) -> HeaderMap {
     let mut resp_headers = HeaderMap::new();
     for (k, v) in up.headers().iter() {
         if let (Ok(n), Ok(val)) = (
@@ -341,6 +350,16 @@ fn passthrough_upstream_response(up: reqwest::Response, metrics: &GatewayMetrics
         decode_enabled,
         Some(metrics),
     );
+    resp_headers
+}
+
+/// H11/D11：NonDialog 透传响应装配（计数 + hop 过滤 + 字节流），供专用入口与
+/// `serve_nonstream` 的 `is_passthrough` 兼容分支单一复用。
+fn passthrough_upstream_response(up: reqwest::Response, metrics: &GatewayMetrics) -> Response {
+    metrics.record_nondialog_passthrough();
+    let status = StatusCode::from_u16(up.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    let resp_headers = clone_upstream_headers(&up, metrics);
     for (k, v) in resp_headers.iter() {
         builder = builder.header(k, v);
     }
@@ -350,15 +369,18 @@ fn passthrough_upstream_response(up: reqwest::Response, metrics: &GatewayMetrics
 }
 
 /// T4/D4：非流响应体有界读取结果——完整体或累计超限（调用方转 502）。
-enum BoundedBody {
+pub(super) enum BoundedBody {
     Complete(Vec<u8>),
     Oversize,
 }
 
 /// T4/D4：以 `chunk()` 有界累计读取上游 body，累计超过 `cap` 立即停止并返回
-/// `Oversize`（不先全量缓存）；读取错误与既有 `up.bytes().await.unwrap_or_default()`
-/// 同口径退化为空体，交空体分类处置。
-async fn read_bounded_body(mut up: reqwest::Response, cap: usize) -> BoundedBody {
+/// `Oversize`（不先全量缓存）；读取错误记 warn + 指标后退化为空体，交空体分类处置。
+pub(super) async fn read_bounded_body(
+    mut up: reqwest::Response,
+    cap: usize,
+    metrics: &GatewayMetrics,
+) -> BoundedBody {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         match up.chunk().await {
@@ -369,7 +391,15 @@ async fn read_bounded_body(mut up: reqwest::Response, cap: usize) -> BoundedBody
                 buf.extend_from_slice(&chunk);
             }
             Ok(None) => return BoundedBody::Complete(buf),
-            Err(_) => return BoundedBody::Complete(Vec::new()),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    read_bytes = buf.len(),
+                    "上游响应体读取失败，退化为空体"
+                );
+                metrics.record_upstream_read_error();
+                return BoundedBody::Complete(Vec::new());
+            }
         }
     }
 }
@@ -386,22 +416,7 @@ fn retry_stripped(restored: &str) -> Option<String> {
 /// T2/D2：消费上游 body 前快照响应头，经逐跳过滤后剥除上游 `x-veil-*`
 /// （网关自有同名头在转发后覆盖写入，上游声明不得生效）。
 fn snapshot_downstream_headers(up: &reqwest::Response, metrics: &GatewayMetrics) -> HeaderMap {
-    let mut resp_headers = HeaderMap::new();
-    for (k, v) in up.headers().iter() {
-        if let (Ok(n), Ok(val)) = (
-            k.to_string().parse::<axum::http::HeaderName>(),
-            axum::http::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            resp_headers.insert(n, val);
-        }
-    }
-    let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
-    llm_gateway::filter_hop_headers_counted(
-        &mut resp_headers,
-        "downstream",
-        decode_enabled,
-        Some(metrics),
-    );
+    let mut resp_headers = clone_upstream_headers(up, metrics);
     let veil_keys: Vec<axum::http::HeaderName> = resp_headers
         .keys()
         .filter(|k| k.as_str().starts_with("x-veil-"))
@@ -441,7 +456,7 @@ fn build_downstream_response(
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
 }
 
-/// F2：对话非流响应体超限 502（体形态与 Python `_llm.py:2942` 同字）。
+/// F2：对话非流响应体超限 502（体形态与 Python `_llm.py:2951-2961` 同字）。
 /// `S6` 复用：流式上游非 SSE/错误体同样受 `NONSTREAM_MAX_BYTES` 约束。
 pub(crate) fn oversize_response(protocol: Protocol) -> Response {
     with_protocol_header(
@@ -458,3 +473,6 @@ pub(crate) fn oversize_response(protocol: Protocol) -> Response {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod read_error_tests;

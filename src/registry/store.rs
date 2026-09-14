@@ -290,7 +290,11 @@ impl CallerRegistry {
         // （内容相同双脚本可各自注册）；判重仍按 `caller_path` 与未吊销 `name`——
         // path 已存在直接拒绝；`name` 非空且与任一未吊销条目重名亦拒绝
         // （`C5`/D5，已吊销条目释放其名以允许复用）。
-        if self.entries.contains_key(caller_path) {
+        // `AUTH-7`：仅对**未吊销**条目拒绝重路径；已吊销路径允许复用（与已释放 `name` 语义一致），
+        // 重注册条目按下方全新初始化（`enabled=false`/`revoked=false`/无旧哈希宽限）。
+        if let Some(existing) = self.entries.get(caller_path)
+            && !existing.revoked
+        {
             return Err(VeilError::Conflict {
                 message: format!("调用方已注册: {caller_path}"),
             });
@@ -321,6 +325,11 @@ impl CallerRegistry {
             .ok_or_else(|| VeilError::Storage {
                 message: "注册表写入后回读失败".to_string(),
             })
+    }
+
+    /// `AUTH-6` 回滚：删除指定 `caller_path` 条目并返回之（注册审批建单/发送失败原子回滚用）。
+    pub fn remove_entry(&mut self, caller_path: &str) -> Option<CallerEntry> {
+        self.entries.remove(caller_path)
     }
 
     pub fn revoke(&mut self, key: &str) -> Result<&CallerEntry> {

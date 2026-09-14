@@ -41,6 +41,7 @@ IGNORE_MARKER = "<!-- doc-paths-ignore -->"
 _ARCHIVED_HISTORY = "目标 change 已归档（canonical 在位），历史记录，其他 change 目录禁改"
 _ARCHIVED_HARDENING_REF = "veil-hardening 归档后其 change-local admin-ratelimit-contract spec 引用（历史/情景文本），canonical 已在位"
 _ARCHIVED_SELF_REF = "2026-09-13 归档后其 change-local spec 引用（历史/情景文本），canonical 已在位"
+_ARCHIVED_SELF_REF_0914 = "2026-09-14 归档后其 change-local spec 引用（历史/情景文本），canonical 已在位"
 
 # 已知悬空引用登记表，键为（引用所在文件相对路径，引用原文）。
 # 仅登记历史/情景性悬空引用（其他 change 目录、归档 change、canonical 中的旧 change-local 路径）；打印 PENDING
@@ -90,6 +91,26 @@ PENDING_REFS: dict[tuple[str, str], str] = {
         "openspec/changes/archive/2026-09-13-veil-stream-fidelity-fix/proposal.md",
         "openspec/changes/veil-stream-fidelity-fix/specs/stream-fidelity-fix/spec.md",
     ): _ARCHIVED_SELF_REF,
+    (
+        "openspec/changes/archive/2026-09-14-veil-audit-policy-enforcement/tasks.md",
+        "openspec/changes/veil-audit-policy-enforcement/specs/audit-policy-enforcement/spec.md",
+    ): _ARCHIVED_SELF_REF_0914,
+    (
+        "openspec/changes/archive/2026-09-14-veil-credential-auth-hardening/proposal.md",
+        "openspec/changes/veil-credential-auth-hardening/specs/credential-auth-hardening/spec.md",
+    ): _ARCHIVED_SELF_REF_0914,
+    (
+        "openspec/changes/archive/2026-09-14-veil-credential-auth-hardening/tasks.md",
+        "openspec/changes/veil-credential-auth-hardening/specs/credential-auth-hardening/spec.md",
+    ): _ARCHIVED_SELF_REF_0914,
+    (
+        "openspec/changes/archive/2026-09-14-veil-gateway-transport-fidelity/proposal.md",
+        "openspec/changes/veil-gateway-transport-fidelity/specs/gateway-transport-fidelity/spec.md",
+    ): _ARCHIVED_SELF_REF_0914,
+    (
+        "openspec/changes/archive/2026-09-14-veil-redaction-audit-coverage/proposal.md",
+        "openspec/changes/veil-redaction-audit-coverage/specs/redaction-audit-coverage/spec.md",
+    ): _ARCHIVED_SELF_REF_0914,
 }
 
 

@@ -37,12 +37,14 @@ pub fn chat_block_frames(reason: &str) -> Vec<String> {
     ]
 }
 
-pub fn anthropic_block_frames(reason: &str) -> Vec<String> {
+pub fn anthropic_block_frames(reason: &str, index: u32) -> Vec<String> {
     vec![
         format!(
-            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"[blocked: {reason}]\"}}}}\n\n"
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"[blocked: {reason}]\"}}}}\n\n"
         ),
-        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        format!(
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
+        ),
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n".to_string(),
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ]
@@ -68,16 +70,24 @@ pub fn responses_truncated_frames(response_id: &str) -> Vec<String> {
     responses_sequence(response_id, text, false)
 }
 
-/// P4/D4 + D5：`type:"error"` 单帧合成——`response.failed` 单帧携带上游
+/// P4/D4 + D5 + TRN-2：`type:"error"` 单帧合成——`response.failed` 单帧携带上游
 /// error 诊断对象（`code`/`type`/`param`/`message` 存在即保留；`None` 时保持
-/// 既有 `{"id","status"}` 形态，不带 error 字段）；不注入
+/// 既有 `{"id","status"}` 形态，不带 error 字段）；`sequence_number` 可得时写入
+/// 载荷顶层（对齐官方 `ResponseErrorEvent`）；不注入
 /// `output_index`/`output_item.*` 序列，不与已流出 item 冲突。
-pub fn responses_failed_frame(response_id: &str, error: Option<&Value>) -> String {
+pub fn responses_failed_frame(
+    response_id: &str,
+    error: Option<&Value>,
+    sequence_number: Option<u64>,
+) -> String {
     let mut response = serde_json::json!({"id": response_id, "status": "failed"});
     if let Some(err) = error {
         response["error"] = err.clone();
     }
-    let payload = serde_json::json!({"type": "response.failed", "response": response});
+    let mut payload = serde_json::json!({"type": "response.failed", "response": response});
+    if let Some(seq) = sequence_number {
+        payload["sequence_number"] = serde_json::json!(seq);
+    }
     format!("event: response.failed\ndata: {payload}\n\n")
 }
 
@@ -300,6 +310,7 @@ pub fn synthesize_truncation(protocol: GatewayProtocol, conv_id: &str) -> Vec<St
         GatewayProtocol::Responses => vec![responses_failed_frame(
             conv_id,
             Some(&serde_json::json!({"message": "truncated"})),
+            None,
         )],
         GatewayProtocol::Chat | GatewayProtocol::Anthropic | GatewayProtocol::NonDialog => {
             vec![]

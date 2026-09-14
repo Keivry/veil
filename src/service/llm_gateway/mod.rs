@@ -102,6 +102,10 @@ pub struct GatewayMetrics {
     restore_fallback: AtomicU64,
     /// E8：Responses/Anthropic 终止判定 JSON 解析失败回退 contains 的次数。
     terminal_fallback: AtomicU64,
+    /// RUN-2：管理面限流条目超上限被驱逐的累计次数。
+    admin_rate_evicted: AtomicU64,
+    /// RUN-4：上游响应体读取失败（`chunk()`/`bytes()` 报错）的累计次数。
+    upstream_read_errors: AtomicU64,
 }
 
 impl Default for GatewayMetrics {
@@ -117,6 +121,8 @@ impl Default for GatewayMetrics {
             nondialog_passthrough: AtomicU64::new(0),
             restore_fallback: AtomicU64::new(0),
             terminal_fallback: AtomicU64::new(0),
+            admin_rate_evicted: AtomicU64::new(0),
+            upstream_read_errors: AtomicU64::new(0),
         }
     }
 }
@@ -174,6 +180,22 @@ impl GatewayMetrics {
     pub fn record_restore_fallback(&self) { self.restore_fallback.fetch_add(1, Ordering::Relaxed); }
 
     pub fn restore_fallback_count(&self) -> u64 { self.restore_fallback.load(Ordering::Relaxed) }
+
+    pub fn record_admin_rate_evicted(&self, n: u64) {
+        self.admin_rate_evicted.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn admin_rate_evicted_count(&self) -> u64 {
+        self.admin_rate_evicted.load(Ordering::Relaxed)
+    }
+
+    pub fn record_upstream_read_error(&self) {
+        self.upstream_read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn upstream_read_error_count(&self) -> u64 {
+        self.upstream_read_errors.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,13 +301,7 @@ pub async fn fetch_upstream_with_retry(
 }
 
 pub use {
-    hop::{
-        DECODE_ENABLED,
-        HOP_HEADERS,
-        downstream_decode_enabled,
-        filter_hop_headers,
-        filter_hop_headers_counted,
-    },
+    hop::{DECODE_ENABLED, HOP_HEADERS, downstream_decode_enabled, filter_hop_headers_counted},
     placeholder::{
         has_placeholder_tokens,
         inject_placeholder_prompt,
@@ -683,5 +699,29 @@ mod tests {
         assert_eq!(m.conv_missing_count("failed"), TASKS * PER_TASK);
         assert_eq!(m.hop_filtered_count("downstream"), 0, "方向隔离");
         assert_eq!(m.truncated_count("synthesized_failed"), 0, "模式隔离");
+    }
+
+    #[test]
+    fn admin_rate_evicted_counter_accumulates() {
+        let m = GatewayMetrics::default();
+        assert_eq!(m.admin_rate_evicted_count(), 0);
+        m.record_admin_rate_evicted(3);
+        m.record_admin_rate_evicted(1);
+        assert_eq!(m.admin_rate_evicted_count(), 4);
+        m.record_admin_rate_evicted(0);
+        assert_eq!(m.admin_rate_evicted_count(), 4, "零驱逐不递增");
+    }
+
+    #[test]
+    fn upstream_read_error_counter_accumulates() {
+        let m = GatewayMetrics::default();
+        assert_eq!(m.upstream_read_error_count(), 0);
+        m.record_upstream_read_error();
+        assert_eq!(m.upstream_read_error_count(), 1, "一次失败递增 1");
+        m.record_nondialog_passthrough();
+        m.add_sse_event();
+        assert_eq!(m.upstream_read_error_count(), 1, "成功路径不递增");
+        m.record_upstream_read_error();
+        assert_eq!(m.upstream_read_error_count(), 2);
     }
 }

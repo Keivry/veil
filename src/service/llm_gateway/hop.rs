@@ -27,11 +27,6 @@ pub fn downstream_decode_enabled(response_headers: &HeaderMap) -> bool {
     DECODE_ENABLED && !response_headers.contains_key("content-encoding")
 }
 
-/// 兼容旧单参调用：默认按响应方向计数（`dir="downstream"`），解码配对按 [`DECODE_ENABLED`]。
-pub fn filter_hop_headers(headers: &mut HeaderMap) {
-    filter_hop_headers_counted(headers, "downstream", DECODE_ENABLED, None);
-}
-
 /// FIX-1 全集双向过滤 + 编解码配对。
 /// - 先剥 hop 全集（含 `Connection` 动态项），再做编码改写（顺序固定）；
 /// - `decode_enabled=true` 时剥 `content-encoding`/`content-length`（已解码，长度已变）；

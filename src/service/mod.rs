@@ -129,7 +129,7 @@ mod declaration_lock {
                     }
                 }
                 // 未登记写路径守护：写点数量须与登记数一致（新增写路径需登记）。
-                const REGISTERED_WRITE_SITES: usize = 4;
+                const REGISTERED_WRITE_SITES: usize = 5;
                 let n = src.matches("registry().write().await").count();
                 if n != REGISTERED_WRITE_SITES {
                     out.push(format!(

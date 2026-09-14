@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn anthropic_four_part_termination_order_locked() {
-        let frames = ensure_event_lines(anthropic_block_frames("policy"));
+        let frames = ensure_event_lines(anthropic_block_frames("policy", 0));
         let joined = frames.join("");
         for key in [
             "content_block_start",
@@ -184,9 +184,12 @@ mod tests {
         let joined = chat_frames.join("");
         assert!(!joined.contains("response.completed"));
         assert!(joined.contains("[blocked: truncated]"));
-        let anth_frames = ensure_event_lines(anthropic_block_frames("truncated"));
+        let anth_frames = ensure_event_lines(anthropic_block_frames("truncated", 0));
         let joined_a = anth_frames.join("");
-        assert!(!joined_a.contains("message_stop") || joined_a.contains("truncated"));
+        assert!(
+            joined_a.contains("message_stop"),
+            "anthropic 阻断帧须含终端 `message_stop`（不依赖理由文案）: {joined_a:?}"
+        );
         assert!(terminal_count(&chat_frames, "chat") == 1);
     }
 
@@ -461,7 +464,8 @@ mod tests {
     #[test]
     fn approve_empty_whitelist_direct_call_downgrades_to_block() {
         // T4.2/D2：approve + 空白名单直调 → Block 降级（与流式同口径）。
-        // 生产不可达：启动门禁拒绝 approve 空白名单（`src/config/env_parse.rs:307-310`），
+        // 生产不可达：启动门禁拒绝 approve 空白名单（`src/config/env_parse.rs:469-478`
+        // 的 `validate_approve_whitelist` 与 `src/main.rs:45` 的 `preflight_whitelist`），
         // 本用例锁定降级语义本身。
         use {
             super::super::{audit::AuditPolicy, llm_gateway::Protocol},
@@ -551,5 +555,49 @@ mod tests {
         assert!(resp.join("").contains("response.failed"));
         assert!(!resp.join("").contains("response.completed"));
         assert!(empty_stream_frames("passthrough", "x").is_empty());
+    }
+
+    #[test]
+    fn anthropic_block_frame_real_index() {
+        // TRN-6：阻断帧使用真实 block index，未知才回退 0。
+        let frames = ensure_event_lines(anthropic_block_frames("audit", 2));
+        let mut saw_start = false;
+        let mut saw_stop = false;
+        for f in &frames {
+            for line in f.lines().filter_map(|l| l.strip_prefix("data: ")) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("content_block_start") => {
+                        assert_eq!(v["index"], 2, "start index 须为真实值");
+                        saw_start = true;
+                    }
+                    Some("content_block_stop") => {
+                        assert_eq!(v["index"], 2, "stop index 须为真实值");
+                        saw_stop = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_start && saw_stop, "须含 start/stop: {frames:?}");
+        let fallback = ensure_event_lines(anthropic_block_frames("audit", 0)).join("");
+        assert!(fallback.contains("\"index\":0"), "未知回退 0: {fallback}");
+    }
+
+    #[test]
+    fn anthropic_multi_index_block_frames() {
+        // TRN-6：不同命中块 index 各自独立，不硬编码 0。
+        let f2 = ensure_event_lines(anthropic_block_frames("audit", 2)).join("");
+        let f5 = ensure_event_lines(anthropic_block_frames("audit", 5)).join("");
+        assert!(
+            f2.contains("\"index\":2") && !f2.contains("\"index\":0"),
+            "{f2}"
+        );
+        assert!(
+            f5.contains("\"index\":5") && !f5.contains("\"index\":0"),
+            "{f5}"
+        );
     }
 }

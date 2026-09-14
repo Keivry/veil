@@ -66,7 +66,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 审计 | `AUDIT_ENABLED` | 空 | 遗留回退：`AUDIT_MODE` 缺失/空白时真值 `1/true/yes/on`（trim + 大小写不敏感）→ `block`（fail-closed），显式 `AUDIT_MODE` 优先，缺省仍 `off` |
 | 审计 | `AUDIT_TIMEOUT` | `90`s | 禁止落在 `110`-`130`s 竞态区间，否则拒启动 |
 | 审计 | `AUDIT_HOLD_MAX_BYTES` | `1048576` | 审计 hold 上限字节（须 ≥1 正整数） |
-| 审计 | `AUDIT_POLICY_FILE` | 内建默认策略 | 审计策略文件路径 |
+| 审计 | `AUDIT_POLICY_FILE` | 内建默认策略 | 审计策略文件路径；启动期 fail-fast 加载（损坏拒启动），文件 `mode` 生效（优先级 env 显式 > 文件 > off，见 §6.11） |
 | 审计 | `APPROVAL_WHITELIST` | 空 | 审批人 Matrix ID 逗号分隔（`@user:server`） |
 | TPM | `VEIL_ALLOW_MOCK_TPM` | 未设置（硬件强制） | 仅 trim 后等于字面 `1` 放行 Mock TPM（其余值仍走硬件门禁 fail-closed），专供无硬件开发机与 CI；生产禁用（见下方指引） |
 | TPM | （硬编码）TPM 子进程单步超时 | `30s` | `tpm2_createprimary/load/unseal` 单步上限；存活探测走 `tpm2_pcrread sha256:0` 只读 PCR（不预演密封回放，差异有意，见 `src/service/tpm.rs`） |
@@ -179,13 +179,21 @@ curl -fsS http://127.0.0.1:8877/credential \
 
 语义补充（与 `credential-api` spec 一致）：
 
-- 服务端未配置对应调用方期望哈希（未 enrolled）时兼容放行，但 Secret 仍校验。
+- 服务端未配置对应调用方期望哈希（未 enrolled）时**默认转 Matrix 审批**
+  （`202 + E_PENDING`；`AUTO_APPROVE=false` 时直接 `403`）——未注册调用方不再直接取用凭据，
+  自动放行仅对已注册调用方生效（`AUTH-4`，**BREAKING**）。迁移：旧部署依赖未 enrolled 直接取用的
+  须先完成注册审批，或恢复旧口径另立 change 并撤回本条。
 - `caller_hash == GET_BINARY_HASH`（终端直调而非脚本调用）拒绝 403。
 - 自动放行三态：`True` 放行 / `False` 拒绝 / `None` 转 Matrix 审批（哈希不一致走 `None` 分支）；
   别名集（trim + 大小写不敏感）：`true/1/yes` 放行、`false/0/no` 拒绝、`none/pending/matrix` 转审批
   （`src/config/env_parse.rs::AutoApprove`）。
 - 管理面鉴权优先级：`X-Admin-Token` 头 > `__Host-admin_token` Cookie > `?access_token`（仅 SSE 回退）；
   非 SSE 接口以 query 携带 token 恒 401。
+- 写端点部署密钥强制（`AUTH-11`，**BREAKING**）：`POST /approve-hash-change`、`POST /register-caller`、
+  `POST /revoke` 在部署未配置 `GET_BINARY_SECRET`/`CREDENTIAL_SECRET`（compat 默认）时 fail-closed——
+  一律 `403`（`E_AUTH`）且不执行任何注册/吊销/哈希变更动作；迁移须配置非空部署密钥并与客户端
+  `X-Get-Binary-Secret`（或 `body.secret`）取值对齐。该约束**不适用于** `POST /credential` 读路径
+  （compat 模式仍按 Python 语义跳过 Secret 因子），与三因子核验共用同一字段口径。
 
 ## 3. 限流规则
 
@@ -250,7 +258,8 @@ done
 审批票回收两口径并存、不可混用（`F16`，`veil-oracle-followup-fix`）：**空闲票 60s 回收上限**——
 无阻塞等待者的孤儿票按分支 TTL（审计/解锁类 `60s`）清扫；**有阻塞等待者凭据类票 300s 阻塞 TTL**——
 凭据/注册/哈希变更类存在阻塞等待者的未决票在其自身 `300s` 阻塞超时前不被回收。前者是清扫延迟上限，
-后者是阻塞等待保留时长，维度不同（详见 §8.4）。
+后者是阻塞等待保留时长，维度不同（详见 §8.4）。内存侧 `PendingApprovals` 清扫与矩阵侧同口径按记录 TTL
+执行（`AUTH-9`：凭据/注册/哈希变更类阻塞票 `300s`、空闲/审计/解锁类 `60s`），不再对全部记录一律 `60s`。
 
 `GET /health` 与 `/_admin/health` 的 `pii_custom_disabled`（只增字段）为已停用自定义规则计数
 （`disabled_snapshot()` 口径，`P2`，`veil-pii-parity-closeout`）：ReDoS 守卫连续 3 次超时停用的
@@ -273,6 +282,10 @@ done
 | `EVENT_IDLE_TIMEOUT` | `30s` | `src/config/env_parse.rs` |
 | `KEEPALIVE_INTERVAL` | `10s` | `src/config/env_parse.rs` |
 | `RING_CAP` | `10000` | `src/service/metrics/aggregate.rs` |
+| `METRICS_FLUSH_INTERVAL_SECS` | `60` | `src/service/metrics/store.rs` |
+| `AGGS_MAX_ENTRIES` | `4096` | `src/service/metrics/aggregate.rs` |
+| `AGGS_DAILY_KEEP` / `AGGS_HOURLY_KEEP` / `AGGS_FIVE_MIN_KEEP` | `32` / `170` / `1` | `src/service/metrics/aggregate.rs` |
+| `ADMIN_RATE_MAX_ENTRIES` | `4096` | `src/service/admin/ratelimit.rs` |
 
 ## 5. Go 客户端对接指引
 
@@ -282,9 +295,9 @@ done
 | 用途 | 方法与路径 | 鉴权 |
 |:-----|:-----------|:-----|
 | 取用凭据 | `POST /credential` | 三因子（`X-Get-Binary-Hash` + `X-Get-Binary-Secret`/`body.secret` + `body.auth.caller_hash`/`caller_path`） |
-| 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` 或部署密钥 `X-Get-Binary-Secret`；两者皆缺/不匹配 401；原仓无鉴权直读，旧脚本须补凭据，Go `get list` 经部署密钥可用） |
+| 查看注册 | `GET /registrations` | 原仓经 `_require_auth` 校验 `GET_BINARY_HASH` + `GET_BINARY_SECRET`（未配置时兼容跳过）；本仓管理面鉴权（`X-Admin-Token` 或部署密钥 `X-Get-Binary-Secret`，两者皆缺/不匹配 401）；旧脚本须补凭据，Go `get list` 经部署密钥可用 |
 | 注册调用方 | `POST /register-caller` | 三因子（同取用；重名 409） |
-| 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销管理 token/文件在位/内网三者任一（见 7.5） |
+| 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销管理 token/内网两者任一（见 7.5） |
 | 批准哈希变更 | `POST /approve-hash-change` | 三因子 |
 | LLM 代理透传 | 任意 `/{tail}`（含 `GET`；未知 admin 子路径除外） | 无（上游透传） |
 | 存活探针 | `GET /health` | 无 |
@@ -298,6 +311,14 @@ get credential 网易 授权码 --raw
 get register --name "check-mail" --entry "网易" --fields "授权码" --desc "检查邮件" --auto
 get revoke --name "check-mail"
 ```
+
+- `allow_mode` 契约（`AUTH-10`）：`POST /register-caller` 的 `allow_mode` 接受 `auto`（等价自动放行
+  `true`）与 `manual`（等价转审批 `none`），与 Go `get register --auto` 及 Python 默认 `manual` 对齐；
+  未知非空值回退 `auto` 布尔并记 `warn` 日志。
+- 写端点部署密钥前置（`AUTH-11`，**BREAKING**）：`POST /register-caller`、`POST /revoke`、
+  `POST /approve-hash-change` 要求部署已配置 `GET_BINARY_SECRET`/`CREDENTIAL_SECRET`；compat 默认
+  （未配置）下三者恒 `403`（`E_AUTH`）不执行动作。存量 Go 部署迁移须配置部署密钥（Go `get` 实发
+  `X-Get-Binary-Secret`，配置后无需改客户端）。`POST /credential` 取用路径不受影响。
 
 - `POST /revoke` 定位顺序 `key → caller_path → caller_hash → name`（`C5`，`veil-credential-flow-parity`）：
   `get revoke --name "check-mail"` 命中未吊销同名条目；重名 409——未吊销条目重名注册直接拒绝，
@@ -479,12 +500,28 @@ get revoke --name "check-mail"
 
 ### 6.11 审计策略文件 fail-closed（原仓解析失败禁用审计继续）
 
-- 变更：`AUDIT_POLICY_FILE` 不可读、含未知键、孤立列表项或非法 `mode` 时拒启动；原仓 Python 策略
+- 变更：`AUDIT_POLICY_FILE` 在**启动期** fail-fast 加载并注入共享运行时状态（请求路径零读盘、
+  零 env 快照）；不可读、含未知键、孤立列表项、非法 `mode`、无法解析行或列表段形态错误时拒启动，
+  SHALL NOT 降级为「无审计」空策略。加载早于 TPM 门禁、sqlite 初始化与后台任务。原仓 Python 策略
   文件解析失败即禁用审计并继续（fail-open）。`dangerous:` 段兼容原仓对象形
   `{pattern, reason, network}`（YAML mapping 与 JSON 对象，`network` 缺省 `false`）与字符串形，原仓
   风格文件可直接加载或经最小迁移加载。
-- 影响：策略文件配置错误不再静默降级为「无审计」，而是显式报错；错误须先修复再启动。
-- 迁移：修正策略文件语法/键名/`mode` 取值即可；原仓对象形 `dangerous` 无需改写。
+- 策略 `mode` 生效：文件 `mode` 实际参与运行模式判定并注入运行时配置（`state.config.audit_mode`）；
+  优先级为 **env 显式 > 文件 `mode` > 默认 `off`**——`AUDIT_MODE` 非空，或 `AUDIT_MODE` 缺失/空白时
+  `AUDIT_ENABLED` 真值回退推导的 `block`，均属 env 显式；文件 `mode` 仅在 env 未给出审计模式时生效，
+  两者显式且冲突时记 warn 并以 env 为准，不静默覆盖。
+- 生效模式口径的空白名单门禁：当**最终生效模式**为 `approve`（无论来自环境变量、策略文件还是其它
+  来源）且 `APPROVAL_WHITELIST` 为空时，启动以配置错误拒绝，不因来源不同而放行。
+- 空白名单语义：`APPROVAL_WHITELIST` 为空或未配置时审批白名单层「不过滤」（对标 Python
+  `_matrix.py:235,254`），非空时非成员 reaction 仍被忽略；审计 `approve` 空名单由上述启动门禁兜底。
+- 自定义 PII 文件上限：`PII_CUSTOM_*` 文件读取前施加 1MB（`1_048_576` 字节）上限，超限具名拒绝启动，
+  恰 1MB 放行。
+- 审计日志权限：`DATA_DIR/audit.log` 创建即 `0600`（`OpenOptionsExt::mode`），无先创建后 chmod 的宽权限窗；
+  轮转产物同样 `0600`。
+- 影响：策略文件配置错误不再静默降级为「无审计」，而是显式报错；策略 `mode` 不再「只校验不生效」；
+  文件 `mode: approve` + 空白名单不再绕过启动门禁。
+- 迁移：修正策略文件语法/键名/`mode` 取值即可；原仓对象形 `dangerous` 无需改写；如需策略文件
+  `mode` 生效请确保未显式设置 `AUDIT_MODE`/`AUDIT_ENABLED`。
 
 ## 7. 传输与兼容声明
 
@@ -538,6 +575,10 @@ Chat 显式 false 即放弃流式用量，按 key 合并保留不覆写：Chat �
 `stream_options={"include_usage":false}` 时转发体保留 `false`，不覆写为 `true`
 （按 key 合并语义，见 `src/service/llm_gateway/protocol.rs` 与
 `src/handler/llm/rewrite.rs`）；此时流式无 usage 帧，metrics 空 usage 桶为预期而非异常。
+`stream_options` 三态保留（`TRN-5`，`veil-gateway-transport-fidelity`）：键**缺失**时注入
+`{"include_usage":true}`；值为 `null`（用户显式第三态）时**原样保留 `null`**，不注入、不替换；
+值为对象时仅在缺 `include_usage` 时按 key 合并，已含 `include_usage`（含 `false`）时原样保留；
+字符串/数组等畸形形态维持 warn + 整体替换，不静默丢键。
 Responses **不注入** `stream_options`（官方规范仅接受 `include_obfuscation`，无
 `include_usage`；决策依据与回退条款见 change `veil-llm-proto-closeout` 的 design.md D1/R1），其流式用量一律经
 `response.completed.response.usage` 三级回退记录，用户自带键逐字节保留。
@@ -551,16 +592,39 @@ Responses **不注入** `stream_options`（官方规范仅接受 `include_obfusc
 `synthesized_failed`，零帧维持真空流最小终止（见 §8.6）。三协议合成终端恒恰一
 （见 `src/handler/llm/pump/spawn.rs`、`src/handler/llm/pump/synth_flush.rs`）。
 
+SSE 出口信封保真（`TRN-1`，`veil-gateway-transport-fidelity`）：出口在 `event:` 重放基础上
+保真透出 `id:`（WHATWG last-event-id——最近一次出现的 `id` 对后续无 `id` 事件持续有效，
+空值 `id:` 重置）与合法整数 `retry:`（非数字值不透出）；上游把 `event:`/`id:` 与 `data:`
+分置于不同块时，网关按 `event` FIFO、`id` 最近值跨块暂存并与后续含 `data` 块**同块重建**，
+不产生无 `data` 的孤立 `event:` 块；跨块暂存不改事件/帧计数语义——分块信封流与同内容同块流的
+`sse_event_count`、`add_sse_event()` 计数与转发帧数逐一致（见
+`src/service/sse/parser.rs`、`src/handler/llm/pump/spawn.rs`）。
+
+Anthropic `message_start` 会话/模型提取（`TRN-7`，`veil-gateway-transport-fidelity`）：会话标识
+从嵌套 `message.id` 提取，模型名顶层 `model` 优先、回退 `message.model`，使 `message_start`
+之后不再恒为 `unknown_model`（见 `src/service/llm_gateway/tool.rs::extract_conv_id`、
+`src/handler/llm/pump/spawn.rs`）。
+
+Anthropic 阻断帧 index 与参数累积清洁（`TRN-6`，`veil-gateway-transport-fidelity`）：阻断帧
+使用触发本次阻断的**真实 content block index**（仅无法获知时回退 `0`），多块流中不再错位；
+`content_block_start` 的空占位 `input`（`{}`/空串/null）不计入参数累积，避免审计参数出现
+`"{}{...}"` 前缀污染，非空完整 `input` 与 `partial_json` 语义不变（见
+`src/service/block_inject/frames.rs`、`src/handler/llm/pump/fragments.rs`）。
+
 Responses 断序容忍：流中 `sequence_number` 不连续（跳号/回退）时帧原样透传、不 panic、
 不丢帧，终端恰一，不因断序升级为错误日志（见 `src/handler/llm/pump/event.rs::extract_responses_seq`）。
 
 Responses `error` 事件统一为失败终端：流中 `type:"error"` 合成恰一 `response.failed`，
 不出现 `response.completed`、无重复终端（见 `src/handler/llm/pump/spawn.rs`）。
 
-Responses 失败帧诊断字段（M2/D5，lossy 边界）：合成 `response.failed.response.error`
-保留上游 error 对象中存在的 `type`/`code`/`param`/`message` 四字段（缺失 `message`
-或 error 非对象时回退既有 `{"id","status"}` 形态）；error 对象中这四字段之外的其余
-字段不保留，属已声明 lossy 范围，下游诊断依赖须以本清单为准。
+Responses 失败帧诊断字段（M2/D5 + `TRN-2`，lossy 边界）：合成 `response.failed.response.error`
+兼容上游 error 事件的**两种形态**——官方 `ResponseErrorEvent`（`code`/`message`/`param`/
+`sequence_number` 位于**顶层**）与既有嵌套 `error` 对象形态；嵌套字段优先，顶层
+`code`/`param`/`message` 仅补缺。`sequence_number` 可得时写入合成 `response.failed`
+载荷顶层。缺失 `message`（合并后为空）或 error 非对象时回退既有 `{"id","status"}` 形态；
+error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留，属已声明 lossy 范围，
+下游诊断依赖须以本清单为准（见 `src/handler/llm/pump/event.rs::responses_error_object`、
+`src/service/block_inject/frames.rs::responses_failed_frame`）。
 
 空 usage 桶排查指引：观测到某模型空 usage 桶时，先查请求是否显式 `false`
 （转发体保留原值即用户放弃流式用量），再判上游异常或采样缺失，不得直接按故障报修。
@@ -577,12 +641,19 @@ Responses 失败帧诊断字段（M2/D5，lossy 边界）：合成 `response.fai
 错误体（429 限流文案、500 HTML、404 说明，含空体）原样透传状态码与正文字节，
 不再合成 `502 E_EMPTY_BODY`（见 `src/handler/llm/nonstream.rs`）。
 
-流式上游错误状态透传（S6/D7，`veil-stream-fidelity-fix`）：`stream:true` 请求仅在
+流式上游错误状态透传（S6/D7，`veil-stream-fidelity-fix`；`TRN-3`/`TRN-4`，`veil-gateway-transport-fidelity`）：
+`stream:true` 请求仅在
 上游 `status<400` 且响应 `content-type` 为 `text/event-stream` 时进入 SSE 泵；
 上游 `status>=400`（4xx/5xx 的 JSON/HTML/空体）或 2xx 非 `text/event-stream`
 正文一律按非流口径保状态与正文字节透传（hop 头过滤 + `x-veil-protocol`，受
-`NONSTREAM_MAX_BYTES` 约束），不改写为 200 SSE 假流；仅非错误状态严格超限走
-502 `response_too_large`（见 `src/handler/llm/dispatch.rs::stream_upstream_passthrough`）。
+`NONSTREAM_MAX_BYTES` 约束），不改写为 200 SSE 假流；仅非错误状态（`status<400`）
+严格超限走 502 `response_too_large`（见 `src/handler/llm/dispatch.rs::stream_upstream_passthrough`）。
+有界读（`TRN-3`）：透传读取先判上游 `content-length`，再按 `NONSTREAM_MAX_BYTES`
+有界读，不先全量缓冲；超限 502 **严格作用于非错误状态**，4xx/5xx 错误体不因体大
+改写状态或正文（有界读/流式转发仅为内存安全，错误体按透传语义不改写，与 §4
+「错误体按透传语义不改写」一致）。内部头隔离（`TRN-4`）：透传前剔除上游所有
+`x-veil-*` 内部头（大小写不敏感），网关自置 `x-veil-protocol`/`x-veil-normalized`
+在剔除后写入，上游同名声不得覆盖或泄漏。
 
 流式/非流超时口径（`T3`/D3，`veil-transport-fidelity-fix`）：流式（SSE）转发使用
 启动期构造的独立 client，**不设**覆盖整响应体读取的总超时，故长流不因
@@ -602,7 +673,7 @@ fail-closed 收尾。档位硬编码，见 `src/service/llm_gateway/mod.rs::RETR
 非流超限观测口径（`T14`/D12，`veil-transport-fidelity-fix`）：`NONSTREAM_MAX_BYTES`
 严格超限（仅 `status<400`）恒返回 502 `response_too_large`，`len == cap` 放行、
 `status>=400` 错误体不改写；超限判定先于空体/非 JSON 502 生效。本仓超限分支**无独立
-指标与 warning**（与 Python `_llm.py:2936-2944` 的 `metrics_ctx['status']=502` + warning
+指标与 warning**（与 Python `_llm.py:2936-2946` 的 `metrics_ctx['status']=502` + warning
 及无状态门为有意观测差异），差异记录见 change `veil-transport-fidelity-fix` design D12。
 
 ### 7.3 请求隔离声明
@@ -629,22 +700,28 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 
 ### 7.5 吊销与注册鉴权声明
 
-- 紧急吊销 `POST /revoke/emergency`：入参含 `file_present` 文件在位标记，
-  管理 token 可走请求体或 `X-Admin-Token` 头；内网判定只认 TCP 远端地址
-  （`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头（防伪造绕过）。
-  与常规吊销同注册表定位条目（见 `src/handler/credential.rs::emergency_revoke_handler`）。
+- 写端点鉴权前置（`AUTH-11`，**BREAKING**）：常规吊销 `POST /revoke`、注册 `POST /register-caller`、
+  哈希变更 `POST /approve-hash-change` 的三因子守卫在部署未配置部署密钥
+  （`GET_BINARY_SECRET`/`CREDENTIAL_SECRET` 均空）时 fail-closed，动作前返回 `403`（`E_AUTH`）；
+  迁移须配置非空部署密钥。紧急吊销 `POST /revoke/emergency` 不受此条约束（只认管理 token/内网，见下）。
+- 紧急吊销 `POST /revoke/emergency`：仅认两类放行依据——有效管理 token
+  （请求体 `admin_token` 或 `X-Admin-Token` 头）与内网来源；服务端
+  **不接受任何客户端自证放行字段**（历史自证通道已移除，`AUTH-2`，BREAKING）。
+  内网判定只认 TCP 远端地址（`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头
+  （防伪造绕过）。未命中两依据时转常规审批，不直接吊销。与常规吊销同注册表定位条目
+  （见 `src/handler/credential.rs::emergency_revoke_handler`）。
 - 紧急吊销豁免网段（`C13`，`veil-credential-flow-parity`）：内网来源覆盖
   `localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、
   `169.254.0.0/16`（链路本地）、`100.64.0.0/10`（CGNAT）、`fd00::/8`（ULA）、`fe80::/10`
-  （IPv6 链路本地）；命中管理 token、`file_present`、内网来源三者任一即直接吊销，公网来源转
+  （IPv6 链路本地）；命中管理 token 或内网来源两者任一即直接吊销，公网来源转
   常规审批。内网判定只认 TCP 远端（`ConnectInfo`），伪造代理头无效。
 - 常规吊销 `POST /revoke`（`C2`，`veil-credential-flow-parity`）：经 Matrix 审批确认后执行——
   建单（`MatrixBranch::Register` 三态映射）后仅 `✅` 置 `revoked=true` 且 `enabled=false`；
   `❎` 与等待超时**保持条目原状**（不做破坏性动作）。默认 `202` 抛单，`CREDENTIAL_BLOCK_WAIT=1`
-  阻塞至 `300s`。与紧急吊销旁路（上条三通道）分工：常态吊销走审批，止损走旁路且不建审批单。
-- `GET /registrations`：原仓无鉴权直读；本仓要求管理面鉴权（`X-Admin-Token` 或部署密钥
+  阻塞至 `300s`。与紧急吊销旁路（上条两通道）分工：常态吊销走审批，止损走旁路且不建审批单。
+- `GET /registrations`：原仓经 `_require_auth` 校验 `GET_BINARY_HASH` + `GET_BINARY_SECRET`（未配置时兼容跳过）；本仓要求管理面鉴权（`X-Admin-Token` 或部署密钥
   `X-Get-Binary-Secret`，见 `src/handler/credential.rs::registrations_handler`），两者皆缺/不匹配 401。
-  旧脚本直读须补凭据；Go `get list` 携带部署密钥可用（有意收敛，见 `observability-admin` spec）。
+  旧脚本须补凭据；Go `get list` 携带部署密钥可用（有意收敛，见 `observability-admin` spec）。
 - 哈希变更 `POST /approve-hash-change`（`C3`，`veil-credential-flow-parity`）：经 Matrix 三态落定——
   `🔓` 保持现有 `allow_mode`（自动放行延续）；`✅` 降级为人工审批模式（`allow_mode` 置 `none` 语义，
   后续取用进入审批）；`❎` 与等待超时置 `enabled=false`（取用被拒绝）。三态均写入旧哈希宽限
@@ -713,12 +790,21 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   `AUDIT_HOLD_MAX_BYTES`（默认 `1048576` 字节）独立承载。二者维度不同（响应侧缝窗字符 vs 审计 hold 字节），
   不可互相替代；变量名与默认值保持不重命名以规避配置 BREAKING，语义差异以本映射文档吸收。
 
-### 7.10 掩码边缘与别名（`veil-pii-parity-closeout`）
+### 7.10 掩码边缘与别名（`veil-pii-parity-closeout`；`RED-3`，`veil-redaction-audit-coverage`）
 
-- kind 别名（`P9`/D10）：`mask_pii_value` 受理 `bankcard`（等价 `bank_card`）与 `apikey`
-  （等价 `api_key`），行为与主名逐字一致，属已声明兼容超集。
-- 非 4 段 6-7 字符 IPv4 形掩码取前 4/后 4 拼接（重叠不裁剪、逐字符）对齐原仓；
+- kind 别名集（`P9`/D10 + `RED-3`）：`mask_pii_value` 受理 `bankcard`（等价 `bank_card`）、
+  `id_card`（与 `bank_card` 同分支）与 `apikey`（等价 `api_key`），行为与主名逐字一致，
+  属已声明兼容超集；别名集以本条登记为准。
+- 非 4 段 IPv4 形（`RED-3` 对齐原仓 `_pii.py:1008-1016`）：字符数 `<8` → 首 1/尾 1
+  （如 `123456` → `1****6`），`>=8` → 前 4/后 4（如 `12345678` → `1234****5678`）；
+  4 段形仍为 `{前}.{二}.**.**`。
+- email（`RED-3` 对齐原仓 `_pii.py:989-1002`）：域名含 `.` → `***@***.<suffix>`；含 `@`
+  但域名无 `.` → `***@***`（如 `a@b` → `***@***`）；无 `@` 落短值口径。
   其余分支与 64 字符截断上限不变。
+- 摘要引擎兜底（`TST-8`，`veil-docs-test-parity`）：管理面事件摘要引擎 `redact_summary`
+  对 IPv4（4 段形）、身份证（17 位 + 数字/`X`）、卡号（13-19 位连续数字）三类形态兜底替换为
+  `[REDACTED:ipv4]`/`[REDACTED:id_card]`/`[REDACTED:bank_card]`（检出形态与 `sample_mask`
+  对应分支同口径）；摘要输出不含三类明文。
 
 ## 8. 遗留决策记录
 
@@ -752,17 +838,19 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - Matrix `_ask` 返回 `None` 即 rejected 并清理；审批票回收两口径并存、不得混用（`F16`，`veil-oracle-followup-fix`）：
   **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（审计/解锁类）按分支 TTL `60s` 清扫；
   **有阻塞等待者凭据类票 300s 阻塞 TTL**——凭据/注册/哈希变更类存在阻塞等待者的未决票，
-  在其自身 `300s` 阻塞超时前不被回收（`C7`，`veil-credential-flow-parity`）。
+  在其自身 `300s` 阻塞超时前不被回收（`C7`，`veil-credential-flow-parity`）；
+  两口径对矩阵侧票与内存侧 `PendingApprovals` 一致适用（`AUTH-9`）。
 - 文本指令 `lock`/`forget` 经网关侧清理接线（`C6`，`veil-credential-flow-parity`）：
-  `lock` 清口令缓存 + KeePass 会话 + 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。
+  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（`AUTH-5`，清除并零化，再次解锁须重新经
+  TPM 解封）+ 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。
 - `AUTO_APPROVE` 三态：`true` 放行 / `false` 拒绝 / `none` 转 Matrix 审批（见 §2）。
 
 ### 8.5 测试口径注明（T-M7/T-M9，`veil-review-followup-test-gap`）
 
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
-- 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 20 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。
+- 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 23 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。
   **已纳入 gate 步骤**（`veil-test-coverage-fill` T3）：`bash scripts/gate.sh` 第 6 步执行真 SDK 一致性
-  （20 项 = 11 常规 + 3 阻断 + 5 取用 + 1 无库 503），与 fmt/clippy/test/文档路径/文件大小五步串联，任一失败整体非零退出。
+  （23 项 = 14 常规 + 3 阻断 + 5 取用 + 1 无库 503），与 fmt/clippy/test/文档路径/文件大小五步串联，任一失败整体非零退出。
   前置条件：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
   可用 `VEIL_CONFORMANCE_PYTHON` 覆盖）与 SDK pin `openai==3.5.0`/`anthropic==1.1.0` + `pykeepass`；
   无 TPM 硬件时脚本内建 `VEIL_ALLOW_MOCK_TPM=1` 回退（仅开发/CI，生产接 TPM 2.0 硬件）。

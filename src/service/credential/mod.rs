@@ -30,7 +30,7 @@ pub mod vault_ops;
 
 pub use {
     approval::{await_audit_approval, await_credential_approval},
-    auth::handle_credential,
+    auth::{handle_credential, verify_three_factor, verify_three_factor_write},
     ratelimit::RateTable,
     vault_ops::{
         approve_hash_change,
@@ -63,6 +63,8 @@ pub trait AppStateParts {
     fn keepass(&self) -> &Arc<dyn KeePassBackend>;
     fn pending(&self) -> &Arc<PendingApprovals>;
     fn approval(&self) -> &Arc<matrix::MatrixApproval>;
+    /// `ARC-2`：受管审批决策表（进程级 `static` 已移除），所有决策读写经此访问。
+    fn decisions(&self) -> &Arc<std::sync::Mutex<approval::DecisionTable>>;
     fn http_client(&self) -> &Arc<reqwest::Client>;
     fn vault(&self) -> &Arc<credential_vault::CredentialVault>;
     fn credential_hits(&self) -> &Arc<tokio::sync::Mutex<RateTable>>;
@@ -362,6 +364,30 @@ pub(crate) mod test_support {
             entry.to_string(),
             fields.iter().map(|s| (*s).to_string()).collect(),
         )])
+    }
+
+    /// `AUTH-4` 测试装配：注册并启用具备 `网易/授权码` 放行权限的调用方；
+    /// `name` 取 `path` 以保证多次调用不触发重名 409。
+    pub(crate) async fn enroll_allow(state: &AppState, path: &str, hash: &str) {
+        vault_ops::register_caller_extended(
+            state,
+            &RegisterParams {
+                caller_path: path.to_string(),
+                caller_hash: hash.to_string(),
+                name: path.to_string(),
+                entries: entries_for("网易", &["授权码"]),
+                ..RegisterParams::default()
+            },
+            &format!("enroll-{path}"),
+        )
+        .await
+        .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled(path, true)
+            .unwrap();
     }
 
     pub(crate) async fn enrolled_with_entries(

@@ -730,3 +730,48 @@ fn t12_restore_only_own_scope_tokens() {
             .contains("13800138000")
     );
 }
+
+#[test]
+fn nested_stringified_json_restore_inner_valid() {
+    // RED-1：两层嵌套 stringified JSON 参数内含带引号凭据明文，还原写回须按
+    // 实际 JSON 深度转义，内层结构保持有效、无非法裸 `"`。
+    let vault = CredentialVault::new();
+    let secret = "p@ss\"q";
+    let token = vault.register(secret).unwrap();
+    let scope = Scope::new();
+    let frame = serde_json::to_string(&serde_json::json!({
+        "arguments": serde_json::to_string(&serde_json::json!({ "k": token })).unwrap()
+    }))
+    .unwrap();
+    let (restored, spans) = scope.restore_response_with_spans_json(&vault, &frame);
+    assert!(restored.contains("p@ss"), "{restored}");
+    assert!(!restored.contains(&token), "token 须还原: {restored}");
+    assert!(!spans.is_empty());
+    let outer: serde_json::Value = serde_json::from_str(&restored).expect("还原后外层须合法 JSON");
+    let inner_raw = outer["arguments"].as_str().expect("arguments 为字符串");
+    let inner: serde_json::Value =
+        serde_json::from_str(inner_raw).expect("还原后内层 stringified JSON 须可解析");
+    assert_eq!(inner["k"], secret);
+    assert!(
+        !inner_raw.contains("\"p@ss\"q\""),
+        "内层不得裸写未转义引号: {inner_raw}"
+    );
+}
+
+#[test]
+fn restore_json_aware_regression() {
+    // RED-1 回归：单层帧仅命中 span 单层转义、其余字节等价；零替换帧不触发
+    // `loads→dumps` 重排（逐字节透传）。
+    let vault = CredentialVault::new();
+    let secret = "p@ss\"q";
+    let token = vault.register(secret).unwrap();
+    let scope = Scope::new();
+    let single = format!("{{\"msg\":\"hi {token}\"}}");
+    let (restored, spans) = scope.restore_response_with_spans_json(&vault, &single);
+    assert_eq!(restored, "{\"msg\":\"hi p@ss\\\"q\"}");
+    assert_eq!(spans.len(), 1);
+    let zero = r#"{"b":2,"a":1e3}"#;
+    let (out, zero_spans) = scope.restore_response_with_spans_json(&vault, zero);
+    assert_eq!(out, zero, "零替换须逐字节透传");
+    assert!(zero_spans.is_empty());
+}

@@ -341,3 +341,31 @@ fn retrieval_args_legacy_fallback() {
     let with_results = serde_json::json!({"action":{"query":"q"},"results":[{"big":"body"}]});
     assert_eq!(retrieval_args(with_results.as_object().unwrap()), "q");
 }
+
+#[test]
+fn extract_conv_id_variants() {
+    let cases: [(&serde_json::Value, Option<&str>); 7] = [
+        (&serde_json::json!({"id":"top"}), Some("top")),
+        (&serde_json::json!({"response":{"id":"r1"}}), Some("r1")),
+        (&serde_json::json!({"data":{"id":"d1"}}), Some("d1")),
+        (
+            &serde_json::json!({"data":{"response":{"id":"r2"}}}),
+            Some("r2"),
+        ),
+        (&serde_json::json!({"error":{"id":"e1"}}), Some("e1")),
+        (&serde_json::json!({"error":"estr"}), Some("estr")),
+        (&serde_json::json!({"type":"response.failed"}), None),
+    ];
+    for (v, want) in cases {
+        assert_eq!(extract_conv_id(v).as_deref(), want, "变体不得回退: {v}");
+    }
+}
+
+#[test]
+fn anthropic_message_start_conv_id() {
+    let v =
+        serde_json::json!({"type":"message_start","message":{"id":"msg_abc","model":"claude-x"}});
+    assert_eq!(extract_conv_id(&v).as_deref(), Some("msg_abc"));
+    let empty = serde_json::json!({"type":"message_start","message":{"id":"","model":"claude-x"}});
+    assert!(extract_conv_id(&empty).is_none(), "空 id 不得命中");
+}

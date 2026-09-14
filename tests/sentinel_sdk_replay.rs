@@ -75,6 +75,28 @@ async fn post_stream(base: &str, path: &str, body: &str) -> (u16, String) {
 const ANTH_BODY: &str =
     "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}";
 
+/// 结构性解析网关 SSE 输出为 `(event, data-json)` 对（按块序，行尾归一 `\n`），
+/// 供断言具体帧类型/载荷而非单点 `body.contains`。
+fn sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    let mut event = String::new();
+    let mut data = String::new();
+    for line in body.replace('\r', "\n").split('\n') {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data = rest.trim().to_string();
+        } else if line.trim().is_empty() && !data.is_empty() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                out.push((std::mem::take(&mut event), v));
+            }
+            data.clear();
+            event.clear();
+        }
+    }
+    out
+}
+
 // —— 01：thinking signature_delta 单帧块字节一致 ——
 
 #[tokio::test]
@@ -94,7 +116,25 @@ async fn thinking_signature_single_frame_byte_identical() {
     .await;
     let (status, body) = post_stream(&base, "/v1/messages", ANTH_BODY).await;
     assert_eq!(status, 200);
-    assert!(body.contains(sig), "signature 块须字节一致透传: {body}");
+    let events = sse_events(&body);
+    let start_idx = events
+        .iter()
+        .position(|(_, v)| {
+            v["type"] == "content_block_start" && v["content_block"]["type"] == "thinking"
+        })
+        .expect("须有 thinking content_block_start");
+    let sig_ev = events
+        .iter()
+        .find(|(_, v)| {
+            v["type"] == "content_block_delta" && v["delta"]["type"] == "signature_delta"
+        })
+        .expect("须有 signature_delta 帧");
+    assert_eq!(sig_ev.1["delta"]["signature"], sig, "签名字节须一致");
+    let stop_idx = events
+        .iter()
+        .position(|(_, v)| v["type"] == "content_block_stop")
+        .expect("须有 content_block_stop");
+    assert!(start_idx < stop_idx, "块序须 start 先于 stop: {body}");
     handle.abort();
     uhandle.abort();
 }
@@ -169,19 +209,36 @@ async fn tool_use_fragments_passthrough_ordered_until_stop() {
     .await;
     let (status, body) = post_stream(&base, "/v1/messages", ANTH_BODY).await;
     assert_eq!(status, 200);
-    // 当前指定行为：网关对分片只做透传、不做逐包校验/合并（合并由下游 SDK 在
-    // stop 后完成；审计侧累积见 AuditHold）。断言分片原样透传且顺序完整。
-    assert!(body.contains("toolu_1"), "tool_use 须还原: {body}");
-    let p1 = body
-        .find(" partial_json")
-        .or_else(|| body.find("\"partial_json\""));
-    assert!(p1.is_some(), "分片须透传: {body}");
-    assert!(
-        body.contains("\\\"x\\\"") || body.contains("{\"x\""),
-        "{body}"
-    );
-    assert!(body.contains("content_block_stop"), "stop 须透传: {body}");
-    assert!(!body.contains("[blocked:"), "{body}");
+    // 网关对分片只做透传、不做逐包校验/合并（合并由下游 SDK 在 stop 后完成；
+    // 审计侧累积见 AuditHold）——结构性断言分片按序拼接为完整 input。
+    let events = sse_events(&body);
+    let start = events
+        .iter()
+        .position(|(_, v)| {
+            v["type"] == "content_block_start"
+                && v["content_block"]["type"] == "tool_use"
+                && v["content_block"]["name"] == "calc"
+        })
+        .expect("须有 tool_use content_block_start");
+    let frags: String = events
+        .iter()
+        .filter(|(_, v)| {
+            v["type"] == "content_block_delta" && v["delta"]["type"] == "input_json_delta"
+        })
+        .map(|(_, v)| {
+            v["delta"]["partial_json"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(frags, "{\"x\":1}", "input_json_delta 须按序拼接: {body}");
+    let stop = events
+        .iter()
+        .position(|(_, v)| v["type"] == "content_block_stop")
+        .expect("stop 须透传");
+    assert!(start < stop, "块序须 start 先于 stop: {body}");
+    assert!(!events.iter().any(|(_, v)| v["type"] == "error"), "{body}");
     handle.abort();
     uhandle.abort();
 }
@@ -251,7 +308,24 @@ async fn error_overloaded_interrupts_stream() {
         status, 200,
         "error 插帧后须中断而非挂起（本断言完成即非挂起）"
     );
-    assert!(body.contains("中断前分片"), "中断前分片须保留: {body}");
+    let events = sse_events(&body);
+    assert!(
+        events.iter().any(|(_, v)| {
+            v["type"] == "content_block_delta" && v["delta"]["text"] == "中断前分片"
+        }),
+        "中断前分片须保留: {body}"
+    );
+    let err = events
+        .iter()
+        .position(|(_, v)| v["type"] == "error")
+        .expect("须透出 error 终端帧");
+    assert_eq!(events[err].1["error"]["type"], "overloaded_error");
+    assert!(
+        !events[err + 1..]
+            .iter()
+            .any(|(_, v)| v["type"] == "message_stop"),
+        "error 即终端，其后不得补 message_stop: {body}"
+    );
     handle.abort();
     uhandle.abort();
 }

@@ -7,7 +7,7 @@
 #   3) cargo test
 #   4) python3 scripts/check_doc_paths.py
 #   5) python3 scripts/check_file_sizes.py
-#   6) scripts/api_conformance.py（真 SDK 一致性，20 项）
+#   6) scripts/api_conformance.py（真 SDK 一致性，23 项）
 #
 # 前置条件（第 6 步）：
 #   - Python venv：默认按仓库相对定位 `<veil 仓库>/../../Python/credential-proxy/.venv/bin/python`

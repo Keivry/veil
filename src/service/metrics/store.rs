@@ -24,11 +24,17 @@ use {
         collections::{HashMap, VecDeque},
         path::{Path, PathBuf},
         sync::{
+            Arc,
             Mutex,
             atomic::{AtomicU64, Ordering},
         },
+        time::Duration,
     },
 };
+
+/// 指标周期刷盘间隔（秒，D1）：与既有 `RateTable::SWEEP_SECS`/`PENDING_TTL_SECS`
+/// 同为 60，写入放大可控；关闭路径另有一次最终刷盘。
+pub const METRICS_FLUSH_INTERVAL_SECS: u64 = 60;
 
 /// 指标聚合存储：内存环 + 窗口累计（覆盖式）+ sqlite 落盘。
 pub struct MetricsStore {
@@ -36,6 +42,10 @@ pub struct MetricsStore {
     pub(crate) aggs: Mutex<HashMap<AggKey, WindowAgg>>,
     pub(crate) db_path: PathBuf,
     pub(crate) dropped: AtomicU64,
+    /// `aggs` 有界驱逐累计计数（retention + LRU，可观测）。
+    pub(crate) aggs_evicted: AtomicU64,
+    /// `aggs` 最近更新序号（LRU 驱逐依据）。
+    pub(crate) agg_tick: AtomicU64,
 }
 
 impl std::fmt::Debug for MetricsStore {
@@ -55,6 +65,8 @@ impl MetricsStore {
             aggs: Mutex::new(HashMap::new()),
             db_path,
             dropped: AtomicU64::new(0),
+            aggs_evicted: AtomicU64::new(0),
+            agg_tick: AtomicU64::new(0),
         }
     }
 
@@ -126,6 +138,7 @@ impl MetricsStore {
             ring.push_back(sample);
         }
         if let Ok(mut aggs) = self.aggs.lock() {
+            let mut any_new = false;
             for (g, key) in [
                 (Granularity::Daily, super::aggregate::day_key(ts_secs)),
                 (Granularity::Hourly, super::aggregate::hour_key(ts_secs)),
@@ -134,13 +147,15 @@ impl MetricsStore {
                     super::aggregate::five_min_key(ts_secs),
                 ),
             ] {
-                let entry = aggs
-                    .entry(AggKey {
-                        granularity: g,
-                        window: key,
-                        protocol: proto.clone(),
-                    })
-                    .or_default();
+                let agg_key = AggKey {
+                    granularity: g,
+                    window: key,
+                    protocol: proto.clone(),
+                };
+                if !aggs.contains_key(&agg_key) {
+                    any_new = true;
+                }
+                let entry = aggs.entry(agg_key).or_default();
                 entry.count += 1;
                 entry.prompt += ext.prompt_tokens;
                 entry.completion += ext.completion_tokens;
@@ -149,12 +164,16 @@ impl MetricsStore {
                 entry.cached_write += ext.cached_write;
                 entry.unknown += ext.unknown;
                 entry.buckets[bucket_index(latency_ms)] += 1;
+                entry.updated = self.agg_tick.fetch_add(1, Ordering::Relaxed);
                 match truncated.as_deref() {
                     Some("silent_discard") => entry.t_silent += 1,
                     Some("open_ended") => entry.t_open += 1,
                     Some("synthesized_failed") => entry.t_synth += 1,
                     _ => {}
                 }
+            }
+            if any_new {
+                super::aggregate::enforce_agg_bounds(&mut aggs, &self.aggs_evicted);
             }
         }
         true
@@ -165,6 +184,9 @@ impl MetricsStore {
 
     /// 环满丢弃计数（`mpsc(512)` 背压语义的内存环对应物，只计数不阻塞）。
     pub fn dropped_total(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
+
+    /// `aggs` 有界驱逐累计计数（retention + LRU，可观测）。
+    pub fn aggs_evicted_total(&self) -> u64 { self.aggs_evicted.load(Ordering::Relaxed) }
 
     /// 覆盖式刷盘同步镜像（仅单测用；生产一律走异步 [`flush`](MetricsStore::flush)）。
     #[cfg(test)]
@@ -195,6 +217,23 @@ impl MetricsStore {
         .map_err(|e| anyhow::anyhow!("metrics 刷盘任务异常: {e}"))?
     }
 
+    /// 周期刷盘驱动（RUN-1/D1）：每 `interval` 调 [`flush`](MetricsStore::flush)，
+    /// 失败仅 `warn` 不退出（指标降级为内存累计，接口照常服务）；返回句柄供调用方持有。
+    pub fn spawn_flush_driver(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // 首个 tick 立即到点，先消费，使刷盘按完整周期起算。
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if let Err(err) = me.flush().await {
+                    tracing::warn!("指标周期刷盘失败（服务继续，内存累计）: {err:#}");
+                }
+            }
+        })
+    }
+
     /// 附属计数（pii/cred/audit 三列，日/小时口径）：网关侧审计与脱敏事件回填。
     /// 与 `record_chat` 独立累积，flush 时同窗合并（覆盖式 UPSERT）。
     pub fn record_aux_counts(
@@ -210,6 +249,7 @@ impl MetricsStore {
         }
         let proto = protocol.as_tail().to_string();
         if let Ok(mut aggs) = self.aggs.lock() {
+            let mut any_new = false;
             for (g, key) in [
                 (Granularity::Daily, super::aggregate::day_key(ts_secs)),
                 (Granularity::Hourly, super::aggregate::hour_key(ts_secs)),
@@ -218,16 +258,22 @@ impl MetricsStore {
                     super::aggregate::five_min_key(ts_secs),
                 ),
             ] {
-                let entry = aggs
-                    .entry(AggKey {
-                        granularity: g,
-                        window: key,
-                        protocol: proto.clone(),
-                    })
-                    .or_default();
+                let agg_key = AggKey {
+                    granularity: g,
+                    window: key,
+                    protocol: proto.clone(),
+                };
+                if !aggs.contains_key(&agg_key) {
+                    any_new = true;
+                }
+                let entry = aggs.entry(agg_key).or_default();
                 entry.pii_hits += pii_hits;
                 entry.cred_hits += cred_hits;
                 entry.audit_blocks += audit_blocks;
+                entry.updated = self.agg_tick.fetch_add(1, Ordering::Relaxed);
+            }
+            if any_new {
+                super::aggregate::enforce_agg_bounds(&mut aggs, &self.aggs_evicted);
             }
         }
     }
@@ -521,3 +567,6 @@ pub(crate) async fn sample_flush_driver(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reliability_tests;

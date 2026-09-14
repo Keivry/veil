@@ -179,3 +179,68 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}
         "阻断终端恰一: {joined}"
     );
 }
+
+/// 与 [`run`] 同语义，接受动态构造的 SSE 体（四类 delta 危险/良性矩阵）。
+async fn run_bytes(sse: Vec<u8>) -> (crate::handler::llm::pump::PumpOutcome, Vec<String>) {
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let out = collect_pump(upstream, block_ctx()).await;
+    server.abort();
+    out
+}
+
+#[tokio::test]
+async fn responses_four_delta_block_matrix() {
+    // RED-4：四类工具 delta 危险参数在 block 模式阻断且不透传，良性放行。
+    let cases = [
+        (
+            "response.code_interpreter_call_code",
+            "{\"code\":\"rm -rf /\"}",
+        ),
+        ("response.shell_call_command", "{\"command\":\"rm -rf /\"}"),
+        ("response.mcp_call_arguments", "{\"query\":\"rm -rf /\"}"),
+        (
+            "response.custom_tool_call_input",
+            "{\"input\":\"rm -rf /\"}",
+        ),
+    ];
+    for (base, dangerous) in cases {
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            serde_json::json!({"type": format!("{base}.delta"), "item_id": "call-x", "output_index": 0, "delta": dangerous}),
+            serde_json::json!({"type": format!("{base}.done"), "item_id": "call-x", "output_index": 0}),
+            serde_json::json!({"type": "response.completed", "response": {"id": "r1", "status": "completed"}}),
+        );
+        let (outcome, frames) = run_bytes(sse.into_bytes()).await;
+        assert!(outcome.block_injected, "{base} 危险参数须阻断");
+        let joined = frames.join("");
+        assert!(
+            !joined.contains("rm -rf"),
+            "{base} 危险明文不得到达下游: {joined}"
+        );
+        assert!(
+            !joined.contains("call-x"),
+            "{base} 危险 item id 不得透传: {joined}"
+        );
+        assert_eq!(
+            block_inject::terminal_count(&frames, "responses"),
+            1,
+            "{base} 阻断终端恰一: {joined}"
+        );
+
+        let benign = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            serde_json::json!({"type": format!("{base}.delta"), "item_id": "call-y", "output_index": 0, "delta": "{\"note\":\"hello\"}"}),
+            serde_json::json!({"type": format!("{base}.done"), "item_id": "call-y", "output_index": 0}),
+            serde_json::json!({"type": "response.completed", "response": {"id": "r1", "status": "completed"}}),
+        );
+        let (ok, ok_frames) = run_bytes(benign.into_bytes()).await;
+        assert!(!ok.block_injected, "{base} 良性参数不得阻断");
+        let ok_joined = ok_frames.join("");
+        assert!(
+            ok_joined.contains("hello"),
+            "{base} 良性参数须放行: {ok_joined}"
+        );
+    }
+}

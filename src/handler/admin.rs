@@ -277,6 +277,12 @@ pub async fn admin_metrics(
     }
     let snap = state.admin_state().metrics.snapshot();
     let gm = &state.gateway_metrics();
+    // `ARC-2`：审批决策表软上限只读观测；锁中毒时按零降级，不影响其余指标。
+    let (decision_overflow, decision_size) = state
+        .decisions
+        .lock()
+        .map(|t| (t.overflow_count(), t.entry_count()))
+        .unwrap_or((0, 0));
     let mut body = json!({
         "ok": true,
         "is_precise": snap.is_precise,
@@ -299,6 +305,8 @@ pub async fn admin_metrics(
         "sse_events": gm.sse_event_total(),
         "ring_len": snap.ring_len,
         "dropped": snap.dropped,
+        "approval_decision_overflow_total": decision_overflow,
+        "decision_table_size": decision_size,
     });
     let compat: HashMap<&str, &String> = ["model", "upstream"]
         .into_iter()

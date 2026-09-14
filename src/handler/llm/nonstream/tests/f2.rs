@@ -21,7 +21,7 @@ fn test_ctx_with_cap(protocol: Protocol, cap: usize) -> NonstreamCtx {
 
 #[tokio::test]
 async fn f2_oversize_dialog_response_returns_502_response_too_large() {
-    // F2：对话非流响应体 `len > cap` → 502，体与 Content-Type 对齐 Python `_llm.py:2942`。
+    // F2：对话非流响应体 `len > cap` → 502，体与 Content-Type 对齐 Python `_llm.py:2951-2961`。
     let client = reqwest::Client::new();
     let upstream =
         br#"{"id":"cmpl-big","model":"m","choices":[{"message":{"content":"big"}}]}"#.to_vec();
@@ -56,7 +56,7 @@ async fn f2_oversize_dialog_response_returns_502_response_too_large() {
         serde_json::json!({
             "error": {"message": "response too large", "type": "response_too_large"}
         }),
-        "体形态须与 Python `_llm.py:2942` 同字"
+        "体形态须与 Python `_llm.py:2951-2961` 同字"
     );
 }
 

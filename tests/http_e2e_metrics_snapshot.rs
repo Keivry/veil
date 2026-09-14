@@ -110,6 +110,14 @@ async fn b5_snapshot_shape_matches_series_and_empty_window_ok() {
             "chat_tail_lenient.{field} 须数值零: {body}"
         );
     }
+    // ARC-2：审批决策表只读观测键存在且为数值（空窗零值）。
+    for field in ["approval_decision_overflow_total", "decision_table_size"] {
+        assert_eq!(
+            body[field].as_u64(),
+            Some(0),
+            "空窗 {field} 须数值零: {body}"
+        );
+    }
     // series 空窗同样 200：三粒度 points 为空数组（形状 + 零值语义）。
     for granularity in ["daily", "hourly", "five_min"] {
         let (status, series) = get_json(

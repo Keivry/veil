@@ -4,7 +4,9 @@
 use {
     super::{super::credential::AppStateParts, state::AdminState},
     std::{
+        collections::HashMap,
         net::IpAddr,
+        sync::atomic::Ordering,
         time::{Duration, Instant},
     },
 };
@@ -15,6 +17,21 @@ use {
 pub const ADMIN_RATE_LIMIT: usize = 10;
 /// 限流窗口（秒）。
 pub const ADMIN_RATE_WINDOW_SECS: u64 = 60;
+/// per-IP 限流状态硬上限（RUN-2：超上限按最久未用驱逐，防大量源 IP 无界增长）。
+pub const ADMIN_RATE_MAX_ENTRIES: usize = 4096;
+/// 周期清扫节拍（每 N 次限流检查执行一次过期条目清扫）。
+const ADMIN_RATE_SWEEP_INTERVAL_OPS: u64 = 1024;
+
+/// 清除窗内无命中的过期条目，返回清理数（`decide_rate_limit` 阈值语义不变）。
+fn sweep_expired_rate(
+    rate: &mut HashMap<IpAddr, Vec<Instant>>,
+    now: Instant,
+    window: Duration,
+) -> u64 {
+    let before = rate.len();
+    rate.retain(|_, hits| hits.iter().any(|t| now.duration_since(*t) < window));
+    (before - rate.len()) as u64
+}
 
 /// 限流豁免路径：`/_admin/health` 为存活探针（前端刷新高频），豁免通用 10/min 限流。
 /// 阈值数值不动（10/min 等接线维持），仅 health 不计数。
@@ -46,20 +63,76 @@ fn decide_rate_limit(
 
 impl AdminState {
     /// 通用限流（10/min/IP）：超限返回 `Retry-After` 秒数。
-    pub fn check_rate(&self, ip: IpAddr) -> Result<(), u64> {
+    pub fn check_rate(&self, ip: IpAddr) -> Result<(), u64> { self.check_rate_with_evictions(ip).0 }
+
+    /// RUN-2：限流判定 + 有界管理。周期清扫过期条目，超硬上限按最久未用驱逐；
+    /// 返回 `(判定结果, 本次驱逐数)`。阈值与 `Retry-After` 语义不变。
+    pub fn check_rate_with_evictions(&self, ip: IpAddr) -> (Result<(), u64>, u64) {
         let mut guard = self.rate.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let window = Duration::from_secs(ADMIN_RATE_WINDOW_SECS);
-        let hits = guard.entry(ip).or_default();
-        decide_rate_limit(hits, now, ADMIN_RATE_LIMIT, window)
+        let mut evicted = 0u64;
+        if self
+            .rate_ops
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(ADMIN_RATE_SWEEP_INTERVAL_OPS)
+        {
+            evicted += sweep_expired_rate(&mut guard, now, window);
+        }
+        let decision = {
+            let hits = guard.entry(ip).or_default();
+            decide_rate_limit(hits, now, ADMIN_RATE_LIMIT, window)
+        };
+        if guard.len() > ADMIN_RATE_MAX_ENTRIES {
+            evicted += sweep_expired_rate(&mut guard, now, window);
+            evicted += evict_oldest_rate_entries(&mut guard, ip);
+        }
+        (decision, evicted)
     }
+
+    /// 周期清扫入口：删除窗内无命中的过期条目，返回清理数。
+    pub fn sweep_rate(&self, now: Instant) -> u64 {
+        let mut guard = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        let window = Duration::from_secs(ADMIN_RATE_WINDOW_SECS);
+        sweep_expired_rate(&mut guard, now, window)
+    }
+}
+
+/// 达硬上限时按「最久未用」驱逐（当前 IP 桶因刚写入 `now` 必为最新，不会自逐），
+/// 返回驱逐数。
+fn evict_oldest_rate_entries(rate: &mut HashMap<IpAddr, Vec<Instant>>, current: IpAddr) -> u64 {
+    let mut evicted = 0u64;
+    while rate.len() > ADMIN_RATE_MAX_ENTRIES {
+        let victim = rate
+            .iter()
+            .filter(|(ip, _)| **ip != current)
+            .min_by_key(|(_, hits)| hits.iter().max().copied())
+            .map(|(ip, _)| *ip);
+        match victim {
+            Some(ip) => {
+                rate.remove(&ip);
+                evicted += 1;
+            }
+            None => break,
+        }
+    }
+    evicted
 }
 
 /// 通用限流门（速率维度）：通过则计数 +1；超限返回 `Retry-After` 秒数
 /// （响应构造归 handler 层，本层不 import axum）。
 /// 与 SSE 并发计数相互独立（正交），本函数不触 `sse_count`。
 pub(crate) fn check_admin_rate(state: &impl AppStateParts, ip: IpAddr) -> Option<u64> {
-    state.admin_state().check_rate(ip).err()
+    let (decision, evicted) = state.admin_state().check_rate_with_evictions(ip);
+    if evicted > 0 {
+        tracing::warn!(
+            evicted,
+            cap = ADMIN_RATE_MAX_ENTRIES,
+            "管理面限流状态超上限，已驱逐最久未用条目"
+        );
+        state.gateway_metrics().record_admin_rate_evicted(evicted);
+    }
+    decision.err()
 }
 
 #[cfg(test)]
@@ -207,5 +280,47 @@ mod tests {
         assert_eq!(st.sse_current(ip), SSE_MAX_PER_IP);
         drop(guards.pop());
         assert!(st.acquire_sse(ip).is_some(), "释放后须可再建");
+    }
+
+    #[test]
+    fn admin_rate_map_bounded_under_many_ips() {
+        let st = test_admin_state();
+        for i in 0..(ADMIN_RATE_MAX_ENTRIES + 512) {
+            let ip = IpAddr::from([
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ]);
+            assert!(st.check_rate(ip).is_ok(), "新 IP 首次须放行");
+        }
+        let len = st.rate.lock().expect("限流锁无毒").len();
+        assert!(len <= ADMIN_RATE_MAX_ENTRIES, "限流状态须有界: {len}");
+        assert!(st.check_rate(test_ip()).is_ok(), "驱逐后其他 IP 仍可判定");
+    }
+
+    #[test]
+    fn admin_rate_sweep_preserves_semantics() {
+        let st = test_admin_state();
+        let ip = test_ip();
+        for _ in 0..ADMIN_RATE_LIMIT {
+            assert!(st.check_rate(ip).is_ok());
+        }
+        {
+            let mut guard = st.rate.lock().expect("限流锁无毒");
+            let stale = Instant::now() - Duration::from_secs(ADMIN_RATE_WINDOW_SECS + 1);
+            guard.insert(IpAddr::from([10, 9, 9, 9]), vec![stale]);
+        }
+        assert!(st.sweep_rate(Instant::now()) >= 1, "过期条目须被清理");
+        assert!(st.check_rate(ip).is_err(), "清扫后同 IP 仍按 10/min 拒绝");
+        let retry = st.check_rate(ip).unwrap_err();
+        assert!(
+            (1..=ADMIN_RATE_WINDOW_SECS).contains(&retry),
+            "Retry-After 取值不变: {retry}"
+        );
+        assert!(
+            st.check_rate(IpAddr::from([10, 0, 0, 2])).is_ok(),
+            "其他 IP 不受影响"
+        );
     }
 }

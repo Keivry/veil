@@ -288,6 +288,9 @@ async fn real_backend_missing_entry_returns_404() {
     .with_keepass(Arc::new(crate::keepass::RealKeePass::new(
         db_path, None, provider,
     )));
+    let mut allowed = entries_for("网易", &[]);
+    allowed.insert("不存在".to_string(), vec![]);
+    enrolled_with_entries(&state, "/s/svc.sh", "svc1", allowed).await;
     let mut missing = body("svc1", "/s/svc.sh", None);
     missing.entry = Some("不存在".to_string());
     let err = handle_credential(&state, &headers("gethash", Some("s3cr3t")), &missing)
@@ -295,6 +298,7 @@ async fn real_backend_missing_entry_returns_404() {
         .unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
     assert!(err.to_string().contains("不存在"));
+    enroll_allow(&state, "/s/svc2.sh", "svc2").await;
     let mut ok_body = body("svc2", "/s/svc2.sh", None);
     ok_body.field = None;
     ok_body.fields = None;
@@ -316,6 +320,7 @@ async fn locked_returns_503() {
             db_path: PathBuf::from("/tmp/x.sqlite"),
         },
     );
+    enroll_allow(&locked, "/s/k.sh", "k1").await;
     let err = handle_credential(
         &locked,
         &headers("gethash", Some("s3cr3t")),
@@ -517,13 +522,13 @@ async fn react(state: &AppState, event_id: &str, key: &str) {
 }
 
 async fn emergency_revoke_public_ip(state: &AppState, key: &str) -> Result<RegistrationView> {
-    emergency_revoke(state, key, None, Some("203.0.113.9"), false).await
+    emergency_revoke(state, key, None, Some("203.0.113.9")).await
 }
 
-async fn wait_decision_slot(key: &str, want: DecisionSlot) {
+async fn wait_decision_slot(state: &AppState, key: &str, want: DecisionSlot) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if credential_decision_slot(key) == Some(want) {
+        if credential_decision_slot(state, key) == Some(want) {
             return;
         }
         assert!(
@@ -589,7 +594,7 @@ async fn emergency_revoke_async_202_closure() {
         .approval
         .resolve(&event_id, "@admin:example.com", true)
         .await;
-    wait_decision_slot(&pending_key, DecisionSlot::Approved).await;
+    wait_decision_slot(&state, &pending_key, DecisionSlot::Approved).await;
     let view = emergency_revoke_public_ip(&state, key).await.unwrap();
     assert!(view.revoked && !view.enabled, "批准后须执行吊销: {view:?}");
 
@@ -613,7 +618,7 @@ async fn emergency_revoke_async_202_closure() {
         .approval
         .resolve(&deny_event, "@admin:example.com", false)
         .await;
-    wait_decision_slot(&format!("revoke:{deny_key}"), DecisionSlot::Denied).await;
+    wait_decision_slot(&state, &format!("revoke:{deny_key}"), DecisionSlot::Denied).await;
     let denied = emergency_revoke_public_ip(&state, deny_key)
         .await
         .unwrap_err();
@@ -640,7 +645,8 @@ async fn emergency_revoke_async_202_closure() {
         .await
         .unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
-    wait_decision_slot(&format!("revoke:{to_key}"), DecisionSlot::TimedOut).await;
+    let to_pk = format!("revoke:{to_key}");
+    wait_decision_slot(&to_state, &to_pk, DecisionSlot::TimedOut).await;
     let timed = emergency_revoke_public_ip(&to_state, to_key)
         .await
         .unwrap_err();
@@ -668,7 +674,7 @@ async fn emergency_revoke_202_e2e() {
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
     let event_id = wait_new_event_id(&state, &[]).await;
     react(&state, &event_id, "✅").await;
-    wait_decision_slot(&format!("revoke:{ok_key}"), DecisionSlot::Approved).await;
+    wait_decision_slot(&state, &format!("revoke:{ok_key}"), DecisionSlot::Approved).await;
     let view = emergency_revoke_public_ip(&state, ok_key).await.unwrap();
     assert_eq!(view.status, "❎");
     assert!(view.revoked && !view.enabled, "✅ 后重试须吊销生效");
@@ -690,7 +696,7 @@ async fn emergency_revoke_202_e2e() {
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
     let event_id = wait_new_event_id(&state, &[]).await;
     react(&state, &event_id, "❎").await;
-    wait_decision_slot(&format!("revoke:{no_key}"), DecisionSlot::Denied).await;
+    wait_decision_slot(&state, &format!("revoke:{no_key}"), DecisionSlot::Denied).await;
     let denied = emergency_revoke_public_ip(&state, no_key)
         .await
         .unwrap_err();
@@ -718,7 +724,7 @@ async fn emergency_revoke_202_e2e() {
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
     let auto_event = wait_new_event_id(&state, &[]).await;
     react(&state, &auto_event, "🔓").await;
-    wait_decision_slot(&format!("revoke:{auto_key}"), DecisionSlot::Denied).await;
+    wait_decision_slot(&state, &format!("revoke:{auto_key}"), DecisionSlot::Denied).await;
     let auto_denied = emergency_revoke_public_ip(&state, auto_key)
         .await
         .unwrap_err();
@@ -780,7 +786,8 @@ async fn emergency_revoke_202_e2e() {
         .await
         .unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
-    wait_decision_slot(&format!("revoke:{to_key}"), DecisionSlot::TimedOut).await;
+    let to_pk = format!("revoke:{to_key}");
+    wait_decision_slot(&to_state, &to_pk, DecisionSlot::TimedOut).await;
     let timed = emergency_revoke_public_ip(&to_state, to_key)
         .await
         .unwrap_err();

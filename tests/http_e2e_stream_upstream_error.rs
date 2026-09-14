@@ -157,3 +157,28 @@ async fn stream_upstream_non_sse_oversize_returns_502() {
     handle.abort();
     uhandle.abort();
 }
+
+#[tokio::test]
+async fn stream_upstream_error_oversize_passthrough_unchanged() {
+    // TRN-3：4xx/5xx 错误体超过 NONSTREAM_MAX_BYTES 仍保状态保字节透传，
+    // 不改写为 502、不截断。
+    let up_body = vec![b'e'; 64];
+    let (upstream, uhandle) = mock_upstream(500, "application/json", up_body.clone()).await;
+    let (base, handle) = serve(test_app_db(
+        &[
+            ("LLM_UPSTREAM", upstream.as_str()),
+            ("NONSTREAM_MAX_BYTES", "8"),
+        ],
+        "/tmp/veil-e2e-s6-err-oversize.sqlite",
+    ))
+    .await;
+    let (status, headers, got) = post_stream_true(&base).await;
+    assert_eq!(status, 500, "错误状态须保原码");
+    assert_eq!(got, up_body, "错误正文字节须逐字节一致（超限不截断）");
+    assert!(
+        !content_type(&headers).contains("text/event-stream"),
+        "错误状态不得改写为 SSE 假流"
+    );
+    handle.abort();
+    uhandle.abort();
+}

@@ -266,9 +266,29 @@ async fn apply_register_approval(
     drop(save_guard);
 }
 
+/// `AUTH-6` 原子回滚：删除指定条目的内存态并落盘，使 `caller_path` 立即可重试。
+async fn rollback_registered_entry(state: &impl AppStateParts, caller_path: &str) {
+    let save_guard = state.registry_save_lock().lock().await;
+    let bytes = {
+        let mut registry = state.registry().write().await;
+        if registry.remove_entry(caller_path).is_some() {
+            Some(registry.to_file_bytes())
+        } else {
+            None
+        }
+    };
+    match bytes {
+        Some(Ok(bytes)) => persist_registry_bytes(state.registry_path(), Ok(bytes)).await,
+        Some(Err(e)) => tracing::warn!("注册回滚序列化失败（内存已回滚）: {e}"),
+        None => {}
+    }
+    drop(save_guard);
+}
+
 /// C1/D1：注册审批链。先落盘中立条目（`disabled`），再建 `Register` 审批单，
 /// 复用双模：默认 `202` 抛单（后台等待落定回写），`CREDENTIAL_BLOCK_WAIT=1`
 /// 阻塞至 `300s`。三态落定见 [`apply_register_approval`]。
+/// `AUTH-6`：建单/发送失败时回滚已落条目，不遗留不可决孤儿。
 pub async fn register_caller_with_approval(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     params: &RegisterParams,
@@ -282,7 +302,7 @@ pub async fn register_caller_with_approval(
         view.script_hash.clone()
     };
     let reason = format!("register审批 :: {reg_id} :: {caller_path}");
-    let event_id = submit_pending_with_branch(
+    let event_id = match submit_pending_with_branch(
         state,
         &caller_path,
         &reason,
@@ -290,7 +310,14 @@ pub async fn register_caller_with_approval(
         "",
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(event_id) => event_id,
+        Err(err) => {
+            rollback_registered_entry(state, &caller_path).await;
+            return Err(err);
+        }
+    };
     if !state.config().credential_block_wait {
         let owned = (*state).clone();
         let path_for_task = caller_path.clone();
@@ -427,7 +454,6 @@ pub async fn emergency_revoke(
     key: &str,
     admin_token: Option<&str>,
     peer_ip: Option<&str>,
-    file_present: bool,
 ) -> Result<RegistrationView> {
     let admin_ok = match (
         admin_token,
@@ -437,7 +463,7 @@ pub async fn emergency_revoke(
         _ => false,
     };
     let net_ok = peer_ip.is_some_and(is_private_ip);
-    if admin_ok || file_present || net_ok {
+    if admin_ok || net_ok {
         return revoke_caller(state, key).await;
     }
     // `S1`/D1：转常规审批不再裸建单，改走同一决策闭环（批准动作 = 吊销注册）。
@@ -452,6 +478,7 @@ pub async fn emergency_revoke(
         ClosureLane {
             label: "吊销",
             auto_policy: AutoPolicy::Reject,
+            branch: matrix::MatrixBranch::Register,
         },
         || revoke_caller(state, key),
     )
@@ -514,5 +541,7 @@ pub async fn approve_hash_change(
     Ok(view)
 }
 
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod tests;

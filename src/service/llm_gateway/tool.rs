@@ -37,10 +37,6 @@ pub(crate) fn normalize_tool_args_with(emit_warn: bool, raw: Option<&Value>) -> 
     }
 }
 
-fn synth_id(index: u32, present: Option<&str>) -> (String, bool) {
-    synth_tool_id_with(true, index, present)
-}
-
 /// X2/D8：合成 id 共享实现（缺失/空 → `call_stable_<index>`），`emit_warn`
 /// 控制告警（非流 warn、流式静默），两入口共用防漂移。
 pub(crate) fn synth_tool_id_with(
@@ -144,24 +140,6 @@ pub fn retrieval_args(obj: &serde_json::Map<String, Value>) -> String {
     String::new()
 }
 
-fn custom_obj_to_call(index: u32, obj: &serde_json::Map<String, Value>) -> Option<ToolCall> {
-    let (id_raw, name, args) = custom_tool_parts(true, obj);
-    let (id, id_synth) = synth_id(index, id_raw.as_deref());
-    // L16：空增量（id 缺失合成 + 无名 + 无参，创槽心跳）只 warn 不建条目，
-    // 与 anthropic 空跳过同条件；有真实 id 的待名槽仍保留锚定。
-    if name.is_none() && args.is_empty() && id_synth {
-        tracing::warn!("tool 三元组缺失（id/name/args 全空），跳过建条目不断链");
-        return None;
-    }
-    Some(ToolCall {
-        index,
-        id,
-        name,
-        args,
-        id_synth,
-    })
-}
-
 /// Chat 桶键混入 choice 序号（F-P1b）：`ci*64+index`，`n>1` 时跨 choice
 /// 同 `index` 分桶隔离；`ci=0` 时与旧键等值，单 choice 快照不变。
 pub fn chat_bucket(ci: usize, idx: u32) -> u32 {
@@ -190,40 +168,126 @@ pub fn anthropic_bucket_index(outer: Option<u32>, block: &Value, fallback: u32) 
         .unwrap_or(fallback)
 }
 
-/// 非流/流 tool 调用提取：外层 `index` 语义经 [`anthropic_bucket_index`]
-/// 与流式分桶单实现对齐（chat 取 `chat_bucket(ci, call.index)`、legacy 取
-/// `chat_bucket(ci, 0)`；anthropic 外层→内层→枚举回退；responses 取 output_index/index）。
-pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> {
+fn custom_obj_to_call(
+    emit_warn: bool,
+    index: u32,
+    obj: &serde_json::Map<String, Value>,
+) -> Option<ToolCall> {
+    let (id_raw, name, args) = custom_tool_parts(emit_warn, obj);
+    let (id, id_synth) = synth_tool_id_with(emit_warn, index, id_raw.as_deref());
+    // L16：空增量（id 缺失合成 + 无名 + 无参，创槽心跳）只 warn 不建条目，
+    // 与 anthropic 空跳过同条件；有真实 id 的待名槽仍保留锚定。
+    if name.is_none() && args.is_empty() && id_synth {
+        if emit_warn {
+            tracing::warn!("tool 三元组缺失（id/name/args 全空），跳过建条目不断链");
+        }
+        return None;
+    }
+    Some(ToolCall {
+        index,
+        id,
+        name,
+        args,
+        id_synth,
+    })
+}
+
+/// RED-4：Responses 四类工具 delta 事件 → 派生工具名（流/非流统一，对齐 Python
+/// `_llm.py:783-791` 将四者统一归 `function_call_arguments` 审计路径）。
+pub(crate) fn responses_derived_tool_kind(ev_type: &str) -> Option<&'static str> {
+    if ev_type.contains("code_interpreter_call_code") {
+        Some("code_interpreter")
+    } else if ev_type.contains("shell_call_command") {
+        Some("shell")
+    } else if ev_type.contains("mcp_call_arguments") {
+        Some("mcp")
+    } else if ev_type.contains("custom_tool_call_input") {
+        Some("custom_tool")
+    } else {
+        None
+    }
+}
+
+/// ARC-3/D3：三协议 tool 调用提取单一核心，流式分片与非流两路径共用同一三臂
+/// walk；`emit_warn` 区分非流（warn）与流式（静默）。分桶、合成 id、字段优先级、
+/// 检索事件派生、`.delta`/`.done` 语义逐项等价。
+pub(crate) fn extract_tool_calls_with(
+    emit_warn: bool,
+    protocol: Protocol,
+    payload: &Value,
+) -> Vec<ToolCall> {
     let mut out = Vec::new();
     match protocol {
         Protocol::Chat => {
             if let Some(choices) = payload.get("choices").and_then(|c| c.as_array()) {
                 for (ci, ch) in choices.iter().enumerate() {
+                    // RED-7：分桶用协议声明 `choices[].index`（缺省回退枚举位置）。
+                    let choice_idx = ch
+                        .get("index")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(ci as u64) as usize;
                     for key in ["delta", "message"] {
-                        if let Some(container) = ch.get(key) {
-                            if let Some(calls) =
-                                container.get("tool_calls").and_then(|c| c.as_array())
-                            {
-                                for (i, call) in calls.iter().enumerate() {
-                                    let idx = call
-                                        .get("index")
-                                        .and_then(|x| x.as_u64())
-                                        .unwrap_or(i as u64)
-                                        as u32;
-                                    let bucket = chat_bucket(ci, idx);
+                        let Some(container) = ch.get(key) else {
+                            continue;
+                        };
+                        if let Some(calls) = container.get("tool_calls").and_then(|c| c.as_array())
+                        {
+                            for (i, call) in calls.iter().enumerate() {
+                                let idx = call
+                                    .get("index")
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(i as u64)
+                                    as u32;
+                                let bucket = chat_bucket(choice_idx, idx);
+                                let (id, id_synth) = synth_tool_id_with(
+                                    emit_warn,
+                                    bucket,
+                                    call.get("id").and_then(|x| x.as_str()),
+                                );
+                                let name = call
+                                    .get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string());
+                                let args = normalize_tool_args_with(
+                                    emit_warn,
+                                    call.get("function").and_then(|f| f.get("arguments")),
+                                );
+                                if emit_warn && name.is_none() && args.is_empty() {
+                                    tracing::warn!("chat tool 三元组缺失，暂缓审计放行");
+                                }
+                                out.push(ToolCall {
+                                    index: bucket,
+                                    id,
+                                    name,
+                                    args,
+                                    id_synth,
+                                });
+                            }
+                        }
+                        for legacy_key in ["function_call", "custom_tool_call"] {
+                            let Some(legacy) = container.get(legacy_key) else {
+                                continue;
+                            };
+                            let items: Vec<&Value> = match legacy {
+                                Value::Array(a) => a.iter().collect(),
+                                Value::Object(_) => vec![legacy],
+                                _ => vec![],
+                            };
+                            for (i, item) in items.iter().enumerate() {
+                                let Some(obj) = item.as_object() else {
+                                    continue;
+                                };
+                                if legacy_key == "function_call" {
+                                    let bucket = chat_bucket(choice_idx, 0);
                                     let (id, id_synth) =
-                                        synth_id(bucket, call.get("id").and_then(|x| x.as_str()));
-                                    let name = call
-                                        .get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(|x| x.as_str())
+                                        synth_tool_id_with(emit_warn, bucket, None);
+                                    let name = obj
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
                                         .map(|s| s.to_string());
-                                    let args = normalize_tool_args(
-                                        call.get("function").and_then(|f| f.get("arguments")),
-                                    );
-                                    if name.is_none() && args.is_empty() {
-                                        tracing::warn!("chat tool 三元组缺失，暂缓审计放行");
-                                    }
+                                    let args =
+                                        normalize_tool_args_with(emit_warn, obj.get("arguments"));
                                     out.push(ToolCall {
                                         index: bucket,
                                         id,
@@ -231,40 +295,12 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                                         args,
                                         id_synth,
                                     });
-                                }
-                            }
-                            for legacy_key in ["function_call", "custom_tool_call"] {
-                                if let Some(legacy) = container.get(legacy_key) {
-                                    let items: Vec<&Value> = match legacy {
-                                        Value::Array(a) => a.iter().collect(),
-                                        Value::Object(_) => vec![legacy],
-                                        _ => vec![],
-                                    };
-                                    for (i, item) in items.iter().enumerate() {
-                                        if let Some(obj) = item.as_object() {
-                                            if legacy_key == "function_call" {
-                                                let bucket = chat_bucket(ci, 0);
-                                                let (id, id_synth) = synth_id(bucket, None);
-                                                let name = obj
-                                                    .get("name")
-                                                    .and_then(|v| v.as_str())
-                                                    .map(|s| s.to_string());
-                                                let args =
-                                                    normalize_tool_args(obj.get("arguments"));
-                                                out.push(ToolCall {
-                                                    index: bucket,
-                                                    id,
-                                                    name,
-                                                    args,
-                                                    id_synth,
-                                                });
-                                            } else if let Some(c) =
-                                                custom_obj_to_call(chat_bucket(ci, i as u32), obj)
-                                            {
-                                                out.push(c);
-                                            }
-                                        }
-                                    }
+                                } else if let Some(c) = custom_obj_to_call(
+                                    emit_warn,
+                                    chat_bucket(choice_idx, i as u32),
+                                    obj,
+                                ) {
+                                    out.push(c);
                                 }
                             }
                         }
@@ -293,30 +329,19 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     blocks.push(msg);
                 }
             }
-            // §2.4：分桶经共享 [`anthropic_bucket_index`]（外层优先，见上）。
             let outer_index: Option<u32> = payload
                 .get("index")
                 .and_then(|x| x.as_u64())
                 .map(|n| n as u32);
             for (i, b) in blocks.iter().enumerate() {
                 let bucket = anthropic_bucket_index(outer_index, b, i as u32);
-                let is_tool = b.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-                    t.contains("tool_use") || t.contains("function") || t.contains("custom")
-                }) || b.get("name").is_some()
-                    || b.get("partial_json").is_some()
-                    || b.get("input").is_some()
-                    || b.get("function_call").is_some()
-                    || b.get("custom_tool_call").is_some();
-                if !is_tool {
-                    continue;
-                }
                 if let Some(fc) = b.get("function_call").and_then(|v| v.as_object()) {
-                    let (id, id_synth) = synth_id(bucket, None);
+                    let (id, id_synth) = synth_tool_id_with(emit_warn, bucket, None);
                     let name = fc
                         .get("name")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let args = normalize_tool_args(fc.get("arguments"));
+                    let args = normalize_tool_args_with(emit_warn, fc.get("arguments"));
                     out.push(ToolCall {
                         index: bucket,
                         id,
@@ -329,7 +354,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                 if let Some(cc) = b.get("custom_tool_call") {
                     match cc {
                         Value::Object(obj) => {
-                            if let Some(c) = custom_obj_to_call(bucket, obj) {
+                            if let Some(c) = custom_obj_to_call(emit_warn, bucket, obj) {
                                 out.push(c);
                             }
                             continue;
@@ -337,7 +362,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                         Value::Array(a) => {
                             for (j, item) in a.iter().enumerate() {
                                 if let Some(obj) = item.as_object()
-                                    && let Some(c) = custom_obj_to_call(j as u32, obj)
+                                    && let Some(c) = custom_obj_to_call(emit_warn, j as u32, obj)
                                 {
                                     out.push(c);
                                 }
@@ -347,20 +372,41 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                         _ => {}
                     }
                 }
+                let is_tool = b.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+                    t.contains("tool_use") || t.contains("function") || t.contains("custom")
+                }) || b.get("name").is_some()
+                    || b.get("partial_json").is_some()
+                    || b.get("input").is_some()
+                    || b.get("function_call").is_some()
+                    || b.get("custom_tool_call").is_some();
+                if !is_tool {
+                    continue;
+                }
                 let id_raw = b.get("id").and_then(|v| v.as_str());
                 let name = b
                     .get("name")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let args_raw = b
-                    .get("partial_json")
-                    .or_else(|| b.get("input"))
-                    .or_else(|| b.get("arguments"));
-                let args = normalize_tool_args(args_raw);
+                // TRN-6：`content_block_start` 的空占位 `input`（`{}`/空串/null）
+                // 不作为 args 累积，避免与后续 `partial_json` 拼接成 `"{}{...}"`。
+                let empty_placeholder = |v: &Value| match v {
+                    Value::Null => true,
+                    Value::String(s) => s.is_empty(),
+                    Value::Object(m) => m.is_empty(),
+                    _ => false,
+                };
+                let args_raw = if let Some(pj) = b.get("partial_json") {
+                    Some(pj)
+                } else if let Some(inp) = b.get("input").filter(|x| !empty_placeholder(x)) {
+                    Some(inp)
+                } else {
+                    b.get("arguments")
+                };
+                let args = normalize_tool_args_with(emit_warn, args_raw);
                 if name.is_none() && args.is_empty() && id_raw.is_none() {
                     continue;
                 }
-                let (id, id_synth) = synth_id(bucket, id_raw);
+                let (id, id_synth) = synth_tool_id_with(emit_warn, bucket, id_raw);
                 out.push(ToolCall {
                     index: bucket,
                     id,
@@ -375,7 +421,8 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
             // 三级键：`output_index` 为桶号、`item_id/id` 为槽键、
             // `sequence_number` 由 AuditHold 保序；此处只做提取不排序不解析。
             let ev_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if ev_type.contains("function_call_arguments") {
+            let derived = responses_derived_tool_kind(ev_type);
+            if ev_type.contains("function_call_arguments") || derived.is_some() {
                 let idx = payload
                     .get("output_index")
                     .and_then(|x| x.as_u64())
@@ -388,14 +435,15 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                 let name = payload
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(|s| s.to_string())
+                    .or_else(|| derived.map(str::to_string));
                 if ev_type.ends_with(".delta") {
                     let delta = payload
                         .get("delta")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
                     if !delta.is_empty() || name.is_some() {
-                        let (id, id_synth) = synth_id(idx, id_raw);
+                        let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
                         out.push(ToolCall {
                             index: idx,
                             id,
@@ -407,13 +455,19 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     return out;
                 }
                 if ev_type.ends_with(".done") {
-                    let args = match payload.get("arguments") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => serde_json::to_string(other).unwrap_or_default(),
-                        None => String::new(),
-                    };
+                    let args = ["arguments", "code", "command", "input"]
+                        .iter()
+                        .find_map(|k| payload.get(*k))
+                        .map(|a| {
+                            if let Some(s) = a.as_str() {
+                                s.to_string()
+                            } else {
+                                a.to_string()
+                            }
+                        })
+                        .unwrap_or_default();
                     if !args.is_empty() || name.is_some() {
-                        let (id, id_synth) = synth_id(idx, id_raw);
+                        let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
                         out.push(ToolCall {
                             index: idx,
                             id,
@@ -424,6 +478,39 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     }
                     return out;
                 }
+                return out;
+            }
+            // C10 检索事件计 tool（与非流一致）：名按类型派生，参按
+            // queries 回退；中间态同样建槽审计，误报优于漏审。
+            if let Some(rname) = retrieval_tool_name(ev_type) {
+                let idx = payload
+                    .get("output_index")
+                    .or_else(|| payload.get("index"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                let id_raw = payload
+                    .get("item_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload.get("id").and_then(|v| v.as_str()));
+                let name = payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(rname.to_string()));
+                let mut args = payload.as_object().map(retrieval_args).unwrap_or_default();
+                if args.is_empty()
+                    && let Some(d) = payload.get("delta").and_then(|v| v.as_str())
+                {
+                    args = d.to_string();
+                }
+                let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
+                out.push(ToolCall {
+                    index: idx,
+                    id,
+                    name,
+                    args,
+                    id_synth,
+                });
                 return out;
             }
             if ev_type.contains("output_text") {
@@ -439,11 +526,16 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     .and_then(|x| x.as_u64())
                     .map(|n| n as u32)
                     .unwrap_or(0);
-                let mut args = match item.get("arguments") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
-                    None => String::new(),
-                };
+                let mut args = item
+                    .get("arguments")
+                    .map(|a| {
+                        if let Some(s) = a.as_str() {
+                            s.to_string()
+                        } else {
+                            a.to_string()
+                        }
+                    })
+                    .unwrap_or_default();
                 // C10：检索完成项参按 queries 回退（与流式分片同结论）。
                 if args.is_empty()
                     && let Some(obj) = item.as_object()
@@ -460,7 +552,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     .and_then(|v| v.as_str())
                     .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
                 if !args.is_empty() || name.is_some() {
-                    let (id, id_synth) = synth_id(idx, id_raw);
+                    let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
                     out.push(ToolCall {
                         index: idx,
                         id,
@@ -500,7 +592,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     .get("id")
                     .and_then(|v| v.as_str())
                     .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
-                let (id, id_synth) = synth_id(idx, id_raw);
+                let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
                 out.push(ToolCall {
                     index: idx,
                     id,
@@ -515,25 +607,21 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
             }
             if let Some(output) = payload.get("output").and_then(|o| o.as_array()) {
                 for (i, item) in output.iter().enumerate() {
-                    let bucket = responses_output_bucket(item, i);
-                    let is_tool = item.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-                        t.contains("function_call")
-                            || t.contains("custom_tool_call")
-                            || t.contains("tool")
-                            || retrieval_tool_name(t).is_some()
-                    }) || item.get("name").is_some()
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_tool = item_type.contains("function_call")
+                        || item_type.contains("custom_tool_call")
+                        || item_type.contains("tool")
+                        || retrieval_tool_name(item_type).is_some()
+                        || item.get("name").is_some()
                         || item.get("arguments").is_some()
                         || item.get("input").is_some();
                     if !is_tool {
                         continue;
                     }
-                    // C10 检索调用直建条目：名缺失时按类型派生，参按
-                    // queries 回退；与流式分片同结论（误报优于漏审）。
+                    let bucket = responses_output_bucket(item, i);
+                    // C10 检索调用直建条目（与非流同形：名派生+queries 回退）。
                     if let Some(obj) = item.as_object()
-                        && let Some(rname) = obj
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .and_then(retrieval_tool_name)
+                        && let Some(rname) = retrieval_tool_name(item_type)
                     {
                         let id_raw = obj
                             .get("id")
@@ -544,7 +632,7 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .or_else(|| Some(rname.to_string()));
-                        let (id, id_synth) = synth_id(bucket, id_raw);
+                        let (id, id_synth) = synth_tool_id_with(emit_warn, bucket, id_raw);
                         out.push(ToolCall {
                             index: bucket,
                             id,
@@ -556,18 +644,15 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
                     }
                     if let Some(obj) = item.as_object()
                         && let Some(Value::Object(inner)) = obj.get("custom_tool_call")
-                        && let Some(c) = custom_obj_to_call(bucket, inner)
+                        && let Some(c) = custom_obj_to_call(emit_warn, bucket, inner)
                     {
                         out.push(c);
                         continue;
                     }
                     if let Some(obj) = item.as_object()
-                        && let Some(c) = custom_obj_to_call(bucket, obj)
+                        && let Some(c) = custom_obj_to_call(emit_warn, bucket, obj)
                     {
-                        let meaningful = c.name.is_some() || !c.args.is_empty() || !c.id_synth;
-                        if meaningful {
-                            out.push(c);
-                        }
+                        out.push(c);
                     }
                 }
             }
@@ -575,6 +660,11 @@ pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> 
         Protocol::NonDialog => {}
     }
     out
+}
+
+/// 非流 tool 调用提取（ARC-3 薄包装）：`emit_warn=true` 调用单一核心。
+pub fn extract_tool_calls(protocol: Protocol, payload: &Value) -> Vec<ToolCall> {
+    extract_tool_calls_with(true, protocol, payload)
 }
 
 pub fn extract_conv_id(data: &Value) -> Option<String> {
@@ -600,6 +690,12 @@ pub fn extract_conv_id(data: &Value) -> Option<String> {
         {
             return Some(id);
         }
+    }
+    // TRN-7：Anthropic `message_start`——唯一 id 位于嵌套 `message.id`，顶层恒无。
+    if let Some(msg) = data.get("message")
+        && let Some(id) = non_empty(msg.get("id"))
+    {
+        return Some(id);
     }
     if let Some(err) = data.get("error") {
         match err {

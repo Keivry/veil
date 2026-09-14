@@ -13,6 +13,79 @@ fn duplicate_path_conflicts_409_same_hash_multi_path_allowed() {
 }
 
 #[test]
+fn revoked_caller_path_can_reregister() {
+    // AUTH-7：已吊销 `caller_path` 允许重注册，新条目全新初始化。
+    let mut reg = CallerRegistry::empty();
+    reg.register_extended(&RegisterParams {
+        caller_path: "/s/rev-reuse.sh".to_string(),
+        caller_hash: "h-old".to_string(),
+        ..RegisterParams::default()
+    })
+    .unwrap();
+    reg.set_enabled("/s/rev-reuse.sh", true).unwrap();
+    reg.revoke("/s/rev-reuse.sh").unwrap();
+    let e = reg
+        .register_extended(&RegisterParams {
+            caller_path: "/s/rev-reuse.sh".to_string(),
+            caller_hash: "h-new".to_string(),
+            ..RegisterParams::default()
+        })
+        .expect("已吊销路径须可复用重注册");
+    assert_eq!(e.expected_hash, "h-new");
+    assert!(!e.enabled && !e.revoked, "重注册须全新初始化");
+}
+
+#[test]
+fn reregister_clears_old_hash_grace() {
+    // AUTH-7：重注册不得继承已吊销条目的旧哈希宽限。
+    let mut reg = CallerRegistry::empty();
+    reg.register_extended(&RegisterParams {
+        caller_path: "/s/grace-reuse.sh".to_string(),
+        caller_hash: "h1".to_string(),
+        ..RegisterParams::default()
+    })
+    .unwrap();
+    reg.approve_hash_change("/s/grace-reuse.sh", "h2").unwrap();
+    assert!(
+        reg.lookup_by_path("/s/grace-reuse.sh")
+            .unwrap()
+            .old_hash
+            .is_some(),
+        "前置：宽限须已写入"
+    );
+    reg.revoke("/s/grace-reuse.sh").unwrap();
+    let e = reg
+        .register_extended(&RegisterParams {
+            caller_path: "/s/grace-reuse.sh".to_string(),
+            caller_hash: "h3".to_string(),
+            ..RegisterParams::default()
+        })
+        .unwrap();
+    assert!(
+        e.old_hash.is_none() && e.old_hash_expires_at.is_none(),
+        "重注册条目不得继承旧哈希宽限"
+    );
+    assert!(!e.matches_old_hash("h2"));
+}
+
+#[test]
+fn register_extended_rejects_duplicate_unrevoked_name() {
+    let mut reg = CallerRegistry::empty();
+    let p = |path: &str, name: &str| RegisterParams {
+        caller_path: path.to_string(),
+        caller_hash: format!("h-{path}"),
+        name: name.to_string(),
+        ..RegisterParams::default()
+    };
+    reg.register_extended(&p("/s/u1.sh", "uniq-job")).unwrap();
+    let dup = reg.register_extended(&p("/s/u2.sh", "uniq-job"));
+    assert!(
+        matches!(dup, Err(VeilError::Conflict { .. })),
+        "未吊销重名须 409"
+    );
+}
+
+#[test]
 fn new_registration_disabled_by_default() {
     let mut reg = CallerRegistry::empty();
     let e = reg.register("/s/a.sh", "h1").unwrap();

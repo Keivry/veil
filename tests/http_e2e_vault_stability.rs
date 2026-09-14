@@ -17,11 +17,14 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/vault-flow.sh",
             "caller_hash": "h-vault-flow-1",
             "name": "vault-flow-job",
-            "entry": "网易", "field": "授权码"
+            "entry": "网易", "field": "授权码",
+            "auth": {"caller_hash": "h-vault-flow-1", "caller_path": "/srv/vault-flow.sh"}
         }))
         .send()
         .await
@@ -42,9 +45,12 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
     assert_eq!(pre.status().as_u16(), 403, "审批启用前须拒绝");
     let approve = client
         .post(format!("{base}/approve-hash-change"))
+        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Get-Binary-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/vault-flow.sh",
-            "new_hash": "h-vault-flow-1"
+            "new_hash": "h-vault-flow-1",
+            "auth": {"caller_hash": "h-vault-flow-1", "caller_path": "/srv/vault-flow.sh"}
         }))
         .send()
         .await

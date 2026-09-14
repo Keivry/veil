@@ -131,11 +131,12 @@ pub(super) fn responses_failed_incomplete(
     }
 }
 
-/// D5：`type:"error"` 事件的上游 error 诊断提取：`error` 对象内存在的
-/// `code`/`type`/`param`/`message` 字段原样保留（缺失 `message` 时回退顶层
-/// `message`）；无 `message` 或 `error` 非对象返回 `None`
+/// D5 + TRN-2：`type:"error"` 事件的双形态诊断提取——兼容官方顶层形态
+/// （`code`/`message`/`param` 在顶层）与既有嵌套 `error` 对象形态：嵌套字段优先，
+/// 顶层 `code`/`param`/`message` 仅补缺；同时携带顶层 `sequence_number`（可得时）。
+/// 无 `message`（合并后为空）或两形态均无有效字段时返回 `None`
 /// （合成帧回退既有 `{"id","status"}` 形态，不带 error 字段、无空字段噪声）。
-pub(super) fn responses_error_object(data: &str) -> Option<Value> {
+pub(super) fn responses_error_object(data: &str) -> Option<(Value, Option<u64>)> {
     let v = serde_json::from_str::<Value>(strip_bom(data)).ok()?;
     let mut obj = serde_json::Map::new();
     if let Some(err) = v.get("error").filter(|e| e.is_object()) {
@@ -145,19 +146,26 @@ pub(super) fn responses_error_object(data: &str) -> Option<Value> {
             }
         }
     }
-    if !obj.contains_key("message")
-        && let Some(msg) = v
-            .get("message")
-            .and_then(|m| m.as_str())
-            .filter(|s| !s.is_empty())
-    {
-        obj.insert("message".to_string(), Value::String(msg.to_string()));
+    for key in ["code", "param", "message"] {
+        if !obj.contains_key(key)
+            && let Some(val) = v.get(key).filter(|x| !x.is_null())
+        {
+            obj.insert(key.to_string(), val.clone());
+        }
     }
     let has_message = obj
         .get("message")
         .and_then(|m| m.as_str())
         .is_some_and(|s| !s.is_empty());
-    has_message.then_some(Value::Object(obj))
+    has_message.then(|| (Value::Object(obj), extract_responses_seq(&v)))
+}
+
+/// TRN-7：流式模型提取——顶层 `model` 优先，回退 Anthropic `message_start.message.model`
+/// （Anthropic 唯一模型名位于嵌套 `message`，顶层恒无）。
+pub(super) fn stream_model_of(v: &Value) -> Option<&str> {
+    v.get("model")
+        .or_else(|| v.get("message").and_then(|m| m.get("model")))
+        .and_then(|m| m.as_str())
 }
 
 /// E9 合成截断帧 conv 取值：优先流内首见 `id`，其次泵内最新 `conv_id`，
@@ -258,11 +266,9 @@ pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
         P::Responses => {
             let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
             // C10：`file_search/web_search` 计 tool（与非流一致），不再列为
-            // 次要事件；其余检索外围（reasoning/mcp/code_interpreter/image_gen）
-            // 仍透传不审计。
-            ["reasoning", "mcp", "code_interpreter", "image_gen"]
-                .iter()
-                .any(|k| t.contains(k))
+            // 次要事件；RED-4：`mcp`/`code_interpreter` 工具 delta 现计入审计，
+            // 从次要集移除使审计判定可达；`reasoning`/`image_gen` 维持次要。
+            ["reasoning", "image_gen"].iter().any(|k| t.contains(k))
         }
         P::Chat => v
             .get("choices")
@@ -280,7 +286,7 @@ pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
 
 #[cfg(test)]
 mod event_tests {
-    use super::*;
+    use {super::*, crate::service::block_inject};
 
     #[test]
     fn terminal_error_spaced_variant_triggers_truncation() {
@@ -406,7 +412,8 @@ mod event_tests {
             P::Responses,
             &serde_json::json!({"type":"response.reasoning.delta","delta":"x"})
         ));
-        assert!(is_minor_event(
+        // RED-4：`mcp`/`code_interpreter` 工具事件现计入审计，不再次要。
+        assert!(!is_minor_event(
             P::Responses,
             &serde_json::json!({"type":"response.mcp_call.in_progress"})
         ));
@@ -453,18 +460,21 @@ mod event_tests {
         ] {
             assert!(responses_error_object(raw).is_none(), "须回退: {raw}");
         }
-        let frame = block_inject::responses_failed_frame("r1", None);
+        let frame = block_inject::responses_failed_frame("r1", None, None);
         assert!(frame.contains("\"status\":\"failed\""));
         assert!(!frame.contains("\"error\""), "回退形态不得带 error 字段");
         // 顶层 message 回退 + 仅 message 无空字段噪声。
-        let obj = responses_error_object(r#"{"type":"error","message":"boom"}"#).expect("顶层回退");
+        let (obj, seq) =
+            responses_error_object(r#"{"type":"error","message":"boom"}"#).expect("顶层回退");
         assert_eq!(obj["message"], "boom");
-        let obj = responses_error_object(r#"{"type":"error","error":{"message":"only"}}"#).unwrap();
+        assert_eq!(seq, None);
+        let (obj, _) =
+            responses_error_object(r#"{"type":"error","error":{"message":"only"}}"#).unwrap();
         assert!(
             obj.get("code").is_none() && obj.get("param").is_none() && obj.get("type").is_none()
         );
-        // 完整诊断字段全保留。
-        let obj = responses_error_object(
+        // 完整诊断字段全保留（嵌套形态）。
+        let (obj, _) = responses_error_object(
             r#"{"type":"error","error":{"type":"err","code":"c","param":"p","message":"m"}}"#,
         )
         .unwrap();
@@ -479,11 +489,105 @@ mod event_tests {
     }
 
     #[test]
+    fn responses_error_official_shape_keeps_code_param() {
+        // TRN-2：官方 `ResponseErrorEvent` 顶层形态——`code`/`param`/`message` 与
+        // `sequence_number` 均保留，并写入合成 `response.failed` 载荷顶层。
+        let raw = r#"{"type":"error","code":"server_error","message":"boom","param":"p","sequence_number":7}"#;
+        let (obj, seq) = responses_error_object(raw).expect("官方形态须提取");
+        assert_eq!(obj["code"], "server_error");
+        assert_eq!(obj["param"], "p");
+        assert_eq!(obj["message"], "boom");
+        assert_eq!(seq, Some(7));
+        let frame = block_inject::responses_failed_frame("r1", Some(&obj), seq);
+        assert!(frame.contains("\"code\":\"server_error\""), "{frame}");
+        assert!(frame.contains("\"param\":\"p\""), "{frame}");
+        assert!(frame.contains("\"sequence_number\":7"), "{frame}");
+    }
+
+    #[test]
+    fn responses_error_nested_shape_still_supported() {
+        // TRN-2：既有嵌套形态保留 `code`/`message`，无 sequence_number 不写。
+        let raw = r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow"}}"#;
+        let (obj, seq) = responses_error_object(raw).expect("嵌套形态须提取");
+        assert_eq!(obj["code"], "rate_limit_exceeded");
+        assert_eq!(obj["message"], "slow");
+        assert_eq!(seq, None);
+        let frame = block_inject::responses_failed_frame("r1", Some(&obj), seq);
+        assert!(
+            frame.contains("\"code\":\"rate_limit_exceeded\""),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("sequence_number"),
+            "缺失不得空噪声: {frame}"
+        );
+    }
+
+    #[test]
+    fn responses_error_fallback_shape() {
+        // TRN-2/D5：无 `message` 或 error 非对象时维持 `{"id","status"}` 回退，不断链。
+        for raw in [
+            r#"{"type":"error","error":{"code":"x"}}"#,
+            r#"{"type":"error","error":"oops"}"#,
+            r#"{"type":"error"}"#,
+        ] {
+            assert!(responses_error_object(raw).is_none(), "须回退: {raw}");
+        }
+        let frame = block_inject::responses_failed_frame("r1", None, None);
+        assert!(frame.contains("\"status\":\"failed\""));
+        assert!(!frame.contains("\"error\""), "回退形态不得带 error 字段");
+    }
+
+    #[test]
     fn empty_stream_synthesis_gate_truth_table() {
         assert!(should_synthesize_empty_stream(false, false, false));
         assert!(!should_synthesize_empty_stream(false, true, false));
         assert!(!should_synthesize_empty_stream(true, false, false));
         assert!(!should_synthesize_empty_stream(false, false, true));
         assert!(!should_synthesize_empty_stream(true, true, true));
+    }
+
+    #[test]
+    fn anthropic_message_start_model_bucket() {
+        use crate::service::metrics::normalize_model;
+        let start = serde_json::json!({"type":"message_start","message":{"id":"msg_abc","model":"claude-x"}});
+        assert_eq!(stream_model_of(&start), Some("claude-x"));
+        assert_eq!(
+            normalize_model(stream_model_of(&start).unwrap_or("")),
+            "claude-x"
+        );
+        let top = serde_json::json!({"model":"gpt-4o"});
+        assert_eq!(stream_model_of(&top), Some("gpt-4o"), "顶层优先不回退");
+        let none = serde_json::json!({"type":"message_start","message":{"id":"m"}});
+        assert_eq!(stream_model_of(&none), None);
+        assert_eq!(
+            normalize_model(stream_model_of(&none).unwrap_or("")),
+            "unknown_model"
+        );
+    }
+
+    #[test]
+    fn minor_event_excludes_tool_deltas() {
+        use crate::service::llm_gateway::Protocol as P;
+        for t in [
+            "response.code_interpreter_call_code.delta",
+            "response.shell_call_command.delta",
+            "response.mcp_call_arguments.delta",
+            "response.custom_tool_call_input.delta",
+        ] {
+            assert!(
+                !is_minor_event(P::Responses, &serde_json::json!({"type": t})),
+                "{t} 不得为次要事件（审计须可达）"
+            );
+        }
+        for t in [
+            "response.reasoning_text.delta",
+            "response.image_gen_call.delta",
+        ] {
+            assert!(
+                is_minor_event(P::Responses, &serde_json::json!({"type": t})),
+                "{t} 须维持次要"
+            );
+        }
     }
 }

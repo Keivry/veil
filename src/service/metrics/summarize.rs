@@ -35,6 +35,28 @@ fn placeholder_re() -> &'static regex::Regex {
     })
 }
 
+fn ipv4_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?-u:\b)(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?-u:\b)")
+            .expect("ipv4 正则恒合法")
+    })
+}
+
+fn id_card_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?-u:\b)[0-9]{17}[0-9Xx](?-u:\b)").expect("id_card 正则恒合法")
+    })
+}
+
+fn bank_card_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?-u:\b)[0-9]{13,19}(?-u:\b)").expect("bank_card 正则恒合法")
+    })
+}
+
 /// 摘要脱敏（单一路径）：先脱敏后截断。
 ///
 /// 顺序硬性 `redact → truncate`：`__PII__`/`__VG_CRED__`/`sk-`/email/秘密键值
@@ -53,6 +75,12 @@ pub fn redact_summary(text: &str) -> String {
     let s = placeholder_re().replace_all(&cleaned, "[REDACTED:placeholder]");
     let s = sk_re().replace_all(&s, "[REDACTED:api_key]");
     let s = email_re().replace_all(&s, "[REDACTED:email]");
+    // TST-8 兜底：IPv4（4 段）/身份证（17 位 + 数字或 X）/卡号（13-19 位连续数字）
+    // 三类形态，与 `sample_mask` 对应分支可检出形态同口径；身份证先于卡号
+    // （18 位为卡号子集）。`(?-u:\b)` 使 CJK 相邻也能切边界。
+    let s = ipv4_re().replace_all(&s, "[REDACTED:ipv4]");
+    let s = id_card_re().replace_all(&s, "[REDACTED:id_card]");
+    let s = bank_card_re().replace_all(&s, "[REDACTED:bank_card]");
     // JSON 键形态：保留键名与分隔符，只脱敏值部（`$1` 为键+分隔符捕获组）。
     let s = secret_key_re().replace_all(&s, "$1[REDACTED:secret]");
     s.into_owned()
@@ -234,5 +262,26 @@ mod tests {
         let t = summarize(&cn, 10);
         assert!(t.chars().count() <= 24, "{t}");
         assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn redact_summary_redacts_ipv4() {
+        let out = redact_summary("客户端 192.168.1.10 连接");
+        assert!(!out.contains("192.168.1.10"), "{out}");
+        assert!(out.contains("[REDACTED:ipv4]"), "{out}");
+    }
+
+    #[test]
+    fn redact_summary_redacts_id_card() {
+        let out = redact_summary("身份证 11010119900307123X 校验");
+        assert!(!out.contains("11010119900307123X"), "{out}");
+        assert!(out.contains("[REDACTED:id_card]"), "{out}");
+    }
+
+    #[test]
+    fn redact_summary_redacts_bank_card() {
+        let out = redact_summary("卡号 6225880123456789 转账");
+        assert!(!out.contains("6225880123456789"), "{out}");
+        assert!(out.contains("[REDACTED:bank_card]"), "{out}");
     }
 }

@@ -216,6 +216,33 @@ pub fn test_app_cfg(
 /// 仅需 `AppState` 时使用（如矩阵审批注入场景）。
 pub fn test_state(opts: impl Into<TestOpts>) -> AppState { test_app(opts).1 }
 
+/// `AUTH-4` e2e 装配：注册并启用具备 `网易/授权码` 放行权限的调用方。
+pub async fn enroll_allow(state: &AppState, path: &str, hash: &str) {
+    use veil::registry::RegisterParams;
+    veil::service::credential::register_caller_extended(
+        state,
+        &RegisterParams {
+            caller_path: path.to_string(),
+            caller_hash: hash.to_string(),
+            name: path.to_string(),
+            entries: std::collections::BTreeMap::from([(
+                "网易".to_string(),
+                vec!["授权码".to_string()],
+            )]),
+            ..RegisterParams::default()
+        },
+        &format!("e2e-enroll-{path}"),
+    )
+    .await
+    .expect("e2e 注册装配须成功");
+    state
+        .registry
+        .write()
+        .await
+        .set_enabled(path, true)
+        .unwrap();
+}
+
 /// 绑定回环随机端口并启动 axum 服务，返回 `(base_url, JoinHandle)`。
 pub async fn serve(app: axum::Router) -> (String, JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

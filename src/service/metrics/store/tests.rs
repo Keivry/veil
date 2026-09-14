@@ -410,20 +410,22 @@ async fn series_four_windows_cross_day_approx_sum_query() {
 #[test]
 fn sample_upsert_rollover() {
     use super::super::aggregate::PII_SAMPLE_RETENTION_DAYS;
-    // P11/D12：复合键 (day,upstream,kind,hash) 覆盖式 UPSERT + 7 天滚动删除。
+    // P11/D12：复合键 (day,upstream,kind,hash) 覆盖式 UPSERT（重复 flush 合并不增行），
+    // 滚动删除按多 distinct 主键判定——仅超窗行删除，窗口/边界内行保留。
     let db = tmp_db("sample-upsert-rollover");
     let _ = std::fs::remove_file(&db);
     let ts = now();
-    let row = |seen: i64| super::SampleRow {
+    let window = PII_SAMPLE_RETENTION_DAYS * 86_400;
+    let row = |hash: &str, seen: i64| super::SampleRow {
         day: "2026-09-09".to_string(),
         upstream: "https://u.example".to_string(),
         kind: "phone".to_string(),
-        hash: "hash-phone".to_string(),
+        hash: hash.to_string(),
         mask: "138****8000".to_string(),
         seen,
     };
-    persist_sample_batch(&db, &[row(ts)]).unwrap();
-    persist_sample_batch(&db, &[row(ts + 1)]).unwrap();
+    persist_sample_batch(&db, &[row("hash-phone", ts)]).unwrap();
+    persist_sample_batch(&db, &[row("hash-phone", ts + 1)]).unwrap();
     let conn = open_wal(&db).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM pii_value_samples", [], |r| r.get(0))
@@ -437,14 +439,29 @@ fn sample_upsert_rollover() {
     assert_eq!(hits, 2, "重复 flush hits 须累加为 2");
     assert_eq!(last, ts + 1, "last_seen 须刷新为最近一次");
     drop(conn);
-    let old = ts - (PII_SAMPLE_RETENTION_DAYS + 1) * 86_400;
-    persist_sample_batch(&db, &[row(old)]).unwrap();
+    persist_sample_batch(
+        &db,
+        &[
+            row("fresh", ts - 3 * 86_400),
+            row("boundary", ts - window + 60),
+            row("expired", ts - window - 60),
+        ],
+    )
+    .unwrap();
     purge_retention_blocking(&db).unwrap();
     let conn = open_wal(&db).unwrap();
-    let rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pii_value_samples", [], |r| r.get(0))
+    let kept: Vec<String> = conn
+        .prepare("SELECT hash FROM pii_value_samples ORDER BY hash")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(rows, 0, "超 7 天 last_seen 行须被滚动删除");
+    assert_eq!(
+        kept,
+        vec!["boundary", "fresh", "hash-phone"],
+        "仅超窗行删除，窗口/边界内行与既有 upsert 行保留"
+    );
     drop(conn);
     let _ = std::fs::remove_file(&db);
 }

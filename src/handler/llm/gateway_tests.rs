@@ -72,7 +72,7 @@ fn nonstream_ctx(
         sqlite_precise: false,
         req_start: std::time::Instant::now(),
         audit_mode: AuditMode::Off,
-        audit_policy_file: None,
+        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
         approval_whitelist: Vec::new(),
         audit_sink: crate::service::audit::AuditSink::test_arc(),
         pending: Arc::new(PendingApprovals::default()),

@@ -40,6 +40,9 @@ pub fn resolve_kdbx(db_dir: &std::path::Path) -> Option<ResolvedKdbx> {
         keyfile_path,
     })
 }
+/// `POL-3`/D3：自定义 PII 文件读取上限（1MB，对标 Python `_pii.py:120-121`）。
+pub const CUSTOM_FILE_MAX_BYTES: u64 = 1_048_576;
+
 /// 自定义 PII 文件 fail-closed 加载：`vars` 按优先级依次命中（主文件变量优先，
 /// 别名文件变量次之，短变量最后），三槽（rules/patterns/dict）相互叠加、互不排斥；
 /// 首个非空命中即为生效路径。已配置但缺文件/不可读/解析失败/形态非法一律拒绝启动，
@@ -69,6 +72,27 @@ pub fn load_custom_file(
         return Err(config_error(
             var,
             &format!("{var} 指向的文件不存在或不可读: {raw:?}，拒绝启动"),
+        ));
+    }
+    // `POL-3`/D3：读取前以 metadata 判长，超限拒绝且不读内容（恰 1MB 放行）。
+    let size = std::fs::metadata(&path)
+        .map_err(|e| {
+            config_error(
+                var,
+                &format!(
+                    "{var} 文件元数据读取失败 {}: {e:?}，拒绝启动",
+                    path.display()
+                ),
+            )
+        })?
+        .len();
+    if size > CUSTOM_FILE_MAX_BYTES {
+        return Err(config_error(
+            var,
+            &format!(
+                "{var} 文件 {} 超过 1MB 上限（{size} 字节），拒绝启动",
+                path.display()
+            ),
         ));
     }
     let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -365,6 +389,7 @@ mod tests {
     };
 
     mod f3;
+    mod size_cap;
 
     #[test]
     fn file_len_under_800_or_split() {
