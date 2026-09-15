@@ -49,7 +49,7 @@
 
 ### Requirement: 自定义规则跨帧前缀 hold
 
-系统 SHALL 提供自定义规则前缀 hint（自定义正则可提取字面前缀 + 字典全名，cap 64、长度降序去重）；流式放行前若尾部匹配任一 hint 前缀，系统 SHALL 滞留至下一帧完成判定（完整命中则跨帧整体掩码；不再匹配则放行），SHALL NOT 在首帧直接放行半截自定义字面量。终止/阻断 flush SHALL 与既有 `BoundaryHold::flush` 同语义（不丢内容）。
+系统 SHALL 提供自定义规则前缀 hint（自定义正则可提取字面前缀 + 字典全名，长度降序去重）；hint 集合 SHALL 以 64 为**总条数上限**（去重后超出按长度降序保留前 64），与 Python `partial_prefix_hints` 的总条数上限一致，SHALL NOT 只对单条 hint 长度设限而缺失总数上限。流式放行前若尾部匹配任一 hint 前缀，系统 SHALL 滞留至下一帧完成判定（完整命中则跨帧整体掩码；不再匹配则放行），SHALL NOT 在首帧直接放行半截自定义字面量。终止/阻断 flush SHALL 与既有 `BoundaryHold::flush` 同语义（不丢内容）。
 
 #### Scenario: 跨帧字典名不先泄出
 
@@ -65,6 +65,11 @@
 
 - **WHEN** 流在滞留状态下终止
 - **THEN** 滞留内容按 flush 语义释放，终端帧恒恰一
+
+#### Scenario: hint 总数有界
+
+- **WHEN** 自定义规则/字典可提取的前缀 hint 去重后超过 64 条
+- **THEN** 系统仅保留至多 64 条（长度降序优先），内存与匹配开销有界
 
 ### Requirement: fuzzy 还原超集与审计分类
 

@@ -159,8 +159,13 @@ _PLANNING_REFS: list[tuple[str, str]] = [
     ("tasks.md", "src/service/pii/emit.rs"),
     ("tasks.md", "src/service/registry/store.rs"),
 ]
-for _file, _ref in _PLANNING_REFS:
-    PENDING_REFS[(_PLANNING_CHANGE + _file, _ref)] = _PLANNING_TARGET
+# 2026-09-15 归档后其规划快照随 change 迁入 archive/（键须同步；规划正文不改写）。
+_ARCHIVED_PLANNING_CHANGE = (
+    "openspec/changes/archive/2026-09-15-veil-audit-r2-remediation/"
+)
+for _base in (_PLANNING_CHANGE, _ARCHIVED_PLANNING_CHANGE):
+    for _file, _ref in _PLANNING_REFS:
+        PENDING_REFS[(_base + _file, _ref)] = _PLANNING_TARGET
 
 # 行号越界例外登记，键为（引用所在文件相对路径，目标文件相对路径）。
 # 仅登记非本 change 范围的历史/规划快照（canonical 旧行号、在途 change 规划快照）；
@@ -170,23 +175,18 @@ PENDING_LINE_REFS: dict[tuple[str, str], str] = {
         "openspec/specs/hygiene-round5/spec.md",
         "src/registry.rs",
     ): "canonical 历史行号（registry.rs 已 façade 拆分），本 change 不改 canonical",
-    (
-        "openspec/changes/veil-audit-r2-remediation/design.md",
-        "src/service/pii/scope.rs",
-    ): _PLANNING_TARGET,
-    (
-        "openspec/changes/veil-audit-r2-remediation/specs/nonstream-audit-align/spec.md",
-        "src/handler/llm/mod.rs",
-    ): _PLANNING_TARGET,
-    (
-        "openspec/changes/veil-audit-r2-remediation/tasks.md",
-        "src/service/pii/scope.rs",
-    ): _PLANNING_TARGET,
-    (
-        "openspec/changes/veil-audit-r2-remediation/tasks.md",
-        "src/handler/llm/mod.rs",
-    ): _PLANNING_TARGET,
 }
+
+# 本 change 规划快照的行号越界（归档后随 changes 目录迁移，两种落点键均登记）。
+_PLANNING_LINE_REFS: list[tuple[str, str]] = [
+    ("design.md", "src/service/pii/scope.rs"),
+    ("specs/nonstream-audit-align/spec.md", "src/handler/llm/mod.rs"),
+    ("tasks.md", "src/service/pii/scope.rs"),
+    ("tasks.md", "src/handler/llm/mod.rs"),
+]
+for _base in (_PLANNING_CHANGE, _ARCHIVED_PLANNING_CHANGE):
+    for _file, _target in _PLANNING_LINE_REFS:
+        PENDING_LINE_REFS[(_base + _file, _target)] = _PLANNING_TARGET
 
 
 def refs_in_file(path: Path, pattern: re.Pattern[str]) -> list[tuple[int, str]]:
