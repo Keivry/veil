@@ -1,18 +1,12 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../nonstream.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "nonstream.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split(
+        "nonstream.rs",
+        include_str!("../nonstream.rs"),
     );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "nonstream/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+    crate::test_support::file_len_under_800_or_split(
+        "nonstream/tests.rs",
+        include_str!("tests.rs"),
     );
 }
 
@@ -21,6 +15,7 @@ use {
     crate::{
         approval::PendingApprovals,
         config::{AuditMode, Config},
+        handler::llm::pump::RequestCtx,
         service::{
             credential_vault::CredentialVault,
             llm_gateway::{self, EmptyAction, Protocol, classify_empty},
@@ -52,23 +47,25 @@ fn test_config() -> Config { Config::load_from(&base_env()).expect("测试配置
 fn test_ctx(protocol: Protocol) -> NonstreamCtx {
     let _ = test_config();
     NonstreamCtx {
-        protocol,
-        normalized_out: false,
+        req: RequestCtx {
+            protocol,
+            normalized_out: false,
+            scope: Arc::new(Scope::new()),
+            vault: Arc::new(CredentialVault::new()),
+            detector: Arc::new(PiiDetector::new()),
+            gateway_metrics: Arc::new(llm_gateway::GatewayMetrics::default()),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-nonstream-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            audit_mode: AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            pending: Arc::new(PendingApprovals::default()),
+        },
         stream_flag: false,
-        scope: Arc::new(Scope::new()),
-        vault: Arc::new(CredentialVault::new()),
-        detector: Arc::new(PiiDetector::new()),
-        gateway_metrics: Arc::new(llm_gateway::GatewayMetrics::default()),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-nonstream-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        audit_mode: AuditMode::Off,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
-        pending: Arc::new(PendingApprovals::default()),
         nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
     }
 }
@@ -252,7 +249,10 @@ fn llm_empty_7_nondialog_exempt_from_empty_mapping() {
 }
 
 mod f2;
+mod gate_boundary;
 mod headers;
+mod nlp_error_sse;
+mod nlp_p2;
 mod restore;
 mod t4_bounded;
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn block_verdict_2xx_synthesizes_200_block_body() {
     let body = br#"{"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"exec","arguments":"rm -rf /"}}]}}]}"#.to_vec();
     let (url, server) = loopback_server(200, "application/json", body).await;
     let mut ctx = test_ctx(Protocol::Chat);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     let outcome = serve_nonstream(
         &client,
         reqwest::Method::POST,
@@ -420,8 +420,8 @@ async fn block_verdict_error_status_preserves_upstream_body_and_records_audit() 
         let admin = Arc::new(MetricsStore::new(db));
         let (url, server) = loopback_server(status, "application/json", up_body).await;
         let mut ctx = test_ctx(Protocol::Chat);
-        ctx.audit_mode = AuditMode::Block;
-        ctx.admin_metrics = admin.clone();
+        ctx.req.audit_mode = AuditMode::Block;
+        ctx.req.admin_metrics = admin.clone();
         let outcome = serve_nonstream(
             &client,
             reqwest::Method::POST,
@@ -485,7 +485,7 @@ async fn block_inject_status_symmetric_all_protocols() {
     for (protocol, upstream_body) in cases {
         let (url, server) = loopback_server(200, "application/json", upstream_body).await;
         let mut ctx = test_ctx(protocol);
-        ctx.audit_mode = AuditMode::Block;
+        ctx.req.audit_mode = AuditMode::Block;
         let outcome = serve_nonstream(
             &client,
             reqwest::Method::POST,
@@ -531,7 +531,7 @@ async fn nonstream_400_json_traverses_post_processing_e6() {
     let (url, server) = loopback_server(400, "application/json", up_body).await;
     let client = reqwest::Client::new();
     let mut ctx = test_ctx(Protocol::Chat);
-    ctx.admin_metrics = admin.clone();
+    ctx.req.admin_metrics = admin.clone();
     let outcome = serve_nonstream(
         &client,
         reqwest::Method::POST,
@@ -697,7 +697,7 @@ async fn web_search_action_audit_hold_nonstream() {
     let body = br#"{"output":[{"type":"web_search_call","id":"ws-bad","action":{"type":"search","query":"rm -rf /"}}]}"#.to_vec();
     let (url, server) = loopback_server(200, "application/json", body).await;
     let mut ctx = test_ctx(Protocol::Responses);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     let outcome = serve_nonstream(
         &client,
         reqwest::Method::POST,

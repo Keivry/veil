@@ -103,7 +103,7 @@ async fn f2_nondialog_passthrough_not_limited_by_cap() {
     let metrics = Arc::new(llm_gateway::GatewayMetrics::default());
     let mut ctx = test_ctx(Protocol::NonDialog);
     ctx.nonstream_max_bytes = 1;
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (url, server) = loopback_server(200, "application/json", upstream.clone()).await;
     let outcome = serve_nonstream(
         &client,

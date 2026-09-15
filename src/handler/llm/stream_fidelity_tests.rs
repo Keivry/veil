@@ -2,7 +2,7 @@
 
 use {
     super::{
-        pump::StreamPumpCtx,
+        pump::{RequestCtx, StreamPumpCtx},
         stream_tests::{collect_pump, fresh_arcs, loopback_server, pump_ctx},
     },
     crate::{
@@ -31,25 +31,28 @@ async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetric
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let metrics = Arc::new(GatewayMetrics::default());
     let ctx = StreamPumpCtx {
-        protocol: Protocol::Chat,
-        scope: Arc::new(Scope::new()),
-        vault,
-        detector: Arc::new(PiiDetector::new()),
-        audit_mode: AuditMode::Off,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        req: RequestCtx {
+            protocol: Protocol::Chat,
+            scope: Arc::new(Scope::new()),
+            vault,
+            detector: Arc::new(PiiDetector::new()),
+            audit_mode: AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: metrics.clone(),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            normalized_out: false,
+        },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
-        gateway_metrics: metrics.clone(),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        pending: Arc::new(PendingApprovals::default()),
         init_conv: None,
-        normalized_out: false,
+        req_model: String::new(),
     };
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     server.abort();
@@ -222,25 +225,28 @@ async fn pump_sse_with_vault(
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let ctx = StreamPumpCtx {
-        protocol,
-        scope: Arc::new(Scope::new()),
-        vault,
-        detector: Arc::new(PiiDetector::new()),
-        audit_mode: AuditMode::Off,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        req: RequestCtx {
+            protocol,
+            scope: Arc::new(Scope::new()),
+            vault,
+            detector: Arc::new(PiiDetector::new()),
+            audit_mode: AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: Arc::new(GatewayMetrics::default()),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            normalized_out: false,
+        },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
-        gateway_metrics: Arc::new(GatewayMetrics::default()),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        pending: Arc::new(PendingApprovals::default()),
         init_conv: None,
-        normalized_out: false,
+        req_model: String::new(),
     };
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     server.abort();
@@ -444,25 +450,28 @@ async fn pump_raw_sse_with_metrics(
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let ctx = StreamPumpCtx {
-        protocol,
-        scope,
-        vault,
-        detector,
-        audit_mode: AuditMode::Off,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        req: RequestCtx {
+            protocol,
+            scope,
+            vault,
+            detector,
+            audit_mode: AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: metrics.clone(),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            normalized_out: false,
+        },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
-        gateway_metrics: metrics.clone(),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        pending: Arc::new(PendingApprovals::default()),
         init_conv: None,
-        normalized_out: false,
+        req_model: String::new(),
     };
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     server.abort();

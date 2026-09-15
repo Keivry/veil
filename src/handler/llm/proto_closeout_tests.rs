@@ -29,7 +29,7 @@ fn tracked_ctx(
 ) -> (StreamPumpCtx, Arc<GatewayMetrics>) {
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(protocol, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     (ctx, metrics)
 }
 
@@ -157,8 +157,8 @@ async fn anthropic_error_terminal() {
 
 #[tokio::test]
 async fn chat_finish_reason_without_done_synthesizes_single_done() {
-    // P1/D2：Chat 已见 finish_reason:"stop" 后 EOF 无 [DONE] → 补发恰一 [DONE]，
-    // open_ended 观测保留（内容帧与 finish_reason 不伪造、不丢）。
+    // P1/D2 + CHC-5/2.24：Chat 已见 finish_reason:"stop" 后 EOF 无 [DONE] →
+    // 补发恰一 [DONE]，属干净收尾不记 open_ended（内容帧与 finish_reason 不丢）。
     let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
@@ -177,8 +177,8 @@ async fn chat_finish_reason_without_done_synthesizes_single_done() {
     assert!(outcome.terminal_injected, "补发后终端须落位");
     assert_eq!(
         metrics.truncated_count("open_ended"),
-        1,
-        "缺 [DONE] 须记 open_ended 观测"
+        0,
+        "有 finish_reason 的干净收尾不记 open_ended"
     );
     server.abort();
 }
@@ -251,7 +251,7 @@ data: {"type":"message_stop"}
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx = pump_ctx(Protocol::Anthropic, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     assert!(outcome.block_injected, "危险 tool 须阻断");
     let joined = frames.join("");
@@ -317,7 +317,7 @@ async fn responses_usage_recorded_from_completed_without_injection() {
     )));
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
-    ctx.admin_metrics = admin_metrics.clone();
+    ctx.req.admin_metrics = admin_metrics.clone();
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     assert!(
         frames.iter().any(|f| f.contains("response.completed")),
@@ -422,18 +422,18 @@ async fn n1_single_terminal_completed_then_error_or_incomplete() {
 
 #[tokio::test]
 async fn p1_chat_done_three_scenarios() {
-    // P1/D2 三场景：finish_reason 后断流补发恰一；usage 尾帧（choices: []）保留；
-    // 上游已发 [DONE] 不重复补发。
+    // P1/D2 + CHC-5/2.24 三场景：finish_reason 后断流补发恰一且不记 open_ended；
+    // usage 尾帧（choices: []）保留；上游已发 [DONE] 不重复补发。
     for (name, sse, expect_open_ended) in [
         (
             "finish_reason 后断流",
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
-            1u64,
+            0u64,
         ),
         (
             "finish_reason+usage 尾帧后断流",
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n".to_vec(),
-            1,
+            0,
         ),
         (
             "正常 [DONE] 不重复",

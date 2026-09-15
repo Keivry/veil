@@ -81,7 +81,7 @@ pub(super) fn should_apply_midstream_terminal(
     if !any_frame_sent && !stream_truncated {
         return false;
     }
-    protocol != Protocol::Responses || any_frame_sent
+    !protocol.is_responses() || any_frame_sent
 }
 
 /// tool hold-until-complete 缓冲判定：审计开启且 tool 事件且非完成且非
@@ -113,13 +113,14 @@ pub(super) fn tool_replay_slot(
     }
 }
 
-/// D1 持有抑制：仅「审计开启 + 确有未完成 tool 分片 + 本帧有输出 + 非次要」
-/// 四条件同时成立才持有；流级未完成不构成持有信号。
+/// D1 持有抑制：仅「审计开启 / 确有未完成 tool 分片 / 本帧有输出（`emitted`）/
+/// 非次要」四条件同时成立才持有；流级未完成不构成持有信号。参数据实际放行语义
+/// 命名（`emitted`），避免调用点传取反值导致极性反转。
 pub(super) fn should_suppress_held_output(
     audit_hold_on: bool,
     has_pending_fragments: bool,
-    out_data_nonempty: bool,
+    emitted: bool,
     minor: bool,
 ) -> bool {
-    audit_hold_on && has_pending_fragments && out_data_nonempty && !minor
+    audit_hold_on && has_pending_fragments && emitted && !minor
 }

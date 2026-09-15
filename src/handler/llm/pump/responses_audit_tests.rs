@@ -16,7 +16,7 @@ fn block_ctx() -> StreamPumpCtx {
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx =
         crate::handler::llm::stream_tests::pump_ctx(Protocol::Responses, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     ctx.pii_boundary_chars = 0;
     ctx
 }
@@ -243,4 +243,31 @@ async fn responses_four_delta_block_matrix() {
             "{base} 良性参数须放行: {ok_joined}"
         );
     }
+}
+
+#[tokio::test]
+async fn responses_missing_item_done_blocked_param() {
+    // D5/STP-1/RSP-2：仅在 `response.completed` 前发参数分片、不发 per-item `.done`，
+    // 全局完成路径须先审后放——危险参数 Block 并筛除该槽不重放；与逐-item done
+    // 路径（`responses_tool_delta_no_leak_block`）同 verdict。
+    let sse = br#"data: {"type":"response.function_call_arguments.delta","item_id":"call-9","output_index":0,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-9","output_index":0,"delta":"-rf /\"}"}
+
+data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}
+
+"#;
+    let (outcome, frames) = run(sse).await;
+    assert!(outcome.block_injected, "缺 done + 危险参数须阻断");
+    let joined = frames.join("");
+    assert!(!joined.contains("rm -rf"), "危险明文不得到达下游: {joined}");
+    assert!(
+        !joined.contains("call-9"),
+        "危险 item id 不得透传: {joined}"
+    );
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "阻断终端恰一: {joined}"
+    );
 }

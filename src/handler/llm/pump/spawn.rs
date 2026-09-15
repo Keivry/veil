@@ -7,6 +7,7 @@ mod finish;
 mod frame_feed;
 mod setup;
 mod terminal;
+#[cfg(test)]
 pub(crate) use frame_feed::guard_restored_frame;
 
 /// 2.3 `spawn_stream_pump`：把上游字节流泵为下游 SSE 帧流，保证终止闭合；

@@ -5,6 +5,7 @@ use {
     super::{
         NonstreamCtx,
         NonstreamOutcome,
+        RequestCtx,
         StreamPumpCtx,
         build_sse_response,
         forward_headers,
@@ -188,6 +189,15 @@ pub(crate) async fn gateway_serve(
         .await;
     }
 
+    let req_value = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+    // NLP-2/3.9：请求侧 `model` 快照，流式响应帧缺失有效 model 时回退分桶。
+    let req_model = req_value
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or("")
+        .to_string();
     let rw = super::request_rewrite(
         body_bytes,
         protocol,
@@ -199,7 +209,8 @@ pub(crate) async fn gateway_serve(
     .await;
     let dialog_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
-    let pump_ctx = || StreamPumpCtx {
+    // ARH-3（7.2）：单一装配点构造共享请求上下文，流式/非流路径复用。
+    let req = RequestCtx {
         protocol,
         scope: scope.clone(),
         vault: vault.clone(),
@@ -208,15 +219,19 @@ pub(crate) async fn gateway_serve(
         audit_policy: audit_policy.clone(),
         approval_whitelist: approval_whitelist.clone(),
         audit_sink: state.audit_sink.clone(),
-        hold_max,
-        pii_boundary_chars,
         gateway_metrics: state.gateway_metrics.clone(),
         admin_metrics: state.admin.metrics.clone(),
         sqlite_precise,
         req_start,
         pending: state.pending.clone(),
-        init_conv: rw.init_conv.clone(),
         normalized_out: rw.normalized_out,
+    };
+    let pump_ctx = || StreamPumpCtx {
+        req: req.clone(),
+        hold_max,
+        pii_boundary_chars,
+        init_conv: rw.init_conv.clone(),
+        req_model: req_model.clone(),
     };
     if rw.stream_flag {
         let fwd_headers = forward_headers(&parts.headers, &state.gateway_metrics);
@@ -251,28 +266,17 @@ pub(crate) async fn gateway_serve(
                     .await;
                 }
                 let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-                let _pump = spawn_stream_pump(up, tx, pump_ctx());
-                build_sse_response(rx, rw.normalized_out)
+                // D3/ARH-1：不 detach 泵任务——JoinHandle 交响应体持有，客户端断开
+                // 时由响应体 drop 触发 abort 回收（避免上游连接与任务泄漏）。
+                let pump = spawn_stream_pump(up, tx, pump_ctx());
+                build_sse_response(rx, rw.normalized_out, pump)
             }
             Err(_) => super::empty_body_response(protocol),
         }
     } else {
         let nctx = NonstreamCtx {
-            protocol,
-            normalized_out: rw.normalized_out,
+            req: req.clone(),
             stream_flag: false,
-            scope: scope.clone(),
-            vault: vault.clone(),
-            detector: detector.clone(),
-            gateway_metrics: state.gateway_metrics.clone(),
-            admin_metrics: state.admin.metrics.clone(),
-            sqlite_precise,
-            req_start,
-            audit_mode,
-            audit_policy: audit_policy.clone(),
-            approval_whitelist: approval_whitelist.clone(),
-            audit_sink: state.audit_sink.clone(),
-            pending: state.pending.clone(),
             nonstream_max_bytes: state.config.nonstream_max_bytes,
         };
         match serve_nonstream(
@@ -295,8 +299,8 @@ pub(crate) async fn gateway_serve(
                 if req_conv.is_some() {
                     pctx.init_conv = req_conv;
                 }
-                let _pump = spawn_stream_pump(up, tx, pctx);
-                build_sse_response(rx, rw.normalized_out)
+                let pump = spawn_stream_pump(up, tx, pctx);
+                build_sse_response(rx, rw.normalized_out, pump)
             }
         }
     }
@@ -314,7 +318,9 @@ pub(super) async fn stream_upstream_passthrough(
     max_bytes: usize,
     metrics: &llm_gateway::GatewayMetrics,
 ) -> Response {
-    let status_u16 = up.status().as_u16();
+    // ARH-10（7.7）：上游状态码经受约束类型承载；非法值按现状回退 `502`。
+    let upstream_status = llm_gateway::UpstreamStatus::new(up.status().as_u16());
+    let is_error = upstream_status.is_none_or(|s| s.is_error());
     let mut resp_headers = HeaderMap::new();
     for (k, v) in up.headers().iter() {
         if let (Ok(n), Ok(val)) = (
@@ -336,7 +342,7 @@ pub(super) async fn stream_upstream_passthrough(
     }
     let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
     // TRN-3：先判 `content-length`（仅非错误状态），超限即 502 且不读 body。
-    if status_u16 < 400
+    if !is_error
         && up
             .content_length()
             .is_some_and(|len| len > max_bytes as u64)
@@ -349,7 +355,9 @@ pub(super) async fn stream_upstream_passthrough(
         decode_enabled,
         Some(metrics),
     );
-    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = upstream_status
+        .and_then(|s| StatusCode::from_u16(s.as_u16()).ok())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     for (k, v) in resp_headers.iter() {
         builder = builder.header(k, v);
@@ -360,7 +368,7 @@ pub(super) async fn stream_upstream_passthrough(
     let builder = builder.header("x-veil-protocol", super::protocol_header_value(protocol));
     // TRN-3：`status >= 400` 错误体按透传语义保状态保字节，流式转发仅为内存安全，
     // 不改写为 502、不缓冲放大。
-    if status_u16 >= 400 {
+    if is_error {
         return builder
             .body(Body::from_stream(up.bytes_stream()))
             .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response());
@@ -388,6 +396,70 @@ mod entry_tests {
         },
         *,
     };
+
+    #[test]
+    fn shared_ctx_equivalence() {
+        // ARH-3（7.2）：流式/非流共享同一请求上下文——重叠 14 字段取值等价。
+        let req = RequestCtx {
+            protocol: Protocol::Chat,
+            scope: Arc::new(crate::service::redaction::Scope::new()),
+            vault: Arc::new(crate::service::credential_vault::CredentialVault::new()),
+            detector: Arc::new(crate::service::pii::PiiDetector::new()),
+            audit_mode: crate::config::AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: vec!["@a:b".to_string()],
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: Arc::new(llm_gateway::GatewayMetrics::default()),
+            admin_metrics: Arc::new(crate::service::metrics::MetricsStore::new(
+                std::path::PathBuf::from("/tmp/veil-shared-ctx.sqlite"),
+            )),
+            sqlite_precise: true,
+            req_start: Instant::now(),
+            pending: Arc::new(crate::approval::PendingApprovals::default()),
+            normalized_out: true,
+        };
+        let stream = StreamPumpCtx {
+            req: req.clone(),
+            hold_max: 4096,
+            pii_boundary_chars: 64,
+            init_conv: None,
+            req_model: "m".to_string(),
+        };
+        let nonstream = NonstreamCtx {
+            req,
+            stream_flag: true,
+            nonstream_max_bytes: 8,
+        };
+        assert_eq!(stream.req.protocol, nonstream.req.protocol);
+        assert_eq!(stream.req.audit_mode, nonstream.req.audit_mode);
+        assert_eq!(
+            stream.req.approval_whitelist,
+            nonstream.req.approval_whitelist
+        );
+        assert_eq!(stream.req.sqlite_precise, nonstream.req.sqlite_precise);
+        assert_eq!(stream.req.req_start, nonstream.req.req_start);
+        assert_eq!(stream.req.normalized_out, nonstream.req.normalized_out);
+        assert!(Arc::ptr_eq(&stream.req.scope, &nonstream.req.scope));
+        assert!(Arc::ptr_eq(&stream.req.vault, &nonstream.req.vault));
+        assert!(Arc::ptr_eq(&stream.req.detector, &nonstream.req.detector));
+        assert!(Arc::ptr_eq(
+            &stream.req.audit_policy,
+            &nonstream.req.audit_policy
+        ));
+        assert!(Arc::ptr_eq(
+            &stream.req.audit_sink,
+            &nonstream.req.audit_sink
+        ));
+        assert!(Arc::ptr_eq(
+            &stream.req.gateway_metrics,
+            &nonstream.req.gateway_metrics
+        ));
+        assert!(Arc::ptr_eq(
+            &stream.req.admin_metrics,
+            &nonstream.req.admin_metrics
+        ));
+        assert!(Arc::ptr_eq(&stream.req.pending, &nonstream.req.pending));
+    }
 
     #[test]
     fn build_upstream_url_query_join_and_absent() {

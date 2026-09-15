@@ -49,10 +49,10 @@ async fn run_restore(
     let up_body = up_body.replace("<TOKEN>", &token);
     let (url, server) = loopback_server(200, "application/json", up_body.into_bytes()).await;
     let mut ctx = test_ctx(Protocol::Chat);
-    ctx.scope = Arc::new(Scope::new());
-    ctx.vault = vault;
-    ctx.detector = Arc::new(PiiDetector::new());
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.scope = Arc::new(Scope::new());
+    ctx.req.vault = vault;
+    ctx.req.detector = Arc::new(PiiDetector::new());
+    ctx.req.gateway_metrics = metrics.clone();
     let resp = drive(&url, ctx).await;
     server.abort();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);

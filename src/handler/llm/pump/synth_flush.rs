@@ -7,11 +7,14 @@
 //! D6/S11：断流终端策略统一收尾（[`midstream_terminal`]），合并既有 Chat
 //! `finish_reason` 补发与截断合成到同一路径，消除 `truncated_mode_set` 条件竞态。
 
-use crate::service::{
-    block_inject,
-    llm_gateway::{self, GatewayMetrics, Protocol},
-    redaction::BoundaryHold,
-    sse::{StreamMeta, TruncatedMode, set_truncated},
+use {
+    super::event::data_event_count,
+    crate::service::{
+        block_inject,
+        llm_gateway::{self, GatewayMetrics, Protocol},
+        redaction::BoundaryHold,
+        sse::{StreamMeta, TruncatedMode, set_truncated},
+    },
 };
 
 /// 合成终端前把边界滞留帧并入 `agg` 并优先下发；返回本次是否实际下发成功
@@ -30,9 +33,12 @@ pub(super) async fn flush_pre_terminal(
     if agg.is_empty() {
         return false;
     }
+    let events = data_event_count(agg);
     let sent = pump_tx.send(std::mem::take(agg)).await.is_ok();
     if sent {
-        metrics.add_sse_event();
+        for _ in 0..events {
+            metrics.add_sse_event();
+        }
     }
     sent
 }
@@ -45,8 +51,16 @@ pub(super) struct MidstreamTerminalOutcome {
     pub terminal_sent: bool,
 }
 
+/// D6/S11 + CHC-5/2.24：断流终端输入（conv 与干净收尾标志合并，控制参数数）。
+pub(super) struct MidstreamInput<'a> {
+    pub conv_id: Option<&'a str>,
+    /// 已见非空 `finish_reason` 的干净 EOF（Chat 不记 `open_ended`）。
+    pub clean_close: bool,
+}
+
 /// D6/S11：中途断流终端策略（仅在已发帧、未终端、未阻断时由调用方进入）。
-/// Chat 补恰一 `data: [DONE]`（传输层终止标记）并记 `truncated_mode=open_ended`；
+/// Chat 补恰一 `data: [DONE]`（传输层终止标记）；异常截断记 `truncated_mode=open_ended`，
+/// `clean_close`（已见非空 `finish_reason` 的干净 EOF）则不计该观测（CHC-5/2.24）；
 /// Anthropic 不合成 `message_stop`（不伪造成功终止），仅记 `open_ended` 观测；
 /// Responses 合成恰一 `response.failed`（失败语义）并记 `synthesized_failed`。
 ///
@@ -55,27 +69,40 @@ pub(super) struct MidstreamTerminalOutcome {
 /// 不置位，空流守门不被掩盖，`PumpOutcome` 如实反映未注入终端。
 pub(super) async fn midstream_terminal(
     protocol: Protocol,
-    conv_id: Option<&str>,
+    input: MidstreamInput<'_>,
     boundary: &mut BoundaryHold,
     agg: &mut String,
     pump_tx: &tokio::sync::mpsc::Sender<String>,
     metrics: &GatewayMetrics,
     meta: &mut StreamMeta,
 ) -> MidstreamTerminalOutcome {
+    let MidstreamInput {
+        conv_id,
+        clean_close,
+    } = input;
     // D3/S3：合成终端前先 flush 边界滞留帧，保证末段增量先于终端帧下行。
     let flush_ok = flush_pre_terminal(boundary, agg, pump_tx, metrics).await;
     let mut forwarded = u64::from(flush_ok);
     let terminal_sent = match protocol {
         Protocol::Chat => {
             agg.push_str(&block_inject::chat_done_frame());
+            let events = data_event_count(agg);
             let ok = pump_tx.send(std::mem::take(agg)).await.is_ok();
             if ok {
-                metrics.add_sse_event();
+                for _ in 0..events {
+                    metrics.add_sse_event();
+                }
                 forwarded += 1;
                 block_inject::mark_terminal(meta);
             }
-            let _ = set_truncated(meta, protocol, TruncatedMode::OpenEnded, Some(metrics));
-            tracing::warn!("Chat 流中途断流，按恰一 [DONE] 收尾（open_ended 观测）");
+            if clean_close {
+                // CHC-5/2.24：已见非空 `finish_reason` 的干净 EOF，仅补线级 [DONE]，
+                // 不记 `open_ended`（仅异常截断才记）。
+                tracing::debug!("Chat 流干净完成，补恰一 [DONE]（不计截断）");
+            } else {
+                let _ = set_truncated(meta, protocol, TruncatedMode::OpenEnded, Some(metrics));
+                tracing::warn!("Chat 流中途断流，按恰一 [DONE] 收尾（open_ended 观测）");
+            }
             ok
         }
         Protocol::Anthropic => {

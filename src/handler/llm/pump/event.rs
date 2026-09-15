@@ -13,14 +13,26 @@ use {
     serde_json::Value,
 };
 
+/// D3/ARH-1：泵任务回收守卫——响应体（及其帧流）被 drop 时中止泵任务，避免
+/// `let _pump=` detach 后泵任务/上游连接泄漏；流正常消费完毕时 `abort` 为 no-op。
+struct PumpTaskGuard(tokio::task::JoinHandle<super::PumpOutcome>);
+
+impl Drop for PumpTaskGuard {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
 /// 2.3 `build_sse_response`：把泵出的帧通道装成下游 SSE 响应，保留
-/// `x-veil-normalized` 声明与 `X-Accel-Buffering: no`。
+/// `x-veil-normalized` 声明与 `X-Accel-Buffering: no`。泵 `JoinHandle` 由响应体
+/// 持有（不 detach）：客户端断开致响应体 drop 时经 [`PumpTaskGuard`] 中止并回收。
 pub fn build_sse_response(
     rx: tokio::sync::mpsc::Receiver<String>,
     normalized_out: bool,
+    pump: tokio::task::JoinHandle<super::PumpOutcome>,
 ) -> Response {
     use bytes::Bytes;
+    let guard = PumpTaskGuard(pump);
     let stream = async_stream::stream! {
+        let _guard = guard;
         let mut rx = rx;
         while let Some(msg) = rx.recv().await {
             yield Ok::<_, anyhow::Error>(Bytes::from(msg));
@@ -37,6 +49,21 @@ pub fn build_sse_response(
         .header("X-Accel-Buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "stream").into_response())
+}
+
+/// ARC-2/2.18：Fast 攒批下一帧可含多个逻辑 SSE 事件——以 `data:` 行数计
+/// （Slow/未攒批单帧恒为 1），保持 `sse_events` 与下游逻辑帧数一致。
+pub(super) fn data_event_count(frame: &str) -> usize {
+    frame
+        .lines()
+        .filter(|l| l.trim_start().starts_with("data:"))
+        .count()
+}
+
+pub(super) fn record_emitted_events(metrics: &GatewayMetrics, frame: &str) {
+    for _ in 0..data_event_count(frame) {
+        metrics.add_sse_event();
+    }
 }
 
 pub fn now_secs() -> i64 {
@@ -245,6 +272,26 @@ pub(super) fn is_anthropic_opaque_event(v: &Value) -> bool {
             .is_some_and(opaque)
 }
 
+/// MSP-4/2.28：Anthropic 思考**明文**载体（`thinking_delta`，或顶层
+/// `thinking_delta` 且不携签名/密文）——可安全参与跨帧 token 缝合；
+/// `signature`/`redacted`（签名/密文）与 `content_block_start` 的
+/// `thinking`+`signature` 组合不在此列，维持 opaque fail-closed。
+pub(super) fn is_anthropic_thinking_event(v: &Value) -> bool {
+    let is_thinking = |t: &str| t.contains("thinking") && !t.contains("redacted");
+    if v.get("type")
+        .and_then(|x| x.as_str())
+        .is_some_and(is_thinking)
+        && v.get("signature").is_none()
+        && v.get("redacted_data").is_none()
+    {
+        return true;
+    }
+    v.get("delta")
+        .and_then(|d| d.get("type"))
+        .and_then(|x| x.as_str())
+        .is_some_and(is_thinking)
+}
+
 pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
     use crate::service::llm_gateway::Protocol as P;
     match protocol {
@@ -275,9 +322,16 @@ pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
             .and_then(|c| c.as_array())
             .is_some_and(|choices| {
                 choices.iter().any(|ch| {
-                    ["delta", "message"]
-                        .iter()
-                        .any(|k| ch.get(k).and_then(|c| c.get("refusal")).is_some())
+                    ["delta", "message"].iter().any(|k| {
+                        ch.get(k)
+                            .and_then(|c| c.get("refusal"))
+                            // CHC-4/2.23：仅 `refusal` 非 null 且非空才判次要；
+                            // `refusal:null`（OpenAI 常态默认字段）不构成次要语义，
+                            // 含工具/参数信息的帧不得据此跳过审计。
+                            .is_some_and(|r| {
+                                !r.is_null() && r.as_str().is_none_or(|s| !s.is_empty())
+                            })
+                    })
                 })
             }),
         P::NonDialog => false,
@@ -428,6 +482,28 @@ mod event_tests {
         assert!(!is_minor_event(
             P::Responses,
             &serde_json::json!({"type":"response.function_call_arguments.delta","delta":"x"})
+        ));
+    }
+
+    #[test]
+    fn chat_refusal_null_not_minor() {
+        use crate::service::llm_gateway::Protocol as P;
+        // CHC-4/2.23：`refusal:null`（缺省占位）不判次要；空串同不判次要。
+        for v in [
+            serde_json::json!({"choices":[{"delta":{"content":"hi","refusal":null}}]}),
+            serde_json::json!({"choices":[{"delta":{"refusal":null}}]}),
+            serde_json::json!({"choices":[{"message":{"refusal":null}}]}),
+        ] {
+            assert!(!is_minor_event(P::Chat, &v), "refusal:null 不得判次要: {v}");
+        }
+        // 非 null 且非空仍次要；空串非次要。
+        assert!(is_minor_event(
+            P::Chat,
+            &serde_json::json!({"choices":[{"delta":{"refusal":"no"}}]})
+        ));
+        assert!(!is_minor_event(
+            P::Chat,
+            &serde_json::json!({"choices":[{"delta":{"refusal":""}}]})
         ));
     }
 

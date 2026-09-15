@@ -3,6 +3,7 @@
 use {
     super::pump::{
         PumpOutcome,
+        RequestCtx,
         StreamPumpCtx,
         build_sse_response,
         should_synthesize_empty_stream,
@@ -40,25 +41,28 @@ pub(super) fn pump_ctx(
     detector: Arc<PiiDetector>,
 ) -> StreamPumpCtx {
     StreamPumpCtx {
-        protocol,
-        scope,
-        vault,
-        detector,
-        audit_mode: AuditMode::Off,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        req: RequestCtx {
+            protocol,
+            scope,
+            vault,
+            detector,
+            audit_mode: AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: Arc::new(GatewayMetrics::default()),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            normalized_out: false,
+        },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
-        gateway_metrics: Arc::new(GatewayMetrics::default()),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        pending: Arc::new(PendingApprovals::default()),
         init_conv: None,
-        normalized_out: false,
+        req_model: String::new(),
     }
 }
 
@@ -170,25 +174,28 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"argu
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let ctx = StreamPumpCtx {
-        protocol: Protocol::Chat,
-        scope,
-        vault,
-        detector,
-        audit_mode: AuditMode::Block,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        req: RequestCtx {
+            protocol: Protocol::Chat,
+            scope,
+            vault,
+            detector,
+            audit_mode: AuditMode::Block,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: metrics.clone(),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            normalized_out: false,
+        },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
-        gateway_metrics: metrics.clone(),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        pending: Arc::new(PendingApprovals::default()),
         init_conv: None,
-        normalized_out: false,
+        req_model: String::new(),
     };
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     assert!(!outcome.block_injected, "截断丢弃非阻断，不得注阻断帧");
@@ -235,25 +242,28 @@ data: [DONE]
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let ctx = StreamPumpCtx {
-        protocol: Protocol::Chat,
-        scope,
-        vault,
-        detector,
-        audit_mode: AuditMode::Block,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
+        req: RequestCtx {
+            protocol: Protocol::Chat,
+            scope,
+            vault,
+            detector,
+            audit_mode: AuditMode::Block,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            gateway_metrics: metrics.clone(),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: Instant::now(),
+            pending: Arc::new(PendingApprovals::default()),
+            normalized_out: false,
+        },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,
-        gateway_metrics: metrics.clone(),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: Instant::now(),
-        pending: Arc::new(PendingApprovals::default()),
         init_conv: None,
-        normalized_out: false,
+        req_model: String::new(),
     };
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     assert!(!outcome.block_injected, "良性工具调用不得阻断");
@@ -524,7 +534,14 @@ async fn thinking_and_signature_opaque_passthrough_values_match() {
     )
     .await;
     assert!(!outcome.block_injected, "次要事件不得触发阻断");
-    assert_eq!(frames.len(), 3, "三帧须逐帧透出不丢弃");
+    let joined = frames.join("");
+    assert_eq!(
+        joined.matches("\"thinking\":\"hmm...\"").count()
+            + joined.matches("\"signature\":\"sig-bytes-123\"").count()
+            + joined.matches("\"redacted_data\":\"eHh4\"").count(),
+        3,
+        "三帧 opaque 值须原样透出不丢弃（Fast 攒批可同帧）: {joined}"
+    );
     let mut values = Vec::new();
     for f in &frames {
         for line in f.lines() {
@@ -608,10 +625,11 @@ async fn responses_incomplete_passthrough() {
     server.abort();
 }
 
-#[test]
-fn sse_response_builder_headers_compliant() {
+#[tokio::test]
+async fn sse_response_builder_headers_compliant() {
     let (_tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-    let resp = build_sse_response(rx, true);
+    let pump = tokio::spawn(async { std::future::pending::<PumpOutcome>().await });
+    let resp = build_sse_response(rx, true, pump);
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
@@ -642,7 +660,7 @@ async fn stream_transport_error_observed() {
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     let joined = frames.join("");
     assert!(joined.contains('甲'), "已收分片须保留: {joined}");
@@ -671,7 +689,7 @@ async fn midstream_truncation_terminal_matrix() {
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     assert_eq!(
         block_inject::terminal_count(&frames, "chat"),
@@ -693,7 +711,7 @@ async fn midstream_truncation_terminal_matrix() {
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Anthropic, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     assert_eq!(
         block_inject::terminal_count(&frames, "anthropic"),
@@ -715,7 +733,7 @@ async fn midstream_truncation_terminal_matrix() {
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     assert_eq!(
         block_inject::terminal_count(&frames, "responses"),

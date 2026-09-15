@@ -13,7 +13,7 @@ fn chat_block_ctx() -> StreamPumpCtx {
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx =
         crate::handler::llm::stream_tests::pump_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     ctx.pii_boundary_chars = 0;
     ctx
 }
@@ -94,8 +94,8 @@ async fn truncation_unfinished_tool_audited() {
     // RED-8：截断未完成 tool 分片须产生审计记录/告警（含槽号/分片数、不含参数明文），
     // 并保留 `truncated_tool_dropped` 指标。
     let ctx = chat_block_ctx();
-    let metrics = ctx.gateway_metrics.clone();
-    let sink = ctx.audit_sink.clone();
+    let metrics = ctx.req.gateway_metrics.clone();
+    let sink = ctx.req.audit_sink.clone();
     let sse = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-u","function":{"name":"run","arguments":"{\"command\":\"rm -rf /\"}"}}]}}]}
 
 "#;
@@ -122,8 +122,8 @@ async fn truncation_unfinished_tool_audited() {
 async fn normal_complete_no_truncation_audit() {
     // RED-8 回归：正常完成路径不产生截断型审计告警。
     let ctx = chat_block_ctx();
-    let metrics = ctx.gateway_metrics.clone();
-    let sink = ctx.audit_sink.clone();
+    let metrics = ctx.req.gateway_metrics.clone();
+    let sink = ctx.req.audit_sink.clone();
     let sse = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"cok","function":{"name":"run","arguments":"{\"note\":\"hello\"}"}}]}}]}
 
 data: {"choices":[{"index":0,"finish_reason":"tool_calls"}]}

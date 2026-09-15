@@ -30,15 +30,8 @@ use {
 };
 
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 hygiene-round4 模板）：
-    // 超 800 即失败，须按模板拆分，不得只改数字放行。
-    const SELF_SRC: &str = include_str!("spawn.rs");
-    let lines = SELF_SRC.lines().count();
-    assert!(
-        lines <= 800,
-        "spawn.rs {lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("spawn.rs", include_str!("spawn.rs"));
 }
 
 #[test]
@@ -436,7 +429,8 @@ async fn direct_n1_completed_then_error_single_terminal() {
 async fn direct_p1_backfill_preserves_usage_tail() {
     // T1/D1 决策点 P1（原仓 `llm_test.py::test_finish_reason_with_pending` 与
     // `test_done_flushes_pending`）：finish_reason 后 usage 尾帧照常透传，
-    // EOF 无 `[DONE]` 时补发恰一且置于尾帧之后，`truncated_mode=open_ended` 保留。
+    // EOF 无 `[DONE]` 时补发恰一且置于尾帧之后；有 finish_reason 属干净收尾，
+    // 不记 `open_ended`（CHC-5/2.24）。
     let sse = br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}
 
 data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
@@ -451,7 +445,7 @@ data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":8,"total_toke
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     let joined = frames.join("");
     assert_eq!(
@@ -469,8 +463,8 @@ data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":8,"total_toke
     assert!(outcome.terminal_injected, "补发后终端标记须落位");
     assert_eq!(
         metrics.truncated_count("open_ended"),
-        1,
-        "缺 [DONE] 须保留 open_ended 观测"
+        0,
+        "有 finish_reason 的干净收尾不得记 open_ended"
     );
     server.abort();
 }
@@ -527,9 +521,9 @@ data: [DONE]
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     ctx.hold_max = 16;
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     let joined = frames.join("");
     assert!(outcome.block_injected, "审计超限须注入阻断帧: {joined}");
@@ -558,10 +552,16 @@ data: [DONE]
 
 #[tokio::test]
 async fn sse_incremental_default_off() {
-    // 1.2 回归：默认 AUDIT_MODE=off，多帧文本须在终止帧前逐帧到达（非终止时
-    // 一次性拼接），且到达序与上游投递序一致。
-    let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"segment-A\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"segment-B\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"segment-C\"}}]}\n\ndata: [DONE]\n\n"
-        .to_vec();
+    // 1.2 + STP-6 回归：默认 AUDIT_MODE=off（Fast），大流按 4KB 阈值在终止帧前
+    // 增量分帧到达（非全流缓冲、非终止时一次性拼接），到达序与投递序一致。
+    let seg = |name: &str, fill: char| format!("{name}{}", fill.to_string().repeat(5000));
+    let sse = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: [DONE]\n\n",
+        seg("segment-A", 'a'),
+        seg("segment-B", 'b'),
+        seg("segment-C", 'c'),
+    )
+    .into_bytes();
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
@@ -624,7 +624,7 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Block;
+    ctx.req.audit_mode = AuditMode::Block;
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     let joined = frames.join("");
     assert!(outcome.block_injected, "item1 危险调用须被阻断: {joined}");
@@ -734,8 +734,8 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-t","fu
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Block;
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.audit_mode = AuditMode::Block;
+    ctx.req.gateway_metrics = metrics.clone();
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     let joined = frames.join("");
     let a = joined.find("held-A").expect("滞留段 A 须落下");

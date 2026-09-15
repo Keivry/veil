@@ -30,7 +30,8 @@ mod stream_tests;
 pub use crate::config::{AUDIT_SUBLIMIT_CEILING_BYTES, GATEWAY_BODY_LIMIT_BYTES};
 
 /// 审计/扫描类体长归属判定（spec 8MB 上限的回归锚点，不接请求路径）。
-pub fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SUBLIMIT_CEILING_BYTES }
+#[cfg(test)]
+pub(crate) fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SUBLIMIT_CEILING_BYTES }
 
 /// 上游转发头：剥 `host`/`content-length`/`content-encoding` 与下游
 /// `accept-encoding`（M1/D4：reqwest 仅在其请求头缺席时注入网关支持集
@@ -41,6 +42,16 @@ pub fn forward_headers(incoming: &HeaderMap, metrics: &GatewayMetrics) -> Header
     fwd.remove(header::CONTENT_LENGTH);
     fwd.remove(header::CONTENT_ENCODING);
     fwd.remove(header::ACCEPT_ENCODING);
+    // NLP-8：请求方向同样剔除下游 `x-veil-*` 内部头——`HeaderName` 大小写不敏感
+    // 且规范化为小写，`starts_with("x-veil-")` 即大小写不敏感匹配，防内部头外传上游。
+    let veil_keys: Vec<header::HeaderName> = fwd
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-veil-"))
+        .cloned()
+        .collect();
+    for k in veil_keys {
+        fwd.remove(&k);
+    }
     llm_gateway::filter_hop_headers_counted(
         &mut fwd,
         "upstream",
@@ -50,14 +61,7 @@ pub fn forward_headers(incoming: &HeaderMap, metrics: &GatewayMetrics) -> Header
     fwd
 }
 
-pub(crate) fn protocol_header_value(protocol: Protocol) -> &'static str {
-    match protocol {
-        Protocol::Chat => "chat",
-        Protocol::Anthropic => "anthropic",
-        Protocol::Responses => "responses",
-        Protocol::NonDialog => "passthrough",
-    }
-}
+pub(crate) fn protocol_header_value(protocol: Protocol) -> &'static str { protocol.wire_name() }
 
 /// T10/D9：网关生成响应统一置 `x-veil-protocol`（与成功/阻断分支口径一致）。
 pub(crate) fn with_protocol_header(mut resp: Response, protocol: Protocol) -> Response {
@@ -89,6 +93,6 @@ pub fn should_pump_stream(resp_content_type: &str, stream_flag: bool) -> bool {
 pub use {
     dispatch::llm_proxy_handler,
     nonstream::{NonstreamCtx, NonstreamOutcome, serve_nondialog_passthrough, serve_nonstream},
-    pump::{PumpOutcome, StreamPumpCtx, build_sse_response, spawn_stream_pump},
+    pump::{PumpOutcome, RequestCtx, StreamPumpCtx, build_sse_response, spawn_stream_pump},
     rewrite::{RewriteOutput, request_rewrite},
 };

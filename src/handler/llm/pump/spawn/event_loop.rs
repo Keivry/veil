@@ -7,9 +7,11 @@ use {
             event::{
                 extract_responses_seq,
                 is_anthropic_opaque_event,
+                is_anthropic_thinking_event,
                 is_minor_event,
                 is_terminal_event,
                 outer_event_index,
+                record_emitted_events,
                 responses_error_object,
                 responses_failed_incomplete,
                 responses_synth_conv_id,
@@ -20,8 +22,7 @@ use {
             synth_flush::flush_pre_terminal,
             toolbuf::take_pending_tool_inputs,
         },
-        frame_feed::{drain_prefix_hold, feed_output_frame},
-        guard_restored_frame,
+        frame_feed::{drain_prefix_hold, feed_output_frame, guard_restored_frame_parsed},
         setup::{PumpEnv, PumpLoopState},
     },
     crate::{
@@ -32,7 +33,7 @@ use {
             audit::{self, AuditHold},
             block_inject,
             json_walk::strip_bom,
-            llm_gateway::{self, Protocol},
+            llm_gateway,
             sse::{SseEvent, SseParser, is_done_payload},
         },
     },
@@ -76,6 +77,9 @@ where
 {
     let mut received_bytes: usize = 0;
     let mut transport_error = false;
+    // D3/ARH-1：下游断开（`handle_event` 发送失败返回 `BreakFor`）须中止上游读取
+    // 并回收泵任务——外层循环以 `downstream_abort` 跳出，SHALL NOT 继续 `chunk()`。
+    let mut downstream_abort = false;
     loop {
         let bytes = match upstream.chunk().await {
             Ok(Some(b)) => b,
@@ -105,12 +109,20 @@ where
             if handle_event(state, &ev, env, line_dropped, boundary_spans).await
                 == EventFlow::BreakFor
             {
+                downstream_abort = true;
                 break;
             }
         }
-        if state.terminated {
+        if downstream_abort || state.terminated {
             break;
         }
+    }
+    if downstream_abort {
+        tracing::debug!(
+            forwarded = state.forwarded,
+            received_bytes,
+            "客户端断开：中止上游读取并回收泵任务（不再拉取 chunk）"
+        );
     }
     transport_error
 }
@@ -140,25 +152,32 @@ where
             .await;
         return EventFlow::Next;
     }
-    if !ev.data.is_empty()
-        && !is_done_payload(&ev.data)
-        && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data))
-    {
-        if let Some(id) = llm_gateway::extract_conv_id(&v) {
+    // ARH-2（7.1）：每帧单次全量 JSON 解析，产物供本函数各判定复用。
+    let parsed: Option<Value> = if ev.data.is_empty() || is_done_payload(&ev.data) {
+        None
+    } else {
+        serde_json::from_str::<Value>(strip_bom(&ev.data)).ok()
+    };
+    if let Some(v) = parsed.as_ref() {
+        if let Some(id) = llm_gateway::extract_conv_id(v) {
             if state.stream_first_id.is_none() {
                 state.stream_first_id = Some(id.clone());
             }
             state.conv_id = Some(id);
         }
-        if state.stream_model.is_none()
-            && let Some(m) = stream_model_of(&v)
-        {
+        if let Some(m) = stream_model_of(v).filter(|m| !m.is_empty()) {
             state.stream_model = Some(m.to_string());
+            state.stream_model_from_resp = true;
+        } else if !state.stream_model_from_resp && !env.req_model.is_empty() {
+            state.stream_model = Some(env.req_model.clone());
         }
         llm_gateway::accumulate_usage(
             &mut state.stream_usage,
-            llm_gateway::extract_usage_stream(env.protocol, &v),
+            llm_gateway::extract_usage_stream(env.protocol, v),
         );
+        if env.protocol.is_chat() && AuditHold::chat_finish_reason_present(v) {
+            state.chat_finish_seen = true;
+        }
     }
     env.hold_gate.store(
         !matches!(env.audit_mode, AuditMode::Off) && state.hold.has_pending_fragments(),
@@ -171,12 +190,10 @@ where
         let is_done = is_done_payload(&ev.data);
         let is_terminal =
             !data_empty && !is_done && sticky_terminal_event(env.protocol, &ev.data, &env.metrics);
-        let is_tool_or_complete = !data_empty
-            && !is_done
-            && serde_json::from_str::<Value>(strip_bom(&ev.data)).is_ok_and(|v| {
-                !extract_tool_fragments(env.protocol, &v).is_empty()
-                    || AuditHold::is_audit_due_event(env.protocol, &v)
-            });
+        let is_tool_or_complete = parsed.as_ref().is_some_and(|v| {
+            !extract_tool_fragments(env.protocol, v).is_empty()
+                || AuditHold::is_audit_due_event(env.protocol, v)
+        });
         if decide::sticky_suppress_action(
             state.rejected_sticky,
             data_empty,
@@ -188,7 +205,7 @@ where
             return EventFlow::Next;
         }
     }
-    if env.protocol == Protocol::Responses && !ev.data.is_empty() {
+    if env.protocol.is_responses() && !ev.data.is_empty() {
         // N1 守卫（T1/D1）：决策交纯函数 `responses_control_action`；
         // 已发终端时保持原语义不解析（terminal_fallback 计数不漂移）。
         let (is_failed, is_error) = if state.terminal_sent {
@@ -270,15 +287,15 @@ where
         }
     }
     if !ev.data.is_empty() && !is_done_payload(&ev.data) {
-        if let Ok(v) = serde_json::from_str::<Value>(strip_bom(&ev.data)) {
+        if let Some(v) = parsed.as_ref() {
             // 终端后不再透出任何数据帧：恰一终止帧且其后无内容。
             if state.terminal_sent {
                 return EventFlow::Next;
             }
-            let event_terminal = is_terminal_event(env.protocol, &v);
-            let frags = extract_tool_fragments(env.protocol, &v);
+            let event_terminal = is_terminal_event(env.protocol, v);
+            let frags = extract_tool_fragments(env.protocol, v);
             let is_tool_event = !frags.is_empty();
-            let minor = !is_tool_event && is_minor_event(env.protocol, &v);
+            let minor = !is_tool_event && is_minor_event(env.protocol, v);
             if state.rejected_sticky && is_tool_event {
                 return EventFlow::Next;
             }
@@ -286,39 +303,78 @@ where
             // `response.function_call_arguments.done`）视同按槽完成——既触发
             // 该槽缓冲分片重放，又使本帧不被缓冲（其审计/释放由
             // `responses_slot_complete` 承载）。
-            let responses_slot_complete = AuditHold::is_responses_slot_complete_event(&v);
+            let responses_slot_complete = AuditHold::is_responses_slot_complete_event(v);
             let is_index_complete =
-                AuditHold::is_index_complete_event(&v) || responses_slot_complete;
+                AuditHold::is_index_complete_event(v) || responses_slot_complete;
             // P0-3.1：完成事件先放行此前缓冲的残缺分片（到达序重放进
             // 边界 hold，保证缝合时序），再处理本帧；全局完成全放行，
             // 按槽完成只放行对应槽（他槽残缺继续缓冲）。F3/D3：Responses
             // 工具分片纳入 hold（先审后放），未完成分片缓冲至槽 `.done`。
-            let audit_hold_on = !matches!(env.audit_mode, AuditMode::Off)
-                && matches!(
-                    env.protocol,
-                    Protocol::Chat | Protocol::Anthropic | Protocol::Responses
-                );
+            let audit_hold_on =
+                !matches!(env.audit_mode, AuditMode::Off) && env.protocol.is_dialog();
+            let mut reject_reason: Option<String> = None;
+            let mut approve_held = false;
             if audit_hold_on {
                 let slot = decide::tool_replay_slot(
                     env.protocol,
-                    &v,
-                    AuditHold::is_audit_due_event(env.protocol, &v),
+                    v,
+                    AuditHold::is_audit_due_event(env.protocol, v),
                     is_index_complete,
                 );
                 if let Some(slot) = slot {
-                    for (b_prefix, b_data) in
-                        take_pending_tool_inputs(&mut state.pending_tool_frames, slot)
+                    // D5/STP-1/RSP-2：全局完成（`slot == None`）时对仍缺 per-item
+                    // `.done` 的 Responses 槽「先审后放」——按已累积参数执行与逐-item
+                    // done 相同判定，Block 则整槽筛除不重放；SHALL NOT 因缺 `.done`
+                    // 绕过审计直接重放（与 `terminal.rs` 终审同 verdict）。
+                    if env.protocol.is_responses()
+                        && slot.is_none()
+                        && !matches!(env.audit_mode, AuditMode::Off)
+                        && !state.hold.is_rejected()
                     {
-                        feed_output_frame(
-                            &mut state.prefix_hold,
-                            &mut state.boundary,
-                            &env.resp_detector,
-                            &env.resp_vault,
-                            &boundary_spans,
-                            &mut state.agg,
-                            (b_prefix, b_data),
-                        )
-                        .await;
+                        for (idx, name, args) in state.hold.responses_pending_triples() {
+                            match env
+                                .audit_sink
+                                .evaluate_and_record(
+                                    env.audit_mode,
+                                    &name,
+                                    &args,
+                                    &env.audit_policy,
+                                    &env.approval_whitelist,
+                                    Some(protocol_header_value(env.protocol)),
+                                )
+                                .await
+                            {
+                                audit::AuditVerdict::Block { .. } => {
+                                    state.hold.mark_rejected();
+                                    reject_reason = Some("audit-policy-block".to_string());
+                                    break;
+                                }
+                                audit::AuditVerdict::NeedApproval { reason, summary } => {
+                                    env.audit_pending.insert(PendingRecord::new(
+                                        &format!("audit-hold-{idx}-{name}"),
+                                        &format!("{reason}: {summary}"),
+                                    ));
+                                    approve_held = true;
+                                }
+                                audit::AuditVerdict::Allow => {}
+                            }
+                        }
+                    }
+                    if reject_reason.is_none() {
+                        for (b_prefix, b_data) in
+                            take_pending_tool_inputs(&mut state.pending_tool_frames, slot)
+                        {
+                            feed_output_frame(
+                                &mut state.prefix_hold,
+                                &mut state.boundary,
+                                &env.resp_detector,
+                                &env.resp_vault,
+                                &boundary_spans,
+                                &mut state.agg,
+                                (b_prefix, b_data),
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -327,15 +383,14 @@ where
             let buffer_tool_frame = decide::should_buffer_tool_frame(
                 audit_hold_on,
                 is_tool_event,
-                AuditHold::is_audit_due_event(env.protocol, &v),
+                AuditHold::is_audit_due_event(env.protocol, v),
                 is_index_complete,
             );
             let tool_buckets: Vec<u32> = frags.iter().map(|f| f.0).collect();
-            let mut reject_reason: Option<String> = None;
             if minor {
                 // 次要事件透传且审计声明放行：不进 hold、不审计。
-            } else if env.protocol == Protocol::Responses {
-                let slot_complete = AuditHold::is_responses_slot_complete_event(&v);
+            } else if env.protocol.is_responses() {
+                let slot_complete = AuditHold::is_responses_slot_complete_event(v);
                 for frag in &frags {
                     let key = AuditHold::responses_key(frag.1.as_deref(), frag.0);
                     if slot_complete {
@@ -357,7 +412,7 @@ where
                         }
                         continue;
                     }
-                    let seq = extract_responses_seq(&v);
+                    let seq = extract_responses_seq(v);
                     let verdict = state.hold.push_responses_fragment(
                         &key,
                         frag.0,
@@ -386,10 +441,9 @@ where
                 }
             }
             // D2：Responses per-item `.done` 走槽级审计，与全局完成解耦。
-            let mut approve_held = false;
             if reject_reason.is_none()
                 && !state.hold.is_rejected()
-                && (AuditHold::is_audit_due_event(env.protocol, &v) || responses_slot_complete)
+                && (AuditHold::is_audit_due_event(env.protocol, v) || responses_slot_complete)
                 && !matches!(env.audit_mode, AuditMode::Off)
             {
                 for (idx, name, args) in state.hold.tool_triples() {
@@ -427,8 +481,8 @@ where
             if reject_reason.is_none()
                 && !state.hold.is_rejected()
                 && !matches!(env.audit_mode, AuditMode::Off)
-                && AuditHold::is_index_complete_event(&v)
-                && let Some(idx) = outer_event_index(env.protocol, &v)
+                && AuditHold::is_index_complete_event(v)
+                && let Some(idx) = outer_event_index(env.protocol, v)
             {
                 for (_, name, args) in state
                     .hold
@@ -468,7 +522,7 @@ where
             // 作用域出抑制集，后续帧据此恢复逐帧增量；拒绝态已清理。
             if reject_reason.is_none()
                 && !state.hold.is_rejected()
-                && (AuditHold::is_audit_due_event(env.protocol, &v) || responses_slot_complete)
+                && (AuditHold::is_audit_due_event(env.protocol, v) || responses_slot_complete)
             {
                 state.hold.release_audited();
             }
@@ -483,68 +537,61 @@ where
                 state.pending_tool_frames.clear();
                 if !state.block_injected {
                     state.block_injected = true;
-                    for f in block_inject::ensure_event_lines(match env.protocol {
-                        Protocol::Chat => block_inject::chat_block_frames(&reason),
-                        Protocol::Anthropic => {
-                            let idx = outer_event_index(env.protocol, &v).unwrap_or(0);
-                            block_inject::anthropic_block_frames(&reason, idx)
-                        }
-                        Protocol::Responses => {
-                            let bid = state.conv_id.clone().unwrap_or_else(|| {
-                                llm_gateway::resolve_conv_id(
-                                    None,
-                                    &serde_json::Value::Null,
-                                    Some(&env.metrics),
-                                    "block",
-                                )
-                                .0
-                            });
-                            block_inject::responses_block_frames(&bid)
-                        }
-                        Protocol::NonDialog => vec![],
-                    }) {
+                    let blocked_index = outer_event_index(env.protocol, v).unwrap_or(0);
+                    for f in block_inject::ensure_event_lines(block_inject::protocol_block_frames(
+                        env.protocol,
+                        &reason,
+                        state.conv_id.as_deref(),
+                        blocked_index,
+                        Some(&env.metrics),
+                    )) {
                         let _ = env.pump_tx.send(f).await;
                     }
                     block_inject::mark_terminal(&mut state.meta);
                 }
                 if is_tool_event
-                    || AuditHold::is_audit_due_event(env.protocol, &v)
-                    || AuditHold::is_index_complete_event(&v)
+                    || AuditHold::is_audit_due_event(env.protocol, v)
+                    || AuditHold::is_index_complete_event(v)
                 {
                     return EventFlow::Next;
                 }
-            } else if AuditHold::is_complete_event(&v) && !approve_held {
+            } else if AuditHold::is_complete_event(v) && !approve_held {
                 state.hold.mark_completed();
             }
-            let restored_data =
-                if env.protocol == Protocol::Anthropic && is_anthropic_opaque_event(&v) {
-                    // M3/D6：opaque（signature/redacted/thinking）帧跳过响应侧
-                    // 新 PII 扫描与 `json_aware_line` 重序列化，仅做字节级还原
-                    //（JSON 转义变体保证不破帧）；审计 hold/次要判定维持现状。
-                    let (restored, _spans) = env
-                        .resp_scope
-                        .restore_response_with_spans_json(&env.resp_vault, &ev.data);
-                    guard_restored_frame(restored, &ev.data, &env.metrics)
-                } else {
-                    let cleaned = state.carry.prepare(&ev.data);
-                    let (restored, spans) = env
-                        .resp_scope
-                        .restore_response_with_spans_json(&env.resp_vault, &cleaned);
-                    let scanned = env
-                        .resp_scope
-                        .redact_response_new_pii_with_skip(
-                            &env.resp_vault,
-                            &env.resp_detector,
-                            &restored,
-                            &spans,
-                        )
-                        .await;
-                    guard_restored_frame(
-                        crate::service::sse::json_aware_line(&scanned, |s| s),
-                        &cleaned,
-                        &env.metrics,
+            let restored_data = if env.protocol.is_anthropic()
+                && is_anthropic_opaque_event(v)
+                && !is_anthropic_thinking_event(v)
+            {
+                // M3/D6：opaque（signature/redacted/thinking+signature）帧跳过
+                // 响应侧新 PII 扫描与 `json_aware_line` 重序列化，仅做字节级还原
+                //（JSON 转义变体保证不破帧）；审计 hold/次要判定维持现状。
+                let (restored, _spans) = env
+                    .resp_scope
+                    .restore_response_with_spans_json(&env.resp_vault, &ev.data);
+                guard_restored_frame_parsed(restored, &ev.data, parsed.as_ref(), &env.metrics)
+            } else {
+                // MSP-4/2.28：thinking 明文 opaque 增量与其他文本同路——接入
+                // `TokenCarry` 做跨帧缝合，不绕过携带。
+                let cleaned = state.carry.prepare(&ev.data);
+                let (restored, spans) = env
+                    .resp_scope
+                    .restore_response_with_spans_json(&env.resp_vault, &cleaned);
+                let scanned = env
+                    .resp_scope
+                    .redact_response_new_pii_with_skip(
+                        &env.resp_vault,
+                        &env.resp_detector,
+                        &restored,
+                        &spans,
                     )
-                };
+                    .await;
+                guard_restored_frame_parsed(
+                    crate::service::sse::json_aware_line(&scanned, |s| s),
+                    &cleaned,
+                    (cleaned == ev.data).then_some(parsed.as_ref()).flatten(),
+                    &env.metrics,
+                )
+            };
             let prefix = envelope_prefix(ev);
             if event_terminal {
                 state.terminal_sent = true;
@@ -571,7 +618,7 @@ where
             if decide::should_suppress_held_output(
                 audit_hold_on,
                 state.hold.has_pending_fragments(),
-                !emitted,
+                emitted,
                 minor,
             ) {
                 return EventFlow::Next;
@@ -630,7 +677,7 @@ where
         state.agg.push_str(&format!("{prefix}data: [DONE]\n\n"));
     }
     if let Some(out) = crate::service::sse::select_emit(&mut state.agg, env.speed) {
-        env.metrics.add_sse_event();
+        record_emitted_events(&env.metrics, &out);
         state.forwarded += 1;
         state.any_frame_sent = true;
         if env.pump_tx.send(out).await.is_err() {

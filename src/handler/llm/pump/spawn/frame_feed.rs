@@ -7,21 +7,53 @@ use {
         llm_gateway::GatewayMetrics,
         pii::PiiDetector,
         redaction::{BoundaryHold, PrefixHold},
+        sse::classify_residue,
     },
     serde_json::Value,
 };
+
+/// CHC-2/D7：截断残余帧归一化——对齐 Python `_llm.py:2718-2720`「丢弃残余」：
+/// 先剥 BOM 与已存在的 `data:` 前缀，再要求载荷为**完整 JSON 容器**；半帧
+/// （如 `data: {"a": 1`）、CR-only 半帧与非 JSON 残余一律返回 `None` 丢弃，
+/// 杜绝把裸残余二次加 `data:` 前缀转发（下游 `JSONDecodeError`）。
+pub(super) fn residual_frame_payload(raw: &str) -> Option<String> {
+    let classified = classify_residue(raw)?;
+    let trimmed = strip_bom(classified.trim()).trim();
+    let payload = trimmed
+        .strip_prefix("data:")
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    if (payload.starts_with('{') || payload.starts_with('['))
+        && serde_json::from_str::<Value>(payload).is_ok()
+    {
+        Some(payload.to_string())
+    } else {
+        None
+    }
+}
 
 /// H2/D1 兜底回退：还原后帧 `jloads` 校验（BOM 感知）；失败时回退**还原前占位符帧**
 /// （fail-closed，token 形态保留、不破帧），记 warn + `restore_fallback` 计数，
 /// 对齐非流 `retry_stripped` 回退语义（`nonstream.rs::retry_stripped`）。
 /// RED-1：外层合法时进一步校验字符串值内的 stringified JSON 结构有效性——
 /// 外层合法会掩盖内层破损，内层破损须回退而非静默透传。
+#[cfg(test)]
 pub(crate) fn guard_restored_frame(
     restored: String,
     placeholder_frame: &str,
     metrics: &GatewayMetrics,
 ) -> String {
-    if guard_ok(&restored, placeholder_frame) {
+    guard_restored_frame_parsed(restored, placeholder_frame, None, metrics)
+}
+
+/// ARH-2（7.1）：调用方已持有占位符帧的解析产物时复用，避免同帧二次解析。
+pub(crate) fn guard_restored_frame_parsed(
+    restored: String,
+    placeholder_frame: &str,
+    placeholder_parsed: Option<&Value>,
+    metrics: &GatewayMetrics,
+) -> String {
+    if guard_ok(&restored, placeholder_frame, placeholder_parsed) {
         return restored;
     }
     tracing::warn!("流式还原后 JSON 校验失败，已回退还原前占位符帧（fail-closed）");
@@ -29,14 +61,17 @@ pub(crate) fn guard_restored_frame(
     placeholder_frame.to_string()
 }
 
-fn guard_ok(restored: &str, placeholder_frame: &str) -> bool {
+fn guard_ok(restored: &str, placeholder_frame: &str, placeholder_parsed: Option<&Value>) -> bool {
     let Ok(rv) = serde_json::from_str::<Value>(strip_bom(restored)) else {
         return false;
     };
-    match serde_json::from_str::<Value>(strip_bom(placeholder_frame)) {
-        Ok(pv) => inner_json_intact(&pv, &rv),
+    match placeholder_parsed {
+        Some(pv) => inner_json_intact(pv, &rv),
         // 占位符帧不可解析：无内层参照，维持既有外层口径。
-        Err(_) => true,
+        None => match serde_json::from_str::<Value>(strip_bom(placeholder_frame)) {
+            Ok(pv) => inner_json_intact(&pv, &rv),
+            Err(_) => true,
+        },
     }
 }
 
@@ -201,6 +236,44 @@ mod tests {
         assert!(
             out.contains("__VG_CRED_000001__"),
             "回退须保留 token 形态: {out}"
+        );
+    }
+
+    #[test]
+    fn residual_frame_no_duplicate_prefix() {
+        // CHC-2/D7：完整残余剥 `data:` 前缀后放行，帧内恒恰一前缀。
+        let payload = residual_frame_payload("data: {\"a\":1}").expect("完整残余须保留");
+        assert_eq!(payload, "{\"a\":1}", "须剥已存在的 data: 前缀");
+        let mut boundary = BoundaryHold::new(0);
+        let spans = |_: &str, _: usize| Vec::<(usize, usize)>::new();
+        let mut agg = String::new();
+        push_frame(&mut boundary, &spans, &mut agg, String::new(), payload);
+        assert_eq!(agg, "data: {\"a\":1}\n\n");
+        assert_eq!(agg.matches("data:").count(), 1, "不得二次加前缀: {agg:?}");
+        assert!(
+            residual_frame_payload("data: {\"a\": 1").is_none(),
+            "半帧须按 Python 丢弃"
+        );
+    }
+
+    #[test]
+    fn residual_frame_cr_only() {
+        // CHC-2/D7：CR-only 完整残余可放行（trim 收敛），CR-only 半帧须丢弃。
+        assert_eq!(
+            residual_frame_payload("data: {\"a\":1}\r").as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(
+            residual_frame_payload("{\"a\":1}\r").as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert!(
+            residual_frame_payload("data: {\"a\": 1\r").is_none(),
+            "CR-only 半帧须丢弃"
+        );
+        assert!(
+            residual_frame_payload("data: [DONE]").is_none(),
+            "DONE 残余须丢弃"
         );
     }
 }

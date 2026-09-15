@@ -7,10 +7,10 @@ use {
             super::protocol_header_value,
             carry::TokenCarry,
             decide,
-            event::should_synthesize_empty_stream,
-            synth_flush::midstream_terminal,
+            event::{record_emitted_events, should_synthesize_empty_stream},
+            synth_flush::{MidstreamInput, midstream_terminal},
         },
-        frame_feed::{drain_prefix_hold, feed_output_frame},
+        frame_feed::{drain_prefix_hold, feed_output_frame, residual_frame_payload},
     },
     crate::{
         approval::{PendingApprovals, PendingRecord},
@@ -22,7 +22,7 @@ use {
             llm_gateway::{self, GatewayMetrics, Protocol},
             pii::PiiDetector,
             redaction::{BoundaryHold, PrefixHold, Scope},
-            sse::{SseParser, StreamMeta, TruncatedMode, classify_residue, set_truncated},
+            sse::{SseParser, StreamMeta, TruncatedMode, set_truncated},
         },
     },
 };
@@ -36,6 +36,8 @@ where
     pub conv_id: &'a Option<String>,
     pub transport_error: bool,
     pub terminal_sent: bool,
+    /// CHC-5/2.24：Chat 干净收尾（已见非空 `finish_reason`），断流终端不记 open_ended。
+    pub chat_finish_seen: bool,
     pub any_frame_sent: bool,
     pub forwarded: &'a mut usize,
     pub block_injected: &'a mut bool,
@@ -70,6 +72,7 @@ where
         conv_id,
         transport_error,
         terminal_sent: terminal_sent_in,
+        chat_finish_seen,
         any_frame_sent: any_frame_sent_in,
         forwarded,
         block_injected,
@@ -112,6 +115,7 @@ where
     // RED-5：终端最终审计（恰一次幂等）——清除持仓/收尾前对未判定 tool 参数
     // 执行评估：截断/未完成或晚到分片在此被审且 `block` 模式阻断；已判定参数
     // 已由流内 `release_audited` 移出持仓，空持仓天然 no-op，不重复评估。
+    let mut blocked_index: Option<u32> = None;
     if !matches!(audit_mode, AuditMode::Off) && !hold.is_rejected() {
         let mut blocked = false;
         for (idx, name, args) in hold.tool_triples() {
@@ -128,6 +132,7 @@ where
             {
                 audit::AuditVerdict::Block { .. } => {
                     hold.mark_rejected();
+                    blocked_index = Some(idx);
                     blocked = true;
                     break;
                 }
@@ -149,23 +154,13 @@ where
             if !*block_injected {
                 *block_injected = true;
                 let reason = "audit-policy-block".to_string();
-                for f in block_inject::ensure_event_lines(match protocol {
-                    Protocol::Chat => block_inject::chat_block_frames(&reason),
-                    Protocol::Anthropic => block_inject::anthropic_block_frames(&reason, 0),
-                    Protocol::Responses => {
-                        let bid = conv_id.clone().unwrap_or_else(|| {
-                            llm_gateway::resolve_conv_id(
-                                None,
-                                &serde_json::Value::Null,
-                                None,
-                                "block",
-                            )
-                            .0
-                        });
-                        block_inject::responses_block_frames(&bid)
-                    }
-                    Protocol::NonDialog => vec![],
-                }) {
+                for f in block_inject::ensure_event_lines(block_inject::protocol_block_frames(
+                    protocol,
+                    &reason,
+                    conv_id.as_deref(),
+                    blocked_index.unwrap_or(0),
+                    None,
+                )) {
                     let _ = pump_tx.send(f).await;
                 }
                 block_inject::mark_terminal(meta);
@@ -201,16 +196,16 @@ where
         agg.push_str(&format!("data: {fd}\n\n"));
     }
     if !agg.is_empty() {
-        metrics.add_sse_event();
+        record_emitted_events(metrics, agg);
         let _ = pump_tx.send(std::mem::take(agg)).await;
         *forwarded += 1;
         any_frame_sent = true;
     }
     let residual = parser.residual_json_aware();
-    // 残余分类（§2.6）：None 直接丢弃，不得 `data:` 直发；
-    // BOM/`[DONE]`/空白同样归入丢弃，终端去重已处理。
-    if let Some(classified) = classify_residue(&residual) {
-        let (restored, spans) = resp_scope.restore_response_with_spans(resp_vault, &classified);
+    // CHC-2/D7：残余分类（§2.6）+ 半帧丢弃——BOM/`[DONE]`/空白/半帧/非 JSON 一律
+    // 丢弃；仅完整 JSON 载荷（已剥 `data:` 前缀）才放行，杜绝二次加前缀转发。
+    if let Some(payload) = residual_frame_payload(&residual) {
+        let (restored, spans) = resp_scope.restore_response_with_spans(resp_vault, &payload);
         let scanned = resp_scope
             .redact_response_new_pii_with_skip(resp_vault, resp_detector, &restored, &spans)
             .await;
@@ -248,7 +243,10 @@ where
     ) {
         let mid = midstream_terminal(
             protocol,
-            conv_id.as_deref(),
+            MidstreamInput {
+                conv_id: conv_id.as_deref(),
+                clean_close: protocol.is_chat() && chat_finish_seen,
+            },
             boundary,
             agg,
             pump_tx,
@@ -283,7 +281,7 @@ where
             let _ = set_truncated(
                 meta,
                 protocol,
-                if protocol == Protocol::Responses {
+                if protocol.is_responses() {
                     TruncatedMode::SynthesizedFailed
                 } else {
                     TruncatedMode::OpenEnded

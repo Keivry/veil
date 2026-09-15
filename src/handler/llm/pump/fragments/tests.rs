@@ -1,18 +1,12 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../fragments.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "fragments.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split(
+        "fragments.rs",
+        include_str!("../fragments.rs"),
     );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "fragments/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+    crate::test_support::file_len_under_800_or_split(
+        "fragments/tests.rs",
+        include_str!("tests.rs"),
     );
 }
 
@@ -57,7 +51,12 @@ fn streaming_legacy_function_call_matches_nonstream() {
     assert_eq!(frags2[0].1.as_deref(), Some("call_stable_0"));
     let legacy_arr = serde_json::json!({"choices":[{"delta":{"function_call":[{"name":"a","arguments":"{}"}]}}]});
     let frags3 = extract_tool_fragments(P::Chat, &legacy_arr);
-    assert!(frags3.is_empty() || frags3.len() == 1);
+    assert_eq!(
+        frags3.len(),
+        1,
+        "legacy function_call 数组须提取恰一: {frags3:?}"
+    );
+    assert_eq!(frags3[0].2.as_deref(), Some("a"));
 }
 
 #[test]

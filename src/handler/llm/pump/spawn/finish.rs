@@ -26,6 +26,7 @@ where
         conv_id: &state.conv_id,
         transport_error,
         terminal_sent: state.terminal_sent,
+        chat_finish_seen: state.chat_finish_seen,
         any_frame_sent: state.any_frame_sent,
         forwarded: &mut state.forwarded,
         block_injected: &mut state.block_injected,

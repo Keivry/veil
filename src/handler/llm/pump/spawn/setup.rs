@@ -1,7 +1,7 @@
 //! ARC-1：流泵 setup——`StreamPumpCtx` 解构、循环可变状态聚合与只读依赖装配。
 
 use {
-    super::super::{StreamPumpCtx, carry::TokenCarry, toolbuf::clamp_pump_limits},
+    super::super::{RequestCtx, StreamPumpCtx, carry::TokenCarry, toolbuf::clamp_pump_limits},
     crate::{
         approval::PendingApprovals,
         config::AuditMode,
@@ -39,6 +39,8 @@ pub(super) struct PumpEnv {
     pub pump_tx: tokio::sync::mpsc::Sender<String>,
     pub speed: Speed,
     pub hold_gate: Arc<AtomicBool>,
+    /// NLP-2/3.9：请求侧 `model`，流式响应帧缺失有效 model 时回退分桶。
+    pub req_model: String,
     /// 保活任务句柄（持有即存活），仅供生命周期持有。
     pub _keepalive: RequestKeepalive,
 }
@@ -48,6 +50,8 @@ pub(super) struct PumpLoopState {
     pub conv_id: Option<String>,
     pub stream_first_id: Option<String>,
     pub stream_model: Option<String>,
+    /// 响应帧是否已提供有效 model（用于请求侧 model 回退判定）。
+    pub stream_model_from_resp: bool,
     pub stream_usage: Option<llm_gateway::Usage>,
     pub hold: AuditHold,
     pub carry: TokenCarry,
@@ -64,6 +68,8 @@ pub(super) struct PumpLoopState {
     pub audit_blocked: bool,
     pub terminal_sent: bool,
     pub responses_failed_sent: bool,
+    /// CHC-5/2.24：Chat 已见非空 `finish_reason`（干净收尾信号）。
+    pub chat_finish_seen: bool,
 }
 
 /// ARC-1：setup 构造器——解构 `StreamPumpCtx`，钳位配置，装配环境、循环状态与解析器。
@@ -72,6 +78,13 @@ pub(super) fn setup(
     tx: tokio::sync::mpsc::Sender<String>,
 ) -> (PumpEnv, PumpLoopState, SseParser) {
     let StreamPumpCtx {
+        req,
+        hold_max,
+        pii_boundary_chars,
+        init_conv,
+        req_model,
+    } = ctx;
+    let RequestCtx {
         protocol,
         scope: resp_scope,
         vault: resp_vault,
@@ -80,16 +93,13 @@ pub(super) fn setup(
         audit_policy,
         approval_whitelist,
         audit_sink,
-        hold_max,
         gateway_metrics: metrics,
         admin_metrics,
         sqlite_precise,
         req_start,
         pending: audit_pending,
-        init_conv,
         normalized_out: _,
-        pii_boundary_chars,
-    } = ctx;
+    } = req;
     let (hold_max, pii_boundary_chars) = clamp_pump_limits(hold_max, pii_boundary_chars);
     let speed = if matches!(audit_mode, AuditMode::Off) {
         Speed::Fast
@@ -102,6 +112,7 @@ pub(super) fn setup(
         conv_id: init_conv.clone(),
         stream_first_id: init_conv,
         stream_model: None,
+        stream_model_from_resp: false,
         stream_usage: None,
         hold: AuditHold::new(hold_max),
         carry: TokenCarry::new(),
@@ -118,6 +129,7 @@ pub(super) fn setup(
         audit_blocked: false,
         terminal_sent: false,
         responses_failed_sent: false,
+        chat_finish_seen: false,
     };
     let env = PumpEnv {
         protocol,
@@ -136,6 +148,7 @@ pub(super) fn setup(
         pump_tx: tx,
         speed,
         hold_gate,
+        req_model,
         _keepalive: keepalive,
     };
     (env, state, SseParser::new())

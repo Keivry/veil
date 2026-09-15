@@ -32,12 +32,23 @@ pub mod decide;
 #[cfg(test)]
 mod audit_due_tests;
 #[cfg(test)]
+mod disconnect_tests;
+#[cfg(test)]
+mod held_output_tests;
+#[cfg(test)]
+mod model_bucket_tests;
+#[cfg(test)]
+mod p3_tests;
+#[cfg(test)]
 mod responses_audit_tests;
 #[cfg(test)]
 mod spawn_tests;
 
-/// 2.3 `stream_pump` 字节泵的上下文：全 `Arc`，`spawn` 闭包全 `Arc move`。
-pub struct StreamPumpCtx {
+/// ARH-3（7.2）：流式与非流共享的请求级上下文。由 `dispatch.rs` 单一装配点
+/// 构造一次，供 `StreamPumpCtx`/`NonstreamCtx` 复用；SHALL NOT 在两条路径上
+/// 各自重复装配同一请求字段（此前流/非流重叠 14 字段双份装配）。
+#[derive(Clone)]
+pub struct RequestCtx {
     pub protocol: Protocol,
     pub scope: Arc<Scope>,
     pub vault: Arc<CredentialVault>,
@@ -48,16 +59,24 @@ pub struct StreamPumpCtx {
     pub approval_whitelist: Vec<String>,
     /// A1/D1：审计落盘单例（verdict 命中/放行经 `spawn_blocking` 写 JSONL）。
     pub audit_sink: Arc<crate::service::audit::AuditSink>,
-    pub hold_max: usize,
     pub gateway_metrics: Arc<GatewayMetrics>,
     pub admin_metrics: Arc<MetricsStore>,
     pub sqlite_precise: bool,
     pub req_start: Instant,
     pub pending: Arc<PendingApprovals>,
-    pub init_conv: Option<String>,
     pub normalized_out: bool,
+}
+
+/// 2.3 `stream_pump` 字节泵的上下文：共享请求上下文 + 流式专属字段。
+pub struct StreamPumpCtx {
+    /// ARH-3（7.2）：与 `NonstreamCtx` 共享的请求级字段（单一装配点构造）。
+    pub req: RequestCtx,
+    pub hold_max: usize,
     /// PII 边界 hold 窗（字符数，`PII_HOLD_MAX` 口径；0 = 响应侧关闭，直通）。
     pub pii_boundary_chars: usize,
+    pub init_conv: Option<String>,
+    /// NLP-2/3.9：请求侧 `model`；响应帧缺失有效 model 时回退分桶。
+    pub req_model: String,
 }
 
 /// 流泵结束时的可观测结果（单测断言用）。

@@ -2,6 +2,7 @@
 
 use {
     super::{
+        RequestCtx,
         nonstream::{NonstreamCtx, NonstreamOutcome, serve_nonstream},
         rewrite::request_rewrite,
     },
@@ -59,23 +60,25 @@ fn nonstream_ctx(
     detector: Arc<PiiDetector>,
 ) -> NonstreamCtx {
     NonstreamCtx {
-        protocol,
-        normalized_out: false,
+        req: RequestCtx {
+            protocol,
+            normalized_out: false,
+            scope,
+            vault,
+            detector,
+            gateway_metrics: Arc::new(GatewayMetrics::default()),
+            admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
+                "/tmp/veil-gateway-units-test.sqlite",
+            ))),
+            sqlite_precise: false,
+            req_start: std::time::Instant::now(),
+            audit_mode: AuditMode::Off,
+            audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
+            approval_whitelist: Vec::new(),
+            audit_sink: crate::service::audit::AuditSink::test_arc(),
+            pending: Arc::new(PendingApprovals::default()),
+        },
         stream_flag: false,
-        scope,
-        vault,
-        detector,
-        gateway_metrics: Arc::new(GatewayMetrics::default()),
-        admin_metrics: Arc::new(MetricsStore::new(std::path::PathBuf::from(
-            "/tmp/veil-gateway-units-test.sqlite",
-        ))),
-        sqlite_precise: false,
-        req_start: std::time::Instant::now(),
-        audit_mode: AuditMode::Off,
-        audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
-        approval_whitelist: Vec::new(),
-        audit_sink: crate::service::audit::AuditSink::test_arc(),
-        pending: Arc::new(PendingApprovals::default()),
         nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
     }
 }
@@ -241,7 +244,7 @@ async fn nonstream_forward_success_returns_verbatim() {
         "/tmp/veil-gateway-units-test.sqlite",
     )));
     let mut ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.admin_metrics = admin.clone();
+    ctx.req.admin_metrics = admin.clone();
     let outcome = serve_nonstream(
         &client,
         reqwest::Method::POST,
@@ -286,7 +289,7 @@ async fn nonstream_error_status_traverses_post_processing() {
             "/tmp/veil-gateway-units-test.sqlite",
         )));
         let mut ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
-        ctx.admin_metrics = admin.clone();
+        ctx.req.admin_metrics = admin.clone();
         let outcome = serve_nonstream(
             &client,
             reqwest::Method::POST,
@@ -445,9 +448,9 @@ async fn nonstream_approve_records_pending_and_passes_through() {
     let client = reqwest::Client::new();
     let (scope, vault, detector) = fresh_arcs();
     let mut ctx = nonstream_ctx(Protocol::Chat, scope, vault, detector);
-    ctx.audit_mode = AuditMode::Approve;
-    ctx.approval_whitelist = vec!["@admin:example.com".to_string()];
-    let pending = ctx.pending.clone();
+    ctx.req.audit_mode = AuditMode::Approve;
+    ctx.req.approval_whitelist = vec!["@admin:example.com".to_string()];
+    let pending = ctx.req.pending.clone();
     let outcome = serve_nonstream(
         &client,
         reqwest::Method::POST,
@@ -484,7 +487,7 @@ async fn nondialog_arm_passes_through_with_count() {
     let (scope, vault, detector) = fresh_arcs();
     let metrics = Arc::new(GatewayMetrics::default());
     let mut ctx = nonstream_ctx(Protocol::NonDialog, scope, vault, detector);
-    ctx.gateway_metrics = metrics.clone();
+    ctx.req.gateway_metrics = metrics.clone();
     let outcome = serve_nonstream(
         &client,
         reqwest::Method::GET,
@@ -605,5 +608,31 @@ fn forward_headers_strips_accept_encoding() {
     assert!(
         fwd2.get("accept-encoding").is_none(),
         "支持集多值同样剥离（交由 reqwest 注入）"
+    );
+}
+
+#[test]
+fn downstream_xveil_headers_stripped() {
+    // NLP-8：请求向同样剔除下游 `x-veil-*`（大小写不敏感），防内部头外传上游。
+    use axum::http::HeaderValue;
+    let metrics = GatewayMetrics::default();
+    let mut h = HeaderMap::new();
+    h.insert("x-veil-protocol", HeaderValue::from_static("chat"));
+    h.insert(
+        "X-Veil-Normalized",
+        HeaderValue::from_static("json-whitespace"),
+    );
+    h.insert("x-veil-internal-trace", HeaderValue::from_static("abc"));
+    h.insert("authorization", HeaderValue::from_static("Bearer t"));
+    let fwd = super::forward_headers(&h, &metrics);
+    assert!(
+        fwd.keys().all(|k| !k.as_str().starts_with("x-veil-")),
+        "x-veil-* 不得外传: {:?}",
+        fwd.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fwd.get("authorization").map(|v| v.to_str().unwrap()),
+        Some("Bearer t"),
+        "业务头须保留"
     );
 }
