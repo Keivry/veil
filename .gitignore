@@ -5,3 +5,6 @@
 /.omo
 
 __pycache__/
+
+# Go 客户端构建产物
+/get/get-credential-*

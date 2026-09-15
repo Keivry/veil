@@ -289,8 +289,9 @@ done
 
 ## 5. Go 客户端对接指引
 
-存量 Go `get` 客户端无需修改即可对接：网关保持其所用路径与方法不变
-（凭据审批默认 `202` 的例外与 Go 处理结论见本节末条）。
+存量 Go `get` 客户端无需修改即可对接：网关保持其所用路径与方法不变。客户端源码自
+`veil-audit-r2-remediation` 起内置本仓 `get/`（模块路径与二进制名不变），`202 + E_PENDING`
+轮询语义与退出码约定见本节末条。
 
 | 用途 | 方法与路径 | 鉴权 |
 |:-----|:-----------|:-----|
@@ -342,12 +343,14 @@ get revoke --name "check-mail"
   `202 + E_PENDING` 即已建单，客户端应对同一请求轮询重试（建议指数退避），批准后重试返回凭据、
   拒绝后 `403`；`CREDENTIAL_BLOCK_WAIT=1` 时无需轮询（同请求阻塞等待，批准返回凭据、拒绝/超时 `403`）。
   超时码归并（迁移注意）：阻塞超时在本仓按拒绝返回 `403`，Python 原仓超时为 `408`——差异明示与迁移建议见 §6.7。
-- Go `202` 处理结论（`get/internal/proxy.go`）：Go `CredentialResponse` 已容忍网关错误体对象
-  （`ErrMessage`：`{"error":{"code","message"}}` 取 `message`、兼容 Python 字符串错误体）与
-  `/credential` 成功信封 `{"ok":true,"credential":{...}}`；`202` 体 `{"error":{"code":"E_PENDING",...}}`
-  不再报「解析响应失败」。但 `FetchCredential` 仅在 `status >= 400` 报错且不向上层暴露 HTTP 状态码，
-  故 `get credential` CLI 对 `202` 仍走成功分支（不打印 `E_PENDING`）；**端到端轮询需调用方在收到
-  `202` 后自行重试，或部署侧用 `CREDENTIAL_BLOCK_WAIT=1` 走同请求阻塞**（见 `veil-hardening` 5.2 已闭环）。
+- Go `202` 处理（`get/`，本仓内置客户端）：`get revoke` / `get register` / `get credential` 在收到
+  `202 + E_PENDING` 后按退避轮询**同一请求**（服务端经决策表幂等复用既有票，不重复建单）直至终态：
+  批准 → 成功（吊销生效 / 注册生效 / 返回凭据），拒绝或超时 → `403` 报错；间隔与时限由
+  `PROXY_APPROVAL_POLL`（默认 `2s`，逐次翻倍至 `10s`）与 `PROXY_APPROVAL_TIMEOUT`（默认 `300s`）控制。
+  `--no-wait` 或 `PROXY_APPROVAL_WAIT=0` 时仅提交审批单并以**退出码 `2`** 表示「已受理未完成」
+  （不再把 `202` 当成功）；`CREDENTIAL_BLOCK_WAIT=1` 时服务端阻塞返回终态，客户端单次调用即完成。
+  错误体兼容（`ErrMessage`：网关对象取 `message`、兼容 Python 字符串错误体）与 `/credential`
+  成功信封 `{"ok":true,"credential":{...}}` 不变；`202` 体不再报「解析响应失败」。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
 
 ## 6. 行为变更（BREAKING）与迁移
@@ -454,9 +457,8 @@ get revoke --name "check-mail"
   （`VeilError::Auth`，`src/service/credential/approval.rs`），相对 Python 原仓超时 `408`
   （`_credential.py:445`）为**有意归并**——超时与拒绝对下游同码，下游重试语义一律按拒绝处理；
   依赖 `408` 区分超时/拒绝的下游须以本条为准，恢复 `408` 须另立 change 并撤回本条。
-- 影响：不识别 `202` 的旧客户端须补轮询；Go 存量 `get` 已能解析 `202 + E_PENDING` 错误体
-  （`ErrMessage`，见 §5），但 CLI 不自动轮询——轮询由调用方实现，或用 `CREDENTIAL_BLOCK_WAIT=1` 阻塞；
-  恢复旧默认须新 change 并撤回本条。
+- 影响：**第三方/未升级客户端**须自行补轮询，或用 `CREDENTIAL_BLOCK_WAIT=1` 阻塞；本仓内置 Go 客户端
+  （`get/`）已按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）；恢复旧默认须新 change 并撤回本条。
 
 注册审批链（`C1`，`veil-credential-flow-parity`）：`POST /register-caller` **不再「落盘即视为注册完成」**，
 写入中立条目（`enabled=false`）后建 `MatrixBranch::Register` 审批单，复用同一双模口径：默认（`CREDENTIAL_BLOCK_WAIT`
@@ -862,12 +864,14 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
 - 本仓真 SDK 一致性口径为脚本 `scripts/api_conformance.py` **23 项（脚本口径）**，口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）；原仓 `api_spec_conformance` 的 12 项为 **cargo 测试口径**（历史对照，不作为本仓脚本口径标签）。
   **已纳入 gate 步骤**（`veil-test-coverage-fill` T3）：`bash scripts/gate.sh` 第 6 步执行真 SDK 一致性
-  （23 项 = 14 常规 + 3 阻断 + 5 取用 + 1 无库 503），与 fmt/clippy/test/文档路径/文件大小五步串联，任一失败整体非零退出。
-  前置条件：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
+  （23 项 = 14 常规 + 3 阻断 + 5 取用 + 1 无库 503），第 7 步在 `get/` 内执行 Go 客户端 `go vet ./...`
+  与 `go test ./...`，与 fmt/clippy/test/文档路径/文件大小五步串联为七个步骤，任一失败整体非零退出。
+  前置条件（第 6 步）：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
   可用 `VEIL_CONFORMANCE_PYTHON` 覆盖）与 SDK pin `openai==3.5.0`/`anthropic==1.1.0` + `pykeepass`；
   无 TPM 硬件时脚本内建 `VEIL_ALLOW_MOCK_TPM=1` 回退（仅开发/CI，生产接 TPM 2.0 硬件）。
-  跳过语义：缺前置条件默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1` 为显式跳过
-  （打印跳过理由与文档位置），不出现无输出的静默跳过。
+  前置条件（第 7 步）：本机 Go 工具链（`get/go.mod` 要求 go 1.22），在 `get/` 目录内执行。
+  跳过语义：缺前置条件默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与
+  `GATE_SKIP_GO=1`（第 7 步）为显式跳过并打印跳过理由与文档位置，不出现无输出的静默跳过。
 
 ### 8.6 空流三协议语义与原仓差异（P2，`veil-llm-protocol-hardening`）
 
