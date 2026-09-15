@@ -60,7 +60,7 @@
 
 ### Requirement: revoke 异步 202 轮询契约
 
-默认模式（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）下 `POST /revoke`（含紧急吊销转常规审批路径）SHALL 以 `202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示已建单待审批，口径与 `POST /credential` 一致；调用方 SHALL NOT 将 `202` 视为吊销已完成，SHALL 对同一请求轮询重试（建议指数退避）直至批准（吊销生效）或拒绝/超时。`CREDENTIAL_BLOCK_WAIT=1` 时 SHALL 同请求阻塞返回终态，无需轮询。Go 客户端把 `202` 当吊销成功属外部仓库缺陷，其轮询修复登记于本 change 的外部章节（Go `get/internal/proxy.go:341-344`、`revoke.go:25-29`；veil 侧见 `src/service/credential/vault_ops.rs:398-419`）。
+默认模式（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）下 `POST /revoke`（含紧急吊销转常规审批路径）SHALL 以 `202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示已建单待审批，口径与 `POST /credential` 一致；调用方 SHALL NOT 将 `202` 视为吊销已完成，SHALL 对同一请求轮询重试（建议指数退避）直至批准（吊销生效）或拒绝/超时。`CREDENTIAL_BLOCK_WAIT=1` 时 SHALL 同请求阻塞返回终态，无需轮询。Go 客户端（本仓 `get/`）SHALL NOT 将 `202` 视为吊销完成且 SHALL 对同一请求轮询重试至终态；该轮询由内置客户端实现（`get/internal/approval.go` 与 `get/internal/proxy.go` 的 `RevokeCaller`/`RegisterCaller`/`FetchCredential`），CLI 以退出码 `2` 表示「已受理未完成」（veil 侧见 `src/service/credential/vault_ops.rs` 的 `revoke_caller_with_approval`）。
 
 #### Scenario: revoke 返回 202 待审
 
