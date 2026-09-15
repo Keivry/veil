@@ -50,7 +50,8 @@ impl AdminState {
     }
 
     /// 当前 IP 的 SSE 并发数（单测用）。
-    pub fn sse_current(&self, ip: IpAddr) -> usize {
+    #[cfg(test)]
+    pub(crate) fn sse_current(&self, ip: IpAddr) -> usize {
         self.sse_count
             .lock()
             .map(|g| g.get(&ip).copied().unwrap_or(0))

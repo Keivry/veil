@@ -52,9 +52,10 @@ async fn mock_upstream(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-// B7.1：缺 model 上游回体落 unknown 桶且计数隔离。
+// B7.1（NLP-2 parity）：上游回体缺 `model` 时**回退请求 model** 分桶且计数隔离
+// （对照 Python `_llm.py:2975-2977`；仅当请求侧亦无 `model` 才归 `unknown_model`）。
 #[tokio::test]
-async fn b7_missing_model_falls_into_unknown_bucket_isolated() {
+async fn b7_missing_model_falls_into_request_bucket_isolated() {
     let (up_naked, uh1) =
         mock_upstream(br#"{"choices":[{"message":{"content":"hi"}}]}"#.to_vec()).await;
     let (base, handle) = serve(test_app_router(&[("LLM_UPSTREAM", up_naked.as_str())])).await;
@@ -75,9 +76,14 @@ async fn b7_missing_model_falls_into_unknown_bucket_isolated() {
         .unwrap();
     assert_eq!(metrics.status().as_u16(), 200);
     let body: serde_json::Value = metrics.json().await.unwrap();
+    assert_eq!(
+        body["per_model"]["m"].as_u64().unwrap_or(0),
+        1,
+        "缺 model 响应须回退请求 model 桶（NLP-2 parity）: {body}"
+    );
     assert!(
-        body["per_model"]["unknown_model"].as_u64().unwrap_or(0) >= 1,
-        "缺 model 须落 unknown 桶: {body}"
+        body["per_model"].get("unknown_model").is_none(),
+        "回退请求 model 后不得串扰 unknown: {body}"
     );
     handle.abort();
     uh1.abort();
@@ -139,12 +145,16 @@ async fn b7_sse_full_rejects_sixth_keeps_existing() {
     assert_eq!(sixth.status().as_u16(), 429);
     assert!(sixth.headers().contains_key("retry-after"));
     drop(sixth);
-    // 已建连接不受影响：空闲流 2s 内无数据（超时）而非关闭（None 即关闭）。
+    // 已建连接不受影响：空闲流 2s 内无数据（超时）而非关闭（EOF 即关闭）。
     for resp in held.iter_mut() {
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), resp.chunk()).await;
         match chunk {
+            // 超时：连接保持打开（保活 60s，2s 内无帧属预期）。
             Err(_) => {}
-            Ok(Ok(_)) => {}
+            // 收到数据帧：连接保持打开。
+            Ok(Ok(Some(_))) => {}
+            // EOF：连接被服务端关闭——显式失败，不与保持打开混为一态。
+            Ok(Ok(None)) => panic!("已建连接不应被关闭（chunk 流 EOF）"),
             Ok(Err(e)) => panic!("已建连接不应出错: {e}"),
         }
     }

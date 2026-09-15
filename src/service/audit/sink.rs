@@ -8,7 +8,7 @@
 
 use {
     super::{
-        log::AuditLogger,
+        log::{AuditLogger, sanitize_for_log},
         policy::AuditPolicy,
         verdict::{AuditVerdict, evaluate_with_whitelist},
     },
@@ -61,19 +61,24 @@ impl AuditSink {
     ) -> AuditVerdict {
         let verdict = evaluate_with_whitelist(mode, tool_name, args, policy, whitelist);
         if !matches!(mode, AuditMode::Off) {
-            self.record_verdict(&verdict, tool_name, protocol).await;
+            self.record_verdict(&verdict, tool_name, args, protocol)
+                .await;
         }
         verdict
     }
 
     /// 单条 verdict 落盘 + 推环；返回写结果（deny/allow 语义见模块文档）。
+    /// APP-4/D18：每条记录（含 `Block`/`Allow`）补参数脱敏摘要——复用审计面
+    /// ten-form 摘要引擎 `sanitize_for_log`，摘要生成先于落盘（先脱敏后写）。
     pub async fn record_verdict(
         &self,
         verdict: &AuditVerdict,
         tool_name: &str,
+        args: &str,
         protocol: Option<&str>,
     ) -> AuditWriteOutcome {
         let deny = !matches!(verdict, AuditVerdict::Allow);
+        let args_summary = sanitize_for_log(args);
         let (kind, reason, summary) = match verdict {
             AuditVerdict::Allow => ("allow", String::new(), format!("allow {tool_name}")),
             AuditVerdict::Block { reason } => (
@@ -93,6 +98,7 @@ impl AuditSink {
             "tool": tool_name,
             "reason": reason,
             "summary": summary,
+            "args_summary": args_summary,
         });
         let logger = self.logger.clone();
         match tokio::task::spawn_blocking(move || logger.log_event(&event)).await {
@@ -233,6 +239,7 @@ mod sink_tests {
                     reason: "危险 shell".to_string(),
                 },
                 "exec",
+                "rm -rf /",
                 None,
             )
             .await;
@@ -256,7 +263,7 @@ mod sink_tests {
         assert_eq!(sink.breaker_count(), 2);
 
         let allow_outcome = sink
-            .record_verdict(&AuditVerdict::Allow, "exec", None)
+            .record_verdict(&AuditVerdict::Allow, "exec", "echo ok", None)
             .await;
         assert_eq!(allow_outcome, AuditWriteOutcome::AllowWriteFailed);
         assert_eq!(sink.breaker_count(), 3, "allow 写失败须计数 +1");
@@ -277,7 +284,7 @@ mod sink_tests {
         // 连续失败达 10 次 → critical 告警并重置计数。
         for _ in 0..6 {
             let _ = sink
-                .record_verdict(&AuditVerdict::Allow, "exec", None)
+                .record_verdict(&AuditVerdict::Allow, "exec", "echo ok", None)
                 .await;
         }
         assert_eq!(sink.breaker_count(), 0, "第 10 次连续失败须重置计数");
@@ -307,12 +314,13 @@ mod sink_tests {
                         reason: "危险操作".to_string(),
                     },
                     "exec",
+                    "rm -rf /",
                     None,
                 )
                 .await;
             assert_eq!(deny, AuditWriteOutcome::DenyWriteFailed, "{tag}");
             let allow = sink
-                .record_verdict(&AuditVerdict::Allow, "exec", None)
+                .record_verdict(&AuditVerdict::Allow, "exec", "echo ok", None)
                 .await;
             assert_eq!(allow, AuditWriteOutcome::AllowWriteFailed, "{tag}");
             assert_eq!(sink.breaker_count(), 2, "{tag} 两路径各计数 +1");
@@ -365,6 +373,86 @@ mod sink_tests {
                 .query_events(Some("audit"), None, 10)
                 .is_empty()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn audit_log_block_has_summary() {
+        // APP-4/D18：Block/Allow 两类记录均含参数脱敏摘要，无明文。
+        let dir = unique_dir("args-summary");
+        let sink = sink_in(dir.clone());
+        let policy = AuditPolicy::default_policy();
+        let block = sink
+            .evaluate_and_record(
+                AuditMode::Block,
+                "exec",
+                "rm -rf / && call 13800138000",
+                &policy,
+                test_whitelist(),
+                Some("chat"),
+            )
+            .await;
+        assert!(matches!(block, AuditVerdict::Block { .. }), "{block:?}");
+        let allow = sink
+            .evaluate_and_record(
+                AuditMode::Block,
+                "exec",
+                "echo 13800138000",
+                &policy,
+                test_whitelist(),
+                Some("chat"),
+            )
+            .await;
+        assert_eq!(allow, AuditVerdict::Allow);
+        let content = std::fs::read_to_string(dir.join("audit.log")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "Block/Allow 各落一行: {content}");
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let args_summary = v
+                .get("args_summary")
+                .and_then(|s| s.as_str())
+                .expect("记录须含 args_summary");
+            assert!(!args_summary.is_empty(), "参数摘要须非空: {line}");
+        }
+        assert!(
+            content.contains("[REDACTED:phone]"),
+            "参数摘要须经 ten-form 脱敏: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn audit_log_summary_no_plaintext() {
+        // APP-4/D18：摘要不含明文；文件权限维持 0600。
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = unique_dir("summary-no-plain");
+        let sink = sink_in(dir.clone());
+        let policy = AuditPolicy::default_policy();
+        sink.evaluate_and_record(
+            AuditMode::Block,
+            "exec",
+            "send sk-abcDEF1234567890 mail a@b.com",
+            &policy,
+            test_whitelist(),
+            None,
+        )
+        .await;
+        let content = std::fs::read_to_string(dir.join("audit.log")).unwrap();
+        assert!(
+            !content.contains("sk-abcDEF1234567890"),
+            "摘要不得含 API key 明文: {content}"
+        );
+        assert!(
+            !content.contains("a@b.com"),
+            "摘要不得含邮箱明文: {content}"
+        );
+        let mode = std::fs::metadata(dir.join("audit.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "审计日志权限须为 0600");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

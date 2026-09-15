@@ -428,16 +428,16 @@ fn query_series_blocking(
          t_silent, t_open, t_synth FROM {table} WHERE 1=1"
     );
     if since.is_some() {
-        sql.push_str(" AND window >= ?");
+        sql.push_str(" AND CAST(substr(window, 2) AS INTEGER) >= ?");
     }
     if protocol.is_some() {
         sql.push_str(" AND protocol = ?");
     }
-    sql.push_str(" ORDER BY window ASC LIMIT 500");
+    sql.push_str(" ORDER BY CAST(substr(window, 2) AS INTEGER) ASC LIMIT 500");
     let mut stmt = conn.prepare(&sql)?;
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(s) = since {
-        params.push(Box::new(s.to_string()));
+        params.push(Box::new(window_ord(s)));
     }
     if let Some(p) = protocol {
         params.push(Box::new(p.to_string()));

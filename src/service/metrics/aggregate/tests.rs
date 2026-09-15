@@ -1,18 +1,12 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../aggregate.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "aggregate.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split(
+        "aggregate.rs",
+        include_str!("../aggregate.rs"),
     );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "aggregate/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
+    crate::test_support::file_len_under_800_or_split(
+        "aggregate/tests.rs",
+        include_str!("tests.rs"),
     );
 }
 
@@ -360,6 +354,35 @@ mod observability_parity_tests {
             .await
             .unwrap();
         assert!(future.is_empty(), "未来 since 须过滤全部旧窗");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn window_key_ordering() {
+        // OPS-8：SQL 侧 since 过滤与排序改用整数序（字符串序在 d9/d10 进位处失真）。
+        let db = tmp_db("window-key-ordering");
+        let _ = std::fs::remove_file(&db);
+        let store = MetricsStore::new(db.clone());
+        store.record_aux_counts(Protocol::Chat, 9 * 86_400, 0, 0, 1);
+        store.record_aux_counts(Protocol::Chat, 10 * 86_400, 0, 0, 1);
+        store.flush().await.unwrap();
+        let all = store.query_series("daily", None, None).await.unwrap();
+        let windows: Vec<String> = all.iter().map(|p| p.window.clone()).collect();
+        assert_eq!(
+            windows,
+            vec!["d9".to_string(), "d10".to_string()],
+            "窗口须按整数序升序（字符串序会把 d10 排到 d9 之前）"
+        );
+        let since = store
+            .query_series("daily", Some("d10".to_string()), None)
+            .await
+            .unwrap();
+        let kept: Vec<String> = since.iter().map(|p| p.window.clone()).collect();
+        assert_eq!(
+            kept,
+            vec!["d10".to_string()],
+            "since=d10 须按整数序过滤掉 d9（字符串序会误留 d9）"
+        );
         let _ = std::fs::remove_file(&db);
     }
 

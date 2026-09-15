@@ -307,3 +307,55 @@ async fn audit_dynamic_pii_zero_plaintext() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn unique_concurrent_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "veil-audit-concurrent-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn audit_log_concurrent_append() {
+    // TCP-1：多线程并发追加无丢行、无交错损坏，落盘行数等于写入总数。
+    let dir = unique_concurrent_dir("append");
+    let logger = std::sync::Arc::new(AuditLogger::new(dir.clone()));
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 500;
+    std::thread::scope(|scope| {
+        for tid in 0..THREADS {
+            let logger = std::sync::Arc::clone(&logger);
+            scope.spawn(move || {
+                for n in 0..PER_THREAD {
+                    logger
+                        .log_event(&serde_json::json!({
+                            "kind": "block",
+                            "tid": tid,
+                            "n": n,
+                        }))
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let content = std::fs::read_to_string(logger.log_path()).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = 0u64;
+    for line in content.lines() {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("并发追加产生损坏行: {e}: {line}"));
+        let key = (v["tid"].as_u64().unwrap(), v["n"].as_u64().unwrap());
+        assert!(seen.insert(key), "并发追加出现重复行: {key:?}");
+        lines += 1;
+    }
+    assert_eq!(lines, THREADS * PER_THREAD, "并发追加丢行");
+    assert_eq!(seen.len() as u64, THREADS * PER_THREAD);
+    std::fs::remove_dir_all(&dir).ok();
+}

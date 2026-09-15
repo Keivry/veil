@@ -50,7 +50,9 @@ impl PiiSamplerConfig {
 
     /// 无盐告警谓词：采样开启且未配 HMAC 时 hash 退化为无盐 SHA256，
     /// 低熵 PII 可被离线字典枚举，启动期须 warn（生产必须配置）。
-    pub fn needs_hmac_warn(&self) -> bool {
+    /// `DCD-5`：仅测试引用（启动 warn 未接线），`#[cfg(test)]` 收编；接生产时移除收编。
+    #[cfg(test)]
+    pub(crate) fn needs_hmac_warn(&self) -> bool {
         self.enabled && self.hmac_key.as_deref().unwrap_or("").is_empty()
     }
 }
@@ -332,6 +334,7 @@ impl PiiValueSampler {
     }
 
     /// hover 展示掩码 TopN（按 hits 降序，不含明文）。
+    /// `DCD-5`/`OPS-1`：保留 `pub`——`admin_metrics_body` 生产引用，经 `/_admin/metrics` 暴露。
     pub fn top_n(&self, n: usize) -> Vec<SampleView> {
         let mut v: Vec<SampleView> = self
             .recent
@@ -344,7 +347,9 @@ impl PiiValueSampler {
     }
 
     /// 计数口径（关闭时仅计数验收用）。
-    pub fn stats(&self) -> (u64, u64, u64) {
+    /// `DCD-5`：仅测试引用，`#[cfg(test)]` 收编。
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (u64, u64, u64) {
         self.counts
             .lock()
             .map(|c| (c.sampled, c.skipped_disabled, c.skipped_non_chat))
@@ -352,7 +357,11 @@ impl PiiValueSampler {
     }
 
     /// 满队列丢最老计数（含无驱动发送失败；与指标环 `dropped` 同语义可查）。
-    pub fn dropped_total(&self) -> u64 { self.counts.lock().map(|c| c.dropped_full).unwrap_or(0) }
+    /// `DCD-5`：仅测试引用，`#[cfg(test)]` 收编。
+    #[cfg(test)]
+    pub(crate) fn dropped_total(&self) -> u64 {
+        self.counts.lock().map(|c| c.dropped_full).unwrap_or(0)
+    }
 
     /// 队列滞留行数（单测断言落盘前缓冲用）。
     #[cfg(test)]

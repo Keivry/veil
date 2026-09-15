@@ -10,6 +10,8 @@ use {
     std::collections::HashMap,
 };
 
+mod observability;
+
 fn test_ip() -> IpAddr { IpAddr::from([127, 0, 0, 1]) }
 
 fn headers_with(token: Option<&str>, cookie: Option<&str>) -> HeaderMap {
@@ -476,7 +478,9 @@ async fn events_body(state: AppState, q: HashMap<String, String>) -> serde_json:
     )
     .await
     .into_response();
-    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     serde_json::from_slice(&body).unwrap()
 }
 
@@ -501,7 +505,7 @@ async fn admin_events_filter_semantics() {
     assert_eq!(one["events"].as_array().unwrap().len(), 1);
     let all = events_body(state.clone(), q(&[("limit", "200")])).await;
     assert_eq!(all["events"].as_array().unwrap().len(), 3);
-    // limit=0 归一为下限 1（环查询 clamp 1..=500）。
+    // limit=0 归一为下限 1（环查询 clamp 1..=200）。
     let zero = events_body(state.clone(), q(&[("limit", "0")])).await;
     assert_eq!(zero["events"].as_array().unwrap().len(), 1);
     // kind 精确过滤。
@@ -526,5 +530,165 @@ async fn admin_events_filter_semantics() {
     )
     .await;
     assert_eq!(both["events"].as_array().unwrap().len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn cache_control(resp: &Response) -> String {
+    resp.headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn body_json(resp: Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn metrics_body(state: AppState) -> serde_json::Value {
+    let resp = admin_metrics(
+        State(state),
+        PeerIp(Some(test_ip())),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn runtime_counters_exposed_in_metrics() {
+    // OPS-1：三个运行时可靠性计数在 /_admin/metrics 可见（只增不改）。
+    let dir = metrics_test_dir("runtime-counters");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let v = metrics_body(state.clone()).await;
+    for k in ["upstream_read_errors", "admin_rate_evicted", "aggs_evicted"] {
+        assert!(v.get(k).is_some(), "metrics 缺运行时计数键 {k}: {v}");
+        assert!(v[k].is_u64(), "{k} 须为计数: {v}");
+    }
+    assert!(
+        v["requests"].is_u64() && v["tokens"]["total"].is_u64(),
+        "既有 metrics 字段形态不变: {v}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn counters_increment_visible() {
+    // OPS-1：三键随对应事件递增并在 metrics 快照可读。
+    let dir = metrics_test_dir("counter-increment");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let before = metrics_body(state.clone()).await;
+    state.gateway_metrics().record_upstream_read_error();
+    state.gateway_metrics().record_upstream_read_error();
+    state.gateway_metrics().record_admin_rate_evicted(3);
+    state
+        .admin_state()
+        .metrics
+        .aggs_evicted
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let after = metrics_body(state.clone()).await;
+    assert_eq!(
+        after["upstream_read_errors"].as_u64().unwrap(),
+        before["upstream_read_errors"].as_u64().unwrap() + 2
+    );
+    assert_eq!(
+        after["admin_rate_evicted"].as_u64().unwrap(),
+        before["admin_rate_evicted"].as_u64().unwrap() + 3
+    );
+    assert_eq!(
+        after["aggs_evicted"].as_u64().unwrap(),
+        before["aggs_evicted"].as_u64().unwrap() + 1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_security_headers() {
+    // OPS-2：成功/401/404/429 响应统一携带 no-store 等安全头。
+    let dir = metrics_test_dir("security-headers");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let ok = admin_metrics(
+        State(state.clone()),
+        PeerIp(Some(test_ip())),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert!(cache_control(&ok).contains("no-store"));
+    assert_eq!(ok.headers().get("pragma").unwrap(), "no-cache");
+    assert_eq!(
+        ok.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(ok.headers().get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(ok.headers().get("referrer-policy").unwrap(), "no-referrer");
+
+    let unauth = admin_metrics(
+        State(state.clone()),
+        PeerIp(Some(test_ip())),
+        HeaderMap::new(),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    assert!(cache_control(&unauth).contains("no-store"));
+
+    let nf = admin_not_found().await;
+    assert_eq!(nf.status(), StatusCode::NOT_FOUND);
+    assert!(cache_control(&nf).contains("no-store"));
+
+    let rl = rate_limited(42);
+    assert_eq!(rl.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(cache_control(&rl).contains("no-store"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_no_store_header_present() {
+    // OPS-2：含 SSE 路由在内均不豁免 no-store；401 亦不缓存。
+    let dir = metrics_test_dir("no-store");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let health = admin_health(
+        State(state.clone()),
+        PeerIp(Some(test_ip())),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    assert!(cache_control(&health).contains("no-store"));
+
+    let sse = admin_events_stream(
+        State(state.clone()),
+        PeerIp(Some(test_ip())),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    assert_eq!(sse.status().as_u16(), 200);
+    assert!(
+        cache_control(&sse).contains("no-store"),
+        "SSE 路由不得豁免 no-store"
+    );
+
+    let unauth = admin_health(
+        State(state.clone()),
+        PeerIp(Some(test_ip())),
+        HeaderMap::new(),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    assert!(cache_control(&unauth).contains("no-store"));
     std::fs::remove_dir_all(&dir).ok();
 }

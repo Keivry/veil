@@ -6,7 +6,7 @@ use {
     std::{
         collections::HashMap,
         net::IpAddr,
-        sync::atomic::Ordering,
+        sync::{Arc, atomic::Ordering},
         time::{Duration, Instant},
     },
 };
@@ -21,6 +21,8 @@ pub const ADMIN_RATE_WINDOW_SECS: u64 = 60;
 pub const ADMIN_RATE_MAX_ENTRIES: usize = 4096;
 /// 周期清扫节拍（每 N 次限流检查执行一次过期条目清扫）。
 const ADMIN_RATE_SWEEP_INTERVAL_OPS: u64 = 1024;
+/// 周期清扫任务节拍（秒，DCD-3）：生产启动路径实际 spawn，与容量驱逐共同构成有界策略。
+pub const ADMIN_RATE_SWEEP_SECS: u64 = 60;
 
 /// 清除窗内无命中的过期条目，返回清理数（`decide_rate_limit` 阈值语义不变）。
 fn sweep_expired_rate(
@@ -95,6 +97,24 @@ impl AdminState {
         let mut guard = self.rate.lock().unwrap_or_else(|e| e.into_inner());
         let window = Duration::from_secs(ADMIN_RATE_WINDOW_SECS);
         sweep_expired_rate(&mut guard, now, window)
+    }
+
+    /// 生产接线（DCD-3）：spawn 周期清扫任务，按 TTL 清过期条目；
+    /// 返回句柄供调用方持有（`main.rs` 持有至进程结束）。
+    pub fn spawn_rate_sweeper(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // 首个 tick 立即到点，先消费，使清扫按完整周期起算。
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let cleaned = me.sweep_rate(Instant::now());
+                if cleaned > 0 {
+                    tracing::debug!(cleaned, "管理面限流周期清扫已删除过期条目");
+                }
+            }
+        })
     }
 }
 
@@ -321,6 +341,32 @@ mod tests {
         assert!(
             st.check_rate(IpAddr::from([10, 0, 0, 2])).is_ok(),
             "其他 IP 不受影响"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_rate_sweep_wired() {
+        let st = std::sync::Arc::new(test_admin_state());
+        {
+            let mut guard = st.rate.lock().expect("限流锁无毒");
+            let stale = Instant::now() - Duration::from_secs(ADMIN_RATE_WINDOW_SECS + 1);
+            guard.insert(IpAddr::from([10, 8, 8, 8]), vec![stale]);
+        }
+        let handle = st.spawn_rate_sweeper(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !st.rate
+                .lock()
+                .expect("限流锁无毒")
+                .contains_key(&IpAddr::from([10, 8, 8, 8])),
+            "周期清扫任务须删除过期条目"
+        );
+        handle.abort();
+        // 生产接线：main.rs 实际 spawn 周期清扫（DCD-3）。
+        let main_src = include_str!("../../../src/main.rs");
+        assert!(
+            main_src.contains("spawn_rate_sweeper"),
+            "生产启动路径须接线周期清扫"
         );
     }
 }

@@ -179,13 +179,16 @@ impl MetricsStore {
         true
     }
 
-    /// 当前环长度（单测/快照用）。
-    pub fn ring_len(&self) -> usize { self.ring.lock().map(|r| r.len()).unwrap_or(0) }
+    /// 当前环长度（`DCD-5`：仅测试引用，`#[cfg(test)]` 收编；快照走 `ring_len` 字段）。
+    #[cfg(test)]
+    pub(crate) fn ring_len(&self) -> usize { self.ring.lock().map(|r| r.len()).unwrap_or(0) }
 
     /// 环满丢弃计数（`mpsc(512)` 背压语义的内存环对应物，只计数不阻塞）。
+    /// `DCD-5`/`OPS-1`：保留 `pub`——`snapshot()` 生产引用，经 `/_admin/metrics` 暴露。
     pub fn dropped_total(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
 
     /// `aggs` 有界驱逐累计计数（retention + LRU，可观测）。
+    /// `DCD-5`/`OPS-1`：保留 `pub`——`snapshot()` 生产引用，经 `/_admin/metrics` 暴露。
     pub fn aggs_evicted_total(&self) -> u64 { self.aggs_evicted.load(Ordering::Relaxed) }
 
     /// 覆盖式刷盘同步镜像（仅单测用；生产一律走异步 [`flush`](MetricsStore::flush)）。
@@ -461,10 +464,12 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
             ],
         )?;
     }
-    // `five_min` 只留最新窗口（每 protocol 最大 window）。
+    // `five_min` 只留最新窗口（每 protocol 最大 window，按整数序比较）。
     conn.execute_batch(
-        "DELETE FROM metrics_five_min WHERE (protocol, window) NOT IN \
-         (SELECT protocol, MAX(window) FROM metrics_five_min GROUP BY protocol);",
+        "DELETE FROM metrics_five_min WHERE rowid NOT IN \
+         (SELECT m.rowid FROM metrics_five_min AS m WHERE CAST(substr(m.window, 2) AS INTEGER) = \
+          (SELECT MAX(CAST(substr(x.window, 2) AS INTEGER)) FROM metrics_five_min AS x \
+           WHERE x.protocol = m.protocol));",
     )?;
     ensure_0600(db_path);
     drop(conn);
@@ -477,13 +482,15 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
 fn purge_retention_blocking(db_path: &Path) -> anyhow::Result<()> {
     let conn = open_wal(db_path)?;
     ensure_tables(&conn)?;
-    // 窗口键为 `d{days}` / `h{hours}` / `m{win}` 整数序，字符串比较需转整数；
-    // 保守策略：按行数裁剪（daily 保留 32 窗×协议，hourly 保留 7*24+2 窗×协议）。
+    // 窗口键为 `d{days}` / `h{hours}` / `m{win}`：按整数序（`window_ord` 同口径）比较，
+    // 避免字符串在位数进位处（如 `h9` vs `h10`）排序失真；保留窗数与内存侧一致。
     conn.execute_batch(
         "DELETE FROM metrics_daily WHERE window NOT IN \
-         (SELECT window FROM metrics_daily GROUP BY window ORDER BY window DESC LIMIT 32); \
+         (SELECT window FROM metrics_daily GROUP BY window \
+          ORDER BY CAST(substr(window, 2) AS INTEGER) DESC LIMIT 32); \
          DELETE FROM metrics_hourly WHERE window NOT IN \
-         (SELECT window FROM metrics_hourly GROUP BY window ORDER BY window DESC LIMIT 170);",
+         (SELECT window FROM metrics_hourly GROUP BY window \
+          ORDER BY CAST(substr(window, 2) AS INTEGER) DESC LIMIT 170);",
     )?;
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

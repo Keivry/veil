@@ -44,8 +44,10 @@ pub fn load_admin_token_file(data_dir: &std::path::Path) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// 事件查询默认上限。
-pub const EVENT_DEFAULT_LIMIT: usize = 100;
+/// 事件查询默认上限（对齐 Python `_admin.py` 的 50）。
+pub const EVENT_DEFAULT_LIMIT: usize = 50;
+/// 事件查询上限（对齐 Python `_admin.py` 的 200；越界收敛至本值）。
+pub const EVENT_MAX_LIMIT: usize = 200;
 
 #[cfg(test)]
 mod tests {

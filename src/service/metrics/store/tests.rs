@@ -1,19 +1,7 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../store.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "store.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "store/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("store.rs", include_str!("../store.rs"));
+    crate::test_support::file_len_under_800_or_split("store/tests.rs", include_str!("tests.rs"));
 }
 
 use {
@@ -690,4 +678,62 @@ fn model_approximation_caliber_and_window_check() {
         "样本不足须标近似"
     );
     assert!(!super::super::aggregate::is_precise_for_window(0, 0));
+}
+
+#[tokio::test]
+async fn window_cross_digit_ordering() {
+    // OPS-8：retention 与 five_min 最新窗保留按整数序，字符串序在 d9/d10、m9/m10 进位处失真。
+    let db = tmp_db("window-cross-digit");
+    let _ = std::fs::remove_file(&db);
+    let store = MetricsStore::new(db.clone());
+    {
+        let conn = open_wal(&db).unwrap();
+        ensure_tables(&conn).unwrap();
+        for i in 1..=40 {
+            conn.execute(
+                "INSERT INTO metrics_daily(window, protocol, requests) \
+                 VALUES (?1, 'chat/completions', 1)",
+                rusqlite::params![format!("d{i}")],
+            )
+            .unwrap();
+        }
+    }
+    purge_retention_blocking(&db).unwrap();
+    {
+        let conn = open_wal(&db).unwrap();
+        let windows: Vec<String> = conn
+            .prepare("SELECT window FROM metrics_daily")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(windows.len(), 32, "daily retention 保留 32 窗: {windows:?}");
+        for i in 9..=40 {
+            assert!(
+                windows.contains(&format!("d{i}")),
+                "须按整数序保留最 d{i}: {windows:?}"
+            );
+        }
+        assert!(!windows.contains(&"d8".to_string()), "最旧 d8 须被驱逐");
+    }
+    // five_min 只留最新：内存含 m10，库中另注 m9，flush 后应只留 m10。
+    store.record_aux_counts(Protocol::Chat, 10 * 300, 0, 0, 1);
+    {
+        let conn = open_wal(&db).unwrap();
+        conn.execute(
+            "INSERT INTO metrics_five_min(window, protocol, requests) \
+             VALUES ('m9', 'chat/completions', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    store.flush().await.unwrap();
+    let pts = store.query_series("five_min", None, None).await.unwrap();
+    assert_eq!(pts.len(), 1, "five_min 每协议只留最新窗口: {pts:?}");
+    assert_eq!(
+        pts[0].window, "m10",
+        "跨位数最新窗口须为 m10（字符串 MAX 会错误保留 m9）"
+    );
+    let _ = std::fs::remove_file(&db);
 }

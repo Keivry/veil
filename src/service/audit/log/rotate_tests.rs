@@ -64,3 +64,56 @@ fn audit_log_rotate_products_0600() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn audit_log_concurrent_rotate() {
+    // TCP-1：并发追加下触发轮转——轮转产物完整可读、零明文、已确认写不丢。
+    let dir = unique_rotate_dir();
+    let logger = std::sync::Arc::new(AuditLogger::with_max_bytes(dir.clone(), 800));
+    const THREADS: u64 = 4;
+    const PER_THREAD: u64 = 8;
+    std::thread::scope(|scope| {
+        for tid in 0..THREADS {
+            let logger = std::sync::Arc::clone(&logger);
+            scope.spawn(move || {
+                for n in 0..PER_THREAD {
+                    logger
+                        .log_event(&serde_json::json!({
+                            "kind": "block",
+                            "tid": tid,
+                            "n": n,
+                            "reason": "sk-concurrent-rotate-abcdef123456",
+                        }))
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    let mut backups = 0usize;
+    for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("audit.log") {
+            continue;
+        }
+        if name != "audit.log" {
+            backups += 1;
+        }
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(
+            !content.contains("abcdef123456") && !content.contains("sk-concurrent"),
+            "{name} 轮转产物残留明文"
+        );
+        for line in content.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{name} 轮转产物损坏行: {e}: {line}"));
+            let key = (v["tid"].as_u64().unwrap(), v["n"].as_u64().unwrap());
+            assert!(seen.insert(key), "{name} 轮转出现重复行: {key:?}");
+            total += 1;
+        }
+    }
+    assert!(backups >= 1, "并发下须实际发生轮转");
+    assert_eq!(total, THREADS * PER_THREAD, "并发轮转丢已确认写");
+    std::fs::remove_dir_all(&dir).ok();
+}

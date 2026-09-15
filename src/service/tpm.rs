@@ -62,7 +62,8 @@ impl MockTpm {
         }
     }
 
-    pub fn unavailable() -> Self {
+    #[cfg(test)]
+    pub(crate) fn unavailable() -> Self {
         Self {
             secret: Vec::new(),
             available: false,
@@ -313,7 +314,8 @@ pub fn startup_tpm_in(tpm_dir: &std::path::Path, allow_mock: bool) -> anyhow::Re
     require_hardware_tpm(&RealTpm::with_dir(tpm_dir.to_path_buf()))
 }
 
-pub fn startup_tpm(allow_mock: bool) -> anyhow::Result<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn startup_tpm(allow_mock: bool) -> anyhow::Result<Vec<u8>> {
     startup_tpm_in(std::path::Path::new("/data/tpm"), allow_mock)
 }
 
@@ -332,16 +334,14 @@ mod tests {
 
     #[test]
     fn unavailable_tpm_fails_startup_without_software_fallback() {
+        // 注入桩（MockTpm::unavailable）：确定性覆盖「不可用即 fail-closed、禁止软件回退」，
+        // 不依赖宿主是否具备 TPM 硬件，消除条件化断言空转（TCP-3/FAKE-3）。
         let mock = MockTpm::unavailable();
         assert!(!mock.is_available());
         assert!(mock.unseal().is_err());
         let err = require_hardware_tpm(&mock).unwrap_err().to_string();
-        assert!(err.contains("TPM") && err.contains("软件回退"), "{err}");
-        // 真实 TPM 在无硬件 CI 环境下 is_available 为 false，且 unseal 不返回静默密钥。
-        let real = RealTpm::new();
-        if !real.is_available() {
-            assert!(require_hardware_tpm(&real).is_err());
-        }
+        assert!(err.contains("TPM") && err.contains("拒绝启动"), "{err}");
+        assert!(err.contains("软件回退"), "{err}");
     }
 
     #[test]
@@ -359,9 +359,20 @@ mod tests {
 
     #[test]
     fn startup_gate_defaults_to_hardware_and_fails_without_it() {
-        if !RealTpm::new().is_available() {
-            assert!(startup_tpm(false).is_err());
-        }
+        // 注入桩：始终不可用的 TpmUnlock，门禁确定性 fail-closed（真实断言，不空转）。
+        let unavailable = MockTpm::unavailable();
+        let err = require_hardware_tpm(&unavailable).unwrap_err().to_string();
+        assert!(err.contains("TPM") && err.contains("拒绝启动"), "{err}");
+        // 默认硬件门禁走真实 RealTpm 构造：无硬件 → "TPM 不可用"；
+        // 有硬件但空密封目录 → "密封文件缺失"；两分支恒为 Err，断言无条件执行。
+        let dir = unique_test_base("startup-hw-default");
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = startup_tpm_in(&dir, false);
+        assert!(
+            result.is_err(),
+            "默认硬件门禁在缺密封材料时不得放行: {result:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

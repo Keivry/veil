@@ -30,13 +30,124 @@ use {
     std::{collections::HashMap, net::IpAddr},
 };
 
+/// 管理面统一安全响应头（OPS-2，对齐 Python `_admin.py` `_NO_STORE_HEADERS`）：
+/// 防缓存 + 基础安全头；成功/失败（401/404）与 SSE 路由一致生效。
+const ADMIN_SECURITY_HEADERS: [(&str, &str); 5] = [
+    (
+        "cache-control",
+        "no-store, no-cache, must-revalidate, private",
+    ),
+    ("pragma", "no-cache"),
+    ("x-content-type-options", "nosniff"),
+    ("x-frame-options", "DENY"),
+    ("referrer-policy", "no-referrer"),
+];
+
+/// 给响应补管理面统一安全头（幂等；已存在同名头则覆盖为契约值）。
+fn with_security_headers(mut resp: Response) -> Response {
+    for (name, value) in ADMIN_SECURITY_HEADERS {
+        if let Ok(v) = axum::http::HeaderValue::from_str(value) {
+            resp.headers_mut().insert(name, v);
+        }
+    }
+    resp
+}
+
+/// 管理面业务事件帧：SSE 事件名 `event`（对齐 Python `_admin.py`，MUST NOT 用 `message`）。
+fn admin_event_frame(data: String) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("event")
+        .data(data)
+}
+
+/// 管理面 SSE 终止帧 `done`（恰一，流收尾时发送，使下游可判定流结束）。
+fn admin_done_frame() -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("done")
+        .data("{}")
+}
+
+/// SSE 广播接收结果分类：`Lagged` 可恢复（跳帧继续），仅 `Closed` 终止（OPS-7）。
+enum SseRecv {
+    Event(String),
+    Skip(u64),
+    Closed,
+}
+
+fn classify_sse_recv(recv: Result<String, tokio::sync::broadcast::error::RecvError>) -> SseRecv {
+    match recv {
+        Ok(msg) => SseRecv::Event(msg),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => SseRecv::Skip(n),
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => SseRecv::Closed,
+    }
+}
+
+/// 值级采样样本转 Python 同形嵌套 dict：`{kind: {mask: {count, hash}}}`（OPS-5）。
+fn pii_value_samples_json(samples: &[crate::service::metrics::SampleView]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for s in samples {
+        let entry = out
+            .entry(s.kind.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(by_mask) = entry.as_object_mut() {
+            by_mask.insert(s.mask.clone(), json!({"count": s.hits, "hash": s.hash}));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// 指标快照体（`/_admin/metrics` 与 SSE `metrics` 快照共用，字段集一致）：
+/// 含运行时可靠性三计数（OPS-1）、值级采样嵌套字段（OPS-5）与审批决策表观测。
+fn admin_metrics_body(state: &AppState) -> serde_json::Value {
+    let snap = state.admin_state().metrics.snapshot();
+    let gm = state.gateway_metrics();
+    // `ARC-2`：审批决策表软上限只读观测；锁中毒时按零降级，不影响其余指标。
+    let (decision_overflow, decision_size) = state
+        .decisions
+        .lock()
+        .map(|t| (t.overflow_count(), t.entry_count()))
+        .unwrap_or((0, 0));
+    let samples = state.admin_state().sampler.top_n(20);
+    json!({
+        "ok": true,
+        "is_precise": snap.is_precise,
+        "requests": snap.requests,
+        "tokens": {"prompt": snap.prompt_tokens, "completion": snap.completion_tokens, "total": snap.total_tokens, "cached_read": snap.cached_read, "cached_write": snap.cached_write, "unknown": snap.unknown},
+        "per_protocol": snap.per_protocol,
+        "per_model": snap.per_model,
+        "latency_buckets": snap.latency_buckets,
+        "p95_ms": snap.p95_ms,
+        "truncated": {
+            "silent_discard": snap.truncated_silent_discard,
+            "open_ended": snap.truncated_open_ended,
+            "synthesized_failed": snap.truncated_synthesized_failed,
+        },
+        "chat_tail_lenient": {
+            "chat/completions": gm.lenient_count("chat/completions"),
+            "v1/messages": gm.lenient_count("v1/messages"),
+            "v1/responses": gm.lenient_count("v1/responses"),
+        },
+        "sse_events": gm.sse_event_total(),
+        "ring_len": snap.ring_len,
+        "dropped": snap.dropped,
+        "approval_decision_overflow_total": decision_overflow,
+        "decision_table_size": decision_size,
+        "upstream_read_errors": gm.upstream_read_error_count(),
+        "admin_rate_evicted": gm.admin_rate_evicted_count(),
+        "aggs_evicted": snap.aggs_evicted,
+        "pii_value_samples": pii_value_samples_json(&samples),
+    })
+}
+
 /// 未鉴权响应（401 + `E_UNAUTHORIZED`；调用方不区分失败细节，防探测）。
 fn unauthorized(message: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": {"code": "E_UNAUTHORIZED", "message": message}})),
+    with_security_headers(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"code": "E_UNAUTHORIZED", "message": message}})),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 /// 从 `Cookie` 头提取 admin token（`__Host-admin_token` 优先，回退 `admin_token`
@@ -114,7 +225,8 @@ fn authorize(
 /// 头凭证有效时签发登录 Cookie（对标原仓：仅非 SSE 路由签发）。
 /// https 经 `X-Forwarded-Proto` 识别签发 `__Host-admin_token`（Secure），
 /// 否则回退 `admin_token` 兼容 http；token 含非法 cookie-octet 字符时拒绝签发。
-fn with_admin_cookie(mut resp: Response, headers: &HeaderMap, expected: &str) -> Response {
+fn with_admin_cookie(resp: Response, headers: &HeaderMap, expected: &str) -> Response {
+    let mut resp = with_security_headers(resp);
     let Some(got) = headers
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
@@ -184,7 +296,7 @@ fn rate_limited(retry_after: u64) -> Response {
     if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
         resp.headers_mut().insert("retry-after", v);
     }
-    resp
+    with_security_headers(resp)
 }
 
 /// 管理面提取器回退：`ConnectInfo` 缺失（单测直调 `serve` 场景）回退本地回环，
@@ -275,39 +387,7 @@ pub async fn admin_metrics(
     ) {
         return r;
     }
-    let snap = state.admin_state().metrics.snapshot();
-    let gm = &state.gateway_metrics();
-    // `ARC-2`：审批决策表软上限只读观测；锁中毒时按零降级，不影响其余指标。
-    let (decision_overflow, decision_size) = state
-        .decisions
-        .lock()
-        .map(|t| (t.overflow_count(), t.entry_count()))
-        .unwrap_or((0, 0));
-    let mut body = json!({
-        "ok": true,
-        "is_precise": snap.is_precise,
-        "requests": snap.requests,
-        "tokens": {"prompt": snap.prompt_tokens, "completion": snap.completion_tokens, "total": snap.total_tokens, "cached_read": snap.cached_read, "cached_write": snap.cached_write, "unknown": snap.unknown},
-        "per_protocol": snap.per_protocol,
-        "per_model": snap.per_model,
-        "latency_buckets": snap.latency_buckets,
-        "p95_ms": snap.p95_ms,
-        "truncated": {
-            "silent_discard": snap.truncated_silent_discard,
-            "open_ended": snap.truncated_open_ended,
-            "synthesized_failed": snap.truncated_synthesized_failed,
-        },
-        "chat_tail_lenient": {
-            "chat/completions": gm.lenient_count("chat/completions"),
-            "v1/messages": gm.lenient_count("v1/messages"),
-            "v1/responses": gm.lenient_count("v1/responses"),
-        },
-        "sse_events": gm.sse_event_total(),
-        "ring_len": snap.ring_len,
-        "dropped": snap.dropped,
-        "approval_decision_overflow_total": decision_overflow,
-        "decision_table_size": decision_size,
-    });
+    let mut body = admin_metrics_body(&state);
     let compat: HashMap<&str, &String> = ["model", "upstream"]
         .into_iter()
         .filter_map(|k| query.get(k).map(|v| (k, v)))
@@ -398,7 +478,7 @@ pub async fn admin_series(
             let resp = Json(body).into_response();
             with_admin_cookie(resp, &headers, &state.config().observability_admin_token)
         }
-        Err(e) => VeilError::internal(e).into_response(),
+        Err(e) => with_security_headers(VeilError::internal(e).into_response()),
     }
 }
 
@@ -441,8 +521,7 @@ pub async fn admin_events(
     let events = state
         .admin_state()
         .query_events(kind_filter.as_deref(), since, limit);
-    let samples = state.admin_state().sampler.top_n(20);
-    let mut body = json!({"ok": true, "events": events, "pii_value_samples": samples});
+    let mut body = json!({"ok": true, "events": events});
     let mut compat: HashMap<&str, String> = HashMap::new();
     if let Some(v) = verdict {
         compat.insert(
@@ -475,33 +554,7 @@ pub(crate) async fn build_metrics_sse_payload(
     range: Option<&str>,
     granularity: &str,
 ) -> serde_json::Value {
-    let snap = state.admin_state().metrics.snapshot();
-    let gm = state.gateway_metrics();
-    let metrics = json!({
-        "ok": true,
-        "is_precise": snap.is_precise,
-        "requests": snap.requests,
-        "tokens": {
-            "prompt": snap.prompt_tokens,
-            "completion": snap.completion_tokens,
-            "total": snap.total_tokens,
-            "cached_read": snap.cached_read,
-            "cached_write": snap.cached_write,
-            "unknown": snap.unknown,
-        },
-        "per_protocol": snap.per_protocol,
-        "per_model": snap.per_model,
-        "latency_buckets": snap.latency_buckets,
-        "p95_ms": snap.p95_ms,
-        "truncated": {
-            "silent_discard": snap.truncated_silent_discard,
-            "open_ended": snap.truncated_open_ended,
-            "synthesized_failed": snap.truncated_synthesized_failed,
-        },
-        "sse_events": gm.sse_event_total(),
-        "ring_len": snap.ring_len,
-        "dropped": snap.dropped,
-    });
+    let metrics = admin_metrics_body(state);
     let series = match state
         .admin_state()
         .metrics
@@ -566,6 +619,27 @@ pub async fn admin_events_stream(
     ) {
         return r;
     }
+    // 建连过滤维度（model/upstream）；近环回放与实时流同过滤。
+    let filter = admin::SseFilter::from_query(&query);
+    let range = query.get("range").cloned();
+    // OPS-9：非法 granularity 显式拒绝（不静默回退默认粒度）。
+    let granularity = match query.get("granularity") {
+        Some(g) if matches!(g.as_str(), "daily" | "hourly" | "five_min" | "5min") => g.clone(),
+        Some(_) => {
+            return with_security_headers(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "granularity 取值 daily/hourly/five_min"}})),
+                )
+                    .into_response(),
+            );
+        }
+        None => range
+            .as_deref()
+            .and_then(admin::compat_granularity_for_range)
+            .unwrap_or("hourly")
+            .to_string(),
+    };
     // 并发超限：拒绝新连接（429 + Retry-After: 60），不触已建连接计数。
     // 守卫 MUST 移入流中持有至结束，`Drop` 自动释放（断连不泄漏）。
     let sse_guard = match state.admin_state().acquire_sse(ip) {
@@ -574,17 +648,6 @@ pub async fn admin_events_stream(
     };
     let rx = state.admin_state().subscribe();
     let admin = state.admin_state().clone();
-    // 建连过滤维度（model/upstream）；近环回放与实时流同过滤。
-    let filter = admin::SseFilter::from_query(&query);
-    let range = query.get("range").cloned();
-    let granularity = match query.get("granularity") {
-        Some(g) if matches!(g.as_str(), "daily" | "hourly" | "five_min" | "5min") => g.clone(),
-        _ => range
-            .as_deref()
-            .and_then(admin::compat_granularity_for_range)
-            .unwrap_or("hourly")
-            .to_string(),
-    };
     // 近环回放（最近 20 条，已脱敏）。
     let backlog: Vec<String> = admin
         .query_events(None, None, 20)
@@ -604,7 +667,7 @@ pub async fn admin_events_stream(
     let stream = async_stream::stream! {
         let _sse_guard = sse_guard;
         for item in backlog {
-            yield Ok::<_, anyhow::Error>(axum::response::sse::Event::default().data(item).event("message"));
+            yield Ok::<_, anyhow::Error>(admin_event_frame(item));
         }
         let mut rx = rx;
         let deadline = tokio::time::Instant::now() + admin::SSE_MAX_AGE;
@@ -629,36 +692,49 @@ pub async fn admin_events_stream(
                             .data(payload.to_string()),
                     );
                 }
-                recv = rx.recv() => match recv {
-                    Ok(msg) => {
+                recv = rx.recv() => match classify_sse_recv(recv) {
+                    SseRecv::Event(msg) => {
                         if filter.passes(&msg) {
-                            yield Ok::<_, anyhow::Error>(axum::response::sse::Event::default().data(msg).event("message"));
+                            yield Ok::<_, anyhow::Error>(admin_event_frame(msg));
                         }
                     }
-                    Err(_) => break,
+                    SseRecv::Skip(skipped) => {
+                        tracing::warn!(skipped, "管理面 SSE 订阅滞后，跳过缺口事件并继续");
+                    }
+                    SseRecv::Closed => break,
                 },
                 _ = tokio::time::sleep(until_deadline) => break,
             }
         }
+        // 收尾恰一 `done` 终止帧（OPS-3），下游据此判定流结束。
+        yield Ok::<_, anyhow::Error>(admin_done_frame());
         // 5min 强制重连：服务端关闭流，客户端按 retry 重连。
         // 计数释放由 `_sse_guard` 的 `Drop` 自动触发，不手动释放。
     };
-    axum::response::sse::Sse::new(stream)
+    let resp = axum::response::sse::Sse::new(stream)
         .keep_alive(
             axum::response::sse::KeepAlive::new()
                 .interval(admin::SSE_PING_INTERVAL)
                 .text("ping"),
         )
-        .into_response()
+        .into_response();
+    let mut resp = with_security_headers(resp);
+    // OPS-9：禁用反向代理缓冲，防 SSE 被攒批延迟。
+    if let Ok(v) = axum::http::HeaderValue::from_str("no") {
+        resp.headers_mut().insert("x-accel-buffering", v);
+    }
+    resp
 }
 
 /// 未知 admin 子路径 404（精确路由之后、通配之前注册）。
 pub async fn admin_not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": {"code": "E_NOT_FOUND", "message": "未知管理子路径"}})),
+    with_security_headers(
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {"code": "E_NOT_FOUND", "message": "未知管理子路径"}})),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 #[cfg(test)]

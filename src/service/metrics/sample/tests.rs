@@ -1,19 +1,7 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../sample.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "sample.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "sample/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("sample.rs", include_str!("../sample.rs"));
+    crate::test_support::file_len_under_800_or_split("sample/tests.rs", include_str!("tests.rs"));
 }
 
 use {

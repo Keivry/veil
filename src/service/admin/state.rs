@@ -127,7 +127,7 @@ impl AdminState {
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .take(limit.clamp(1, 500))
+            .take(limit.clamp(1, super::events::EVENT_MAX_LIMIT))
             .collect()
     }
 
@@ -229,12 +229,12 @@ mod tests {
             st.push_event("audit", &format!("ev-{i}"), None);
         }
         let all = st.query_events(None, None, 500);
-        assert_eq!(all.len(), 500, "query_events limit 上限 500");
+        assert_eq!(all.len(), 200, "query_events 上限收敛 200");
         assert_eq!(all[0].id, total as u64, "最新事件在前");
-        assert_eq!(all[499].id, (total - 499) as u64, "逆序顺序保持");
+        assert_eq!(all[199].id, (total - 199) as u64, "逆序顺序保持");
         assert!(all.iter().all(|e| e.id > 10), "超容量须淘汰最旧 10 条");
         let audit = st.query_events(Some("audit"), None, 500);
-        assert_eq!(audit.len(), 500, "kind=audit 全命中");
+        assert_eq!(audit.len(), 200, "kind=audit 上限收敛 200");
         assert!(st.query_events(Some("other"), None, 10).is_empty());
         // SSE 建连回放口径：最近 20 条升序（旧→新）且均落环内。
         let replay: Vec<u64> = st

