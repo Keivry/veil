@@ -1,11 +1,10 @@
-//! D1 审批收敛：三文件分工（本文件存单据 + 问询网关 trait）。
+//! D1 审批收敛：本文件承载待审单据存储（`PendingApprovals`）。
 //!
-//! H3.1 owner 锁定：单据存储（`PendingApprovals`）+ 问询 trait（`ApprovalGateway`）
-//! 归本文件，双模执行（`approval_dual_mode`）归 `service::credential::approval`，
+//! H3.1 owner 锁定：单据存储（`PendingApprovals`）归本文件，双模执行
+//! （`approval_dual_mode`）归 `service::credential::approval`，
 //! 分支流转归 `service::matrix`；三处职责正交、互不垫片，新代码按此归属。
 //!
-//! - 本文件：`PendingApprovals` 待审单据存储（`Mutex<HashMap>`，`PENDING_TTL_SECS` 60s 孤儿上限）+
-//!   `ApprovalGateway` 问询网关 trait（`ask`/`ask_audit` + 300s/90s 分表超时）。
+//! - 本文件：`PendingApprovals` 待审单据存储（`Mutex<HashMap>`，`PENDING_TTL_SECS` 60s 孤儿上限）。
 //! - `service::credential::approval`：`approval_dual_mode` 双模（默认 202 抛单建单即返；
 //!   `CREDENTIAL_BLOCK_WAIT=1` 时 300s 阻塞等 reaction；审计问询走 `AUDIT_TIMEOUT` 90s 口径）。
 //! - `service::matrix`：`MatrixBranch` 五业务分支（Unlock/Register/HashChange/Credential/Audit
@@ -13,7 +12,8 @@
 //!       `spawn_sync_loop` 常驻同步。
 //!
 //! D1 保活二选一锁定：流内保活唯一实现为 `service::audit::RequestKeepalive`
-//! （`handler::llm::pump` 经 `spawn_gated` 接线，间隔消费 `service::sse::KEEPALIVE_INTERVAL`
+//! （`service::audit::RequestKeepalive::spawn_gated` 接线于 `src/handler/llm/pump/spawn/setup.rs`，
+//! 间隔消费 `service::sse::KEEPALIVE_INTERVAL`
 //! 10s）；管理面 SSE 60s ping（`service::admin::sse::SSE_PING_INTERVAL`）+ 5min 强制重连
 //! 分属不同链路，差异有意。`KeepaliveTracker`（时间戳自检形态，生产零接线）已删，不再立项。
 use std::{
@@ -108,7 +108,8 @@ impl PendingApprovals {
 
     /// F9/D9：清扫任务启动次数（可观测证据）。构造/建单/手工 sweep 均不启动任务，
     /// 仅显式 [`Self::spawn_sweeper`] 使其递增。
-    pub fn sweeper_spawn_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn sweeper_spawn_count(&self) -> usize {
         self.sweeper_spawns
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -128,36 +129,9 @@ impl PendingApprovals {
     }
 }
 
-pub trait ApprovalGateway: Send + Sync + std::fmt::Debug {
-    fn request_approval(&self, record: &PendingRecord) -> ApprovalOutcome;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalOutcome {
-    Pending,
-    Approved,
-    Blocked,
-}
-
-#[derive(Debug, Default)]
-pub struct NoopApproval;
-
-impl ApprovalGateway for NoopApproval {
-    fn request_approval(&self, _record: &PendingRecord) -> ApprovalOutcome {
-        ApprovalOutcome::Pending
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn placeholder_approval_stays_pending() {
-        let gateway = NoopApproval;
-        let record = PendingRecord::new("k", "hash_mismatch");
-        assert_eq!(gateway.request_approval(&record), ApprovalOutcome::Pending);
-    }
 
     #[test]
     fn pending_table_supports_lookup() {

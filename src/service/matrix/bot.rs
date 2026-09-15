@@ -133,6 +133,34 @@ impl MatrixBot {
             .to_string())
     }
 
+    /// `CRD-5`：向指定事件预置 reaction（`m.annotation`），失败返回 Err 由调用方 best-effort 处理。
+    pub async fn send_reaction(&self, event_id: &str, key: &str) -> anyhow::Result<()> {
+        let txn = format!("{}", chrono_txn());
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.reaction/{txn}",
+            self.homeserver.trim_end_matches('/'),
+            url_encode(&self.room_id)
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .json(&serde_json::json!({
+                "m.relates_to": {
+                    "event_id": event_id,
+                    "key": key,
+                    "rel_type": "m.annotation"
+                }
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Matrix reaction 发送失败: {e}"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Matrix reaction 发送失败: {}", resp.status());
+        }
+        Ok(())
+    }
+
     /// 长轮询 sync 一次（timeout 30s），返回原始 JSON；调用方循环即得持续同步。
     pub async fn poll_sync(&self, since: Option<&str>) -> anyhow::Result<serde_json::Value> {
         let mut url = format!(
@@ -231,7 +259,8 @@ impl MatrixBot {
     }
 
     /// 文本指令执行（兼容版）：签名不变，降级为固定清理量（`unlocked=true/secrets=0`）。
-    pub async fn handle_text_command(
+    #[cfg(test)]
+    pub(crate) async fn handle_text_command(
         approval: &MatrixApproval,
         command: TextCommand,
     ) -> Option<String> {

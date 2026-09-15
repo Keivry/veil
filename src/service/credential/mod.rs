@@ -302,6 +302,33 @@ pub(crate) mod test_support {
         }
     }
 
+    /// `CRD-12` 测试 sink：记录 best-effort 文本，供宽限通知去重断言。
+    #[derive(Debug, Default)]
+    pub(crate) struct CountingSink {
+        texts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingSink {
+        pub(crate) fn new() -> Arc<Self> { Arc::new(Self::default()) }
+
+        pub(crate) fn texts(&self) -> Vec<String> {
+            self.texts
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl NotificationSink for CountingSink {
+        fn send_text(&self, text: String) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                if let Ok(mut guard) = self.texts.lock() {
+                    guard.push(text);
+                }
+            })
+        }
+    }
+
     /// 以注入 sink 覆盖 `AppState.notify`（审批 tracked 发送改走注入 sink）。
     pub(crate) fn inject_sink(mut state: AppState, sink: Arc<dyn NotificationSink>) -> AppState {
         let bot = Arc::new(MatrixBot::new(

@@ -9,9 +9,12 @@
 //! `_register_secret` 复用与 `MAX_TOKEN_ENTRIES=5000` 有界 LRU、
 //! `_redact` 按明文长度降序单次替换、`_strip_partials` 接全出口。
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+use {
+    crate::service::lock_recover::lock_or_recover,
+    std::{
+        collections::{HashMap, VecDeque},
+        sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    },
 };
 
 /// 凭据占位符前缀。
@@ -122,26 +125,12 @@ fn warn_alternation_fallback_once() {
     }
 }
 
-/// 锁中毒恢复（B3/D3）：`PoisonError::into_inner` 继续使用内部状态，首次 warn。
-fn warn_poison_once() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!("凭据 vault 锁中毒，已 PoisonError::into_inner 恢复（首次告警）");
-    }
-}
-
 fn read_inner(lock: &RwLock<VaultInner>) -> RwLockReadGuard<'_, VaultInner> {
-    lock.read().unwrap_or_else(|e: PoisonError<_>| {
-        warn_poison_once();
-        e.into_inner()
-    })
+    lock_or_recover(lock.read())
 }
 
 fn write_inner(lock: &RwLock<VaultInner>) -> RwLockWriteGuard<'_, VaultInner> {
-    lock.write().unwrap_or_else(|e: PoisonError<_>| {
-        warn_poison_once();
-        e.into_inner()
-    })
+    lock_or_recover(lock.write())
 }
 
 fn sorted_keys_desc(map: &HashMap<String, String>) -> Vec<&String> {
@@ -260,7 +249,8 @@ impl CredentialVault {
     }
 
     /// 明文→token 快照（PII 凭据优先判定用，不暴露可变引用）。
-    pub fn snapshot_p2t(&self) -> HashMap<String, String> {
+    #[cfg(test)]
+    pub(crate) fn snapshot_p2t(&self) -> HashMap<String, String> {
         read_inner(&self.inner).pwd_to_token.clone()
     }
 
@@ -388,7 +378,8 @@ fn replace_all_by_map_limited(
 }
 
 /// 显式 mapping 的单次替换（长度降序），供请求级快照复用。
-pub fn redact_with_map(text: &str, map: &HashMap<String, String>) -> String {
+#[cfg(test)]
+pub(crate) fn redact_with_map(text: &str, map: &HashMap<String, String>) -> String {
     replace_all_by_map(text, map)
 }
 

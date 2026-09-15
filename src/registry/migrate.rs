@@ -8,11 +8,31 @@ use {
         store::{CallerRegistry, RegistryFile, bind_script_sha256, integrity_of},
     },
     crate::{
+        config::AutoApprove,
         error::{Result, VeilError},
         fs_perm::ensure_0600,
     },
     std::{collections::BTreeMap, path::Path},
 };
+
+/// 旧格式 `allow_mode` 解析（`CRD-11`）：Python `'auto'`/`'manual'` 与布尔形态均兼容；
+/// 未知/缺省返回 `None`（按全局默认，不静默改语义）。
+fn legacy_allow_mode(c: &serde_json::Value) -> Option<AutoApprove> {
+    let raw = c.get("allow_mode")?;
+    if let Some(b) = raw.as_bool() {
+        return Some(if b {
+            AutoApprove::Allow
+        } else {
+            AutoApprove::Deny
+        });
+    }
+    match raw.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "auto" | "allow" | "true" | "yes" | "1" => Some(AutoApprove::Allow),
+        "manual" | "pending" | "none" | "matrix" => Some(AutoApprove::Pending),
+        "deny" | "false" | "no" | "0" => Some(AutoApprove::Deny),
+        _ => None,
+    }
+}
 
 impl CallerRegistry {
     /// Python `caller_registry.json` 迁移（`version/callers/allowed_entries` 形态）。
@@ -70,6 +90,14 @@ impl CallerRegistry {
             if caller_path.is_empty() || expected_hash.is_empty() {
                 continue;
             }
+            // `CRD-11`：保留旧 `reg_id`（缺省以 `caller_path` 补齐，不静默丢弃）。
+            let reg_id = c
+                .get("reg_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| caller_path.clone());
             // 旧条目 allowed_entries：`{"entry": ["field", ...]}` 或字符串数组。
             let mut entry_map = BTreeMap::new();
             if let Some(allowed) = c.get("allowed_entries").and_then(|v| v.as_object()) {
@@ -101,12 +129,13 @@ impl CallerRegistry {
                         .to_string(),
                     description: String::new(),
                     entries: entry_map,
-                    allow_mode: None,
+                    allow_mode: legacy_allow_mode(c),
                     old_hash: c
                         .get("script_hash_old")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
-                    old_hash_expires_at: None,
+                    old_hash_expires_at: c.get("old_hash_expires_at").and_then(|v| v.as_u64()),
+                    reg_id,
                 },
             );
         }
@@ -124,7 +153,7 @@ impl CallerRegistry {
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::CallerRegistry;
+    use crate::{config::AutoApprove, registry::CallerRegistry};
 
     #[test]
     fn legacy_python_format_migration_keeps_bak() {
@@ -161,6 +190,51 @@ mod tests {
         // 迁移后新格式可直接加载。
         let reloaded = CallerRegistry::load_from(&path).unwrap();
         assert_eq!(reloaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_preserves_fields() {
+        // CRD-11：迁移保留 old_hash_expires_at/allow_mode/reg_id 三字段，不静默丢弃。
+        let dir = std::env::temp_dir().join(format!(
+            "veil-reg-mig-fields-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller_registry.json");
+        let old = serde_json::json!({
+            "version": 1,
+            "callers": [{
+                "reg_id": "legacy-reg-1",
+                "script_path": "/s/legacy-grace.sh",
+                "script_hash": "legacy-new-h",
+                "script_hash_old": "legacy-old-h",
+                "old_hash_expires_at": 1_900_000_000u64,
+                "allow_mode": "auto",
+                "name": "legacy-grace-job",
+                "enabled": true,
+                "allowed_entries": {"网易": ["授权码"]}
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        let migrated = CallerRegistry::load_from(&path).unwrap();
+        let e = migrated.lookup_by_path("/s/legacy-grace.sh").unwrap();
+        assert_eq!(e.reg_id, "legacy-reg-1", "reg_id 迁移后不丢");
+        assert_eq!(
+            e.allow_mode,
+            Some(AutoApprove::Allow),
+            "allow_mode 迁移后不丢"
+        );
+        assert_eq!(
+            e.old_hash_expires_at,
+            Some(1_900_000_000),
+            "old_hash_expires_at 迁移后不丢"
+        );
+        assert_eq!(e.old_hash.as_deref(), Some("legacy-old-h"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

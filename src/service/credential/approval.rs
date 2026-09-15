@@ -1,7 +1,7 @@
 //! 审批/pending 链：建单、双模问询、哈希变更通知、问询口径。
 //!
 //! H3.1 owner 声明：双模执行（`approval_dual_mode`）归本文件；单据存储与问询
-//! trait 归 `crate::approval`（经其 `ApprovalGateway/PendingRecord` 接口协作），
+//! trait 归 `crate::approval`（经其 `PendingApprovals`/`PendingRecord` 接口协作），
 //! 分支流转归 `service::matrix`；三处互不垫片。
 
 use {
@@ -11,10 +11,34 @@ use {
         error::{Result, VeilError},
     },
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
+        sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     },
 };
+
+/// `CRD-12`：宽限通知去重上限（进程级，防无界增长；超限清空重建）。
+const GRACE_NOTIFY_DEDUP_MAX: usize = 4096;
+
+/// `CRD-12`：宽限通知去重表（键 = 条目 + 宽限窗口），同窗口仅首次通知。
+static GRACE_NOTIFY_DEDUP: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// `CRD-12`：`dedup_key` 是否首次出现（同窗口重复返回 `false`，不重复通知）。
+fn first_grace_notification(dedup_key: &str) -> bool {
+    let set = GRACE_NOTIFY_DEDUP.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match set.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.contains(dedup_key) {
+        return false;
+    }
+    if guard.len() >= GRACE_NOTIFY_DEDUP_MAX {
+        guard.clear();
+    }
+    guard.insert(dedup_key.to_string());
+    true
+}
 
 /// `C10`/D10：审批摘要 = 机器可读原因 + 调用方键 + 条目/字段元数据。
 /// 仅接收调用元数据，不接收凭据明文/部署 Secret，敏感值不落消息。
@@ -90,6 +114,13 @@ pub(crate) async fn submit_pending_with_branch(
         pending_ttl_secs(branch),
     ));
     state.approval().submit_branch(&event_id, branch).await;
+    for emoji in branch.reaction_presets() {
+        if !state.notify().send_reaction(&event_id, emoji).await {
+            tracing::warn!(
+                "审批预置 reaction 发送失败，仅告警不阻断: event {event_id} emoji {emoji}"
+            );
+        }
+    }
     tracing::info!("审批已发送: event {event_id} 原因 {reason}");
     Ok(event_id)
 }
@@ -340,6 +371,29 @@ fn consume_decision(state: &impl AppStateParts, key: &str) {
     }
 }
 
+/// `CRD-6`：决策表占位/读取（注册/吊销 `202` 重试幂等复用；`Busy` = 已有在途票）。
+pub(crate) fn begin_decision(state: &impl AppStateParts, key: &str) -> Option<BeginOutcome> {
+    state
+        .decisions()
+        .lock()
+        .ok()
+        .map(|mut table| table.begin(key))
+}
+
+/// `CRD-6`：撤销占位（注册/吊销提交失败时回退，使同一请求可重试）。
+pub(crate) fn cancel_decision(state: &impl AppStateParts, key: &str) {
+    if let Ok(mut table) = state.decisions().lock() {
+        table.cancel(key);
+    }
+}
+
+/// `CRD-6`：消费终态（阻塞模式在终态返回后清理占位）。
+pub(crate) fn consume_decision_key(state: &impl AppStateParts, key: &str) {
+    if let Ok(mut table) = state.decisions().lock() {
+        let _ = table.consume(key);
+    }
+}
+
 fn pending_error(reason: &str) -> VeilError {
     VeilError::PendingApproval {
         message: format!("已转 Matrix 人工审批: {reason}"),
@@ -513,6 +567,20 @@ pub(crate) fn notify_hash_change(state: &impl AppStateParts, key: &str, detail: 
         .format_approval(matrix::MatrixBranch::Credential, None, &summary);
     state.notify().notify_text(text);
     tracing::warn!("调用方哈希变更通知: {summary}");
+}
+
+/// `CRD-12`：旧哈希宽限内放行通知（按条目 + 宽限窗口去重，同窗口仅发一次）。
+pub(crate) fn notify_hash_grace_once(
+    state: &impl AppStateParts,
+    entry: &str,
+    old_hash: &str,
+    expires_at: u64,
+) {
+    let dedup_key = format!("{entry}\u{1}{old_hash}\u{1}{expires_at}");
+    if !first_grace_notification(&dedup_key) {
+        return;
+    }
+    notify_hash_change(state, entry, "old_hash宽限内放行");
 }
 
 /// 凭据审批问询（`credential_approval_timeout_secs` 超时口径，默认 300s；与阻塞模式同源）：

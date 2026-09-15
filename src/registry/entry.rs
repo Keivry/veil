@@ -34,6 +34,10 @@ pub struct CallerEntry {
     /// 旧哈希过期时间（unix 秒）；`None` 表示无宽限。
     #[serde(default)]
     pub old_hash_expires_at: Option<u64>,
+    /// 注册稳定标识（`CRD-11`）：新注册按 `caller_path` 补齐；旧格式迁移保留原
+    /// `reg_id`（缺省回退 `caller_path`）。空串不序列化，保持既有文件完整性哈希不变。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reg_id: String,
 }
 
 /// 旧哈希宽限窗口（秒，对标 Python 3600s 语义）。
@@ -140,6 +144,7 @@ mod tests {
             allow_mode: None,
             old_hash: Some("old".to_string()),
             old_hash_expires_at: Some(exp),
+            reg_id: String::new(),
         }
     }
 

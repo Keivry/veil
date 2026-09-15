@@ -209,6 +209,7 @@ async fn emergency_revoke_network_ranges() {
 #[tokio::test]
 async fn approve_hash_change_handler_contract() {
     // C3/D3：缺 `reg_id`/`reaction` 按 `caller_path` + 保持自动落定并返回成功。
+    // CRD-4：落定不激活既有条目（仅更新哈希与宽限）。
     let state = revoke_test_state();
     service::register_caller(&state, "/s/contract.sh", "c-old", "src-contract")
         .await
@@ -237,7 +238,10 @@ async fn approve_hash_change_handler_contract() {
         let registry = state.registry.read().await;
         let e = registry.lookup_by_path("/s/contract.sh").unwrap();
         assert_eq!(e.expected_hash, "c-new");
-        assert!(e.enabled && !e.revoked, "缺省 reaction 按保持自动并激活");
+        assert!(
+            !e.enabled && !e.revoked,
+            "CRD-4：缺省 reaction 仅更新哈希，不激活既有条目"
+        );
         assert_eq!(e.allow_mode, None, "缺省 reaction 不得改动 allow_mode");
     }
     // `reg_id`（哈希）可定位：显式 `✅` 降级人工。
@@ -296,6 +300,84 @@ async fn approve_hash_change_handler_contract() {
 
 fn three_factor_state() -> AppState {
     service::credential::test_support::cred_state(&service::credential::test_support::cred_env(&[]))
+}
+
+fn list_items(item: &Value, path: &str) -> Value {
+    item["registrations"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["caller_path"] == path))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// `CRD-3`：`GET /registrations` 每条目含 Go 契约 `type` 字段（非空、稳定 `caller`）。
+#[tokio::test]
+async fn registrations_response_has_type() {
+    let state = three_factor_state();
+    service::register_caller(&state, "/s/list-type.sh", "list-type-h", "src-list")
+        .await
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-get-binary-secret", "s3cr3t".parse().unwrap());
+    let Json(body) = registrations_handler(State(state.clone()), headers)
+        .await
+        .unwrap();
+    let item = list_items(&body, "/s/list-type.sh");
+    assert_eq!(item["type"], "caller", "响应须含 Go 契约 type: {body}");
+    assert!(
+        item["type"].as_str().is_some_and(|t| !t.is_empty()),
+        "type 须非空: {item}"
+    );
+}
+
+/// `CRD-3`：`allow_mode` 输出词汇为 `auto`/`manual`；输入三态兼容保持。
+#[tokio::test]
+async fn registrations_allow_mode_vocabulary() {
+    use crate::{config::AutoApprove, registry::RegisterParams};
+    let state = three_factor_state();
+    {
+        let mut registry = state.registry.write().await;
+        for (path, hash, mode) in [
+            ("/s/am-auto.sh", "am-auto-h", Some(AutoApprove::Allow)),
+            ("/s/am-manual.sh", "am-manual-h", Some(AutoApprove::Pending)),
+            ("/s/am-none.sh", "am-none-h", None),
+        ] {
+            registry
+                .register_extended(&RegisterParams {
+                    caller_path: path.to_string(),
+                    caller_hash: hash.to_string(),
+                    name: hash.to_string(),
+                    allow_mode: mode,
+                    ..RegisterParams::default()
+                })
+                .unwrap();
+        }
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("x-get-binary-secret", "s3cr3t".parse().unwrap());
+    let Json(body) = registrations_handler(State(state.clone()), headers)
+        .await
+        .unwrap();
+    assert_eq!(list_items(&body, "/s/am-auto.sh")["allow_mode"], "auto");
+    assert_eq!(list_items(&body, "/s/am-manual.sh")["allow_mode"], "manual");
+    assert_eq!(
+        list_items(&body, "/s/am-none.sh")["allow_mode"],
+        "manual",
+        "缺省词汇按 manual 呈现"
+    );
+    // 输入三态兼容保持（`auto`→放行、`manual`→审批、未知回退 auto 布尔）。
+    assert_eq!(
+        service::register_map::parse_register_allow_mode(Some("auto"), None),
+        Some(AutoApprove::Allow)
+    );
+    assert_eq!(
+        service::register_map::parse_register_allow_mode(Some("manual"), None),
+        Some(AutoApprove::Pending)
+    );
+    assert_eq!(
+        service::register_map::parse_register_allow_mode(Some("bogus"), Some(true)),
+        Some(AutoApprove::Allow)
+    );
 }
 
 #[tokio::test]

@@ -33,7 +33,8 @@ pub struct EntrySnapshot {
 }
 
 impl EntrySnapshot {
-    pub fn custom_value(&self, name: &str) -> Option<&CustomProp> {
+    #[cfg(test)]
+    pub(crate) fn custom_value(&self, name: &str) -> Option<&CustomProp> {
         self.custom.iter().find(|c| c.name == name)
     }
 }
@@ -68,7 +69,8 @@ impl MockKeePass {
         }
     }
 
-    pub fn fetch_credential(&self, caller: &str) -> Result<String> {
+    #[cfg(test)]
+    pub(crate) fn fetch_credential(&self, caller: &str) -> Result<String> {
         if !self.is_unlocked() {
             return Err(VeilError::Unavailable {
                 message: "KeePass 未解锁".to_string(),

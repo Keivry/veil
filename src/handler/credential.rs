@@ -68,7 +68,36 @@ pub async fn registrations_handler(
         header_str(&headers, "x-get-binary-secret").as_deref(),
     )
     .await?;
-    Ok(Json(json!({ "ok": true, "registrations": views })))
+    let items: Vec<Value> = views.iter().map(registration_list_item).collect();
+    Ok(Json(json!({ "ok": true, "registrations": items })))
+}
+
+/// `CRD-3`：`GET /registrations` 条目的 Go 契约 `type` 恒定值（对标 Python
+/// `/registrations` 的 `'type': 'caller'`）。
+const REGISTRATION_ITEM_TYPE: &str = "caller";
+
+/// `CRD-3`：`allow_mode` 输出词汇映射为 Go 契约 `auto`/`manual`（不再输出布尔或
+/// `none`）；仅 `Allow` 为 `auto`，其余（`Deny`/`Pending`/缺省）按 `manual` 呈现。
+/// 输入三态兼容仍由 `register_map::parse_register_allow_mode` 承载。
+fn registration_allow_mode_wire(mode: Option<crate::config::AutoApprove>) -> &'static str {
+    match mode {
+        Some(crate::config::AutoApprove::Allow) => "auto",
+        _ => "manual",
+    }
+}
+
+/// `CRD-3`：把 `RegistrationView` 序列化后叠加 Go 契约字段（`type` + `allow_mode`
+/// 词汇），既有字段只增不改。
+fn registration_list_item(view: &service::RegistrationView) -> Value {
+    let mut item = serde_json::to_value(view).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert("type".to_string(), json!(REGISTRATION_ITEM_TYPE));
+        obj.insert(
+            "allow_mode".to_string(),
+            json!(registration_allow_mode_wire(view.allow_mode)),
+        );
+    }
+    item
 }
 
 #[derive(Debug, Clone, Deserialize)]

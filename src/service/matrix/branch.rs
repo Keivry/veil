@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+/// DCD-4：MXID 校验单一实现——canonical 定义在 `config::validate`，此处重导出复用。
+pub(crate) use crate::config::validate::is_valid_mxid;
+
 /// 凭据审批超时（秒），与审计分表，固定 300s。
 pub const CREDENTIAL_TIMEOUT_SECS: u64 = 300;
 /// 孤儿 pending 清扫阈值（秒）。
@@ -47,6 +50,18 @@ impl MatrixBranch {
     pub fn status_emoji_pending(&self) -> &'static str { "🔓" }
 
     pub fn is_known(&self) -> bool { !matches!(self, Self::Unknown) }
+
+    /// `CRD-5`：该分支预置提示的 reaction 表情集（与 [`reaction_to_decision`] 受理集一致，
+    /// 含注册/哈希变更分支的 `🔓`），供建单后预置、使审批人可点选。
+    pub fn reaction_presets(&self) -> &'static [&'static str] {
+        match self {
+            Self::Register | Self::HashChange => {
+                &[REACTION_AUTO_UNLOCK, REACTION_APPROVE, REACTION_REJECT]
+            }
+            Self::Unlock | Self::Credential | Self::Audit => &[REACTION_APPROVE, REACTION_REJECT],
+            Self::Unknown => &[],
+        }
+    }
 }
 
 /// 白名单校验（`POL-5`/D5）：空白名单＝不过滤（对标 Python `_matrix.py:235,254`）；
@@ -67,22 +82,6 @@ pub fn validate_whitelist_mxids(whitelist: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn is_valid_mxid(s: &str) -> bool {
-    let rest = s.strip_prefix('@').unwrap_or("");
-    // A12/D11：`@` 前缀之后（localpart + domain）不得再含 `@`
-    // （等价 Python `s[1:].count('@') == 0`）；与 `config::validate::is_valid_mxid` 语义一致。
-    if rest.contains('@') {
-        return false;
-    }
-    let mut parts = rest.split(':');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(user), Some(server), None) => {
-            !user.is_empty() && !server.is_empty() && !s.chars().any(|c| c.is_whitespace())
-        }
-        _ => false,
-    }
 }
 
 /// reaction 表情常量（对标 Python `_sse.py`）。
@@ -253,6 +252,33 @@ mod branch_tests {
         assert!(validate_whitelist_mxids(&["@keivry@matrix.example".to_string()]).is_err());
         assert!(validate_whitelist_mxids(&["admin:example.com".to_string()]).is_err());
         assert!(validate_whitelist_mxids(&["@a: b".to_string()]).is_err());
+    }
+
+    #[test]
+    fn is_valid_mxid_equivalence() {
+        // DCD-4：合并为单一实现后判定须与合并前两份副本逐例等价。
+        let cases = [
+            ("@admin:example.com", true),
+            ("@keivry:matrix.example.org", true),
+            ("@a.b-c_d:x.y", true),
+            ("@a@b:c", false),
+            ("@keivry@matrix.example", false),
+            ("admin:example.com", false),
+            ("@a:", false),
+            ("@:b", false),
+            ("@a b:c", false),
+            ("@a:b:c", false),
+            ("", false),
+            ("@", false),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(is_valid_mxid(s), expected, "单一实现判定漂移: {s:?}");
+            assert_eq!(
+                validate_whitelist_mxids(&[s.to_string()]).is_ok(),
+                expected,
+                "Matrix 门禁复用同一实现: {s:?}"
+            );
+        }
     }
 
     #[test]

@@ -15,17 +15,23 @@ use {
         RegistrationView,
         approval::{
             AutoPolicy,
+            BeginOutcome,
             ClosureLane,
+            CredentialDecision,
             approval_decision_closure,
+            begin_decision,
+            cancel_decision,
             clear_terminal_pending,
+            consume_decision_key,
             notify_hash_change,
+            record_credential_decision,
             submit_pending_with_branch,
         },
         ratelimit::check_rate,
         registration_view,
     },
     crate::{
-        auth::{ct_eq, is_private_ip, secret_eq},
+        auth::{is_private_ip, secret_eq},
         config::{EntryMode, REGISTER_RATE_WINDOW_SECS},
         error::{Result, VeilError},
         registry::{HashChangeOutcome, RegisterParams},
@@ -148,7 +154,7 @@ pub async fn list_registrations(
         admin_token,
         state.config().observability_admin_token.as_str(),
     ) {
-        (Some(got), expected) if !got.is_empty() => ct_eq(got, expected),
+        (Some(got), expected) if !got.is_empty() => secret_eq(got, expected),
         _ => false,
     };
     let secret_ok = match (secret, state.config().credential_secret.as_deref()) {
@@ -285,16 +291,60 @@ async fn rollback_registered_entry(state: &impl AppStateParts, caller_path: &str
     drop(save_guard);
 }
 
+/// `CRD-6`：终态重试回读注册视图（已批准条目）。
+async fn read_registration_view(
+    state: &impl AppStateParts,
+    caller_path: &str,
+) -> Result<RegistrationView> {
+    let registry = state.registry().read().await;
+    let entry = registry
+        .lookup_by_path(caller_path)
+        .ok_or_else(|| VeilError::Storage {
+            message: "注册审批后回读失败".to_string(),
+        })?;
+    Ok(registration_view(entry))
+}
+
 /// C1/D1：注册审批链。先落盘中立条目（`disabled`），再建 `Register` 审批单，
 /// 复用双模：默认 `202` 抛单（后台等待落定回写），`CREDENTIAL_BLOCK_WAIT=1`
 /// 阻塞至 `300s`。三态落定见 [`apply_register_approval`]。
 /// `AUTH-6`：建单/发送失败时回滚已落条目，不遗留不可决孤儿。
+/// `CRD-6`：同一未决 `caller_path` 重试经决策表幂等复用（`202 + E_PENDING`，不重复建单、
+/// 不误 `409`）；终态后重试返回终态结果（`✅` 放行、`❎`/超时 `403`）。
 pub async fn register_caller_with_approval(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     params: &RegisterParams,
     source: &str,
 ) -> Result<RegistrationView> {
-    let view = register_caller_extended(state, params, source).await?;
+    let pending_key = format!("register:{}", params.caller_path.trim());
+    match begin_decision(state, &pending_key) {
+        Some(BeginOutcome::Busy) => {
+            return Err(VeilError::PendingApproval {
+                message: format!("注册已转 Matrix 人工审批: {}", params.caller_path.trim()),
+            });
+        }
+        Some(BeginOutcome::Decided(CredentialDecision::Approved)) => {
+            return read_registration_view(state, params.caller_path.trim()).await;
+        }
+        Some(BeginOutcome::Decided(CredentialDecision::Denied)) => {
+            return Err(VeilError::Auth {
+                message: "注册审批被拒绝".to_string(),
+            });
+        }
+        Some(BeginOutcome::Decided(CredentialDecision::TimedOut)) => {
+            return Err(VeilError::Auth {
+                message: "注册审批超时，已按吊销处理".to_string(),
+            });
+        }
+        Some(BeginOutcome::Reserved) | None => {}
+    }
+    let view = match register_caller_extended(state, params, source).await {
+        Ok(view) => view,
+        Err(err) => {
+            cancel_decision(state, &pending_key);
+            return Err(err);
+        }
+    };
     let caller_path = view.caller_path.clone();
     let reg_id = if view.script_hash.is_empty() {
         caller_path.clone()
@@ -315,12 +365,14 @@ pub async fn register_caller_with_approval(
         Ok(event_id) => event_id,
         Err(err) => {
             rollback_registered_entry(state, &caller_path).await;
+            cancel_decision(state, &pending_key);
             return Err(err);
         }
     };
     if !state.config().credential_block_wait {
         let owned = (*state).clone();
         let path_for_task = caller_path.clone();
+        let key_for_task = pending_key.clone();
         tokio::task::spawn(async move {
             let timeout = approval_timeout(&owned);
             let decision = owned.approval().ask(&event_id, timeout).await;
@@ -330,6 +382,7 @@ pub async fn register_caller_with_approval(
                 .await
                 .unwrap_or(false);
             apply_register_approval(&owned, &path_for_task, decision.map(|ok| (ok, auto))).await;
+            record_credential_decision(&owned, &key_for_task, decision);
             clear_terminal_pending(&owned, &path_for_task, &event_id).await;
         });
         return Err(VeilError::PendingApproval {
@@ -347,17 +400,9 @@ pub async fn register_caller_with_approval(
         .unwrap_or(false);
     apply_register_approval(state, &caller_path, decision.map(|ok| (ok, auto))).await;
     clear_terminal_pending(state, &caller_path, &event_id).await;
+    consume_decision_key(state, &pending_key);
     match decision {
-        Some(true) => {
-            let registry = state.registry().read().await;
-            let entry =
-                registry
-                    .lookup_by_path(&caller_path)
-                    .ok_or_else(|| VeilError::Storage {
-                        message: "注册审批后回读失败".to_string(),
-                    })?;
-            Ok(registration_view(entry))
-        }
+        Some(true) => read_registration_view(state, &caller_path).await,
         Some(false) => Err(VeilError::Auth {
             message: "注册审批被拒绝".to_string(),
         }),
@@ -370,6 +415,8 @@ pub async fn register_caller_with_approval(
 /// C2/D2：常规吊销审批链。仅 `✅ (true, false)` 执行吊销；`❎`（含 `🔓`）与
 /// 超时保持条目原状（不做破坏性动作）。默认 `202` 抛单，阻塞模式同
 /// `CREDENTIAL_BLOCK_WAIT` 口径。
+/// `CRD-6`：同一未决吊销请求重试经决策表幂等复用（`202 + E_PENDING`，不重复建单）；
+/// 终态后重试返回终态（批准后条目保持 `revoked=true`/`enabled=false`，拒绝/超时 `403`）。
 pub async fn revoke_caller_with_approval(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     key: &str,
@@ -385,8 +432,30 @@ pub async fn revoke_caller_with_approval(
                 message: format!("调用方不存在: {key}"),
             })?
     };
+    let pending_key = format!("revoke:{caller_path}");
+    match begin_decision(state, &pending_key) {
+        Some(BeginOutcome::Busy) => {
+            return Err(VeilError::PendingApproval {
+                message: format!("吊销已转 Matrix 人工审批: {caller_path}"),
+            });
+        }
+        Some(BeginOutcome::Decided(CredentialDecision::Approved)) => {
+            return revoke_caller(state, &caller_path).await;
+        }
+        Some(BeginOutcome::Decided(CredentialDecision::Denied)) => {
+            return Err(VeilError::Auth {
+                message: "吊销审批被拒绝".to_string(),
+            });
+        }
+        Some(BeginOutcome::Decided(CredentialDecision::TimedOut)) => {
+            return Err(VeilError::Auth {
+                message: "吊销审批超时，按拒绝处理".to_string(),
+            });
+        }
+        Some(BeginOutcome::Reserved) | None => {}
+    }
     let reason = format!("revoke审批 :: {caller_path}");
-    let event_id = submit_pending_with_branch(
+    let event_id = match submit_pending_with_branch(
         state,
         &caller_path,
         &reason,
@@ -394,10 +463,18 @@ pub async fn revoke_caller_with_approval(
         "",
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(event_id) => event_id,
+        Err(err) => {
+            cancel_decision(state, &pending_key);
+            return Err(err);
+        }
+    };
     if !state.config().credential_block_wait {
         let owned = (*state).clone();
         let path_for_task = caller_path.clone();
+        let key_for_task = pending_key.clone();
         tokio::task::spawn(async move {
             let timeout = approval_timeout(&owned);
             let decision = owned.approval().ask(&event_id, timeout).await;
@@ -406,12 +483,18 @@ pub async fn revoke_caller_with_approval(
                 .applied_auto(&event_id)
                 .await
                 .unwrap_or(false);
-            if decision == Some(true)
-                && !auto
+            // `T1`/D1：`🔓`（`Some(true) && auto`）按拒绝落定，不执行吊销。
+            let effective = if decision == Some(true) && auto {
+                Some(false)
+            } else {
+                decision
+            };
+            if effective == Some(true)
                 && let Err(e) = revoke_caller(&owned, &path_for_task).await
             {
                 tracing::warn!("吊销审批落定失败 {path_for_task}: {e}");
             }
+            record_credential_decision(&owned, &key_for_task, effective);
             clear_terminal_pending(&owned, &path_for_task, &event_id).await;
         });
         return Err(VeilError::PendingApproval {
@@ -428,6 +511,7 @@ pub async fn revoke_caller_with_approval(
         .await
         .unwrap_or(false);
     clear_terminal_pending(state, &caller_path, &event_id).await;
+    consume_decision_key(state, &pending_key);
     if decision == Some(true) && !auto {
         return revoke_caller(state, &caller_path).await;
     }
@@ -449,6 +533,19 @@ pub async fn revoke_caller(state: &impl AppStateParts, key: &str) -> Result<Regi
     Ok(view)
 }
 
+/// `CRD-13`：内网判定在 `auth::is_private_ip` 之上补 IPv4-mapped IPv6 形
+/// （如 `::ffff:127.0.0.1`，等价 `127.0.0.0/8`），避免映射环回绕过内网豁免。
+fn is_private_peer(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(v6) = h.parse::<std::net::Ipv6Addr>()
+        && let Some(v4) = v6.to_ipv4_mapped()
+        && is_private_ip(&v4.to_string())
+    {
+        return true;
+    }
+    is_private_ip(host)
+}
+
 pub async fn emergency_revoke(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     key: &str,
@@ -459,10 +556,10 @@ pub async fn emergency_revoke(
         admin_token,
         state.config().observability_admin_token.as_str(),
     ) {
-        (Some(got), expected) if !got.is_empty() => ct_eq(got, expected),
+        (Some(got), expected) if !got.is_empty() => secret_eq(got, expected),
         _ => false,
     };
-    let net_ok = peer_ip.is_some_and(is_private_ip);
+    let net_ok = peer_ip.is_some_and(is_private_peer);
     if admin_ok || net_ok {
         return revoke_caller(state, key).await;
     }
@@ -541,6 +638,10 @@ pub async fn approve_hash_change(
     Ok(view)
 }
 
+#[cfg(test)]
+mod hardening_tests;
+#[cfg(test)]
+mod retry_tests;
 #[cfg(test)]
 mod rollback_tests;
 #[cfg(test)]

@@ -161,8 +161,10 @@ fn revoke_disables_entry() {
 
 #[test]
 fn approve_hash_change_applies_and_enables() {
+    // CRD-4：落定不改 enabled/revoked——活跃条目保持活跃，仅更新哈希与宽限。
     let mut reg = CallerRegistry::empty();
     reg.register("/s/a.sh", "h1").unwrap();
+    reg.set_enabled("/s/a.sh", true).unwrap();
     reg.approve_hash_change("/s/a.sh", "h2").unwrap();
     let e = reg.lookup_by_path("/s/a.sh").unwrap();
     assert_eq!(e.expected_hash, "h2");
@@ -171,9 +173,93 @@ fn approve_hash_change_applies_and_enables() {
 }
 
 #[test]
+fn hash_change_no_resurrect() {
+    // CRD-4：KeepAuto/DemoteManual 不激活未启用条目，仅更新 script_sha256 与宽限。
+    let mut reg = CallerRegistry::empty();
+    reg.register_extended(&RegisterParams {
+        caller_path: "/s/idle-keep.sh".to_string(),
+        caller_hash: "keep-old".to_string(),
+        ..RegisterParams::default()
+    })
+    .unwrap();
+    reg.approve_hash_change_with_script_sha256(
+        "/s/idle-keep.sh",
+        "keep-new",
+        "sha-keep".to_string(),
+        HashChangeOutcome::KeepAuto,
+    )
+    .unwrap();
+    let e = reg.lookup_by_path("/s/idle-keep.sh").unwrap();
+    assert!(
+        !e.enabled && !e.revoked,
+        "未启用条目不因 KeepAuto 被激活: {e:?}"
+    );
+    assert_eq!(e.expected_hash, "keep-new");
+    assert_eq!(e.script_sha256, "sha-keep");
+    assert_eq!(e.old_hash.as_deref(), Some("keep-old"));
+    assert!(e.old_hash_expires_at.is_some());
+
+    reg.register_extended(&RegisterParams {
+        caller_path: "/s/idle-demote.sh".to_string(),
+        caller_hash: "demote-old".to_string(),
+        allow_mode: Some(crate::config::AutoApprove::Allow),
+        ..RegisterParams::default()
+    })
+    .unwrap();
+    reg.approve_hash_change_with_script_sha256(
+        "/s/idle-demote.sh",
+        "demote-new",
+        "sha-demote".to_string(),
+        HashChangeOutcome::DemoteManual,
+    )
+    .unwrap();
+    let e = reg.lookup_by_path("/s/idle-demote.sh").unwrap();
+    assert!(
+        !e.enabled && !e.revoked,
+        "未启用条目不因 DemoteManual 被激活: {e:?}"
+    );
+    assert_eq!(e.allow_mode, Some(crate::config::AutoApprove::Pending));
+    assert_eq!(e.script_sha256, "sha-demote");
+}
+
+#[test]
+fn revoked_entry_hash_change_stays_revoked() {
+    // CRD-4：已吊销条目的哈希变更（🔓/✅）保持 revoked=true，不被写入 revoked=false/enabled=true。
+    let mut reg = CallerRegistry::empty();
+    reg.register("/s/dead.sh", "d-old").unwrap();
+    reg.set_enabled("/s/dead.sh", true).unwrap();
+    reg.revoke("/s/dead.sh").unwrap();
+    reg.approve_hash_change_with_script_sha256(
+        "/s/dead.sh",
+        "d-new",
+        "sha-d".to_string(),
+        HashChangeOutcome::KeepAuto,
+    )
+    .unwrap();
+    let e = reg.lookup_by_path("/s/dead.sh").unwrap();
+    assert!(e.revoked && !e.enabled, "KeepAuto 后仍吊销: {e:?}");
+    assert_eq!(e.expected_hash, "d-new");
+    assert_eq!(e.script_sha256, "sha-d");
+    assert_eq!(e.old_hash.as_deref(), Some("d-old"));
+    assert!(e.old_hash_expires_at.is_some());
+
+    reg.approve_hash_change_with_script_sha256(
+        "/s/dead.sh",
+        "d-new2",
+        "sha-d2".to_string(),
+        HashChangeOutcome::DemoteManual,
+    )
+    .unwrap();
+    let e = reg.lookup_by_path("/s/dead.sh").unwrap();
+    assert!(e.revoked && !e.enabled, "DemoteManual 后仍吊销: {e:?}");
+    assert_eq!(e.allow_mode, Some(crate::config::AutoApprove::Pending));
+    assert_eq!(e.script_sha256, "sha-d2");
+}
+
+#[test]
 fn hash_change_three_state() {
     let mut reg = CallerRegistry::empty();
-    // 🔓 保持 allow_mode 不变，激活并写宽限。
+    // 🔓 保持 allow_mode 不变，写宽限但不改 enabled（CRD-4）。
     reg.register_extended(&RegisterParams {
         caller_path: "/s/keep.sh".to_string(),
         caller_hash: "keep-old".to_string(),
@@ -189,11 +275,14 @@ fn hash_change_three_state() {
     .unwrap();
     let e = reg.lookup_by_path("/s/keep.sh").unwrap();
     assert_eq!(e.allow_mode, None, "🔓 须保持 allow_mode 不变");
-    assert!(e.enabled && !e.revoked);
+    assert!(
+        !e.enabled && !e.revoked,
+        "🔓 不激活未启用条目（CRD-4）: {e:?}"
+    );
     assert_eq!(e.old_hash.as_deref(), Some("keep-old"));
     assert!(e.old_hash_expires_at.is_some());
     assert_eq!(e.script_sha256, "sha-keep");
-    // ✅ 降级人工（allow_mode = Pending），仍激活。
+    // ✅ 降级人工（allow_mode = Pending），但不激活未启用条目（CRD-4）。
     reg.register_extended(&RegisterParams {
         caller_path: "/s/demote.sh".to_string(),
         caller_hash: "demote-old".to_string(),
@@ -214,7 +303,10 @@ fn hash_change_three_state() {
         Some(crate::config::AutoApprove::Pending),
         "✅ 须降级为人工审批模式"
     );
-    assert!(e.enabled && !e.revoked);
+    assert!(
+        !e.enabled && !e.revoked,
+        "✅ 不激活未启用条目（CRD-4）: {e:?}"
+    );
     assert_eq!(e.expected_hash, "demote-new");
     // ❎ 禁用（fail-closed），仍写宽限与哈希。
     reg.register_extended(&RegisterParams {
@@ -446,6 +538,52 @@ async fn bind_script_path_length() {
     let got = bind_script_sha256_async(too_long.clone(), "len-h".to_string()).await;
     assert_eq!(got, derived_script_sha256("len-h", &too_long));
     assert_eq!(bind_script_sha256(&too_long, "len-h"), got);
+}
+
+#[test]
+fn registry_tmp_0600_from_creation() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!(
+        "veil-reg-tmp0600-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.join("caller_registry.tmp");
+    let file = open_tmp_0600(&tmp).expect("暂存文件创建即 0600 须成功");
+    let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "tmp 须创建即 0600，无先创建后 chmod 窗口");
+    drop(file);
+    let path = dir.join("caller_registry.json");
+    let mut reg = CallerRegistry::empty();
+    reg.register("/s/tmp.sh", "tmp-h").unwrap();
+    reg.save_to(&path).unwrap();
+    let final_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(final_mode, 0o600, "重写产物权限口径一致");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn lookup_by_hash_active_first() {
+    let mut reg = CallerRegistry::empty();
+    reg.register("/s/aaa.sh", "shared-h").unwrap();
+    reg.register("/s/zzz.sh", "shared-h").unwrap();
+    reg.set_enabled("/s/aaa.sh", true).unwrap();
+    reg.set_enabled("/s/zzz.sh", true).unwrap();
+    reg.revoke("/s/aaa.sh").unwrap();
+    let hit = reg.lookup_by_hash("shared-h").unwrap();
+    assert_eq!(hit.caller_path, "/s/zzz.sh", "活跃条目须优先于已吊销条目");
+    assert!(!hit.revoked);
+    reg.revoke("/s/zzz.sh").unwrap();
+    let fallback = reg.lookup_by_hash("shared-h").unwrap();
+    assert_eq!(
+        fallback.caller_path, "/s/aaa.sh",
+        "无活跃条目时按 BTreeMap 键序稳定回退"
+    );
+    assert!(fallback.revoked, "回退条目按已吊销语义处理");
 }
 
 #[test]

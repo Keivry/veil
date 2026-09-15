@@ -11,8 +11,8 @@ mod common;
 
 #[tokio::test]
 async fn t3_2_vault_backed_credential_flow_e2e() {
-    // vault 承载的注册取用全链路：注册 200 → 取用 200。
-    let (app, _state) = test_app(common::TestOpts::default());
+    // vault 承载的注册取用全链路：注册 202 → 审批启用 → 取用 200。
+    let (app, state) = test_app(common::TestOpts::default());
     let (base, handle) = serve(app).await;
     let client = reqwest::Client::new();
     let reg = client
@@ -43,19 +43,13 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
         .await
         .unwrap();
     assert_eq!(pre.status().as_u16(), 403, "审批启用前须拒绝");
-    let approve = client
-        .post(format!("{base}/approve-hash-change"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
-        .json(&serde_json::json!({
-            "caller_path": "/srv/vault-flow.sh",
-            "new_hash": "h-vault-flow-1",
-            "auth": {"caller_hash": "h-vault-flow-1", "caller_path": "/srv/vault-flow.sh"}
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(approve.status().as_u16(), 200);
+    // CRD-4：注册审批 ✅ 启用条目（哈希变更落定不再激活既有条目）。
+    let event_id = wait_new_event_id(&state).await;
+    state
+        .approval
+        .resolve(&event_id, "@admin:example.com", true)
+        .await;
+    wait_until_enabled(&state, "/srv/vault-flow.sh").await;
     let cred = client
         .post(format!("{base}/credential"))
         .header("X-Get-Binary-Hash", "gethash1")
@@ -102,5 +96,36 @@ async fn t3_2_vault_lru_eviction_and_capacity_split() {
     for (i, first) in first_tokens.iter().enumerate().skip(1).take(4) {
         let again = vault.register(&val(i)).unwrap();
         assert_ne!(again, *first, "冷条目 val({i}) 须已被 LRU 逐出");
+    }
+}
+
+async fn wait_new_event_id(state: &veil::state::AppState) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(id) = state.approval.pending_event_ids().await.into_iter().next() {
+            return id;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "审批建单超时");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_until_enabled(state: &veil::state::AppState, path: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if state
+            .registry
+            .read()
+            .await
+            .lookup_by_path(path)
+            .is_some_and(|e| e.enabled)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "注册审批启用超时: {path}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }

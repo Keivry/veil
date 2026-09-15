@@ -8,7 +8,7 @@ use {
         AppStateParts,
         CredentialBody,
         CredentialHeaders,
-        approval::{approval_dual_mode, notify_hash_change},
+        approval::{approval_dual_mode, notify_hash_grace_once},
         ratelimit::check_rate,
         vault_ops::query_keepass,
     },
@@ -184,6 +184,7 @@ pub async fn handle_credential(
 
     let pending_key = format!("{caller_path}:{caller_hash}");
     let mut hash_grace = false;
+    let mut grace_notify: Option<(String, String, u64)> = None;
     // AUTH-4：调用者身份未匹配任何注册条目时置位；自动放行仅对已注册条目生效。
     let mut unenrolled = false;
     let decision = {
@@ -216,6 +217,11 @@ pub async fn handle_credential(
                     });
                 }
                 hash_grace = true;
+                grace_notify = caller
+                    .old_hash
+                    .clone()
+                    .zip(caller.old_hash_expires_at)
+                    .map(|(old, exp)| (caller.caller_path.clone(), old, exp));
                 Some(caller.effective_allow_mode(state.config().auto_approve))
             } else {
                 if caller.revoked {
@@ -242,8 +248,8 @@ pub async fn handle_credential(
             Some(state.config().auto_approve)
         }
     };
-    if hash_grace {
-        notify_hash_change(state, &pending_key, "old_hash宽限内放行");
+    if hash_grace && let Some((entry, old_hash, exp)) = grace_notify {
+        notify_hash_grace_once(state, &entry, &old_hash, exp);
     }
 
     check_rate(

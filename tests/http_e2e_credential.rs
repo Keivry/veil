@@ -118,7 +118,8 @@ async fn t6_raw_terminal_call_rejected_403() {
 
 #[tokio::test]
 async fn t6_register_use_flow_200() {
-    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
+    let (app, state) = test_app(TestOpts::default());
+    let (base, handle) = serve(app).await;
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
@@ -147,19 +148,13 @@ async fn t6_register_use_flow_200() {
         .await
         .unwrap();
     assert_eq!(pre.status().as_u16(), 403, "审批启用前须拒绝");
-    let approve = client
-        .post(format!("{base}/approve-hash-change"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
-        .json(&serde_json::json!({
-            "caller_path": "/srv/flow.sh",
-            "new_hash": "h-flow-1",
-            "auth": {"caller_hash": "h-flow-1", "caller_path": "/srv/flow.sh"}
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(approve.status().as_u16(), 200);
+    // CRD-4：注册审批 ✅ 启用条目（哈希变更落定不再激活既有条目）。
+    let event_id = wait_new_event_id(&state, &[]).await;
+    state
+        .approval
+        .resolve(&event_id, "@admin:example.com", true)
+        .await;
+    wait_until_enabled(&state, "/srv/flow.sh").await;
     let use_resp = client
         .post(format!("{base}/credential"))
         .header("X-Get-Binary-Hash", "gethash1")
@@ -193,7 +188,8 @@ async fn t6_register_use_flow_200() {
 }
 
 #[tokio::test]
-async fn t6_duplicate_register_409() {
+async fn t6_duplicate_register_retry_same_pending() {
+    // CRD-6：未决注册重试须幂等复用同一 pending（202 + E_PENDING），不重复建单、不返回 409。
     let (base, handle) = serve(test_app_router(TestOpts::default())).await;
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
@@ -220,7 +216,11 @@ async fn t6_duplicate_register_409() {
         .send()
         .await
         .unwrap();
-    assert_eq!(second.status().as_u16(), 409);
+    assert_eq!(
+        second.status().as_u16(),
+        202,
+        "未决注册重试须返回 202 + E_PENDING（CRD-6）"
+    );
     handle.abort();
 }
 
@@ -248,19 +248,13 @@ async fn t6_revoke_then_use_403() {
         .await
         .unwrap();
     assert_eq!(reg.status().as_u16(), 202);
-    let enable = client
-        .post(format!("{base}/approve-hash-change"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
-        .json(&serde_json::json!({
-            "caller_path": "/srv/gone.sh",
-            "new_hash": "h-gone-1",
-            "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"}
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(enable.status().as_u16(), 200);
+    // CRD-4：注册审批 ✅ 启用条目（哈希变更落定不再激活既有条目）。
+    let reg_event = wait_new_event_id(&state, &[]).await;
+    state
+        .approval
+        .resolve(&reg_event, "@admin:example.com", true)
+        .await;
+    wait_until_enabled(&state, "/srv/gone.sh").await;
     let cred_body = serde_json::json!({
         "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"},
         "entry": "网易", "field": "授权码"
@@ -334,6 +328,26 @@ async fn wait_until_revoked(state: &veil::state::AppState, path: &str) {
     }
 }
 
+async fn wait_until_enabled(state: &veil::state::AppState, path: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if state
+            .registry
+            .read()
+            .await
+            .lookup_by_path(path)
+            .is_some_and(|e| e.enabled)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "注册审批启用超时: {path}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn t6_locked_backend_health_and_credential() {
     let (app, state) = test_app(TestOpts::default().locked(true));
@@ -398,6 +412,44 @@ async fn t6_registrations_require_admin_token() {
         .await
         .unwrap();
     assert_eq!(authed.status().as_u16(), 200);
+    handle.abort();
+}
+
+// TCP-2：`GET /registrations` 部署密钥鉴权分支——匹配放行 / 不匹配 401 / 双缺 401。
+#[tokio::test]
+async fn registrations_deploy_key_auth() {
+    let (base, handle) = serve(test_app_router(TestOpts::default())).await;
+    let client = reqwest::Client::new();
+    let matched = client
+        .get(format!("{base}/registrations"))
+        .header("X-Get-Binary-Secret", common::GET_SECRET)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(matched.status().as_u16(), 200, "部署密钥匹配须放行");
+    let body: serde_json::Value = matched.json().await.unwrap();
+    assert_eq!(body["ok"], true, "放行响应须含 ok=true");
+    assert!(
+        body["registrations"].is_array(),
+        "放行响应须含注册表数组: {body}"
+    );
+    let wrong = client
+        .get(format!("{base}/registrations"))
+        .header("X-Get-Binary-Secret", "wrong-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status().as_u16(), 401, "密钥不匹配须 401");
+    let neither = client
+        .get(format!("{base}/registrations"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        neither.status().as_u16(),
+        401,
+        "管理 token 与部署密钥双缺须 401"
+    );
     handle.abort();
 }
 

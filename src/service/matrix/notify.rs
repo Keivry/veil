@@ -39,6 +39,19 @@ pub trait NotificationSink: Send + Sync + fmt::Debug + 'static {
             None
         })
     }
+
+    /// `CRD-5` best-effort 预置 reaction：返回是否已发送（`false` 由调用方记 warn，不阻断建单）。
+    /// 默认 no-op 返回 `true`，使无 reaction 能力的 sink 不产生噪声告警。
+    fn send_reaction<'a>(
+        &'a self,
+        event_id: &'a str,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = (event_id, key);
+            true
+        })
+    }
 }
 
 impl NotificationSink for MatrixBot {
@@ -64,6 +77,22 @@ impl NotificationSink for MatrixBot {
                 Err(err) => {
                     tracing::warn!("tracked 通知发送失败: {err:#}");
                     None
+                }
+            }
+        })
+    }
+
+    fn send_reaction<'a>(
+        &'a self,
+        event_id: &'a str,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            match MatrixBot::send_reaction(self, event_id, key).await {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!("审批预置 reaction 发送失败（仅告警，不阻断）: {err:#}");
+                    false
                 }
             }
         })
@@ -134,6 +163,11 @@ impl NotificationSpool {
     /// 失败由调用方 fail-closed。
     pub async fn send_tracked(&self, text: String) -> Option<String> {
         self.sink.send_text_tracked(text).await
+    }
+
+    /// `CRD-5`：建单后预置 reaction（best-effort；`false` 由调用方 warn，不阻断建单）。
+    pub async fn send_reaction(&self, event_id: &str, key: &str) -> bool {
+        self.sink.send_reaction(event_id, key).await
     }
 
     /// 非阻塞投递：满队列/已停即丢弃并计数 + warn，返回是否入队。

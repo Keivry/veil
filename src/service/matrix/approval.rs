@@ -11,7 +11,6 @@ use {
         is_mxid_allowed,
         reaction_to_decision,
     },
-    crate::approval::{ApprovalGateway, ApprovalOutcome, PendingRecord},
     std::{
         collections::HashMap,
         sync::Arc,
@@ -78,7 +77,8 @@ impl MatrixApproval {
     pub fn credential_timeout(&self) -> Duration { self.credential_timeout }
 
     /// 登记一个待审批 event；已存在返回 false（幂等建单）。
-    pub async fn submit(&self, event_id: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) async fn submit(&self, event_id: &str) -> bool {
         self.submit_branch(event_id, MatrixBranch::Unknown).await
     }
 
@@ -375,12 +375,6 @@ impl MatrixApproval {
                 me.sweep_orphans().await;
             }
         })
-    }
-}
-
-impl ApprovalGateway for MatrixApproval {
-    fn request_approval(&self, _record: &PendingRecord) -> ApprovalOutcome {
-        ApprovalOutcome::Pending
     }
 }
 

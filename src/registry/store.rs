@@ -8,7 +8,7 @@ use {
         fs_perm::ensure_0600,
     },
     serde::{Deserialize, Serialize},
-    std::{collections::BTreeMap, io::Write as _, path::Path},
+    std::{collections::BTreeMap, io::Write as _, os::unix::fs::OpenOptionsExt as _, path::Path},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -116,6 +116,17 @@ fn storage_io(what: &str, e: std::io::Error) -> VeilError {
     }
 }
 
+/// 创建即 `0600` 的暂存文件（`CRD-9`/`OpenOptionsExt::mode`）：无先创建后 `chmod`
+/// 的宽权限窗口；重写产物权限口径一致。
+fn open_tmp_0600(tmp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)
+}
+
 /// 纯字节原子落盘（B1/D1）：`create_dir_all` + tmp 写 + `0600`，
 /// 随后 `sync_all`、rename、`0600`、父目录 `sync_all`（`C14`/D14，
 /// 掉电后已确认写不丢失）；不引用 `CallerRegistry`，可在 `spawn_blocking`
@@ -136,7 +147,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         std::fs::create_dir_all(parent).map_err(|e| storage_io("注册表目录创建失败", e))?;
     }
     let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp).map_err(|e| storage_io("注册表暂存写入失败", e))?;
+    // 清除可能残留的旧 tmp（历史版本可能留下宽权限文件），确保本次创建即 `0600`。
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = open_tmp_0600(&tmp).map_err(|e| storage_io("注册表暂存写入失败", e))?;
     file.write_all(bytes)
         .map_err(|e| storage_io("注册表暂存写入失败", e))?;
     #[cfg(test)]
@@ -150,7 +163,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all()
         .map_err(|e| storage_io("注册表 fsync 失败", e))?;
     drop(file);
-    ensure_0600(&tmp);
     std::fs::rename(&tmp, path).map_err(|e| storage_io("注册表原子提交失败", e))?;
     ensure_0600(path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -188,7 +200,8 @@ pub(super) fn integrity_of(entries: &BTreeMap<String, CallerEntry>) -> Result<St
 }
 
 impl CallerRegistry {
-    pub fn empty() -> Self { Self::default() }
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self { Self::default() }
 
     pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -230,10 +243,23 @@ impl CallerRegistry {
         self.entries.get(caller_path)
     }
 
+    /// 按哈希查找（`CRD-14`）：活跃（未吊销）条目优先返回；同哈希同时存在活跃与
+    /// 已吊销/废弃条目时 SHALL NOT 返回已吊销者。无活跃条目时按 `BTreeMap`
+    /// 键序（稳定）返回首个匹配，语义明确不误判为活跃。
     pub fn lookup_by_hash(&self, caller_hash: &str) -> Option<&CallerEntry> {
-        self.entries
-            .values()
-            .find(|e| crate::auth::ct_eq(&e.expected_hash, caller_hash))
+        let mut fallback = None;
+        for e in self.entries.values() {
+            if !crate::auth::ct_eq(&e.expected_hash, caller_hash) {
+                continue;
+            }
+            if !e.revoked {
+                return Some(e);
+            }
+            if fallback.is_none() {
+                fallback = Some(e);
+            }
+        }
+        fallback
     }
 
     /// 按展示名定位（`C5`/D5）：未吊销条目优先；因注册已拒未吊销重名，
@@ -318,6 +344,7 @@ impl CallerRegistry {
             allow_mode: params.allow_mode,
             old_hash: None,
             old_hash_expires_at: None,
+            reg_id: caller_path.to_string(),
         };
         self.entries.insert(caller_path.to_string(), entry);
         self.entries
@@ -359,6 +386,10 @@ impl CallerRegistry {
     /// `outcome`（`C3`/D3）三态：`KeepAuto` 保持 `allow_mode`、`DemoteManual`
     /// 降级 `Pending`、`Disable` 置 `enabled=false`；三态均写旧哈希宽限与
     /// `script_sha256`。
+    ///
+    /// `CRD-4`：`KeepAuto`/`DemoteManual` SHALL NOT 写 `revoked=false`/`enabled=true`
+    /// ——落定仅更新 `script_sha256` 与旧哈希宽限字段，不复活/解吊销既有条目
+    /// （对齐 Python `_registry.py:294-306`）。`Disable` 仍 fail-closed 置 `enabled=false`。
     pub fn approve_hash_change_with_script_sha256(
         &mut self,
         caller_path: &str,
@@ -379,13 +410,9 @@ impl CallerRegistry {
         entry.expected_hash = new_hash.to_string();
         entry.script_sha256 = script_sha256;
         match outcome {
-            HashChangeOutcome::KeepAuto => {
-                entry.revoked = false;
-                entry.enabled = true;
-            }
+            // `CRD-4`：保持既有 `allow_mode`/`enabled`/`revoked` 原状，仅哈希与宽限已更新。
+            HashChangeOutcome::KeepAuto => {}
             HashChangeOutcome::DemoteManual => {
-                entry.revoked = false;
-                entry.enabled = true;
                 entry.allow_mode = Some(crate::config::AutoApprove::Pending);
             }
             HashChangeOutcome::Disable => {
