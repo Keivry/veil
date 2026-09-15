@@ -14,4 +14,4 @@ pub mod leaf;
 pub mod scope;
 pub mod seam;
 
-pub use {leaf::*, scope::*, seam::*};
+pub use {scope::*, seam::*};

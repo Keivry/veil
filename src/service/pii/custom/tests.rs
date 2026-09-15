@@ -393,8 +393,14 @@ async fn pii_lock_poison_recovery() {
     assert!(hits.iter().any(|h| h.1 == "HEAL-42"), "{hits:?}");
     // warn 一次性：隔离标志位断言（全局标志位被并行用例抢占，不作断言依据）。
     let flag = std::sync::atomic::AtomicBool::new(false);
-    assert!(super::warn_poison_once_at(&flag), "首次恢复须告警");
-    assert!(!super::warn_poison_once_at(&flag), "重复恢复仅 warn 一次");
+    assert!(
+        crate::service::lock_recover::warn_poison_once_at(&flag),
+        "首次恢复须告警"
+    );
+    assert!(
+        !crate::service::lock_recover::warn_poison_once_at(&flag),
+        "重复恢复仅 warn 一次"
+    );
 }
 
 #[test]
@@ -441,6 +447,31 @@ fn partial_prefix_hints_cap_desc_dedup_and_dict() {
 }
 
 #[test]
+fn prefix_hints_capped_64() {
+    // APP-6（4.15）：hint 集合总条数上限 64（去重后按长度降序保留前 64）。
+    let d = detector();
+    let rules: Vec<(String, String)> = (0..80)
+        .map(|i| (format!("p{i:02}"), format!("PREFIX{i:02}-\\d+")))
+        .collect();
+    let n = d.load_custom_patterns(&rules);
+    assert_eq!(n, 80, "80 条规则须全部加载");
+    let hints = d.partial_prefix_hints();
+    assert_eq!(hints.len(), 64, "hint 总条数须截断至 64: {}", hints.len());
+    // 各前缀等长，按 (长度降序, 字典序) 保留前 64——最长前缀集合内有界。
+    assert!(
+        hints.contains(&"PREFIX00-".to_string()),
+        "保留集须含最优前缀: {hints:?}"
+    );
+    assert!(
+        !hints.contains(&"PREFIX79-".to_string()),
+        "超出 64 条的前缀须被截断: {hints:?}"
+    );
+    let mut uniq = hints.clone();
+    uniq.dedup();
+    assert_eq!(uniq, hints, "hint 须去重: {hints:?}");
+}
+
+#[test]
 fn regex_literal_prefix_extraction_rules() {
     assert_eq!(super::regex_literal_prefix(r"TAG-\d+"), "TAG-");
     assert_eq!(
@@ -451,4 +482,47 @@ fn regex_literal_prefix_extraction_rules() {
     assert_eq!(super::regex_literal_prefix(r"[A-Z]\d+"), "");
     assert_eq!(super::regex_literal_prefix(r"^(a+)+$"), "a");
     assert_eq!(super::regex_literal_prefix(r"a\.b\-c"), "a.b-c");
+}
+
+#[tokio::test]
+async fn scan_custom_batch_equivalence() {
+    // ARH-4（7.3）：单任务批量扫描与逐规则逐分块结果等价；停用规则仍被跳过。
+    use std::collections::HashSet;
+    let d = detector();
+    d.load_custom_patterns(&[
+        ("tag".to_string(), r"TAG-\d+".to_string()),
+        ("emp".to_string(), r"工号\d{6}".to_string()),
+    ]);
+    let hits = d
+        .scan_custom("A TAG-11 工号123456 B TAG-22", &empty_cred())
+        .await;
+    let got: HashSet<(String, String)> = hits
+        .iter()
+        .map(|(k, v, ..)| (k.clone(), v.clone()))
+        .collect();
+    assert!(
+        got.contains(&("tag".to_string(), "TAG-11".to_string())),
+        "{hits:?}"
+    );
+    assert!(
+        got.contains(&("tag".to_string(), "TAG-22".to_string())),
+        "{hits:?}"
+    );
+    assert!(
+        got.contains(&("emp".to_string(), "工号123456".to_string())),
+        "{hits:?}"
+    );
+    assert_eq!(hits.len(), 3, "命中须与逐规则扫描一致: {hits:?}");
+    d.account_rule("tag", true);
+    d.account_rule("tag", true);
+    d.account_rule("tag", true);
+    let hits = d.scan_custom("TAG-33 工号999999", &empty_cred()).await;
+    assert!(
+        hits.iter().all(|h| h.0 != "tag"),
+        "停用规则须跳过: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.0 == "emp"),
+        "他规则不受影响: {hits:?}"
+    );
 }

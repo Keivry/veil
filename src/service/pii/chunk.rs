@@ -210,8 +210,10 @@ fn builtin_chunk_sync(chunk: &str) -> Vec<(String, String, usize, usize)> {
                 }
             }
             "bank_card" => {
-                let cs = start.saturating_sub(64);
-                let ce = (end + 16).min(chunk.len());
+                // APP-1：上下文窗口按字符边界安全切片，避免多字节 UTF-8 毗邻窗口时
+                // 裸字节切片 panic；窗口语义（前 64 / 后 16）与 Luhn 位置不变。
+                let cs = chunk.floor_char_boundary(start.saturating_sub(64));
+                let ce = chunk.ceil_char_boundary((end + 16).min(chunk.len()));
                 if url_query_param_re().is_match(&chunk[cs..ce]) {
                     continue;
                 }
@@ -271,8 +273,9 @@ pub async fn scan_builtin(text: &str, credential_p2t: &HashMap<String, String>) 
                     }
                 }
                 "bank_card" => {
-                    let cs = start.saturating_sub(64);
-                    let ce = (end + 16).min(chunk.len());
+                    // APP-1：同同步路径，上下文窗口按字符边界安全切片（窗口语义不变）。
+                    let cs = chunk.floor_char_boundary(start.saturating_sub(64));
+                    let ce = chunk.ceil_char_boundary((end + 16).min(chunk.len()));
                     if url_query_param_re().is_match(&chunk[cs..ce]) {
                         continue;
                     }
@@ -456,5 +459,72 @@ mod perf_budget_tests {
             elapsed < Duration::from_secs(2),
             "增量扫描 {elapsed:?} 超门禁"
         );
+    }
+}
+
+#[cfg(test)]
+mod multibyte_boundary_tests {
+    use {
+        super::{scan_builtin, scan_builtin_sync},
+        crate::service::pii::detector::{PiiHit, test_support::empty_cred},
+    };
+
+    const LUHN_CARDS: [&str; 6] = [
+        "6200000000000005",
+        "6000000000000007",
+        "3400000000000000",
+        "3700000000000007",
+        "4000000000000002",
+        "5000000000000009",
+    ];
+    const INVALID_PREFIX_CARD: &str = "1200000000000006";
+
+    fn hit(hits: &[PiiHit], value: &str) -> bool {
+        hits.iter().any(|h| h.0 == "bank_card" && h.1 == value)
+    }
+
+    fn boundary_texts(card: &str) -> Vec<String> {
+        vec![
+            format!("卡号{card}后续中文文本汉字内容结束"),
+            format!("卡号{card}a😀😀😀😀收尾"),
+            format!("{}卡号{card}结束", "中".repeat(30)),
+            format!("{}卡号{card}后续中文文本汉字内容", "中".repeat(30)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn chunk_multibyte_boundary_no_panic() {
+        for card in LUHN_CARDS {
+            for text in boundary_texts(card) {
+                let sync = scan_builtin_sync(&text, &empty_cred());
+                let asy = scan_builtin(&text, &empty_cred()).await;
+                assert!(hit(&sync, card), "同步路径须命中 {card}: {text}");
+                assert!(hit(&asy, card), "异步路径须命中 {card}: {text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pii_bank_card_multibyte_adjacency() {
+        for card in LUHN_CARDS {
+            for text in boundary_texts(card) {
+                let sync = scan_builtin_sync(&text, &empty_cred());
+                let asy = scan_builtin(&text, &empty_cred()).await;
+                assert!(hit(&sync, card), "同步路径须命中 {card}: {text}");
+                assert!(hit(&asy, card), "异步路径须命中 {card}: {text}");
+            }
+        }
+        for text in boundary_texts(INVALID_PREFIX_CARD) {
+            let sync = scan_builtin_sync(&text, &empty_cred());
+            let asy = scan_builtin(&text, &empty_cred()).await;
+            assert!(
+                !hit(&sync, INVALID_PREFIX_CARD),
+                "非法前缀同步路径不得误报: {text}"
+            );
+            assert!(
+                !hit(&asy, INVALID_PREFIX_CARD),
+                "非法前缀异步路径不得误报: {text}"
+            );
+        }
     }
 }

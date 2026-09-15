@@ -10,9 +10,11 @@ use {
 
 /// 归一化声明头（protocol-parity Cvem）：注入改写请求体空白归一时声明，
 /// 名/值均为线协议常量，硬编码理由：下游按精确头名识别，改名即 BREAKING。
-pub const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
+#[cfg(test)]
+pub(crate) const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
 /// 归一化声明头值（同上）。
-pub const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
+#[cfg(test)]
+pub(crate) const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
 
 // D1.8：以下三辅助生产零引用（生产走 `Config` 同名成员），`#[cfg(test)]` 收编。
 /// 占位符说明注入开关（与 `Config::is_falsy` 同口径）：`0/false/no/off` 关闭，

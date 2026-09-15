@@ -50,12 +50,14 @@ impl Scope {
     }
 
     /// 底层的请求级 PII 容器（高级用法/断言）。
-    pub fn pii_scope(&self) -> &PiiScope { &self.pii }
+    #[cfg(test)]
+    pub(crate) fn pii_scope(&self) -> &PiiScope { &self.pii }
 
     /// 请求侧脱敏：凭据优先 → PII（内置+字典同步，自定义预扫异步）→ json-walk。
     /// 输出末尾统一 `_strip_partials` 残缺清理。
     /// FIX-5 保字节：全叶零替换时返回原文（不走 dumps 重排）。
-    pub async fn redact_request(
+    #[cfg(test)]
+    pub(crate) async fn redact_request(
         &self,
         vault: &CredentialVault,
         detector: &PiiDetector,
@@ -95,7 +97,8 @@ impl Scope {
     }
 
     /// 请求侧 plain 脱敏（非 JSON / 已超限输入的直通路径，同样全量扫描）。
-    pub async fn redact_request_plain(
+    #[cfg(test)]
+    pub(crate) async fn redact_request_plain(
         &self,
         vault: &CredentialVault,
         detector: &PiiDetector,
@@ -149,39 +152,61 @@ impl Scope {
         vault: &CredentialVault,
         text: &str,
     ) -> (String, Vec<(usize, usize)>) {
-        let restored = self.restore_response(vault, text);
-        let mut spans = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for (_, _, token) in scan_token_forms(text) {
-            if !seen.insert(token.clone()) {
+        let forms = scan_token_forms(text);
+        if forms.is_empty() {
+            return (self.restore_response(vault, text), Vec::new());
+        }
+        // APP-5/D19：逐出现点定位——把每个可还原 token 出现点替换为唯一哨兵，
+        // 经同一还原管线后按哨兵位置回填明文；MUST NOT 以明文子串全量查找后整段
+        // skip，否则响应侧独立同值明文会被漏掩码。
+        let mut restorations: Vec<(String, String)> = Vec::with_capacity(forms.len());
+        let mut masked = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for (s, e, token) in &forms {
+            if *s < cursor {
                 continue;
             }
             // 逐 token 直查（不触全量快照）：未注册/幻觉形态回查不变或清空，直接跳过。
-            let plain = self.restore_response_one(vault, &token);
-            if plain.is_empty() || plain == token {
+            let plain = self.restore_response_one(vault, token);
+            if plain.is_empty() || plain == *token {
                 continue;
             }
-            for (s, e) in find_sub_spans(&restored, &plain) {
-                spans.push((s, e));
-            }
+            masked.push_str(&text[cursor..*s]);
+            let sentinel = skip_sentinel(restorations.len(), text);
+            masked.push_str(&sentinel);
+            restorations.push((sentinel, plain));
+            cursor = *e;
         }
-        spans.sort_unstable();
-        // 重叠区间保留最长者（短明文嵌在长明文内时只留长区间）。
-        let mut dedup: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-        for (s, e) in spans {
-            if let Some((ls, le)) = dedup.last_mut() {
-                if s < *le && e > *le {
-                    *ls = (*ls).min(s);
-                    *le = e;
-                    continue;
-                }
-                if s < *le {
-                    continue;
-                }
-            }
-            dedup.push((s, e));
+        if restorations.is_empty() {
+            return (self.restore_response(vault, text), Vec::new());
         }
-        (restored, dedup)
+        masked.push_str(&text[cursor..]);
+        let restored = self.restore_response(vault, &masked);
+        let mut placed: Vec<(usize, String, String)> = restorations
+            .into_iter()
+            .filter_map(|(sentinel, plain)| {
+                find_sub_spans(&restored, &sentinel)
+                    .into_iter()
+                    .next()
+                    .map(|(pos, _)| (pos, sentinel, plain))
+            })
+            .collect();
+        placed.sort_by_key(|(pos, ..)| *pos);
+        let mut out = String::with_capacity(restored.len());
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(placed.len());
+        let mut cursor = 0usize;
+        for (pos, sentinel, plain) in placed {
+            if pos < cursor {
+                continue;
+            }
+            out.push_str(&restored[cursor..pos]);
+            let start = out.len();
+            out.push_str(&plain);
+            spans.push((start, out.len()));
+            cursor = pos + sentinel.len();
+        }
+        out.push_str(&restored[cursor..]);
+        (out, spans)
     }
 
     /// 响应还原（JSON 字符串上下文变体，H2/D1）：与
@@ -203,7 +228,7 @@ impl Scope {
         // RED-1：按明文实际所在 JSON 字符串嵌套深度转义写回。工具参数常为
         // stringified JSON（字符串值本身是 JSON 文档），内层明文需比外层多一层
         // 转义；仅按外层单层转义会以内层视角产生非法裸 `"`、破内层结构。
-        let depths = token_restore_depths(text, |tok| self.restore_response_one(vault, tok));
+        let mut depths = token_restore_depths(text, |tok| self.restore_response_one(vault, tok));
         let mut out = String::with_capacity(restored.len());
         let mut escaped_spans: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
         let mut cursor = 0usize;
@@ -211,7 +236,12 @@ impl Scope {
             out.push_str(&restored[cursor..s]);
             let start = out.len();
             let plain = &restored[s..e];
-            let depth = depths.get(plain).copied().unwrap_or(1);
+            // NLP-4/D13：按 span 实际所在深度逐点转义（不聚合该明文的全局 max），
+            // 深度按文档序逐出现点取用；同明文跨深度时浅层不得被过度转义。
+            let depth = depths
+                .get_mut(plain)
+                .and_then(std::collections::VecDeque::pop_front)
+                .unwrap_or(1);
             out.push_str(&escape_json_depth(plain, depth));
             escaped_spans.push((start, out.len()));
             cursor = e;
@@ -398,14 +428,15 @@ fn escape_json_depth(plain: &str, depth: u32) -> String {
     out
 }
 
-/// RED-1：统计各还原明文在 JSON 帧中的字符串嵌套深度（明文 → 最大深度），
-/// 供 [`Scope::restore_response_with_spans_json`] 按层转义。`plain_of` 返回
-/// token 还原明文；非 token 明文不计入（默认单层）。
+/// RED-1/NLP-4：统计各还原明文在 JSON 帧中的字符串嵌套深度，**按出现点文档序**
+/// 逐点入队（明文 → 深度队列），供 [`Scope::restore_response_with_spans_json`]
+/// 按 span 实际深度逐点转义。`plain_of` 返回 token 还原明文；非 token 明文不计入。
 fn token_restore_depths(
     text: &str,
     plain_of: impl Fn(&str) -> String,
-) -> std::collections::HashMap<String, u32> {
-    let mut depths: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+) -> std::collections::HashMap<String, std::collections::VecDeque<u32>> {
+    let mut depths: std::collections::HashMap<String, std::collections::VecDeque<u32>> =
+        std::collections::HashMap::new();
     if let Ok(v) = json_walk::jloads(json_walk::strip_bom(text))
         && matches!(
             v,
@@ -418,7 +449,7 @@ fn token_restore_depths(
         for (_, _, tok) in scan_token_forms(text) {
             let plain = plain_of(&tok);
             if !plain.is_empty() && plain != tok {
-                depths.entry(plain).or_insert(1);
+                depths.entry(plain).or_default().push_back(1);
             }
         }
     }
@@ -429,39 +460,50 @@ fn collect_token_depths(
     value: &serde_json::Value,
     depth: u32,
     plain_of: &impl Fn(&str) -> String,
-    depths: &mut std::collections::HashMap<String, u32>,
+    depths: &mut std::collections::HashMap<String, std::collections::VecDeque<u32>>,
 ) {
     match value {
-        serde_json::Value::String(s) => {
-            for (_, _, tok) in scan_token_forms(s) {
-                let plain = plain_of(&tok);
-                if !plain.is_empty() && plain != tok {
-                    let slot = depths.entry(plain).or_insert(depth);
-                    *slot = (*slot).max(depth);
-                }
-            }
-            let inner = json_walk::strip_bom(s).trim();
-            if (inner.starts_with('{') || inner.starts_with('['))
-                && let Ok(v) = json_walk::jloads(inner)
-                && matches!(
-                    v,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                )
-            {
-                collect_token_depths(&v, depth + 1, plain_of, depths);
-            }
-        }
+        serde_json::Value::String(s) => collect_string_depths(s, depth, plain_of, depths),
         serde_json::Value::Array(items) => {
             for v in items {
                 collect_token_depths(v, depth, plain_of, depths);
             }
         }
         serde_json::Value::Object(map) => {
-            for v in map.values() {
+            // NLP-3/D12：对象 key 与字符串值同深度口径——键位凭据深度不得漏算。
+            for (k, v) in map {
+                collect_string_depths(k, depth, plain_of, depths);
                 collect_token_depths(v, depth, plain_of, depths);
             }
         }
         _ => {}
+    }
+}
+
+/// 单个字符串节点的深度统计：stringified JSON 容器只按内层 +1 递归（容器内
+/// token 的深度属内层，不得按外层重复计入），非容器字符串统计自身当前深度。
+fn collect_string_depths(
+    s: &str,
+    depth: u32,
+    plain_of: &impl Fn(&str) -> String,
+    depths: &mut std::collections::HashMap<String, std::collections::VecDeque<u32>>,
+) {
+    let inner = json_walk::strip_bom(s).trim();
+    if (inner.starts_with('{') || inner.starts_with('['))
+        && let Ok(v) = json_walk::jloads(inner)
+        && matches!(
+            v,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        )
+    {
+        collect_token_depths(&v, depth + 1, plain_of, depths);
+        return;
+    }
+    for (_, _, tok) in scan_token_forms(s) {
+        let plain = plain_of(&tok);
+        if !plain.is_empty() && plain != tok {
+            depths.entry(plain).or_default().push_back(depth);
+        }
     }
 }
 
@@ -474,10 +516,15 @@ pub fn strip_partials(text: &str) -> String {
 
 /// 响应出口统一清理：幻觉完整凭据 token 剥离 + 残缺清理接全出口。
 /// 真实 token 应先经 `restore_response` 还原，未还原的完整形态必是幻觉。
-pub fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
+#[cfg(test)]
+pub(crate) fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
     strip_partials(&vault.strip_hallucinated(text))
 }
 
 #[cfg(test)]
 #[path = "scope_tests.rs"]
 mod scope_tests;
+
+#[cfg(test)]
+#[path = "scope_p2_tests.rs"]
+mod scope_p2_tests;

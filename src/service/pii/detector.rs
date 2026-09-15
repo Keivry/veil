@@ -363,6 +363,7 @@ pub fn is_keep_prefix_ip(value: &str, kind: &str) -> bool {
             "172.30.",
             "172.31.",
             "192.168.",
+            "192.88.99.",
             "127.",
             "169.254.",
             "100.64.",
@@ -541,7 +542,8 @@ impl PiiDetector {
     pub fn hardening(&self) -> bool { self.hardening.load(Ordering::Relaxed) }
 
     /// 全量扫描（异步）：内置联合一次扫描 + 自定义 ReDoS 守卫 + 字典独立扫描。
-    pub async fn scan_spans(
+    #[cfg(test)]
+    pub(crate) async fn scan_spans(
         &self,
         text: &str,
         credential_p2t: &HashMap<String, String>,

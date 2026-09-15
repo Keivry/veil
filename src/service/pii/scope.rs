@@ -8,27 +8,13 @@ use {
         pii_loose_re,
         pii_token_re,
     },
+    crate::service::lock_recover::lock_or_recover,
     rand::{rand_core::TryRngCore as _, rngs::OsRng},
     std::{
         collections::{HashMap, HashSet, VecDeque},
-        sync::{Mutex, MutexGuard, OnceLock, PoisonError},
+        sync::{Mutex, OnceLock},
     },
 };
-
-/// 锁中毒恢复（B3/D3）：`PoisonError::into_inner` 返回可用守卫，首次 warn。
-fn warn_poison_once() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!("PII scope 锁中毒，已 PoisonError::into_inner 恢复（首次告警）");
-    }
-}
-
-fn recover_mutex<T>(lock: std::sync::LockResult<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
-    lock.unwrap_or_else(|e: PoisonError<_>| {
-        warn_poison_once();
-        e.into_inner()
-    })
-}
 
 /// 宽松形态分类正则（字面量提升 `OnceLock`，消除每调用编译与 `.expect`）。
 fn malformed_shape_re() -> &'static regex::Regex {
@@ -143,7 +129,7 @@ impl PiiScope {
     /// 分配本身走 [`ScopeInner::alloc_seq`] 游标，不做全量重建）。
     #[cfg(test)]
     fn next_available_index(&self) -> usize {
-        let inner = recover_mutex(self.inner.lock());
+        let inner = lock_or_recover(self.inner.lock());
         let mut seq = 1;
         while inner.used_seqs.contains(&seq) {
             seq += 1;
@@ -166,7 +152,7 @@ impl PiiScope {
                 "PII 值不能匹配内部 token 格式或以 token 前缀开头",
             ));
         }
-        let mut inner = recover_mutex(self.inner.lock());
+        let mut inner = lock_or_recover(self.inner.lock());
         if response_side {
             if let Some(tok) = inner.resp_p2t.get(value).cloned() {
                 touch_order(&mut inner.resp_order, value);
@@ -225,7 +211,7 @@ impl PiiScope {
             return restored;
         }
         let (known, seq_map) = {
-            let inner = recover_mutex(self.inner.lock());
+            let inner = lock_or_recover(self.inner.lock());
             if inner.pii_t2p.is_empty() {
                 drop(inner);
                 for tok in &unknown {
@@ -280,7 +266,7 @@ impl PiiScope {
             return (text.to_string(), Vec::new());
         }
         let (restored, req_hits, resp_hits, known) = {
-            let inner = recover_mutex(self.inner.lock());
+            let inner = lock_or_recover(self.inner.lock());
             if inner.pii_t2p.is_empty() && inner.resp_t2p.is_empty() {
                 return (text.to_string(), Vec::new());
             }
@@ -310,7 +296,7 @@ impl PiiScope {
             (restored, req_hits, resp_hits, known)
         };
         if !req_hits.is_empty() || !resp_hits.is_empty() {
-            let mut inner = recover_mutex(self.inner.lock());
+            let mut inner = lock_or_recover(self.inner.lock());
             for value in &req_hits {
                 touch_order(&mut inner.pii_order, value);
             }
@@ -332,7 +318,9 @@ impl PiiScope {
     /// 对齐 [`PiiScope::next_available_index`] 的既有处置，release 构建不含该符号。
     #[cfg(test)]
     fn contains_request_token(&self, token: &str) -> bool {
-        recover_mutex(self.inner.lock()).pii_t2p.contains_key(token)
+        lock_or_recover(self.inner.lock())
+            .pii_t2p
+            .contains_key(token)
     }
 
     /// 记录宽松形态审计计数（同类聚合，调用方限流落盘）。
@@ -342,7 +330,7 @@ impl PiiScope {
         } else {
             "malformed"
         };
-        let mut counts = recover_mutex(self.malformed.lock());
+        let mut counts = lock_or_recover(self.malformed.lock());
         let c = counts.entry(cat.to_string()).or_insert(0);
         *c += 1;
         cat.to_string()
@@ -351,7 +339,7 @@ impl PiiScope {
     /// 记录 fuzzy 还原命中的独立审计分类计数（D5/P4，与 malformed/unregistered
     /// 同管道；调用方限流落盘由既有 malformed 落盘链路承载）。
     pub fn count_fuzzy(&self) -> String {
-        let mut counts = recover_mutex(self.malformed.lock());
+        let mut counts = lock_or_recover(self.malformed.lock());
         *counts.entry("fuzzy".to_string()).or_insert(0) += 1;
         "fuzzy".to_string()
     }
@@ -359,7 +347,9 @@ impl PiiScope {
     /// 审计分类计数读取（仅测试观测）。
     #[cfg(test)]
     pub(crate) fn audit_count(&self, cat: &str) -> u64 {
-        *recover_mutex(self.malformed.lock()).get(cat).unwrap_or(&0)
+        *lock_or_recover(self.malformed.lock())
+            .get(cat)
+            .unwrap_or(&0)
     }
 }
 

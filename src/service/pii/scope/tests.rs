@@ -3,21 +3,9 @@
 use {super::*, std::sync::Arc};
 
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 hygiene-round4 模板）：
-    // 超 800 即失败，须按模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../scope.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "scope.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "scope/tests.rs {tests_lines} 行超 800 红线：须拆分"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("scope.rs", include_str!("../scope.rs"));
+    crate::test_support::file_len_under_800_or_split("scope/tests.rs", include_str!("tests.rs"));
 }
 
 #[test]
@@ -151,7 +139,7 @@ fn f5_cursor_alloc_is_linear_no_full_rebuild() {
     for i in 0..K {
         scope.register(&format!("f5-linear-{i:04}"), false).unwrap();
     }
-    let inner = recover_mutex(scope.inner.lock());
+    let inner = lock_or_recover(scope.inner.lock());
     assert_eq!(
         inner.scan_steps, K,
         "顺序分配每注册恰探测一次候选（实际 {}）；旧全量重建为 O(K^2)",
@@ -172,7 +160,7 @@ fn f5_hole_reuse_after_eviction_no_conflict() {
     assert!(!scope.contains_request_token(&first), "最旧条目须被淘汰");
     let reused = scope.register("f5-reused", false).unwrap();
     assert_eq!(parse_pii_seq(&reused), Some(first_seq), "空洞须被复用");
-    let inner = recover_mutex(scope.inner.lock());
+    let inner = lock_or_recover(scope.inner.lock());
     let all: Vec<usize> = inner
         .pii_t2p
         .keys()
@@ -532,7 +520,7 @@ fn alloc_seq_cursor() {
     }
     assert_eq!(scope.next_available_index(), PII_MAX_ENTRIES + 1);
     {
-        let mut inner = recover_mutex(scope.inner.lock());
+        let mut inner = lock_or_recover(scope.inner.lock());
         // 满表：直接分配返回 PII_MAX_ENTRIES + 1，探测步数线性有界（非全量重建）。
         assert_eq!(inner.alloc_seq(), PII_MAX_ENTRIES + 1);
         assert!(

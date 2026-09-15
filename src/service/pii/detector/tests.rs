@@ -1,19 +1,7 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../detector.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "detector.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "detector/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("detector.rs", include_str!("../detector.rs"));
+    crate::test_support::file_len_under_800_or_split("detector/tests.rs", include_str!("tests.rs"));
 }
 
 use {
@@ -136,6 +124,22 @@ async fn reserved_allowlist_exempted() {
     );
     // 裸前缀子串不豁免：`fcfake` 不是保留地址。
     assert!(!is_reserved_ip("fcfake", "ipv6"));
+}
+
+#[test]
+fn ipv4_reserved_192_88_99_exempt() {
+    // APP-9（4.16）：6to4 中继任播网段 192.88.99.0/24 须在保留豁免清单，
+    // 命中不脱敏（避免过度脱敏）；紧邻的非保留地址不受影响。
+    assert!(is_reserved_ip("192.88.99.1", "ipv4"), "该段须豁免");
+    assert!(is_reserved_ip("192.88.99.254", "ipv4"), "该段尾值须豁免");
+    assert!(
+        !is_reserved_ip("192.88.100.1", "ipv4"),
+        "相邻非保留段不得被误豁免"
+    );
+    assert!(
+        is_reserved_ip("192.168.1.1", "ipv4"),
+        "既有私有段豁免不回退"
+    );
 }
 
 #[test]
@@ -438,4 +442,43 @@ async fn hardening_analyzer_cache_reuse() {
     assert_eq!(cache.hit_count(), 1, "跨调用复用须观测到一次命中");
     assert!(cache.check("analyzer:k2", || true).await);
     assert_eq!(cache.hit_count(), 1, "新键不得命中缓存");
+}
+
+/// 4.18 互锁：canonical `pii-parity-closeout` spec 的 IPv4 掩码文本与 `mask_pii_value`
+/// 实现逐字一致。 文本漂移或实现回退（`<8` 误改为前 4/后 4）时本测试失败。
+#[test]
+fn ipv4_mask_text_consistency() {
+    const SPEC: &str = include_str!("../../../../openspec/specs/pii-parity-closeout/spec.md");
+    assert!(
+        SPEC.contains("字符数 `<8` 时取首 1/尾 1（如 `123456` → `1****6`）"),
+        "canonical spec 须声明 <8 → 首 1/尾 1 规则"
+    );
+    assert!(
+        SPEC.contains("`>=8` 时取前 4/后 4（如 `12345678` → `1234****5678`"),
+        "canonical spec 须声明 >=8 → 前 4/后 4 规则"
+    );
+    assert_eq!(mask_pii_value("ipv4", "123456"), "1****6");
+    assert_eq!(mask_pii_value("ipv4", "12345678"), "1234****5678");
+    assert_eq!(mask_pii_value("ipv4", "192.168.1.1"), "192.168.**.**");
+}
+
+/// 4.19 互锁：canonical `redaction` spec 文本与内置 recognizer 计数同为 7（含 `ipv6`）。
+/// 计数漂移或正文漏列 `ipv6` 时本测试失败。
+#[test]
+fn recognizer_count_seven() {
+    assert_eq!(BUILTIN_NAMES.len(), 7, "内置 recognizer 名单恒为 7");
+    assert!(BUILTIN_NAMES.contains(&"ipv6"), "内置须含 ipv6");
+    const SPEC: &str = include_str!("../../../../openspec/specs/redaction/spec.md");
+    assert!(
+        SPEC.contains("### Requirement: 7 recognizer + 联合正则 + 中文边界"),
+        "canonical 需求名须为 7 recognizer"
+    );
+    assert!(
+        SPEC.contains("内置 7 recognizer") && SPEC.contains("IPv6"),
+        "canonical 正文须列出 7 recognizer 且含 IPv6"
+    );
+    assert!(
+        SPEC.contains("`email/phone/id_card/bank_card/ipv4/ipv6/api_key`"),
+        "canonical 须列出全部七个内置名（含 ipv6）"
+    );
 }

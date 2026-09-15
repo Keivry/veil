@@ -10,9 +10,13 @@ use {
         chunk::{credential_spans, overlaps_any, protected_spans, split_chunks},
         detector::{BUILTIN_NAMES, PiiDetector, PiiHit, RE_DOS_BUDGET_MS, RE_DOS_STRIKES},
     },
+    crate::{
+        config::custom_file::strip_yaml_quotes,
+        service::lock_recover::lock_or_recover as recover,
+    },
     std::{
         collections::{HashMap, HashSet},
-        sync::atomic::AtomicBool,
+        sync::Arc,
         time::Duration,
     },
 };
@@ -20,32 +24,8 @@ use {
 /// T3/7.2 ReDoS 扫描墙钟绝对上界（毫秒）：对抗输入必须在
 /// [`RE_DOS_BUDGET_MS`] 预算断言与连续三次禁用记账之外，以本明确绝对常量内返回
 /// （独立兜底锁；公式：预算 100ms + 调度/阻塞池余量）。
-pub const REDOS_WALL_CLOCK_CEILING_MS: u64 = 400;
-
-/// 全局首次中毒告警位（进程级 once 语义）。
-static POISON_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// P14/D1 锁中毒恢复：`PoisonError::into_inner` 返回可用守卫，首次恢复 warn 一次。
-/// 与 `scope.rs::recover_mutex` 同形；泛型覆盖 `Mutex`/`RwLock` 全部守卫类型，
-/// 中毒后按当前内存状态继续服务（`scan` 读当前映射，`load_*` 全量覆盖写自愈）。
-fn warn_poison_once() -> bool { warn_poison_once_at(&POISON_WARNED) }
-
-/// 可注入标志位的告警实现（测试隔离用；`warn_poison_once` 置位全局标志）。
-fn warn_poison_once_at(flag: &AtomicBool) -> bool {
-    let first = !flag.swap(true, std::sync::atomic::Ordering::Relaxed);
-    if first {
-        tracing::warn!("PII custom 检测器锁中毒，已 PoisonError::into_inner 恢复（首次告警）");
-    }
-    first
-}
-
-/// 锁访问统一入口：中毒即恢复并首次告警，绝不 panic。
-fn recover<T>(lock: std::sync::LockResult<T>) -> T {
-    lock.unwrap_or_else(|e: std::sync::PoisonError<T>| {
-        warn_poison_once();
-        e.into_inner()
-    })
-}
+#[cfg(test)]
+pub(crate) const REDOS_WALL_CLOCK_CEILING_MS: u64 = 400;
 
 /// 按字符截断（hint cap 用，不按字节切 `CJK`）。
 fn truncate_chars(s: &str, cap: usize) -> String { s.chars().take(cap).collect() }
@@ -281,7 +261,8 @@ impl PiiDetector {
     }
 
     /// 已加载的自定义规则名（断言/可观测用）。
-    pub fn custom_names_snapshot(&self) -> Vec<String> {
+    #[cfg(test)]
+    pub(crate) fn custom_names_snapshot(&self) -> Vec<String> {
         recover(self.custom_names.read()).iter().cloned().collect()
     }
 
@@ -291,7 +272,9 @@ impl PiiDetector {
     }
 
     /// P1/D2 跨帧前缀 hold 的 hint 集：自定义正则可提取字面前缀 + 字典全名，
-    /// cap 64 字符、按长度降序去重；无可提取前缀的规则不产生 hint（退化为缝窗保护）。
+    /// 单条 cap 64 字符、**总条数上限 64**（去重后按长度降序保留前 64，对齐 Python
+    /// `partial_prefix_hints` 总条数上限，见 `pii-parity-closeout` spec）；
+    /// 无可提取前缀的规则不产生 hint（退化为缝窗保护）。
     pub fn partial_prefix_hints(&self) -> Vec<String> {
         const CAP: usize = 64;
         let mut hints: Vec<String> = Vec::new();
@@ -313,6 +296,7 @@ impl PiiDetector {
                 .then_with(|| a.cmp(b))
         });
         hints.dedup();
+        hints.truncate(CAP);
         hints
     }
 
@@ -400,78 +384,103 @@ impl PiiDetector {
         out
     }
 
-    /// 自定义正则扫描（ReDoS 守卫）：每规则每分块经 `spawn_blocking`
-    /// 独立执行 + 100ms 超时；超时跳过并计数，连续 3 次停用。
+    /// 自定义正则扫描（ReDoS 守卫）：整帧以**单次** `spawn_blocking` 批量扫描
+    /// 全部规则与分块（规则集经只读共享引用传递），逐规则判定超时/停用记账；
+    /// 与逐规则逐分块扫描结果等价。
     pub async fn scan_custom(
         &self,
         text: &str,
         credential_p2t: &HashMap<String, String>,
     ) -> Vec<PiiHit> {
-        let custom: Vec<(String, fancy_regex::Regex, String)> = recover(self.custom.read()).clone();
-        if custom.is_empty() || text.is_empty() {
+        let rules: Arc<Vec<(String, fancy_regex::Regex, String)>> =
+            Arc::new(recover(self.custom.read()).clone());
+        if rules.is_empty() || text.is_empty() {
             return Vec::new();
         }
         let disabled: HashSet<String> = recover(self.disabled.lock()).clone();
         let protected = protected_spans(text);
         let cred = credential_spans(text, credential_p2t);
         let chunks: Vec<(usize, String)> = split_chunks(text, SCAN_INPUT_LIMIT, 256);
+        // ARH-4（7.3）：规则集一次性移入单任务并只读共享（`Arc`），无每规则/每分块任务 churn。
+        let scan_rules = Arc::clone(&rules);
+        let scan_disabled = disabled.clone();
+        let batch = tokio::task::spawn_blocking(move || {
+            let mut found: Vec<(usize, usize, usize, String)> = Vec::new();
+            let mut timed_out: Vec<usize> = Vec::new();
+            for (ri, (name, compiled, _src)) in scan_rules.iter().enumerate() {
+                if scan_disabled.contains(name) {
+                    continue;
+                }
+                let mut rule_ok = true;
+                for (offset, chunk) in &chunks {
+                    match compiled.find_iter(chunk).collect::<Result<Vec<_>, _>>() {
+                        Ok(spans) => {
+                            for m in spans {
+                                found.push((
+                                    ri,
+                                    offset + m.start(),
+                                    offset + m.end(),
+                                    m.as_str().to_string(),
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            rule_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !rule_ok {
+                    timed_out.push(ri);
+                }
+            }
+            (found, timed_out)
+        });
+        // 每规则一档 `RE_DOS_BUDGET_MS` 的聚合上界（真挂起才触发全批 fail-closed）。
+        let budget =
+            Duration::from_millis(RE_DOS_BUDGET_MS).saturating_mul(rules.len().max(1) as u32);
+        let (found, timed_out) = match tokio::time::timeout(budget, batch).await {
+            Ok(Ok(out)) => out,
+            // 超时或任务 panic：整批 fail-closed——非停用规则全部按超时记账，零命中。
+            _ => (
+                Vec::new(),
+                rules
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (n, ..))| !disabled.contains(n))
+                    .map(|(ri, _)| ri)
+                    .collect(),
+            ),
+        };
+        let timed_out_names: HashSet<&str> = timed_out
+            .iter()
+            .filter_map(|ri| rules.get(*ri))
+            .map(|(n, ..)| n.as_str())
+            .collect();
         let mut hits = Vec::new();
         let mut seen: HashSet<(usize, usize)> = HashSet::new();
-        let mut timed_out: Vec<String> = Vec::new();
-        let mut succeeded: Vec<String> = Vec::new();
-        for (name, compiled, _src) in &custom {
+        for (ri, s, e, value) in found {
+            if !seen.insert((s, e)) {
+                continue;
+            }
+            // 区间保护：与占位符/凭据重叠整体跳过。
+            if overlaps_any(&protected, s, e) || overlaps_any(&cred, s, e) {
+                continue;
+            }
+            if credential_p2t.contains_key(&value) {
+                continue;
+            }
+            let Some((name, ..)) = rules.get(ri) else {
+                continue;
+            };
+            hits.push((name.clone(), value, s, e));
+        }
+        // 锁外结算：成功清零，超时累计，连续 3 次停用并告警。
+        for (name, ..) in rules.iter() {
             if disabled.contains(name) {
                 continue;
             }
-            let mut rule_ok = true;
-            for (offset, chunk) in &chunks {
-                let re = compiled.clone();
-                let input = chunk.clone();
-                let found = tokio::task::spawn_blocking(move || {
-                    re.find_iter(&input)
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|m| (m.start(), m.end(), m.as_str().to_string()))
-                        .collect::<Vec<_>>()
-                });
-                match tokio::time::timeout(Duration::from_millis(RE_DOS_BUDGET_MS), found).await {
-                    Ok(Ok(spans)) => {
-                        for (s, e, value) in spans {
-                            let (abs_s, abs_e) = (offset + s, offset + e);
-                            if !seen.insert((abs_s, abs_e)) {
-                                continue;
-                            }
-                            // 区间保护：与占位符/凭据重叠整体跳过。
-                            if overlaps_any(&protected, abs_s, abs_e)
-                                || overlaps_any(&cred, abs_s, abs_e)
-                            {
-                                continue;
-                            }
-                            if credential_p2t.contains_key(&value) {
-                                continue;
-                            }
-                            hits.push((name.clone(), value, abs_s, abs_e));
-                        }
-                    }
-                    _ => {
-                        rule_ok = false;
-                        break;
-                    }
-                }
-            }
-            if rule_ok {
-                succeeded.push(name.clone());
-            } else {
-                timed_out.push(name.clone());
-            }
-        }
-        // 锁外结算：成功清零，超时累计，连续 3 次停用并告警。
-        for name in succeeded {
-            self.account_rule(&name, false);
-        }
-        for name in timed_out {
-            self.account_rule(&name, true);
+            self.account_rule(name, timed_out_names.contains(name.as_str()));
         }
         hits
     }
@@ -492,6 +501,237 @@ impl PiiDetector {
         } else {
             tracing::warn!("自定义正则 {name} 扫描超时（第 {c} 次），跳过该规则");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `DCD-1`：启动装配从配置文件读取并抽取运行时注入内容
+// ---------------------------------------------------------------------------
+
+/// 自定义文件抽取结果：`(正则 [(name, pattern)], 字典 [(name, type)])`。
+pub type CustomFileEntries = (Vec<(String, String)>, Vec<(String, String)>);
+
+/// 从三个自定义配置文件路径读取并解析出 `(规则, 字典)`，供 `AppState` 启动装配
+/// 注入检测器（`DCD-1`）。格式与 `config::custom_file::load_custom_file` 一致
+/// （JSON / 极简 YAML / TXT 名单）；文件在配置加载期已 fail-closed 校验，此处仅
+/// 运行时再读抽取，读取/解析失败仍返回 `Err`（调用方按 fail-closed 拒启动）。
+pub fn load_custom_from_paths(
+    rules_file: Option<&std::path::Path>,
+    patterns_file: Option<&std::path::Path>,
+    dict_file: Option<&std::path::Path>,
+) -> std::result::Result<CustomFileEntries, String> {
+    let mut patterns = Vec::new();
+    for path in [rules_file, patterns_file].into_iter().flatten() {
+        patterns.extend(extract_patterns(&read_custom_value(path, false)?));
+    }
+    let mut dict = Vec::new();
+    if let Some(path) = dict_file {
+        dict.extend(extract_dict(&read_custom_value(path, true)?));
+    }
+    Ok((patterns, dict))
+}
+
+/// 读取并解析自定义文件为 JSON 值：TXT 走名单，`.yaml`/`.yml` 走极简 YAML，
+/// 其余 JSON 优先、失败回退 YAML（字典槽再回退 TXT 名单）。
+fn read_custom_value(
+    path: &std::path::Path,
+    is_dict: bool,
+) -> std::result::Result<serde_json::Value, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("自定义 PII 文件读取失败 {}: {e}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if ext.as_deref() == Some("txt") {
+        return Ok(txt_list(&text));
+    }
+    if matches!(ext.as_deref(), Some("yaml") | Some("yml")) {
+        return serde_json::from_str(&text)
+            .or_else(|_| yaml_subset(&text))
+            .map_err(|e| format!("自定义 PII 文件解析失败 {}: {e}", path.display()));
+    }
+    match serde_json::from_str(&text) {
+        Ok(v) => Ok(v),
+        Err(json_err) => match yaml_subset(&text) {
+            Ok(v) => Ok(v),
+            Err(_) if is_dict => Ok(txt_list(&text)),
+            Err(_) => Err(format!(
+                "自定义 PII 文件解析失败 {}: {json_err}",
+                path.display()
+            )),
+        },
+    }
+}
+
+/// TXT 名单：每行一名，`#` 整行/行尾注释忽略。
+fn txt_list(text: &str) -> serde_json::Value {
+    let items = text
+        .lines()
+        .filter_map(|line| {
+            let name = line.split('#').next().unwrap_or("").trim();
+            (!name.is_empty()).then(|| serde_json::Value::String(name.to_string()))
+        })
+        .collect();
+    serde_json::Value::Array(items)
+}
+
+/// 极简 YAML 子集（与 `config::custom_file` 同款解析语义的最小交集）：
+/// 支持 `- name: foo` + `pattern: bar` 列表映射、`- somename` 字符串列表、
+/// `key: value` 顶层映射；`#` 注释与空行忽略。
+fn yaml_subset(text: &str) -> std::result::Result<serde_json::Value, String> {
+    use serde_json::{Map, Value as V};
+    let mut items: Vec<V> = Vec::new();
+    let mut mapping = Map::new();
+    let mut has_mapping_line = false;
+    let mut has_list_line = false;
+    let mut current: Option<Map<String, V>> = None;
+    let flush = |current: &mut Option<Map<String, V>>, items: &mut Vec<V>| {
+        if let Some(m) = current.take()
+            && !m.is_empty()
+        {
+            items.push(V::Object(m));
+        }
+    };
+    for (idx, raw_line) in text.lines().enumerate() {
+        let no_comment = match raw_line.find('#') {
+            Some(p) => &raw_line[..p],
+            None => raw_line,
+        };
+        if no_comment.trim().is_empty() {
+            continue;
+        }
+        let indent = no_comment.len() - no_comment.trim_start().len();
+        let t = no_comment.trim();
+        if let Some(dash_rest) = t.strip_prefix('-') {
+            has_list_line = true;
+            flush(&mut current, &mut items);
+            let rest = dash_rest.trim();
+            if rest.is_empty() {
+                current = Some(Map::new());
+                continue;
+            }
+            if let Some(colon) = rest.find(':') {
+                let (k, v) = rest.split_at(colon);
+                let v = v[1..].trim();
+                if k.trim().is_empty() {
+                    return Err(format!("第 {} 行键为空", idx + 1));
+                }
+                let mut m = Map::new();
+                m.insert(k.trim().to_string(), V::String(strip_yaml_quotes(v)));
+                current = Some(m);
+            } else {
+                items.push(V::String(strip_yaml_quotes(rest)));
+                current = None;
+            }
+            continue;
+        }
+        if let Some(colon) = t.find(':') {
+            let (k, v) = t.split_at(colon);
+            let (k, v) = (k.trim(), v[1..].trim());
+            if k.is_empty() || k.contains(' ') && indent == 0 && has_list_line {
+                return Err(format!("第 {} 行形态非法: {t:?}", idx + 1));
+            }
+            if indent == 0 && current.is_none() && !has_list_line {
+                has_mapping_line = true;
+                mapping.insert(k.to_string(), V::String(strip_yaml_quotes(v)));
+            } else {
+                if k.is_empty() {
+                    return Err(format!("第 {} 行键为空", idx + 1));
+                }
+                match current.as_mut() {
+                    Some(m) => {
+                        m.insert(k.to_string(), V::String(strip_yaml_quotes(v)));
+                    }
+                    None => return Err(format!("第 {} 行缩进键无归属列表项: {t:?}", idx + 1)),
+                }
+            }
+            continue;
+        }
+        return Err(format!("第 {} 行无法解析: {t:?}", idx + 1));
+    }
+    flush(&mut current, &mut items);
+    if has_mapping_line && !has_list_line {
+        return Ok(V::Object(mapping));
+    }
+    if !items.is_empty() {
+        return Ok(V::Array(items));
+    }
+    if has_mapping_line {
+        return Ok(V::Object(mapping));
+    }
+    Err("空 YAML 文档".to_string())
+}
+
+/// 抽取正则规则 `(name, pattern)`：数组对象形、`name: pattern` 映射形，
+/// 以及顶层 `patterns:` 合并段。
+fn extract_patterns(value: &serde_json::Value) -> Vec<(String, String)> {
+    use serde_json::Value as V;
+    match value {
+        V::Array(items) => items
+            .iter()
+            .filter_map(|it| {
+                let o = it.as_object()?;
+                let name = o.get("name")?.as_str()?.trim();
+                let pattern = o.get("pattern")?.as_str()?;
+                (!name.is_empty() && !pattern.is_empty())
+                    .then(|| (name.to_string(), pattern.to_string()))
+            })
+            .collect(),
+        V::Object(map) => {
+            if let Some(inner) = map.get("patterns") {
+                return extract_patterns(inner);
+            }
+            map.iter()
+                .filter_map(|(k, v)| {
+                    let p = v.as_str().filter(|s| !s.is_empty())?;
+                    (!k.trim().is_empty()).then(|| (k.clone(), p.to_string()))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 抽取字典 `(name, type)`：`{name,type}`/字符串数组形、`name: type` 映射形，
+/// 以及顶层 `names:` 合并段；缺省 `type` 为 `name`。
+fn extract_dict(value: &serde_json::Value) -> Vec<(String, String)> {
+    use serde_json::Value as V;
+    match value {
+        V::Array(items) => items
+            .iter()
+            .filter_map(|it| match it {
+                V::String(s) if !s.trim().is_empty() => Some((s.trim().to_string(), "name".into())),
+                V::Object(o) => {
+                    let name = o.get("name")?.as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let typ = o
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or("name");
+                    Some((name.to_string(), typ.to_string()))
+                }
+                _ => None,
+            })
+            .collect(),
+        V::Object(map) => {
+            if let Some(inner) = map.get("names") {
+                return extract_dict(inner);
+            }
+            map.iter()
+                .filter_map(|(k, v)| {
+                    let typ = v.as_str().filter(|s| !s.trim().is_empty())?;
+                    (!k.trim().is_empty()).then(|| (k.clone(), typ.to_string()))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
