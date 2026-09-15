@@ -35,7 +35,7 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 |:-----|:-----|:-----|:-----|
 | 认证 | `GET_BINARY_SECRET` / `CREDENTIAL_SECRET` | 空（兼容模式） | 三因子之部署密钥；前者优先 |
 | 认证 | `GET_BINARY_HASH` | 空 | 独立生效：置位时拒绝调用方冒用 get 自身哈希的直调（`caller_hash == GET_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `GET_BINARY_SECRET` 无联动 |
-| 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同 |
+| 认证 | `CREDENTIAL_ADMIN_TOKEN` | 空 | 遗留兼容项；若设置须与 `OBSERVABILITY_ADMIN_TOKEN` 不同；**不再作为紧急吊销放行依据**（见 §7.5） |
 | 认证 | `AUTO_APPROVE` | `true` | 别名集（trim + 大小写不敏感）：`true/1/yes` 放行 / `false/0/no` 拒绝 / `none/pending/matrix` 转 Matrix 审批 |
 | 认证 | `CREDENTIAL_BLOCK_WAIT` | 关闭 | 凭据审批双模开关；开启条件为真值集合 `1/true/yes/on`（trim + 大小写不敏感），enrolled 篡改/未 enrolled 待审走 `300`s 阻塞等 reaction，默认（未设/非真值）保持 `202` 抛单（建单 + best-effort 发送即返回，接线见 `src/service/credential/approval.rs::approval_dual_mode`）；默认模式客户端按 `E_PENDING` 对同一请求轮询重试（建议指数退避），阻塞模式无需轮询；示例：`CREDENTIAL_BLOCK_WAIT=1` |
 | 入口 | `VEIL_ENTRY_MODE` | `full` | `full` / `credential-only` / `llm-only` |
@@ -320,6 +320,12 @@ get revoke --name "check-mail"
   （未配置）下三者恒 `403`（`E_AUTH`）不执行动作。存量 Go 部署迁移须配置部署密钥（Go `get` 实发
   `X-Get-Binary-Secret`，配置后无需改客户端）。`POST /credential` 取用路径不受影响。
 
+- `POST /revoke` 异步 `202` 轮询契约（`CRD-2`）：默认模式（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）下
+  与 `POST /credential` 同口径——`202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示**已建单
+  待审批**，**不代表吊销已完成**；调用方 SHALL 对同一请求轮询重试（建议指数退避），批准后吊销生效
+  （条目 `revoked=true`/`enabled=false`），拒绝/超时返回 `403`，重试不重复建单。`CREDENTIAL_BLOCK_WAIT=1`
+  时同请求阻塞返回终态、无需轮询。紧急吊销转常规审批路径同此契约。
+
 - `POST /revoke` 定位顺序 `key → caller_path → caller_hash → name`（`C5`，`veil-credential-flow-parity`）：
   `get revoke --name "check-mail"` 命中未吊销同名条目；重名 409——未吊销条目重名注册直接拒绝，
   已吊销条目的名称释放可复用。
@@ -396,7 +402,7 @@ get revoke --name "check-mail"
   不挂起等待真人 `✅/❎`；拒绝/过期语义由凭据审批链承载。原仓在流中挂起等待 Matrix 审批
  （`keepalive` + 超时默认拒绝并注入阻断帧）。
 - 路径集合（`R3`，`veil-reverify-fix`）：`audit-hold` 仅插入内存 pending 记录
-  （`src/handler/llm/pump/spawn.rs::audit_pending`），**不建 Matrix 审批票**（无 tracked 发送、
+  （`audit_pending` 建单点迁移至 `src/handler/llm/pump/spawn/event_loop.rs:414`），**不建 Matrix 审批票**（无 tracked 发送、
   无真实 `event_id` 键建单）；审批建单路径白名单见 §6.7，规范文本见本 change spec
   「审批建单路径白名单」。
 - 影响：长连接不挂起，对 Hermes 更友好；但“危险调用被拦”在流式面表现为 pending 建单
@@ -431,7 +437,7 @@ get revoke --name "check-mail"
 - 变更：`CREDENTIAL_BLOCK_WAIT` 未设或非真值时，enrolled 哈希篡改/未 enrolled 待审请求立即返回
   `202` + `E_PENDING`（先经 tracked 发送取 Bot 返回的真实 Matrix event id 并以之为 pending 键建单，
   再即返回），同一请求不阻塞；原仓 Python 为同一请求内
-  同步阻塞 `300`s（批准返回凭据、拒绝 `403`、超时 `408`，`_credential.py:26,433,455`）。
+  同步阻塞 `300`s（批准返回凭据、拒绝 `403`、超时 `408`，`_credential.py:26,445,455`）。
 - 发送路由差异（`F1`，`veil-oracle-followup-fix`）：审批建单走 `NotificationSink::send_text_tracked`
   （需真实回执——真实 `event_id` 是反应回调命中 pending 的唯一键；发送失败/取不到 id 即 fail-closed
   返回 `403`，不建不可决单）；事件环/失败通知走 `notify_text` 有界 spool 的 best-effort 路径
@@ -446,7 +452,7 @@ get revoke --name "check-mail"
   `300`s 内批准同请求返回凭据、拒绝 `403`、超时按拒绝返回 `403` 且不悬挂。
 - 超时码归并（迁移注意，BREAKING 补充）：`CREDENTIAL_BLOCK_WAIT=1` 阻塞超时在本仓与拒绝同码返回 `403`
   （`VeilError::Auth`，`src/service/credential/approval.rs`），相对 Python 原仓超时 `408`
-  （`_credential.py:433`）为**有意归并**——超时与拒绝对下游同码，下游重试语义一律按拒绝处理；
+  （`_credential.py:445`）为**有意归并**——超时与拒绝对下游同码，下游重试语义一律按拒绝处理；
   依赖 `408` 区分超时/拒绝的下游须以本条为准，恢复 `408` 须另立 change 并撤回本条。
 - 影响：不识别 `202` 的旧客户端须补轮询；Go 存量 `get` 已能解析 `202 + E_PENDING` 错误体
   （`ErrMessage`，见 §5），但 CLI 不自动轮询——轮询由调用方实现，或用 `CREDENTIAL_BLOCK_WAIT=1` 阻塞；
@@ -456,7 +462,9 @@ get revoke --name "check-mail"
 写入中立条目（`enabled=false`）后建 `MatrixBranch::Register` 审批单，复用同一双模口径：默认（`CREDENTIAL_BLOCK_WAIT`
 未设或非真值）返回 `202 + E_PENDING` 抛单（后台等待落定回写）；`CREDENTIAL_BLOCK_WAIT=1` 时阻塞至 `300s`。
 三态落定：`🔓` 保持 `disabled`（不激活）、`✅` 置 `enabled=true`、`❎` 与等待超时置 `revoked=true`（fail-closed）。
-未获 `✅` 前条目不可用。
+未获 `✅` 前条目不可用。同一未决注册请求的重试经决策表幂等（`CRD-6`）：返回同一
+`202 + E_PENDING`、不重复建单、不返回 `409`；终态后重试返回终态（`✅` 放行、`❎`/超时 `403`），
+与 §5 revoke `202` 轮询契约同口径。
 
 吊销类审批 `🔓` 按拒绝处理（`T1`，`veil-revoke-reaction-fix`）：紧急吊销转常规审批票与常规吊销票口径一致——
 `🔓`（`REACTION_AUTO_UNLOCK`）不执行吊销，同请求重试返回 `403` 且条目保持原状（`revoked=false`、`enabled`
@@ -710,6 +718,10 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   内网判定只认 TCP 远端地址（`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头
   （防伪造绕过）。未命中两依据时转常规审批，不直接吊销。与常规吊销同注册表定位条目
   （见 `src/handler/credential.rs::emergency_revoke_handler`）。
+  管理 token 源为 `OBSERVABILITY_ADMIN_TOKEN`（与 `/_admin` 同一 token，`CRD-7`）；
+  `CREDENTIAL_ADMIN_TOKEN` **不再作为紧急吊销放行依据**（**BREAKING**）——仅携带旧
+  `CREDENTIAL_ADMIN_TOKEN` 值且来源非内网时转常规审批，不直接吊销。迁移：将
+  `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs:458-464`）。
 - 紧急吊销豁免网段（`C13`，`veil-credential-flow-parity`）：内网来源覆盖
   `localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、
   `169.254.0.0/16`（链路本地）、`100.64.0.0/10`（CGNAT）、`fd00::/8`（ULA）、`fe80::/10`
@@ -848,7 +860,7 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 ### 8.5 测试口径注明（T-M7/T-M9，`veil-review-followup-test-gap`）
 
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
-- 原仓 `api_spec_conformance` 12 项（cargo）vs 本仓 `scripts/api_conformance.py` 23 项（脚本），口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）。
+- 本仓真 SDK 一致性口径为脚本 `scripts/api_conformance.py` **23 项（脚本口径）**，口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）；原仓 `api_spec_conformance` 的 12 项为 **cargo 测试口径**（历史对照，不作为本仓脚本口径标签）。
   **已纳入 gate 步骤**（`veil-test-coverage-fill` T3）：`bash scripts/gate.sh` 第 6 步执行真 SDK 一致性
   （23 项 = 14 常规 + 3 阻断 + 5 取用 + 1 无库 503），与 fmt/clippy/test/文档路径/文件大小五步串联，任一失败整体非零退出。
   前置条件：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
