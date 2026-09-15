@@ -94,6 +94,6 @@
   - 落地：三处均取 20ms 固定有界等待（mock 单向推送无客户端 readiness 可轮询；策略已注于各 mock 处注释）；三轮重跑 21/21 通过
 - [x] 10.2 两处复核
   - Verify: `truncation:62` 50ms 复核结论已记录，不足够则同步加固
-  - Verify: `src/service/audit.rs:1086` 线程 sleep 链式上限复核结论已记录，叠加超标则设上限熔断
+  - Verify: `src/service/audit/log.rs:444` 线程 sleep 链式上限复核结论已记录，叠加超标则设上限熔断
   - 复核结论：`truncation:62` 50ms 为单次分片间隔（非循环），三轮重跑 2/2 通过，足够，保留；
     `audit.rs:1086` 为单次重试（失败→sleep 50ms→再试一次→熔断返回），每调用至多 +50ms、无循环叠加，不超标，无需熔断上限

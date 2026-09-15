@@ -2,7 +2,7 @@
 
 六维深度审查（2026-09-11）在 LLM 网关三协议流式/非流式面确认 11 项待收敛偏差（见 proposal Why 与覆盖表）。现状真相源：
 
-- Responses 终止合成分支（`src/handler/llm/pump/spawn.rs:218-244`）在 `terminal_sent` 检查前执行，`response.completed` 后仍可能合成 `response.failed`（`N1`）；`incomplete` 被当 failed 处理并注入 7 帧序列，丢弃 `incomplete_details`（`P4`）。
+- Responses 终止合成分支（`src/handler/llm/pump/spawn/event_loop.rs:203-218`）在 `terminal_sent` 检查前执行，`response.completed` 后仍可能合成 `response.failed`（`N1`）；`incomplete` 被当 failed 处理并注入 7 帧序列，丢弃 `incomplete_details`（`P4`）。
 - Chat 见 `finish_reason` 后不补 `[DONE]`（`spawn.rs:663-677`）；真空流三协议仅 Responses 有终止（`src/service/block_inject/frames.rs:293-297`、`spawn.rs:614`）（`P1`/`P2`）。
 - SSE 解析对块末孤立 `\r` 立即切行（`src/service/sse/parser.rs:117-160`），TCP 分片刻在 `\r`/`\n` 间断开时 `event:`/`data:` 分属两事件（`N3`）；无冒号 `data` 行被整行忽略（`P11`）。
 - 非流 `classify_empty`（`src/service/llm_gateway/mod.rs:159-175`）把非 502/401 且非 JSON 的错误体替换为合成 `502 E_EMPTY_BODY`（`N2`）。

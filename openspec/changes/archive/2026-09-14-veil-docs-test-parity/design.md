@@ -19,7 +19,7 @@
 - **`TST-4`**：`src/service/block_inject.rs:189`（函数 `truncation_tss01_openended_no_fake_success`，`:182`）`assert!(!joined_a.contains("message_stop") || joined_a.contains("truncated"))`；`frames.rs:40-48` 的 Anthropic 阻断帧恒含理由文案 `truncated`，故析取恒真。
 - **`TST-5`**：解锁链孤立单测在 `src/keepass.rs`、`src/service/tpm.rs`，无「解封→口令→解锁」串联链 4 例。
 - **`TST-6`**：`on_reaction` 命中/未命中/重复在 `src/service/matrix/approval.rs:344/:446/:494/:635` 已覆盖；空白名单落定缺口 1 例（交叉 `POL-5`）。
-- **`TST-7`**：审计零明文测试（`src/service/audit/log.rs:718` 等）均为静态样本，无动态映射输入。
+- **`TST-7`**：审计零明文测试（`src/service/audit/log/log_tests.rs:263` 等）均为静态样本，无动态映射输入。
 - **`TST-8`**：`src/service/metrics/summarize.rs:47 redact_summary` 无 ipv4/id_card/bank_card 分支；另一引擎 `src/service/metrics/sample.rs:142 sample_mask` 有实现+测试，二者文档化分治（`summarize.rs:42-46`）。
 - **`TST-9`**：`scripts/api_conformance.py` 共 20 项；Anthropic 覆盖 `tool_use`（`:119-137`、`:491-530`），缺 `error`、CR-only、`thinking` 三项。`tests/sentinel_sdk_replay.rs` 网关侧重 `body.contains`（substring），精确断言集中于解析/usage/CR 用例（`:262-271`、`:342-355`、`:367-401`、`:404-433`）。
 - **`TST-10`**：`tests/http_e2e_audit_approve.rs:155 approve_branch_keeps_stream_without_block_frame` 已断言 pending 非空（`:170-173`）、无阻断帧（`:175-177`）、流不断（`:178`），`:193 stream_nonstream_verdict_parity_e2e` 补充；审查所指缺口经核验**已存在覆盖**。

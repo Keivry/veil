@@ -1,6 +1,6 @@
 ## 1. `N1` Responses 双终止帧守卫
 
-- [x] 1.1 `src/handler/llm/pump/spawn.rs:218-252`：`incomplete/error` 合成分支收敛为 `error` 合成路径，并在分支首行加 `if terminal_sent { continue; }` 守卫（先于 `responses_failed_sent` 判定，已发终端后任何后续帧一律忽略）
+- [x] 1.1 `src/handler/llm/pump/spawn/event_loop.rs:203-218`：`incomplete/error` 合成分支收敛为 `error` 合成路径，并在分支首行加 `if terminal_sent { continue; }` 守卫（先于 `responses_failed_sent` 判定，已发终端后任何后续帧一律忽略）
   - 验证：`cargo test -p veil responses_completed_then_error` 通过；构造 `response.completed` 后跟 `type:"error"` 的流，断言下游 `response.completed` 恰一、无 `response.failed`、终端后无数据帧
 - [x] 1.2 补 `N1` 回归测试：`completed → error` 与 `completed → incomplete` 两序列
   - 验证：`cargo test -p veil n1_single_terminal` 通过；`block_inject::terminal_count(&frames, "responses") == 1` 且 `response.failed` 计数为 0
@@ -26,7 +26,7 @@
 
 ## 4. `P1` Chat `[DONE]` 补发
 
-- [x] 4.1 `src/handler/llm/pump/spawn.rs:663-677`：见非 null `finish_reason`（`saw_finish_reason`，`spawn.rs:177`）且流结束时仍未发 `[DONE]`，flush 边界后补发恰一 `data: [DONE]` 并置终端/`mark_terminal`；`finish_reason` 后到达的 usage 尾帧（`choices: []`）照常透传，不提前截断；`truncated_mode=open_ended` 观测保留（复用现有枚举）
+- [x] 4.1 `src/handler/llm/pump/synth_flush.rs:56-80`：见非 null `finish_reason`（`saw_finish_reason`，`spawn.rs:177`）且流结束时仍未发 `[DONE]`，flush 边界后补发恰一 `data: [DONE]` 并置终端/`mark_terminal`；`finish_reason` 后到达的 usage 尾帧（`choices: []`）照常透传，不提前截断；`truncated_mode=open_ended` 观测保留（复用现有枚举）
   - 验证：`cargo test -p veil chat_finish_reason_without_done` 通过；断言 `[DONE]` 恰一、usage 帧未丢、`truncated_mode==open_ended`
   - 验证：上游已发 `[DONE]` 的正常流不重复补发（`terminal_count==1`）
 - [x] 4.2 补 `P1` 回归测试：finish_reason 后断流、finish_reason+usage 尾帧后断流、正常 `[DONE]` 三场景
@@ -64,7 +64,7 @@
 
 ## 8. `P9` 工具分桶对齐
 
-- [x] 8.1 `src/handler/llm/pump/fragments.rs:446/452/457/480` 的 Responses `output[]` 桶号由 `i as u32` 对齐为 `item.output_index.unwrap_or(i)`，与非流 `src/service/llm_gateway/tool.rs:462-466` 同键
+- [x] 8.1 `src/service/llm_gateway/tool.rs:149-156/452/457/480` 的 Responses `output[]` 桶号由 `i as u32` 对齐为 `item.output_index.unwrap_or(i)`，与非流 `src/service/llm_gateway/tool.rs:462-466` 同键
   - 验证：`cargo test -p veil responses_output_bucket` 通过；`output_index` 存在时两路径同值、缺失时均回退枚举下标
 - [x] 8.2 补流/非流交叉一致性测试（`output_index` 存在/缺失两场景，流式分片与非流 `extract_tool_calls` 桶号相同）
   - 验证：`cargo test -p veil tool_bucket_parity` 通过

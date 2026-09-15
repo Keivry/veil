@@ -1,6 +1,6 @@
 ## Context
 
-见 `proposal.md` Why。现状：`src/service/mod.rs:424` 每次新建 Vault、`handler.rs:1178` 每次新建 Detector 致跨请求还原断裂；`mod.rs:321` header==caller 耦合致 Go 正常请求误转审批；凭据审批只有 202 抛单无阻塞等；网关 `instructions` 未注入、还原后二次掩码、非流零审计、Anthropic 内层 index、全局完成误标；注册表/审计/指标/管理面多处口径重写；测试只有单测无 HTTP E2E。约束：不改 Go 二进制协议、不引入重型依赖、fail-closed 优先、阈值数值不动（只修接线）。
+见 `proposal.md` Why。现状：`src/service/credential/mod.rs:55` 每次新建 Vault、`handler.rs:1178` 每次新建 Detector 致跨请求还原断裂；`mod.rs:321` header==caller 耦合致 Go 正常请求误转审批；凭据审批只有 202 抛单无阻塞等；网关 `instructions` 未注入、还原后二次掩码、非流零审计、Anthropic 内层 index、全局完成误标；注册表/审计/指标/管理面多处口径重写；测试只有单测无 HTTP E2E。约束：不改 Go 二进制协议、不引入重型依赖、fail-closed 优先、阈值数值不动（只修接线）。
 
 ## Goals / Non-Goals
 

@@ -26,12 +26,12 @@ README 与 canonical spec 中指向 Python 原仓 `_llm.py` 的每个行号引�
 
 ### Requirement: 源码注释指针准确
 
-Rust 源码注释中引用的本地文件与行号 SHALL 指向所述内容；引用「approve 空白名单启动门禁」时 SHALL 指向配置解析处的 `src/config/env_parse.rs:485-491`（`parse_whitelist` + 空白名单拒启动）与显式门禁 `src/main.rs:58`（`preflight_whitelist`），SHALL NOT 指向 `env_parse.rs:307-310`（该处为 `load_storage` 返回值列表）。
+Rust 源码注释中引用的本地文件与行号 SHALL 指向所述内容；引用「approve 空白名单启动门禁」时 SHALL 指向配置解析处的 `src/config/env_parse.rs:469-478`（`validate_approve_whitelist` + 空白名单拒启动）与显式门禁 `src/main.rs:45`（`preflight_whitelist`），SHALL NOT 指向 `env_parse.rs:307-310`（该处为 `load_storage` 返回值列表）。
 
 #### Scenario: 门禁注释指向真实位置
 
 - **WHEN** 核查 `src/service/audit/verdict.rs`、`src/service/audit.rs`、`src/service/block_inject.rs`、`src/handler/llm/nonstream.rs` 中关于 approve 空白名单门禁的注释
-- **THEN** 其指针为 `env_parse.rs:485-491`（+ `main.rs:58`），打开后确为白名单校验与拒启动逻辑
+- **THEN** 其指针为 `env_parse.rs:469-478`（+ `main.rs:45`），打开后确为白名单校验与拒启动逻辑
 
 ### Requirement: canonical spec 与 README 口径同源
 

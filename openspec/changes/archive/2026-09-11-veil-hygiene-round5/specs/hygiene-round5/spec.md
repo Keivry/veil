@@ -20,7 +20,7 @@
 
 ### Requirement: Python 注册表迁移测试专用化
 
-`CallerRegistry::migrate_python_registry`（`src/registry.rs:372`）SHALL NOT 以生产可见的 `pub fn` 形态存在；SHALL 移入 `#[cfg(test)]`（若改走 `examples/` 须在 design 记录理由）。生产加载入口 SHALL 保持唯一：`CallerRegistry::load_from` 的新格式解析与完整性校验路径不变；Python 旧格式（`version/callers/allowed_entries`）解析、迁移告警与 `.bak` 备份语义 SHALL 保持不变，测试（`registry.rs:644`）SHALL 保持通过。
+`CallerRegistry::migrate_python_registry`（`src/registry/migrate.rs:41`）SHALL NOT 以生产可见的 `pub fn` 形态存在；SHALL 移入 `#[cfg(test)]`（若改走 `examples/` 须在 design 记录理由）。生产加载入口 SHALL 保持唯一：`CallerRegistry::load_from` 的新格式解析与完整性校验路径不变；Python 旧格式（`version/callers/allowed_entries`）解析、迁移告警与 `.bak` 备份语义 SHALL 保持不变，测试（`registry.rs:644`）SHALL 保持通过。
 
 #### Scenario: 生产构建零引用
 

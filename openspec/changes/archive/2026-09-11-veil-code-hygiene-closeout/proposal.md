@@ -6,13 +6,13 @@
 - `A2`（MED）配置巨石：`src/config/env_parse.rs` 770/800 行（自检测试 `:506-515`），`load_from` 220 行串行巨石（`:256-473`，auth/storage/redaction/audit/LLM 逐域内联）。
 - `A3`（LOW）spawn 语义未声明：`src/handler/llm/dispatch.rs:43-52` 为 `tokio::spawn(...).await`（spawn 后立即 await），正常路径无收益；实际作用是 panic→`JoinError`→500 与客户端断连时任务脱离续跑，代码无注释声明。
 - `A4`（LOW）日志级别失当：`src/error.rs:153` 对全部错误（含预期 4xx 404/400）一律 `tracing::error!`，稀释真告警。
-- `X3`（LOW 性能）热路径 O(K×N)：`src/service/redaction/scope.rs:120-158` 的 `restore_response_with_spans` 先全量 restore，再对 `scan_token_forms` 每个 token 循环调 `restore_response`；`src/service/credential_vault.rs:131-150` 的 `restore` 每次经 `snapshot_t2p()`（:122-128）全表克隆并按全部 token（上限 5000 凭据 + 1000 PII）重建 alternation 正则；调用点 `src/handler/llm/pump/spawn.rs:443/483/595` 为每 SSE 事件。
+- `X3`（LOW 性能）热路径 O(K×N)：`src/service/redaction/scope.rs:120-158` 的 `restore_response_with_spans` 先全量 restore，再对 `scan_token_forms` 每个 token 循环调 `restore_response`；`src/service/credential_vault.rs:131-150` 的 `restore` 每次经 `snapshot_t2p()`（:122-128）全表克隆并按全部 token（上限 5000 凭据 + 1000 PII）重建 alternation 正则；调用点 `src/handler/llm/pump/spawn/event_loop.rs:571-599/483/595` 为每 SSE 事件。
 - `X4`（LOW 死码，lint 盲区）四组生产零引用符号：`decide_via_gateway`（`src/service/audit/verdict.rs:36`，仅测试 `hold.rs:506/519/539` 用；README §6.4 已声明流式审批不再同步阻塞）、`is_unlocked_by_password`（`src/keepass.rs:234`，仅测试 `:591/596/603` 用；生产走 `is_unlocked()` `:257`）、`SSE_SNAPSHOT_SECS`/`SSE_DELTA_SECS`（`src/service/admin/sse.rs:37/39`，仅测试 `:277/278` 用）、`SqliteOutcome.memory_only`（`src/state.rs:164`，生产只写不读）。
 - `X5`（=`P8`，LOW）不可达分支：`src/service/llm_gateway/placeholder.rs:175-189` 第二个 `if protocol == Anthropic` 恒不可达（`:141` 已 return；`:159` 已对 Responses return）。
 - `X6`（LOW）重复提取器：`PeerIp` 双实现——`src/handler/credential.rs:297-315`（`Option<String>`）vs `src/service/admin/sse.rs:106-122`（`IpAddr`），同读 `ConnectInfo` 同禁代理头。
 - `X7`（LOW）重复算法：`src/service/credential_vault.rs:131-150`（restore）与 `:176-194`（redact_with_map）算法全同（长度降序 + escape + alternation + 按 map 替换），仅方向相反。
 - `X8`（LOW）重复回退链：`src/service/llm_gateway/usage.rs:105-148` vs `:159-205` 三级回退链重复（Responses 三级 + Anthropic 回退）。
-- `X9`（LOW）垫片未收敛：`src/service/audit_hold.rs:5-9` 自述「新代码应走 `service::audit::*`」，但 `src/handler/llm/pump/spawn.rs:28` 仍引 `audit_hold::{AuditHold, RequestKeepalive}`。
+- `X9`（LOW）垫片未收敛：`src/service/audit_hold.rs:1-8` 自述「新代码应走 `service::audit::*`」，但 `src/handler/llm/pump/spawn.rs:28` 仍引 `audit_hold::{AuditHold, RequestKeepalive}`。
 
 **关键事实（死码逃逸根因）**：`src/lib.rs:1-11` 将全部顶层模块以 `pub mod` 暴露，rustc `dead_code` lint 对 pub 可达项按公开 API 处理、不产生告警，故 `cargo clippy` 全绿与「存在生产零引用 pub 项」并存（`X4`/`X5` 即此类）。因此本 change 的死码清理 MUST NOT 依赖 lint，必须逐项删除后单独编译验证，并同步处理重导出与测试 import。
 

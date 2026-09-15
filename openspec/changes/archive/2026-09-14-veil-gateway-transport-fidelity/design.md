@@ -2,12 +2,12 @@
 
 独立六维审查（2026-09-14，C3 LLM 网关传输面）确认 7 项传输保真偏差（见 proposal Why 与覆盖表）。现状真相源：
 
-- SSE 出口仅重放 `event:`，丢 `id`/`retry`：解析侧已捕获（`src/service/sse/parser.rs:248-255`），出口 `src/handler/llm/pump/spawn.rs:559-563`（JSON 分支）与 `:607-611`（非 JSON 分支）只拼 `event: {type}`；`event:`/`data:` 分块时解析块分发按块独立，配对丢失（`parser.rs:227-265 dispatch_block`）。Python 对照 `_llm.py:5285-5318` 暂存 `event`/`id` 与 `data` 同块写出、`retry` 直通。
-- Anthropic 会话/模型缺失：`extract_conv_id`（`src/service/llm_gateway/tool.rs:580-620`）分支仅覆盖顶层 `id`、`response.id`、`data.id`、`error.id`，无 `message.id`；流泵模型仅读顶层 `v.get("model")`（`src/handler/llm/pump/spawn.rs:198-202`）。Python `_llm.py:350-368` 提取 `data['message']['id']`。
+- SSE 出口仅重放 `event:`，丢 `id`/`retry`：解析侧已捕获（`src/service/sse/parser.rs:248-255`），出口 `src/handler/llm/pump/spawn/event_loop.rs:50-62`（JSON 分支）与 `:607-611`（非 JSON 分支）只拼 `event: {type}`；`event:`/`data:` 分块时解析块分发按块独立，配对丢失（`parser.rs:227-265 dispatch_block`）。Python 对照 `_llm.py:5285-5318` 暂存 `event`/`id` 与 `data` 同块写出、`retry` 直通。
+- Anthropic 会话/模型缺失：`extract_conv_id`（`src/service/llm_gateway/tool.rs:580-620`）分支仅覆盖顶层 `id`、`response.id`、`data.id`、`error.id`，无 `message.id`；流泵模型仅读顶层 `v.get("model")`（`src/handler/llm/pump/event.rs:175-181`）。Python `_llm.py:350-368` 提取 `data['message']['id']`。
 - Responses error 形态：`responses_error_object`（`src/handler/llm/pump/event.rs:138-161`）仅读嵌套 `error` 对象；官方 `ResponseErrorEvent` 字段在顶层（`openai/types/responses/response_error_event.py`：`code`/`message`/`param`/`sequence_number`/`type`）。
 - 透传无界读与头泄漏：`src/handler/llm/dispatch.rs:328` `up.bytes().await` 全量读，超限判定 `:329`；`:318-326` 拷贝全部上游头，`:332-337` hop 过滤不含 `x-veil-*`。
 - `stream_options` 三态：`should_inject_stream_options`（`src/service/llm_gateway/protocol.rs:149-156`）非对象返回 `true`；`inject_stream_options`（`:159-178`）整体替换非对象。
-- Anthropic 阻断帧与参数污染：`anthropic_block_frames`（`src/service/block_inject/frames.rs:40-48`）硬编码 `index:0`；fragments `input` 分支（`src/handler/llm/pump/fragments.rs:155-174`）+ `normalize_tool_args_with`（`src/service/llm_gateway/tool.rs:21-38`）把 `input:{}` 序列化为 `"{}"` 再与 `partial_json` 拼接。
+- Anthropic 阻断帧与参数污染：`anthropic_block_frames`（`src/service/block_inject/frames.rs:40-48`）硬编码 `index:0`；fragments `input` 分支（`src/service/llm_gateway/tool.rs:390-404`）+ `normalize_tool_args_with`（`src/service/llm_gateway/tool.rs:21-38`）把 `input:{}` 序列化为 `"{}"` 再与 `partial_json` 拼接。
 
 约束：本 change 只写规划 artifacts，不改 `src/`、`tests/` 与 README；不新增依赖；不碰协议终端语义与审计 verdict。
 
@@ -30,7 +30,7 @@
 
 ### D1：SSE 出口信封三要素保真（`TRN-1`）
 
-**决策**：出口信封在保留既有 `event:` 重放基础上，补齐两项——① 从 `SseEvent.id`/`SseEvent.retry` 透出 `id:`/`retry:` 行（`retry` 仅在合法整数值透出，与解析侧口径一致）；② 跨块配对：当块分发产生「有 `event` 无 `data`」的事件时，将 `event` 压入 FIFO 暂存、将 `id` 记为最近值（WHATWG last-event-id 语义），下一含 `data` 的块在出口重建为「`event:`+`id:`（最近值）+`data:`」同块；`retry` 随其所在块透出。上游正常同块事件不受影响。**计数保真**：暂存只在出口块重建，不额外产生或吞并事件——`SseEvent` 计数（`src/service/sse/parser.rs:263 sse_event_count`）与出口转发帧计数（`src/handler/llm/pump/spawn.rs:647 metrics.add_sse_event()` 与 `forwarded`）对分块信封流须与同内容非分块流逐一致（审计与 metrics 语义不变）。
+**决策**：出口信封在保留既有 `event:` 重放基础上，补齐两项——① 从 `SseEvent.id`/`SseEvent.retry` 透出 `id:`/`retry:` 行（`retry` 仅在合法整数值透出，与解析侧口径一致）；② 跨块配对：当块分发产生「有 `event` 无 `data`」的事件时，将 `event` 压入 FIFO 暂存、将 `id` 记为最近值（WHATWG last-event-id 语义），下一含 `data` 的块在出口重建为「`event:`+`id:`（最近值）+`data:`」同块；`retry` 随其所在块透出。上游正常同块事件不受影响。**计数保真**：暂存只在出口块重建，不额外产生或吞并事件——`SseEvent` 计数（`src/service/sse/parser.rs:263 sse_event_count`）与出口转发帧计数（`src/handler/llm/pump/spawn/event_loop.rs:685-688 metrics.add_sse_event()` 与 `forwarded`）对分块信封流须与同内容非分块流逐一致（审计与 metrics 语义不变）。
 
 **理由**：解析侧已保留字段而出口丢字段属实现缺口（非设计取舍）；`id` 的 WHATWG 语义是「最近一次出现的 id 对后续事件持续有效」，故为最近值而非 FIFO；`event` 是块级字段，跨块暂存须 FIFO 配对（对齐 Python `slow_event_pending` 与 `_llm.py:5285-5318`）。若让 `event:` 成为孤立块，下游严格 SSE/JSON 解析按块读取会产生空 data 或 JSONDecodeError（Python 注释明确此动机）。
 

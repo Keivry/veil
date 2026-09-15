@@ -33,7 +33,7 @@
 
 ## 4. Responses 四类工具 delta 审计覆盖（`RED-4`）
 
-- [x] 4.1 `src/handler/llm/pump/fragments.rs:181-372` Responses 分支为 `response.code_interpreter_call_code.delta`/`response.shell_call_command.delta`/`response.mcp_call_arguments.delta`/`response.custom_tool_call_input.delta` 建槽并累积参数分片（键按 `output_index`/`item_id`，对齐 Python `_llm.py:783-791`）
+- [x] 4.1 `src/service/llm_gateway/tool.rs:419-482` Responses 分支为 `response.code_interpreter_call_code.delta`/`response.shell_call_command.delta`/`response.mcp_call_arguments.delta`/`response.custom_tool_call_input.delta` 建槽并累积参数分片（键按 `output_index`/`item_id`，对齐 Python `_llm.py:783-791`）
   - 验证：`cargo test -p veil responses_four_delta_kinds_accumulate` 通过；四类各产生分片并入对应槽、`tool_triples` 可见
   - 验证：`grep -n "code_interpreter_call_code\|shell_call_command\|mcp_call_arguments\|custom_tool_call_input" src/handler/llm/pump/fragments.rs` 命中四类识别
 - [x] 4.2 `src/handler/llm/pump/event.rs:258-266 is_minor_event` 从 Responses 次要集移除 `mcp`/`code_interpreter` 工具 delta，使审计判定可达（`reasoning`/`image_gen` 维持次要）
@@ -48,7 +48,7 @@
 - [x] 5.1 `src/service/audit/hold.rs:200-243` 拆分判定：新增审计到期谓词 `is_audit_due_event`——Chat 任意非空 `finish_reason`（顶层、`choices[].finish_reason`、`delta.finish_reason`、`message.finish_reason`，`tool_calls` 在内）触发评估/阻断；`is_complete_event`（全局完成）移除四处 `tool_calls`，仅 `message_stop`/`response.completed`/`response.failed`/`response.incomplete` 触发 `mark_completed`
   - 验证：`cargo test -p veil chat_tool_calls_still_audit_due` 通过；仅 `finish_reason:"tool_calls"` 帧在 `block` 模式危险参数下触发阻断、良性参数下放行
   - 验证：`grep -n "is_audit_due_event\|is_complete_event" src/service/audit/hold.rs` 显示两谓词分离，且 `is_complete_event` 内无 `tool_calls` 分支
-- [x] 5.2 `src/handler/llm/pump/spawn.rs:339-531` 接线：槽重放 `decide::tool_replay_slot`、评估门（`:410-442`）、释放 `release_audited`（`:484-489`）与缓冲判定 `should_buffer_tool_frame`（`:364`）改用审计到期谓词；`mark_completed`（`:530-531`）改用全局完成谓词，`tool_calls` 后晚到分片不再被 `push_fragment`（`hold.rs:72-78`）短路而照常累积入 `args_by_index`
+- [x] 5.2 `src/handler/llm/pump/spawn/event_loop.rs:315-386` 接线：槽重放 `decide::tool_replay_slot`、评估门（`:410-442`）、释放 `release_audited`（`:484-489`）与缓冲判定 `should_buffer_tool_frame`（`:364`）改用审计到期谓词；`mark_completed`（`:530-531`）改用全局完成谓词，`tool_calls` 后晚到分片不再被 `push_fragment`（`hold.rs:72-78`）短路而照常累积入 `args_by_index`
   - 验证：`cargo test -p veil chat_late_tool_fragment_audited` 通过；`finish_reason:"tool_calls"` 后晚到危险参数被审计且 `block` 模式阻断、不透传
   - 验证：`cargo test -p veil chat_tool_calls_not_global_complete` 通过；仅 `tool_calls` 时 `completed` 未置位、后续分片照常累积
 - [x] 5.3 `src/handler/llm/pump/spawn/terminal.rs:52-190` 新增终端最终审计：在清除 `pending_tool_frames`/收尾前，对 `hold.tool_triples()` 执行恰一次幂等 `evaluate_and_record`（`TerminalCtx` 扩展携带 `audit_sink`/`audit_mode`/`audit_policy`/`approval_whitelist`/协议）；`Block` 走既有阻断臂注入终端并丢弃持仓，`Allow`/`NeedApproval` 释放，已判定参数由 `release_audited` 移出持仓或 final-flush 标志保证不重复评估
@@ -69,7 +69,7 @@
 
 ## 7. Chat 审计按声明 index 分桶（`RED-7`）
 
-- [x] 7.1 `src/handler/llm/pump/fragments.rs:31-92` Chat 分桶把 `chat_bucket(ci, idx)` 的 `ci` 改为 `ch.get("index")` 声明值（缺省回退枚举位置）；`src/service/llm_gateway/tool.rs:167 chat_bucket` 语义保持 `declared*64+idx`
+- [x] 7.1 `src/service/llm_gateway/tool.rs:221-309` Chat 分桶把 `chat_bucket(ci, idx)` 的 `ci` 改为 `ch.get("index")` 声明值（缺省回退枚举位置）；`src/service/llm_gateway/tool.rs:167 chat_bucket` 语义保持 `declared*64+idx`
   - 验证：`cargo test -p veil chat_bucket_declared_index` 通过；`choices[].index` 乱序/跳号（如 2、0、5）各 choice 分片归入各自槽
   - 验证：`grep -n "get(\"index\")" src/handler/llm/pump/fragments.rs` 命中 choice 声明 index 读取
 - [x] 7.2 回归：单 choice 分桶键值与旧行为等值

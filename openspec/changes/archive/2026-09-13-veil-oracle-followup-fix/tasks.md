@@ -26,7 +26,7 @@
 
 ## 3. `F3` Responses 工具分片先审后放
 
-- [x] 3.1 `src/handler/llm/pump/spawn.rs:324-325`：`should_buffer_tool_frame` 与 `should_suppress_held_output` 对 Responses 协议生效，未完成工具分片先缓冲、不直接下发
+- [x] 3.1 `src/handler/llm/pump/spawn/event_loop.rs:308-312`：`should_buffer_tool_frame` 与 `should_suppress_held_output` 对 Responses 协议生效，未完成工具分片先缓冲、不直接下发
   - 验证：`cargo test -p veil responses_tool_delta_buffered` 通过；delta 未在 done 前下发
 - [x] 3.2 slot `.done` 完成审计后再决定放行或阻断；block 模式下危险明文不达下游且恰一阻断帧
   - 验证：`cargo test -p veil responses_tool_delta_no_leak_block` 通过；下游无危险明文、阻断帧计数为 1

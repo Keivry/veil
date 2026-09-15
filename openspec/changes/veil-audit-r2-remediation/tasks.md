@@ -1,0 +1,460 @@
+## 1. P0 热路径 panic 修复（`APP-1`；`redaction`）
+
+- [x] 1.1 `src/service/pii/chunk.rs:213-215`（同步 `scan_builtin_sync`）与 `:274-276`（异步 `scan_builtin`）的 `bank_card` 上下文窗口裸字节切片改为字符边界安全切片（`floor_char_boundary`/`ceil_char_boundary` 或 `get(cs..ce)` 回退最邻近边界），保持窗口语义不变（窗口大小、前后锚点、Luhn 校验位置均不动）
+  - 验证：`grep -n "floor_char_boundary\|ceil_char_boundary\|\.get(" src/service/pii/chunk.rs` 命中两处切片点的边界安全化改写，且无 `&s[cs..ce]` 裸切片残留
+  - 验证：`cargo test -p veil chunk_multibyte_boundary_no_panic` 通过；窗口跨界含多字节字符的输入返回降级而非 panic（不复现 `byte index ... is not a char boundary`）
+- [x] 1.2 `src/service/pii/chunk.rs` 补 `bank_card` 多字节 UTF-8 毗邻窗口回归测试：前缀形态 `62`/`60`/`3[47]`/`[45]` 且窗口端点紧邻多字节字符（中文/emoji），同时覆盖 `scan_builtin` 与 `scan_builtin_sync` 双路径
+  - 验证：`grep -n "multibyte\|char_boundary\|scan_builtin_sync" src/service/pii/chunk.rs` 命中新增 `#[test]` 用例名
+  - 验证：`cargo test -p veil pii_bank_card_multibyte_adjacency` 通过；两路径均不 panic，合法卡号仍命中、非法前缀仍不误报（与修复前判定等价）
+
+## 2. 流式管线与协议保真（`STP`/`MSP`/`CHC`/`RSP`；`stream-fidelity-fix`/`stream-protocol-parity`/`llm-protocol-hardening`/`gateway-transport-fidelity`）
+
+- [x] 2.1 `src/handler/llm/pump/event_loop.rs:301-324` 全局完成重放路径（`tool_replay_slot(Some(None))`）对 `!done_seen` 槽按**已累积参数先审后放**：重放前走与逐-item `.done` 相同的审计判定，`Block` 则筛除该槽不重放，与 `src/handler/llm/pump/terminal.rs:115-142` 终审口径一致（`hold.rs:203-215` 的 `responses_triples` 判定同源）
+  - 验证：`grep -n "tool_replay_slot\|done_seen" src/handler/llm/pump/event_loop.rs src/handler/llm/pump/hold.rs` 命中全局完成分支对非 done 槽调用审计判定
+  - 验证：`cargo test -p veil responses_missing_item_done_blocked_param` 通过；缺 per-item `.done` + 危险参数时该槽被 Block、不进入重放输出
+- [x] 2.2 `tests/responses_audit_tests.rs` 补「缺 per-item `.done` + 危险参数」回归：构造仅在 `response.completed` 前发工具参数分片、不发 `.done` 的响应流，断言审计事件被记录且重放按 Block 筛除
+  - 验证：`cargo test -p veil --test responses_audit_tests` 全绿；新增用例名含 `missing_done`
+  - 验证：断言全局完成路径与逐-item done 路径同 verdict（同调用同结论），block 模式下游无该工具输出
+- [x] 2.3 `src/service/sse/parser.rs:29-48` `Utf8ByteBuffer::push` 在 `error_len().is_some()` 时消费无效序列（对齐 Python `errors='replace'`：替换字符或跳过），保证 `valid_up_to`/游标单调前进；`text_carry` 与 pending 缓冲补总上限
+  - 验证：`grep -n "error_len\|valid_up_to" src/service/sse/parser.rs` 命中无效序列消费分支
+  - 验证：`cargo test -p veil utf8_buffer_invalid_bytes_progress` 通过；连续 push 无效字节后缓冲推进、pending 不无界增长
+- [x] 2.4 `src/service/sse/parser.rs` 补无效 UTF-8 + 无限流回归：EOF 一次性 `from_utf8_lossy` 残余按同一替换策略处理，持续无效字节流不卡死
+  - 验证：`cargo test -p veil sse_parser_invalid_utf8_eof_replace` 通过；EOF 残余不乱码、不挂起
+  - 验证：`cargo test -p veil sse_parser_invalid_stream_bounded` 通过；超上限输入缓冲不超过阈值
+- [x] 2.5 `src/handler/llm/pump/event_loop.rs:104-114` 引入取消令牌/JoinHandle 监视：客户端断开（`BreakFor`）时中止上游读取并回收泵任务，外层 while 不再继续 `chunk()`；`src/handler/llm/dispatch.rs:254/298` 的 `let _pump=` detach 改为持有并监视
+  - 验证：`grep -n "CancellationToken\|_pump\|abort" src/handler/llm/pump/event_loop.rs src/handler/llm/dispatch.rs` 命中取消/回收接线
+  - 验证：`cargo test -p veil disconnect_aborts_upstream_read` 通过；断开后上游读被中止且终端恰一语义不变
+- [x] 2.6 补「断连后上游连接被关闭」回归测试
+  - 验证：`cargo test -p veil disconnect_closes_upstream_connection` 通过；mock 上游记录读取被中止
+  - 验证：`cargo test -p veil disconnect_terminal_exactly_once` 通过；断连下合成终端恒恰一
+- [x] 2.7 `src/handler/llm/pump/event_loop.rs:571-577`（`:573`）`should_suppress_held_output` 实参由 `!emitted` 修正为 `emitted`（或按语义改名使调用不可误用），与 `decide.rs:118-125`（`out_data_nonempty`）及 `frame_feed.rs:72-116`（返回 `emitted`）语义一致；修复 RE-OPENED 不完整点（原 `60620c3` 为 `!out_data.is_empty()`）
+  - 验证：`grep -n "should_suppress_held_output" src/handler/llm/pump/event_loop.rs` 显示实参为 `emitted`，无 `!emitted`
+  - 验证：`grep -rn "!emitted" src/handler/llm/` 无残留
+- [x] 2.8 补三协议（Chat/Anthropic/Responses）held 输出抑制/放行回归，含 held 非空 + 无数据帧场景
+  - 验证：`cargo test -p veil held_output_suppression_polarity` 通过；语义按修正后判定
+  - 验证：`cargo test -p veil held_output_three_protocols` 通过；三协议结论一致
+- [x] 2.9 `src/handler/llm/pump/hold.rs` 为 hold 增加条目数/零字节分片计数维度（`output_item.added`/空 `function_call` 同受限），使零字节分片不可绕过 `AUDIT_HOLD_MAX_BYTES` 8MB 上限
+  - 验证：`grep -n "entry\|items\|total_bytes" src/handler/llm/pump/hold.rs` 命中条目数上限常量与零字节计数
+  - 验证：`cargo test -p veil hold_zero_byte_flood_bounded` 通过；零字节分片洪泛下内存有界、不超上限
+- [x] 2.10 补「零字节分片洪泛 → 内存有界」回归，含条目数与字节双维度
+  - 验证：`cargo test -p veil hold_entry_cap_and_byte_cap` 通过；两维度均触发有界策略
+  - 验证：超限行为与既有字节超限一致（截断/告警），非 panic
+- [x] 2.11 `src/handler/llm/pump/terminal.rs:209-238` + `src/handler/llm/pump/frame_feed.rs:72-86` 截断残余帧处理对齐 Python（`_llm.py:2718-2720` 丢弃残余）：剥前缀丢弃或按 Python 丢半帧，禁止二次加 `data:` 前缀（下游 `JSONDecodeError`）
+  - 验证：`grep -n "residual\|残余\|data:" src/handler/llm/pump/terminal.rs src/handler/llm/pump/frame_feed.rs` 命中残余不重复加前缀
+  - 验证：`cargo test -p veil residual_frame_no_duplicate_prefix` 通过；残余帧输出不含重复 `data:` 前缀
+- [x] 2.12 补「残余帧」回归（含 CR-only 换行边界）
+  - 验证：`cargo test -p veil residual_frame_cr_only` 通过；CR-only 残余按丢弃语义处理
+  - 验证：下游解析器对残余不报 `JSONDecodeError`
+- [x] 2.13 `src/service/block_inject/frames.rs:29-38` 合成 chat 流帧补齐 `id/object/created/model` 字段（从会话上下文/默认值），与非流阻断体字段齐全对齐
+  - 验证：`grep -n "id\|object\|created\|model" src/service/block_inject/frames.rs` 命中合成 chat 帧补字段
+  - 验证：`cargo test -p veil synth_chat_frame_fields_complete` 通过；四字段均存在且类型正确
+- [x] 2.14 补 SDK 解析回归：合成 chat 帧可被 openai SDK 解析
+  - 验证：`cargo test -p veil synth_chat_frame_sdk_parse` 通过（或 conformance 覆盖）
+  - 验证：`id` 非空、`object == chat.completion.chunk`、`created` 为整数、`model` 非空
+- [x] 2.15 `src/service/block_inject/frames.rs:94-125` 合成帧（全 7 帧）补必需 `sequence_number` 单调序列
+  - 验证：`grep -n "sequence_number" src/service/block_inject/frames.rs` 命中合成路径逐帧写入
+  - 验证：`cargo test -p veil synth_frames_sequence_number_monotonic` 通过；序列自初值单调递增、无缺口
+  - 验证：`cargo test -p veil synth_frames_sequence_number_required` 通过；每帧结构断言含 `sequence_number`
+- [x] 2.16 `src/service/block_inject/frames.rs` 合成/阻断 `response` 对象补必需字段（`output`、`status` 等），使 SDK `get_final_response().output_text` 可解析
+  - 验证：`grep -n "output\|status" src/service/block_inject/frames.rs` 命中合成 response 补字段
+  - 验证：`cargo test -p veil synth_response_required_fields` 通过；`get_final_response().output_text` 不抛 `TypeError`
+- [x] 2.17 `scripts/api_conformance.py` 相关用例去掉 try/except 掩盖，改为显式断言（23 项口径不变）
+  - 验证：`grep -n "try:\|except" scripts/api_conformance.py` 阻断相不再吞 SDK 异常
+  - 验证：`python3 scripts/api_conformance.py` 23/23 通过且无被掩盖异常
+- [x] 2.18 `src/service/pii/emit.rs:19-26` 修正 `is_punct_boundary` 边界判定使 `Speed::Fast` 攒批生效（agg 尾恒 `\n\n`），或声明保留并删除死分支
+  - 验证：`grep -n "is_punct_boundary\|Speed::Fast" src/service/pii/emit.rs` 命中断言修正或死分支删除
+  - 验证：`cargo test -p veil speed_fast_batching_effective` 通过；Fast 模式下攒批确实合并
+  - 验证：`cargo test -p veil speed_batching_semantics_unchanged` 通过；非 Fast 路径行为不变
+- [x] 2.19 `src/service/sse/parser.rs:219-248` 注释帧保真透传/正确合并，块内注释不丢失、首注释不再被拆为独立事件
+  - 验证：`grep -n "comment" src/service/sse/parser.rs` 命中注释合并逻辑
+  - 验证：`cargo test -p veil sse_comment_frame_fidelity` 通过；注释帧与所属块合并、无丢失
+  - 验证：`cargo test -p veil sse_lead_comment_not_split` 通过；首注释不被拆独立事件
+- [x] 2.20 `src/service/sse/parser.rs:132-172` `text_carry` 补总上限与超限策略（`LINE_LIMIT_BYTES` 仅 `feed_line` 生效）
+  - 验证：`grep -n "text_carry\|LINE_LIMIT_BYTES" src/service/sse/parser.rs` 命中总上限常量
+  - 验证：`cargo test -p veil text_carry_total_bound` 通过；超限截断/告警、内存有界
+- [x] 2.21 `src/service/block_inject/tool.rs:392-404` `empty_placeholder` 覆盖空数组 `input:[]`
+  - 验证：`grep -n "empty_placeholder\|input" src/service/block_inject/tool.rs` 命中 `[]` 分支
+  - 验证：`cargo test -p veil empty_placeholder_covers_empty_array` 通过；`[]` 不计入参数累积、无 `"{}{...}"` 前缀污染
+- [x] 2.22 `src/handler/llm/mod.rs:38-51` 请求方向同样剔除下游 `x-veil-*` 请求头（大小写不敏感），防内部头外传上游
+  - 验证：`grep -n "x-veil\|forward_headers" src/handler/llm/mod.rs` 命中请求向过滤
+  - 验证：`cargo test -p veil downstream_xveil_headers_stripped` 通过；上游收到头不含 `x-veil-*`
+- [x] 2.23 `src/handler/llm/pump/event.rs:273-282` `is_minor_event(Chat)` 修正 `refusal:null` 分类：仅 refusal 非 null 或非空才次要
+  - 验证：`grep -n "is_minor_event\|refusal" src/handler/llm/pump/event.rs` 命中修正判定
+  - 验证：`cargo test -p veil chat_refusal_null_not_minor` 通过；`refusal:null` 不再判次要
+- [x] 2.24 Rust pump 收尾判定区分「干净完成」（有 `finish_reason` 无 `[DONE]`）与「异常收尾」，干净 EOF 不再误记 `open_ended`
+  - 验证：`grep -rn "open_ended\|finish_reason" src/handler/llm/pump/` 命中区分分支
+  - 验证：`cargo test -p veil clean_eof_not_open_ended` 通过；有 `finish_reason` 无 `[DONE]` 不记 `open_ended`
+  - 验证：`cargo test -p veil abnormal_eof_still_open_ended` 通过；异常收尾仍记 `open_ended`
+- [x] 2.25 `chat_bucket` 分桶改无碰撞（消除 64 步长饱和碰撞）；合成阻断帧多 choice 覆盖或显式声明
+  - 验证：`grep -rn "chat_bucket" src/` 命中无碰撞分桶实现
+  - 验证：`cargo test -p veil chat_bucket_no_collision` 通过；不同输入不碰撞
+  - 验证：`cargo test -p veil block_frame_choice_coverage` 通过；多 choice 覆盖或声明锁定
+- [x] 2.26 `src/service/sse/parser.rs` 多 `data:` 行事件按 WHATWG 以 `\n` 连接后处理（不压平为单行）
+  - 验证：`grep -n "data" src/service/sse/parser.rs` 命中多行连接逻辑
+  - 验证：`cargo test -p veil multi_data_line_joined_with_newline` 通过；多 data 行按 `\n` 连接
+- [x] 2.27 `src/handler/llm/pump/terminal.rs:154` 终端最终审计 Anthropic 阻断帧使用真实 content block index（无法获知时回退 0），与 TRN-6 同口径
+  - 验证：`grep -n "index" src/handler/llm/pump/terminal.rs` 命中真实 index 取值
+  - 验证：`cargo test -p veil anthropic_terminal_block_real_index` 通过；多块流 index 不错位
+- [x] 2.28 Rust pump opaque（thinking/signature）分支接入 `TokenCarry`（或将 fail-closed 不完整还原写入 spec 声明并锁定测试）
+  - 验证：`grep -rn "opaque\|signature\|TokenCarry" src/handler/llm/pump/` 命中 carry 接线
+  - 验证：`cargo test -p veil opaque_branch_token_carry` 通过；thinking 内跨帧 token 可缝合
+  - 验证：`cargo test -p veil opaque_fallback_declared` 通过；未接入形态按声明锁定
+- [x] 2.29 hold 放行按相对 `sequence_number` 保序（按 seq 重排或声明），并行 item 交错不改变次序
+  - 验证：`grep -n "sequence_number\|hold" src/handler/llm/pump/hold.rs` 命中保序逻辑
+  - 验证：`cargo test -p veil hold_preserves_sequence_order` 通过；交错回归次序不变
+- [x] 2.30 Rust pump tool 提取器扩展 `output_item.done` item 类型覆盖（或声明范围），非 `function_call` 工具 item 同样进 item-done 审计
+  - 验证：`grep -rn "output_item.done\|item_type" src/handler/llm/pump/` 命中扩展覆盖
+  - 验证：`cargo test -p veil item_done_type_coverage` 通过；各工具 item 类型结论一致
+- [x] 2.31 Rust SSE 出口/合成不注入 `event: message`（保持原 data 帧形态）或显式声明
+  - 验证：`grep -rn "event: message" src/` 无出口注入残留
+  - 验证：`cargo test -p veil no_synthetic_event_message` 通过；无 `event:` 行的 data 帧不被补 `event: message`
+
+## 3. 非流与传输（`NLP`；`nonstream-audit-align`/`metrics-admin-parity`/`transport-fidelity-fix`/`gateway-protocol-fix`）
+
+- [x] 3.1 `src/handler/llm/nonstream.rs:113-126` `looks_sse` 分支前置 `status < 400` 守卫，错误状态一律走错误体透传（状态码与正文字节保留），不再经 `src/handler/llm/pump/event.rs:29-31` `build_sse_response` 合成 200 假流；与 `dispatch.rs:243` 流式分支守卫对齐
+  - 验证：`grep -n "looks_sse\|status" src/handler/llm/nonstream.rs` 命中 `status < 400` 前置守卫
+  - 验证：`cargo test -p veil nonstream_4xx_sse_passthrough` 通过；上游 4xx/5xx + `text/event-stream` 保状态与正文字节
+- [x] 3.2 补上游 4xx/5xx + SSE content-type 回归（含 5xx 空体）
+  - 验证：`cargo test -p veil nonstream_error_sse_status_preserved` 通过；不出现 200
+  - 验证：`cargo test -p veil nonstream_error_sse_empty_body` 通过；空体状态码保留
+- [x] 3.3 `src/handler/llm/nonstream.rs:173-174` model 分桶响应 model 缺失时回退请求 model（流/非流同口径，对齐 Python `_llm.py:2975-2977`）
+  - 验证：`grep -n "unknown_model\|model" src/handler/llm/nonstream.rs` 命中回退分支
+  - 验证：`cargo test -p veil model_bucket_fallback_request` 通过；无 model 响应不以 `unknown_model` 分桶
+- [x] 3.4 补无 model 响应回归（流/非流各一）
+  - 验证：`cargo test -p veil model_bucket_fallback_stream_and_nonstream` 通过；两路径同桶
+  - 验证：请求 model 存在时回退请求 model；响应 model 存在时优先响应 model
+- [x] 3.5 `src/handler/llm/nonstream.rs:130-159` 非流 `status>=400` 错误体走有界读（超限截断或流式转发），状态码与正文语义不变
+  - 验证：`grep -n "read_bounded_body\|bytes()" src/handler/llm/nonstream.rs` 命中错误臂有界读
+  - 验证：`cargo test -p veil nonstream_error_body_bounded` 通过；大错误体内存有界
+- [x] 3.6 补大错误体回归
+  - 验证：`cargo test -p veil nonstream_error_large_body_status_unchanged` 通过；状态码与正文语义不变
+  - 验证：超限策略不产生新错误码
+- [x] 3.7 `src/handler/llm/mod.rs:220-227` 空体/非 JSON→502 门控边界对齐 Python（仅 `status==200`）或显式声明差异并锁定测试
+  - 验证：`grep -n "status" src/handler/llm/mod.rs` 命中边界判定
+  - 验证：`cargo test -p veil empty_body_gate_boundary` 通过；门控行为按裁决锁定
+- [x] 3.8 `src/service/llm_gateway/protocol.rs:44-49` 宽容路径匹配大小写对齐 Python（敏感）或声明宽容为有意；补大小写用例
+  - 验证：`grep -n "to_lowercase\|eq_ignore_ascii_case" src/service/llm_gateway/protocol.rs` 命中裁决
+  - 验证：`cargo test -p veil protocol_path_case_sensitivity` 通过；大小写行为按裁决
+- [x] 3.9 流式分桶补请求 model 回退：`src/handler/llm/pump/spawn/event_loop.rs:164-168` 的 `state.stream_model` 缺失时以**请求 model** 分桶，仅请求与响应均缺才落 `unknown_model`；需将请求 model 经 `StreamPumpCtx`/dispatch 传入泵（对齐 `metrics-admin-parity` spec「响应缺 model 回退请求 model」场景与 Python `_llm.py:8551-8560` `metrics_ctx['model']=_req_model`）
+  - 验证：`cargo test -p veil stream_missing_model_falls_back_to_request` 通过；流式帧无 model 时按请求 model 分桶
+  - 验证：`grep -n "req_model\|request_model" src/handler/llm/pump/spawn/event_loop.rs` 命中回退分支
+  - 验证：请求与响应均无有效 model 时才落 `unknown_model`（`cargo test -p veil stream_model_unknown_only_when_both_absent` 通过）
+
+## 4. PII/脱敏/审计策略（`APP`/`DCD-1`；`audit-policy-enforcement`/`pii-custom-compat`/`redaction-audit-coverage`/`redaction`/`audit-rules-parity`/`audit-parity`/`pii-parity-closeout`）
+
+- [x] 4.1 `src/service/audit/rules.rs:317-347` 为 `curl`/`wget` 增加「命令词 + 裸 host 参数」外传判定分支（含 `-X`/`--data` 后 host、`http://` 前缀变体），与 Python `_audit.py:787-813` 对齐；RE-OPENED POL-6 收口
+  - 验证：`grep -n "curl\|wget\|host" src/service/audit/rules.rs` 命中裸 host 分支
+  - 验证：`cargo test -p veil bare_curl_host_denied` 通过；裸 host 外传被拦
+- [x] 4.2 补裸 host 用例（含负例：本地/GitHub 白名单不变）
+  - 验证：`cargo test -p veil bare_wget_host_denied` 通过
+  - 验证：`cargo test -p veil bare_host_whitelist_negative` 通过；白名单目标不误拦
+- [x] 4.3 `src/state.rs:104-105` AppState 构建时以 `config.pii_custom_*_file` 调 `load_custom_all`/字典加载并注入检测器（当前仅 `PiiDetector::new()` + `set_hardening`）；加载错误沿用 fail-closed 拒启动（对齐 canonical `pii-custom-compat`）
+  - 验证：`grep -n "load_custom_all\|pii_custom" src/state.rs src/main.rs` 命中运行时注入调用
+  - 验证：`cargo test -p veil custom_pii_runtime_injected` 通过；配置自定义规则后运行时命中
+- [x] 4.4 补「配置自定义规则→运行时命中→指标/审计可见」端到端回归
+  - 验证：`cargo test -p veil custom_pii_e2e_hit_visible` 通过；命中在指标/审计可见
+  - 验证：坏规则文件仍拒启动（fail-closed 不变）
+- [x] 4.5 `src/handler/llm/nonstream.rs:264` 非流还原升级为与流式同一守卫（内层 stringified-JSON 递归校验，对齐 `src/handler/llm/pump/frame_feed.rs:45-68`）；`src/service/pii/scope.rs:459-463` `collect_token_depths` 深度扫描纳入对象 key
+  - 验证：`grep -n "from_str\|collect_token_depths" src/handler/llm/nonstream.rs src/service/pii/scope.rs` 命中内层守卫与 key 深度
+  - 验证：`cargo test -p veil nonstream_inner_json_guard` 通过；内层破损 JSON 不被还原
+- [x] 4.6 补内层破损 JSON 非流回归
+  - 验证：`cargo test -p veil nonstream_broken_inner_json` 通过；破损形态不误还原
+  - 验证：对象 key 深度计入后还原边界正确
+- [x] 4.7 `src/service/pii/scope.rs:404-426,210-217` 同明文跨深度按 span 实际所在深度逐点转义（替代明文 max 深度聚合）；深度统计覆盖对象 key
+  - 验证：`grep -n "depth\|escape" src/service/pii/scope.rs` 命中逐点转义
+  - 验证：`cargo test -p veil same_plaintext_cross_depth_escape` 通过；浅层不过度转义
+- [x] 4.8 补「同明文跨深度」与「键位深度」回归
+  - 验证：`cargo test -p veil key_depth_escape` 通过；键位深度正确、不欠转义
+  - 验证：`cargo test -p veil escape_per_occurrence` 通过；各出现点按自身深度
+- [x] 4.9 `src/service/audit/policy.rs:70-82` 策略加载支持顶层 JSON 对象（与 YAML mapping 同解析，对齐 Python `_audit.py:222-234`），fail-closed 语义不变
+  - 验证：`grep -n "json\|from_str" src/service/audit/policy.rs` 命中 JSON 分支
+  - 验证：`cargo test -p veil policy_top_level_json` 通过；JSON 策略正常加载
+- [x] 4.10 补 JSON 策略文件回归
+  - 验证：`cargo test -p veil policy_json_dangerous_object` 通过；对象形 `dangerous` 可加载
+  - 验证：JSON 损坏仍拒启动
+- [x] 4.11 `src/service/audit/sink.rs:77-96` Block/Allow 记录补参数脱敏摘要（复用 ten-form 摘要引擎），保持 0600 与先脱敏后落盘顺序
+  - 验证：`grep -n "summary\|redact_summary" src/service/audit/sink.rs` 命中摘要写入
+  - 验证：`cargo test -p veil audit_log_block_has_summary` 通过；Block/Allow 记录含脱敏摘要、无明文
+- [x] 4.12 补日志形态回归
+  - 验证：`cargo test -p veil audit_log_summary_no_plaintext` 通过；摘要不含明文
+  - 验证：文件权限 0600 不变
+- [x] 4.13 `src/service/pii/scope.rs:147-185` 还原 span 定位改为逐出现点映射（不整段 skip），保证响应侧独立同值明文仍被掩码
+  - 验证：`grep -n "find\|span" src/service/pii/scope.rs` 命中逐出现点定位
+  - 验证：`cargo test -p veil restore_span_per_occurrence` 通过；响应侧独立同值明文被掩码
+- [x] 4.14 补同值多出现点回归
+  - 验证：`cargo test -p veil same_value_multiple_occurrences` 通过；各出现点独立处理
+  - 验证：无过度 skip 导致漏掩码
+- [x] 4.15 `src/service/pii/` hint 路径为 `partial_prefix_hints` 补 Python 的总条数 64 上限
+  - 验证：`grep -rn "64\|partial_prefix_hints\|hint" src/service/pii/` 命中上限常量
+  - 验证：`cargo test -p veil prefix_hints_capped_64` 通过；超过 64 条被截断、内存有界
+- [x] 4.16 `src/service/pii/` IPv4 保留豁免补 `192.88.99.0/24`（当前 Rust 过度脱敏）
+  - 验证：`grep -rn "192.88.99" src/service/pii/` 命中豁免段
+  - 验证：`cargo test -p veil ipv4_reserved_192_88_99_exempt` 通过；该段不脱敏
+- [x] 4.17 策略默认 `internal_suffixes` 补齐 Python 的 `.corp.example`
+  - 验证：`grep -rn "corp.example\|internal_suffixes" src/service/audit/` 命中补齐
+  - 验证：`cargo test -p veil internal_suffix_corp_example` 通过；该后缀按内网豁免
+- [x] 4.18 canonical `openspec/specs/pii-parity-closeout/spec.md:148-151` 的 6-7 字符 IPv4 掩码文本与实现/Python/README 矛盾（实现正确），修正 spec 文本与实现一致（`APP-7`）
+  - 验证：`grep -n "IPv4\|掩码" openspec/specs/pii-parity-closeout/spec.md` 命中修正后文本
+  - 验证：`cargo test -p veil ipv4_mask_text_consistency` 通过；spec 文本与实现断言一致
+- [x] 4.19 canonical `openspec/specs/redaction/spec.md` recognizer 计数 6→7（实现与 Python 均 7；`APP-8`）
+  - 验证：`grep -n "recognizer\|7" openspec/specs/redaction/spec.md` 命中计数 7
+  - 验证：`cargo test -p veil recognizer_count_seven` 通过；计数断言为 7
+
+## 5. 凭据/注册/Matrix/Go（`CRD`；`credential-flow-parity`/`credential-auth-hardening`/`go-client-interop`/`matrix-approval-closure`）
+
+- [x] 5.1 `src/state.rs:76` 注册表加载失败由 `.unwrap_or_default()`（静默吞空表）改为错误上抛 fail-fast 拒启动并记 error 日志（`store.rs:193-208` `load_from` 已正确返 `Err`），对齐 canonical `C14` fail-closed
+  - 验证：`grep -n "unwrap_or_default\|load_from" src/state.rs` 无吞空表残留
+  - 验证：`cargo test -p veil registry_load_failure_fails_startup` 通过；损坏注册表拒启动
+- [x] 5.2 补损坏注册表启动拒绝回归
+  - 验证：`cargo test -p veil registry_corrupt_startup_rejected` 通过；exit 非零 + error 日志
+  - 验证：合法注册表正常启动、行为不变
+- [x] 5.3 veil 侧声明 revoke 异步 202 轮询契约（与 `/credential` `E_PENDING` 同口径）：`README.md` §5 与 canonical `go-client-interop` spec 显式声明
+  - 验证：`grep -n "revoke.*202\|E_PENDING" README.md openspec/specs/go-client-interop/spec.md` 命中声明
+  - 验证：文档明确「202 = 已建单，需轮询；或 `CREDENTIAL_BLOCK_WAIT=1`」
+- [x] 5.4 `src/handler/credential/mod.rs:147-183` `GET /registrations` 响应补齐 Go 契约 `type` 字段
+  - 验证：`grep -n "type\|RegistrationItem" src/handler/credential/mod.rs` 命中 `type` 字段序列化
+  - 验证：`cargo test -p veil registrations_response_has_type` 通过；响应含 `type`
+- [x] 5.5 `src/handler/credential/mod.rs:147-183` `allow_mode` 输出映射 `auto`/`manual`（输入兼容三态：`auto`→true、`manual`→none、未知回退 auto+warn）；补 Go 形状契约测试
+  - 验证：`grep -n "allow_mode" src/handler/credential/mod.rs` 命中 `auto`/`manual` 映射
+  - 验证：`cargo test -p veil registrations_allow_mode_vocabulary` 通过；输出词汇为 `auto`/`manual`
+- [x] 5.6 `src/service/registry/store.rs:381-393` `approve-hash-change` 的 `KeepAuto`/`DemoteManual` 落定不再改 `revoked`/`enabled`（仅更新 `script_sha256` 与宽限字段），与 Python `_registry.py:294-306` 对齐
+  - 验证：`grep -n "revoked\|enabled\|script_sha256" src/service/registry/store.rs` 命中落定不置撤销位
+  - 验证：`cargo test -p veil hash_change_no_resurrect` 通过；已吊销条目不复活
+- [x] 5.7 补「已吊销条目哈希变更不复活」回归
+  - 验证：`cargo test -p veil revoked_entry_hash_change_stays_revoked` 通过；`revoked` 保持 true
+  - 验证：`script_sha256` 与宽限字段确实更新
+- [x] 5.8 `src/service/credential/approval.rs:79-95` 建单后按分支预置 reaction 提示（表情列表与 Python `_matrix.py:282-331` 对齐），发送失败仅 warn 不阻断
+  - 验证：`grep -n "reaction\|REACTION_" src/service/credential/approval.rs` 命中预置调用
+  - 验证：`cargo test -p veil approval_reaction_preseed` 通过；建单后预置调用发生
+- [x] 5.9 补预置调用回归（含发送失败 warn 不阻断）
+  - 验证：`cargo test -p veil reaction_preseed_failure_warns` 通过；失败仅 warn
+  - 验证：五分支表情与 Python 一致
+- [x] 5.10 `src/service/credential/vault_ops.rs:297/389` 常规注册/吊销异步 202 重试语义二选一收敛（实现幂等或 README+spec 声明），与 `E_PENDING` 轮询口径一致；补重试回归
+  - 验证：`grep -n "202\|idempot\|pending" src/service/credential/vault_ops.rs` 命中裁决
+  - 验证：`cargo test -p veil revoke_202_retry_semantics` 通过；重试按裁决确定、注册重试不误 409
+- [x] 5.11 canonical `credential-auth-hardening` spec + `README.md` §7.5 显式声明紧急吊销管理 token 源改为 `OBSERVABILITY_ADMIN_TOKEN` 及迁移（BREAKING）
+  - 验证：`grep -n "OBSERVABILITY_ADMIN_TOKEN\|CREDENTIAL_ADMIN_TOKEN" README.md openspec/specs/credential-auth-hardening/spec.md` 命中声明与迁移
+  - 验证：`src/service/credential/vault_ops.rs:458-464` token 源与声明一致
+- [x] 5.12 补双 token 场景回归（旧 token 失效/新 token 生效）
+  - 验证：`cargo test -p veil emergency_revoke_token_source` 通过；仅 `OBSERVABILITY_ADMIN_TOKEN` 放行
+  - 验证：`CREDENTIAL_ADMIN_TOKEN` 不再放行（按声明）
+- [x] 5.13 `src/service/registry/store.rs` tmp 文件创建即 0600（`OpenOptionsExt::mode`），无先创建后 chmod 的宽权限窗
+  - 验证：`grep -n "OpenOptionsExt\|mode(" src/service/registry/store.rs` 命中创建即 0600
+  - 验证：`cargo test -p veil registry_tmp_0600_from_creation` 通过；权限断言无窗口期
+- [x] 5.14 管理面鉴权改用恒时等长比较（HMAC/hash 后比较），消除 `ct_eq` 长度可分辨
+  - 验证：`grep -n "ct_eq\|hmac\|sha256" src/handler/admin.rs` 命中等长比较
+  - 验证：`cargo test -p veil admin_token_length_indistinguishable` 通过；长度不泄露
+- [x] 5.15 `src/service/registry/store.rs` 迁移路径保留 `old_hash_expires_at`/`allow_mode`/`reg_id`（缺省值语义明确）
+  - 验证：`grep -n "old_hash_expires_at\|allow_mode\|reg_id" src/service/registry/store.rs` 命中迁移保留
+  - 验证：`cargo test -p veil migration_preserves_fields` 通过；三字段迁移后不丢
+- [x] 5.16 `src/service/credential/` 宽限通知按条目+窗口去重，避免重复通知
+  - 验证：`grep -rn "grace\|notify" src/service/credential/` 命中去重逻辑
+  - 验证：`cargo test -p veil grace_notification_dedup` 通过；同窗口不重复通知
+- [x] 5.17 `src/service/credential/` `is_private_ip` 识别 IPv4-mapped IPv6 环回（`::ffff:127.0.0.1`）
+  - 验证：`grep -rn "is_private_ip\|ffff" src/service/credential/` 命中 IPv4-mapped 解析
+  - 验证：`cargo test -p veil ipv4_mapped_loopback` 通过；按内网豁免
+- [x] 5.18 `src/service/registry/store.rs` `lookup_by_hash` 优先返回活跃条目（或声明序）
+  - 验证：`grep -n "lookup_by_hash" src/service/registry/store.rs` 命中 active-first
+  - 验证：`cargo test -p veil lookup_by_hash_active_first` 通过；首条为活跃条目
+
+## 6. 管理面/指标/限流/配置（`OPS`/`ARH-6`/`DCD-3`/`STP-10`；`observability-admin`/`runtime-reliability`/`config-legacy-compat`/`metrics-admin-parity`）
+
+- [x] 6.1 `src/service/llm_gateway/mod.rs:184-197` 的三个计数器（`upstream_read_errors`/`admin_rate_evicted`/`aggs_evicted`）在 `src/handler/admin.rs:286-310` `/_admin/metrics` 暴露新键（只增不改）；RE-OPENED RUN-4 收口
+  - 验证：`grep -n "upstream_read_errors\|admin_rate_evicted\|aggs_evicted" src/handler/admin.rs` 命中三键
+  - 验证：`cargo test -p veil runtime_counters_exposed_in_metrics` 通过；计数递增在 metrics 可见
+- [x] 6.2 补「计数递增在 metrics 可见」回归
+  - 验证：`cargo test -p veil counters_increment_visible` 通过；三键随事件递增
+  - 验证：旧 metrics 键形态不变（只增不改）
+- [x] 6.3 `src/handler/admin.rs` 管理面统一补安全响应头（`Cache-Control: no-store` 等），SSE 除外或同加，与 Python `_admin.py` 对齐
+  - 验证：`grep -n "Cache-Control\|no-store" src/handler/admin.rs` 命中头写入
+  - 验证：`cargo test -p veil admin_security_headers` 通过；响应含 `Cache-Control: no-store`
+- [x] 6.4 补头存在性回归
+  - 验证：`cargo test -p veil admin_no_store_header_present` 通过；管理面响应头存在
+  - 验证：SSE 路由按声明处理（豁免或同加）
+- [x] 6.5 `src/handler/admin.rs:607/635` 管理面 SSE 事件名由 `message` 改为 `event`、补 `done` 终止帧，与 Python `_admin.py:534/596` 对齐
+  - 验证：`grep -n "event:\|done" src/handler/admin.rs` 命中 `event` + `done`
+  - 验证：`cargo test -p veil admin_sse_event_and_done` 通过；帧序列含 `event:` 与 `done`
+- [x] 6.6 `admin.html:1037` 监听 `event` 名随之适配（若交付静态页；本仓 Non-Goal 时按 spec 声明）
+  - 验证：`grep -n "addEventListener\|event" admin.html` 命中 `event` 监听（如适用）
+  - 验证：`cargo test -p veil admin_sse_frame_sequence` 通过；帧序列契约锁定
+- [x] 6.7 `src/config/env_parse.rs:405` `OBSERVABILITY_DISABLE=1` 时管理面全 404 且不要求 token（调整配置门禁顺序使其不因缺 token 拒启动）
+  - 验证：`grep -n "OBSERVABILITY_DISABLE" src/config/env_parse.rs` 命中豁免分支
+  - 验证：`cargo test -p veil disable_skips_token_requirement` 通过；`DISABLE=1` 缺 token 不拒启动
+- [x] 6.8 `src/handler/admin.rs` `pii_value_samples` 形状对齐 Python（metrics 嵌套 dict，`OPS-5`）或显式声明差异；补形状契约测试
+  - 验证：`grep -n "pii_value_samples" src/handler/admin.rs` 命中放置位置
+  - 验证：`cargo test -p veil pii_value_samples_shape` 通过；形状按裁决锁定
+- [x] 6.9 `src/handler/admin.rs` `/_admin/events` limit 默认 50/上限 200（对齐 Python，`OPS-6`）
+  - 验证：`grep -n "limit" src/handler/admin.rs` 命中默认 50/上限 200
+  - 验证：`cargo test -p veil admin_events_limit_bounds` 通过；默认与上限对齐、越界钳位
+- [x] 6.10 `src/handler/admin.rs` SSE loop `Lagged` 可恢复（跳帧/提示）而非断连（`OPS-7`）
+  - 验证：`grep -n "Lagged" src/handler/admin.rs` 命中继续分支
+  - 验证：`cargo test -p veil sse_lagged_recovers` 通过；`Lagged` 后连接不断
+- [x] 6.11 `src/service/metrics/aggregate.rs`/`src/service/metrics/store.rs` SQL 窗口键改用与内存侧一致的可比整数序（`window_ord`）或规范格式（`OPS-8`）
+  - 验证：`grep -n "window_ord\|window" src/service/metrics/store.rs` 命中整数序
+  - 验证：`cargo test -p veil window_key_ordering` 通过；跨位数窗口排序正确
+- [x] 6.12 补跨位数窗口回归（since 过滤/retention）
+  - 验证：`cargo test -p veil window_cross_digit_ordering` 通过；跨位数不失真
+  - 验证：retention/SQL 与内存侧口径一致
+- [x] 6.13 `src/handler/admin.rs` granularity 非法值显式报错或 warn；SSE metrics 快照字段补全；SSE 补 `X-Accel-Buffering: no`（`OPS-9`）
+  - 验证：`grep -n "granularity\|X-Accel-Buffering" src/handler/admin.rs` 命中三处
+  - 验证：`cargo test -p veil granularity_invalid_rejected` 通过；非法值按裁决（4xx 或 warn）
+  - 验证：`cargo test -p veil sse_x_accel_buffering` 通过；SSE 响应含 `X-Accel-Buffering: no`
+- [x] 6.14 `src/config/env_parse.rs` `PII_HOLD_MAX` 增加上界钳位（≤1MB 或与常量匹配），非法值拒启动或 warn+钳位（`ARH-6`）
+  - 验证：`grep -n "PII_HOLD_MAX" src/config/env_parse.rs` 命中上界
+  - 验证：`cargo test -p veil pii_hold_max_upper_bound` 通过；超上界按裁决处理
+- [x] 6.15 `src/service/admin/ratelimit.rs` 接线 `sweep_rate` 周期清扫任务（与 RUN-2 有界策略配套），或修正注释并声明仅容量驱逐（`DCD-3`）
+  - 验证：`grep -n "sweep_rate\|spawn" src/service/admin/ratelimit.rs src/main.rs` 命中周期接线或声明
+  - 验证：`cargo test -p veil admin_rate_sweep_wired` 通过；周期清扫运行可见
+- [x] 6.16 `src/service/sse/parser.rs` 统一 `sse_event_count` 计数口径：注入帧纳入或明确排除并声明，与 `add_sse_event` 一致（`STP-10`）
+  - 验证：`grep -n "sse_event_count\|add_sse_event" src/service/sse/parser.rs` 命中统一口径
+  - 验证：`cargo test -p veil sse_event_count_consistency` 通过；注入帧计数一致
+
+## 7. 架构优化（`ARH`；`architecture-cleanup`）
+
+- [x] 7.1 `src/handler/llm/pump/event_loop.rs:145,273` + `src/handler/llm/pump/frame_feed.rs:33,36` + `inner_json_intact`：每帧单次全量 JSON 解析并复用结果（解析产物传递），行为逐字节不变
+  - 验证：`grep -n "from_str\|from_slice" src/handler/llm/pump/event_loop.rs src/handler/llm/pump/frame_feed.rs` 单帧解析点减少为一次
+  - 验证：`cargo test -p veil single_parse_per_frame` 通过；帧输出与改动前逐字节一致
+- [x] 7.2 `src/handler/llm/dispatch.rs` 合并 `StreamPumpCtx`(17 字段) 与 `NonstreamCtx`(16 字段) 重叠 14 字段为共享请求上下文结构体，消除 dispatch 双份装配
+  - 验证：`grep -n "StreamPumpCtx\|NonstreamCtx" src/handler/llm/dispatch.rs` 命中共享结构
+  - 验证：`cargo test -p veil shared_ctx_equivalence` 通过；结构等价单测
+- [x] 7.3 `src/service/pii/custom.rs:407-412,430` `scan_custom` 批量化：单次任务扫描全部规则/分块、共享只读规则引用（`Arc`），消除每规则每分块 `spawn_blocking` 任务 churn
+  - 验证：`grep -n "spawn_blocking\|Arc" src/service/pii/custom.rs` 命中批量扫描
+  - 验证：`cargo test -p veil scan_custom_batch_equivalence` 通过；结果与逐条等价
+- [x] 7.4 `src/handler/llm/dispatch.rs` 重试路径用可重放体/引用消除请求头/体重复克隆
+  - 验证：`grep -n "clone()" src/handler/llm/dispatch.rs` 重试路径克隆减少
+  - 验证：`cargo test -p veil retry_no_redundant_clone` 通过；行为不变
+- [x] 7.5 审计/还原路径 `HashSet` 每请求分配改用 `SmallVec`/请求级缓存复用
+  - 验证：`grep -rn "HashSet\|SmallVec" src/service/` 命中复用改造
+  - 验证：`cargo test -p veil hashset_reuse_equivalence` 通过；行为不变
+- [x] 7.6 协议分派（19 处/13 文件）收敛为单一分派点或类型化方法
+  - 验证：生产侧 `grep -rn "Protocol::" src/ | grep -v tests | wc -l` 分派点相对基线收敛（230 → 206，-24；测试夹具中的协议枚举字面量不计入分派点口径，口径经用户确认）
+  - 验证：`cargo test -p veil protocol_dispatch_equivalence` 通过；行为不变
+- [x] 7.7 `src/service/llm_gateway/` `Upstream` 状态码引入受约束类型（newtype/serde 校验），非法值处理与现状一致
+  - 验证：`grep -n "struct Upstream\|status" src/service/llm_gateway/` 命中受约束类型
+  - 验证：`cargo test -p veil upstream_status_constrained` 通过；非法值处理不变
+- [x] 7.8 service 层补齐下移不变量守护（`debug_assert` 或类型），部分仅 handler 层的不变量下移
+  - 验证：`grep -rn "debug_assert\|invariant" src/service/` 命中新增守护
+  - 验证：`cargo test -p veil service_invariant_guards` 通过；行为不变
+- [x] 7.9 `src/main.rs` 接线 `notify.shutdown()` 并消除 `GatewayCleanup` 二次 AppState 构造；补停机回归
+  - 验证：`grep -n "shutdown\|GatewayCleanup" src/main.rs` 命中接线
+  - 验证：`cargo test -p veil shutdown_wired` 通过；停机路径单次构造、正常退出
+
+## 8. 死代码/冗余（`DCD`/`CRD-8`；`deadcode-positional-cleanup`）
+
+- [x] 8.1 `src/service/` `ApprovalGateway` trait + `NoopApproval` + `ApprovalOutcome` 死抽象删除（或生产接线，优先删除），测试引用同步清理（`DCD-2`）
+  - 验证：`grep -rn "ApprovalGateway\|NoopApproval\|ApprovalOutcome" src/` 无生产引用残留
+  - 验证：`cargo test -p veil` 全绿；删除后无编译错误
+- [x] 8.2 `src/service/matrix/validate.rs:267` ↔ `src/service/matrix/branch.rs:72` `is_valid_mxid` 去重为单一实现 + 重导出（`DCD-4`）
+  - 验证：`grep -rn "is_valid_mxid" src/service/matrix/` 单一定义点
+  - 验证：`cargo test -p veil is_valid_mxid_equivalence` 通过；行为不变
+- [x] 8.3 `authorize_entry`/`TurnToApproval` 死代码清理或接线，注释修正（`CRD-8`）
+  - 验证：`grep -rn "authorize_entry\|TurnToApproval" src/` 死引用清除或接线
+  - 验证：`cargo test -p veil` 全绿；注释无误导
+- [x] 8.4 20 个仅测试引用的 pub API 收敛 pub 可见性（或接线）；6 个 metrics getter 随 `OPS-1` 生产暴露（`DCD-5`）
+  - 验证：`grep -rn "pub fn" src/` 仅测试引用项收敛
+  - 验证：`cargo test -p veil` 全绿；metrics getter 随 `6.1` 有生产引用
+- [x] 8.5 `strip_yaml_quotes` ↔ `unquote` 重复合并为单一实现（`DCD-6`）
+  - 验证：`grep -rn "strip_yaml_quotes\|fn unquote" src/` 单一定义点
+  - 验证：`cargo test -p veil yaml_unquote_equivalence` 通过
+- [x] 8.6 poison helper ×3 重复合并为单 helper（`DCD-7`）
+  - 验证：`grep -rn "poison" src/` 单 helper
+  - 验证：`cargo test -p veil` 全绿
+- [x] 8.7 `file_len_under_800_or_split` 18 份复制提取共享测试支撑模块（`DCD-8`）
+  - 验证：`grep -rn "file_len_under_800_or_split" tests/ src/` 单一定义 + 引用
+  - 验证：`cargo test -p veil` 全绿；测试支撑模块编译通过
+
+## 9. 文档/注释/文档门禁（`DCS`；`docs-test-parity`/`docs-contract-sync`/`docs-contract-resync`）
+
+- [x] 9.1 canonical `openspec/specs/docs-test-parity/spec.md` 行号修正：`env_parse.rs:485-491`→`469-478`、`main.rs:58`→`45`（`DCS-2`）
+  - 验证：`grep -n "485-491\|:58" openspec/specs/docs-test-parity/spec.md` 无失效指针
+  - 验证：`grep -n "469-478\|:45" openspec/specs/docs-test-parity/spec.md` 命中修正值
+- [x] 9.2 canonical `openspec/specs/docs-contract-sync/spec.md` 两处取证指针修正：`426-429`→`342-347`、`http_e2e_admin_matrix.rs:271`→`252-254`（`DCS-3`）
+  - 验证：`grep -n "426-429\|:271" openspec/specs/docs-contract-sync/spec.md` 无失效指针
+  - 验证：`grep -n "342-347\|252-254" openspec/specs/docs-contract-sync/spec.md` 命中修正值
+- [x] 9.3 `README.md` §6.4 指针 `spawn.rs::audit_pending` 修正为 `src/handler/llm/pump/spawn/event_loop.rs:414`（`DCS-4`）
+  - 验证：`grep -n "audit_pending" README.md` 命中新路径 `spawn/event_loop.rs:414`
+  - 验证：`grep -n "spawn.rs::audit_pending" README.md` 无残留
+- [x] 9.4 `README.md` 行号 `_credential.py:433`→`445`（`DCS-5`）
+  - 验证：`grep -n "_credential.py:445" README.md` 命中；`433` 无残留
+  - 验证：`python3 scripts/check_doc_paths.py` 该指针通过
+- [x] 9.5 源码注释 `pump.rs::spawn_gated` 不存在的符号指针修正（`DCS-6`）
+  - 验证：`grep -rn "spawn_gated" src/` 无失效指针
+  - 验证：`python3 scripts/check_doc_paths.py` 通过
+- [x] 9.6 `docs-contract-resync`/`code-quality-cleanup` 等归档 spec 批量历史指针修正（仅修指针、保留归档语义；含 `DCS-7`/`DCS-8`/`DCS-12..14`）
+  - 验证：`python3 scripts/check_doc_paths.py` 覆盖归档 spec 通过
+  - 验证：归档 spec 语义文本未改（仅 `path:line` 变化）
+- [x] 9.7 `src/lib.rs` 补 `//!` 模块文档，文档门禁覆盖 lib 根（`DCS-9`）
+  - 验证：`head -n 3 src/lib.rs` 含 `//!`
+  - 验证：`python3 scripts/check_doc_paths.py` 通过
+- [x] 9.8 `scripts/README.md` 补记 `PENDING_REFS` 例外说明（`DCS-10`）
+  - 验证：`grep -n "PENDING_REFS" scripts/README.md` 命中说明
+  - 验证：说明与 `check_doc_paths.py` 行为一致
+- [x] 9.9 `README.md` §8.5「12 项（cargo）」标签错位修正为 23 项脚本口径（`DCS-11`）
+  - 验证：`grep -n "23 项\|12 项" README.md` 命中修正标签
+  - 验证：§8.5 与 `scripts/api_conformance.py` 项数一致
+- [x] 9.10 `scripts/check_doc_paths.py` 扩展校验 `path:line` 行号语义（行号在文件行数内 + 可选 anchor），纳入 gate（`DCS-ROOT`）
+  - 验证：`python3 scripts/check_doc_paths.py` 对失效行号返回非零
+  - 验证：`bash scripts/gate.sh` 含该扩展校验步骤；`grep -n "line" scripts/check_doc_paths.py` 命中行号校验
+
+## 10. 测试补强（`TCP`/`FAKE`/`CHC-7`/`DCS-1`；`test-coverage-fill`/`test-e2e-closure`）
+
+- [x] 10.1 `src/service/audit/log.rs:461-474` AuditLogger 补并发追加测试（多线程写不丢行，对齐 Python `test_append_and_concurrent_safe`；`TCP-1`）
+  - 验证：`cargo test -p veil audit_log_concurrent_append` 通过；多线程写无丢行
+  - 验证：行数与写入次数一致
+- [x] 10.2 AuditLogger 补轮转并发测试（轮转不损坏）
+  - 验证：`cargo test -p veil audit_log_concurrent_rotate` 通过；轮转不损坏
+  - 验证：如实现有缺口同步修复并回归全绿
+- [x] 10.3 `src/handler/credential/vault_ops.rs:154-159` `GET /registrations` 部署密钥 `X-Get-Binary-Secret` 鉴权分支补 e2e（匹配放行/不匹配 401/双缺 401；`TCP-2`）
+  - 验证：`cargo test -p veil --test http_e2e_credential registrations_deploy_key_auth` 通过；三分支行为正确
+  - 验证：现有 `tests/http_e2e_credential.rs:385` admin token 用例不回退
+- [x] 10.4 `tests/http_e2e_ratelimit.rs:145-149` 收紧断言：`Ok(Ok(Some(_)))` 显式保持打开、`None => panic!`；补超限拒绝分支断言（`FAKE-1`）
+  - 验证：`grep -n "Ok(Ok(_))" tests/http_e2e_ratelimit.rs` 无宽断言残留
+  - 验证：`cargo test -p veil --test http_e2e_ratelimit` 通过；保持打开/被关闭可区分
+- [x] 10.5 canonical `openspec/specs/test-coverage-fill/spec.md` conformance 计数 20→23（含 23 项明细口径；`DCS-1`）
+  - 验证：`grep -n "23\|20" openspec/specs/test-coverage-fill/spec.md` 命中计数 23
+  - 验证：与 `README.md` §8.5 及 `scripts/api_conformance.py` 项数一致
+- [x] 10.6 `src/service/tpm.rs:342-364` TPM 测试改造：硬件缺失时显式 skip 标记或注入桩，消除条件化断言空转假绿（`TCP-3`/`FAKE-3`）
+  - 验证：`grep -n "skip\|mock" src/service/tpm.rs` 命中显式 skip/桩
+  - 验证：无硬件环境下 `cargo test -p veil tpm_` 不空转假绿（skip 可见）
+- [x] 10.7 `src/handler/llm/pump/hold/tests.rs:65-67` 死分支移除或改为有效断言（`TCP-4`/`FAKE-4`）
+  - 验证：`grep -n "65-67\|死分支" src/handler/llm/pump/hold/tests.rs` 无死分支
+  - 验证：`cargo test -p veil hold` 全绿；断言有效
+- [x] 10.8 `src/handler/llm/pump/fragments/tests.rs:60` 宽松析取 `is_empty() || len()==1` 钉死期望值（`FAKE-2`）
+  - 验证：`grep -n "is_empty() ||" src/handler/llm/pump/fragments/tests.rs` 无宽析取残留
+  - 验证：`cargo test -p veil fragments` 全绿；期望值唯一
+- [x] 10.9 补脱敏→还原 `tool_calls` 参数内端到端测试：请求含 PII→工具参数内占位符→响应还原逐字一致（`CHC-7`）
+  - 验证：`cargo test -p veil tool_calls_redact_restore_e2e` 通过；参数内占位符往返逐字一致
+  - 验证：conformance 请求体含 token 场景被覆盖（不因缺 token 而跳过）
+
+## 11. 外部仓库伴生修复（Python credential-proxy 与 Go 客户端，跨仓；本仓仅登记跟踪，不在本仓标记完成）
+
+- [ ] 11.1 Go 仓 `get/internal/proxy.go:341-344` + `revoke.go:25-29` 修复 `get revoke` 把异步 202 误判为吊销成功（改为轮询或声明需 `CREDENTIAL_BLOCK_WAIT=1`）；应用于 Go 客户端仓（`/home/keivry/项目/Python/credential-proxy` 相邻仓），本仓仅登记跟踪（`CRD-2` 伴生）
+  - 验证：Go 仓 `get revoke` 对 202 不再走成功分支（按轮询/声明修复）
+  - 验证：Go 仓提交后回填记录；本仓 tasks 不标记完成
+- [ ] 11.2 Python 仓 `tests/llm_test.py` 30 处 `assert True` 恢复真实断言（对照注释尾部原断言文本），无依据者用录制回放校验（`PY-1`）；应用于 `/home/keivry/项目/Python/credential-proxy`，本仓仅登记跟踪
+  - 验证：`grep -c "assert True" /home/keivry/项目/Python/credential-proxy/tests/llm_test.py` 为 0
+  - 验证：Python 仓 pytest 全绿；本仓 tasks 不标记完成
+- [ ] 11.3 Python 仓恒真析取（`llm_test.py:1168/1496`）与吞异常断言（`observability_pii_value_test.py:262-275`）钉死期望值、异常路径显式失败（`PY-2`）；外部仓实施，本仓仅登记
+  - 验证：`grep -n "len(events)==1 or\|except:.*pass" /home/keivry/项目/Python/credential-proxy/tests/` 无恒真/吞异常残留
+  - 验证：Python 仓测试全绿；本仓 tasks 不标记完成
+- [ ] 11.4 Python 仓仅类型断言（`detection_hardening_test.py:45/72/107`）与弱析取（`audit_approve_stream_test.py:265/343`）加强为具体值/形状断言（`PY-3`）；外部仓实施，本仓仅登记
+  - 验证：相关断言改为具体值/形状断言
+  - 验证：Python 仓测试全绿；本仓 tasks 不标记完成
+
+## 12. 门禁与验证
+
+- [x] 12.1 `cargo fmt --check`、`cargo clippy --tests --all-targets -- -D warnings`、`cargo test` 全绿
+  - 验证：三条命令退出码 0；新增测试全绿、无既有测试回退
+  - 验证：clippy 在 `-D warnings` 下 0 warning
+- [x] 12.2 `python3 scripts/check_doc_paths.py`（含 `9.10` 行号校验扩展）与 `python3 scripts/check_file_sizes.py` 退出 0
+  - 验证：两命令输出 OK，无 FAIL 项
+  - 验证：142 文件 ≤800 行约束保持
+- [x] 12.3 `openspec validate veil-audit-r2-remediation --strict` 0 failures
+  - 验证：命令输出 `is valid` 且 0 failures
+  - 验证：`openspec status --change veil-audit-r2-remediation` artifacts 齐全（proposal/design/specs/tasks）
+- [x] 12.4 `README.md` + canonical spec 同步终检 + `bash scripts/gate.sh` 全量运行
+  - 验证：`README.md` 相关章节（§5/§6.7/§7.5/§8.5 等）与 canonical spec 口径一致、无旧表述残留
+  - 验证：`bash scripts/gate.sh` 六步全绿（exit 0），真 SDK conformance 23/23
+- [x] 12.5 门禁修复（apply 期新发现）：F2 拆分 `src/service/sse.rs`（887→271 行）致归档 change `2026-09-11-veil-parity-gap-closeout/tasks.md:46` 的历史指针（原指向该文件第 331 行）越界；按 `9.6` 同法仅修指针为 `src/service/sse/tests.rs:485`（refusal 单测现址），保留归档语义
+  - 验证：`python3 scripts/check_doc_paths.py` 越界（FAIL）为 0
+  - 验证：`bash scripts/gate.sh` 六步全绿

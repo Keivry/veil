@@ -2,13 +2,13 @@
 
 独立六维审查（2026-09-14，C3 LLM 网关传输面）确认 7 项传输保真偏差（TRN-1–TRN-7），其中 3 项 P1、4 项 P2，违反既有 spec/README 声明或官方流式契约：
 
-- **`TRN-1`（P1）SSE 出口丢 `id:`/`retry:` 与跨块 `event:` 配对**：解析侧已捕获 `id`/`retry`（`src/service/sse/parser.rs:248-255`），但出口信封重建时仅重放 `event: {type}`，丢弃 `id`/`retry`（`src/handler/llm/pump/spawn.rs:559-563`，非 JSON 分支 `:607-611` 同）；`event:` 与 `data:` 被上游分块/空行隔开时配对丢失。Python 对照 `_llm.py:5285-5318` 将 `event`/`id` FIFO 暂存后与 `data` 同块写出、`retry` 直通。
-- **`TRN-7`（P1）Anthropic 流式 `message.id`/`message.model` 未提取**：`extract_conv_id` 不识别 `message.id` 嵌套形态（`src/service/llm_gateway/tool.rs:580-620`），模型仅读顶层 `model`（`src/handler/llm/pump/spawn.rs:198-202`）；`message_start`（`{"message":{"id","model",...}}`）下会话关联缺失、model 分桶恒 `unknown_model`。Python 对照 `_llm.py:350-368` 提取 `data['message']['id']`。
+- **`TRN-1`（P1）SSE 出口丢 `id:`/`retry:` 与跨块 `event:` 配对**：解析侧已捕获 `id`/`retry`（`src/service/sse/parser.rs:248-255`），但出口信封重建时仅重放 `event: {type}`，丢弃 `id`/`retry`（`src/handler/llm/pump/spawn/event_loop.rs:50-62`，非 JSON 分支 `:607-611` 同）；`event:` 与 `data:` 被上游分块/空行隔开时配对丢失。Python 对照 `_llm.py:5285-5318` 将 `event`/`id` FIFO 暂存后与 `data` 同块写出、`retry` 直通。
+- **`TRN-7`（P1）Anthropic 流式 `message.id`/`message.model` 未提取**：`extract_conv_id` 不识别 `message.id` 嵌套形态（`src/service/llm_gateway/tool.rs:580-620`），模型仅读顶层 `model`（`src/handler/llm/pump/event.rs:175-181`）；`message_start`（`{"message":{"id","model",...}}`）下会话关联缺失、model 分桶恒 `unknown_model`。Python 对照 `_llm.py:350-368` 提取 `data['message']['id']`。
 - **`TRN-2`（P1）Responses `type:"error"` 合成帧丢 `code`/`param`（且缺 `sequence_number`）**：`responses_error_object` 仅读嵌套 `error` 对象（`src/handler/llm/pump/event.rs:138-161`）；官方 `ResponseErrorEvent`（`openai/types/responses/response_error_event.py`）的 `code`/`message`/`param`/`sequence_number` 均在**顶层**，故官方形态下 code/param 丢失、sequence_number 从未透出。
 - **`TRN-3`（P2）`stream_upstream_passthrough` 无界读**：`up.bytes().await` 先全量读 body 再判超限（`src/handler/llm/dispatch.rs:328`，判定 `:329`），错误体/异常大体可致内存放大。
 - **`TRN-4`（P2）透传未剔上游 `x-veil-*` 响应头**：`src/handler/llm/dispatch.rs:318-349` 原样拷贝全部上游响应头并仅做 hop 过滤，上游注入的 `x-veil-*` 会泄漏到下游。
 - **`TRN-5`（P2）`stream_options:null` 被替换**：`should_inject_stream_options` 对非对象（含 `null`）返回 `true`（`src/service/llm_gateway/protocol.rs:149-156`），`inject_stream_options` 将非对象整体替换为 `{"include_usage":true}`（`:159-178`），非最小改写且改变三态语义。
-- **`TRN-6`（P2）Anthropic 阻断帧 `index:0` 硬编码 + `content_block_start.input:{}` 污染审计参数**：阻断帧恒 `index:0`（`src/service/block_inject/frames.rs:40-48`）；fragments 将 `content_block_start` 的 `input:{}` 当作 args_delta（`src/handler/llm/pump/fragments.rs:155-174`），经 `normalize_tool_args_with` 序列化为 `"{}"`（`src/service/llm_gateway/tool.rs:21-38`），与后续 `partial_json` 拼接成 `"{}{...}"` 污染审计参数。
+- **`TRN-6`（P2）Anthropic 阻断帧 `index:0` 硬编码 + `content_block_start.input:{}` 污染审计参数**：阻断帧恒 `index:0`（`src/service/block_inject/frames.rs:40-48`）；fragments 将 `content_block_start` 的 `input:{}` 当作 args_delta（`src/service/llm_gateway/tool.rs:390-404`），经 `normalize_tool_args_with` 序列化为 `"{}"`（`src/service/llm_gateway/tool.rs:21-38`），与后续 `partial_json` 拼接成 `"{}{...}"` 污染审计参数。
 
 真相源为上述 `src/` 文件、`README.md` §7.1/§7.2 与官方 SDK 契约。本 change 只规划修复（proposal/design/spec/tasks），不改 `src/`、`tests/` 与 README；实现与文档同步留待 apply 阶段。
 

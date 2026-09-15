@@ -4,7 +4,7 @@
 
 - **lint 盲区**：`src/lib.rs:1-11` 将全部顶层模块以 `pub mod` 暴露，rustc `dead_code` lint 对 pub 可达项不告警；`D1`/`D2` 的生产零引用 pub 项与该盲区长期并存，故收编 MUST 依赖可见性变更 + 单独编译验证，而非 lint。
 - **`D1`**：`src/service/pii/scope.rs:269-274` `pub fn contains_request_token`，全仓 grep 仅同文件命中：定义 `:269`，测试调用 `:391/395/403/424/454/650`，生产零调用。既有对齐样本：`PiiScope::next_available_index`（`scope.rs:119-129`）已以 `#[cfg(test)] fn` 收编。
-- **`D2`**：`src/registry.rs:372` `pub fn migrate_python_registry`，生产零调用；`CallerRegistry::load_from`（`registry.rs:208-240`）为生产唯一加载入口（含新格式与 `integrity_of` 校验），测试仅 `:644`（断言 Python 旧格式解析与 `.bak` 备份）。
+- **`D2`**：`src/registry/migrate.rs:41` `pub fn migrate_python_registry`，生产零调用；`CallerRegistry::load_from`（`registry.rs:208-240`）为生产唯一加载入口（含新格式与 `integrity_of` 校验），测试仅 `:644`（断言 Python 旧格式解析与 `.bak` 备份）。
 - **`D3`**：`src/service/admin/events.rs:37-45` `load_admin_token_file` **已含 `#[cfg(test)]` gating**（HEAD 已满足）；README §3「诚实声明：B1.2 token 文件加载仅 `cfg(test)` 生效（生产 fail-closed 口径不变）」与代码同字。本项为审计快照过时项，处理方式为验证锁定。
 - **`D4`**：`src/service/pii/detector.rs:189-269 mask_pii_value`（LLM 可见掩码，六分支）vs `src/service/metrics/sample.rs:142-228 sample_mask`（指标采样掩码，六分支）。逐分支核对后的**实际分叉清单**：
   1. bank 别名集：detector `bank_card | bankcard | id_card`（`:231`）vs sample `bank | bank_card`（`:188`）——sample 不识别 `bankcard`/`id_card`，detector 不识别 `bank`；
@@ -48,7 +48,7 @@
 
 ### D2：`migrate_python_registry` 选 `#[cfg(test)]`，不选 `examples/`
 
-**决策**：把 `src/registry.rs:372` 的 `migrate_python_registry` 整函数移入 `#[cfg(test)]`（或等价测试专用模块），测试 `:644` 保持；`load_from` 新格式加载路径（`registry.rs:208-240`）不动，Python 旧格式解析、`tracing::warn!` 迁移告警与 `.bak` 备份语义逐项保持。
+**决策**：把 `src/registry/migrate.rs:41` 的 `migrate_python_registry` 整函数移入 `#[cfg(test)]`（或等价测试专用模块），测试 `:644` 保持；`load_from` 新格式加载路径（`registry.rs:208-240`）不动，Python 旧格式解析、`tracing::warn!` 迁移告警与 `.bak` 备份语义逐项保持。
 
 **理由**：该函数无生产调用点，是「一次性迁移工具 + 回归测试载体」；`load_from` 已是生产唯一入口。`#[cfg(test)]` 与 `D1` 同口径、零新增构建目标，且 gating 后 `RegistryFile`/`integrity_of` 仍被 `load_from` 使用，不会产生 release unused import。
 

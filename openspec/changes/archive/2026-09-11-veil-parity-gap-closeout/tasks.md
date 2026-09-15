@@ -34,7 +34,7 @@
 
 - [x] 5.1（T1）批准路径 e2e（`CREDENTIAL_BLOCK_WAIT=1`，HTTP 层）：请求挂起期间由审批侧批准，同请求返回凭据（无 `202`），验证：e2e 通过且与 Python `_credential.py:433,455` 语义一致
 - [x] 5.2 超时路径 e2e：注入时钟/缩短超时，等待超时后按拒绝/超时口径返回且不悬挂，验证：响应码与 spec 场景一致、无遗留后台任务
-- [x] 5.3 客户端早断连幂等 e2e：请求 future 提前 drop 后 pending 建单可清理、批准不 panic、无资源泄漏（补齐 `src/service/audit/hold.rs:737-754` 仅 keepalive 存活断言的凭据侧对应覆盖），验证：e2e 通过且断连后重复触发幂等
+- [x] 5.3 客户端早断连幂等 e2e：请求 future 提前 drop 后 pending 建单可清理、批准不 panic、无资源泄漏（补齐 `src/service/audit/hold/tests.rs:592-622` 仅 keepalive 存活断言的凭据侧对应覆盖），验证：e2e 通过且断连后重复触发幂等
 
 ## 6. T2 Responses CR-only 回放
 
@@ -43,7 +43,7 @@
 
 ## 7. T3 refusal 集成 + ReDoS 上界
 
-- [x] 7.1（T3）refusal 集成级「独立还原」测试：Chat 流式 refusal 帧经网关后还原为明文（非原样透传 / 非占位），验证：集成测试通过（当前仅 `src/service/sse.rs:331` / `src/handler/llm/pump/event.rs` 单元覆盖）
+- [x] 7.1（T3）refusal 集成级「独立还原」测试：Chat 流式 refusal 帧经网关后还原为明文（非原样透传 / 非占位），验证：集成测试通过（当前仅 `src/service/sse/tests.rs:485` / `src/handler/llm/pump/event.rs` 单元覆盖）
 - [x] 7.2 ReDoS 墙钟绝对上界测试：对抗输入（如 `^(a+)+$`）扫描在明确绝对上界常量内返回，不依赖仅预算断言与连续三次禁用记账，验证：挂起上界测试通过（现有 `malicious_pattern_fast_reject_and_disable_after_three_timeouts` 之外新增）
 
 ## 8. 收口与一致性

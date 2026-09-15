@@ -18,7 +18,7 @@
 
 - [x] 3.1 `src/registry/store.rs:292-313 approve_hash_change_with_script_sha256` 补三态落定参数：`🔓` 保持 `allow_mode` 不变；`✅` 置 `allow_mode = Some(AutoApprove::Pending)`（人工）；`❎` 置 `enabled=false`；三态均写 `old_hash`/`old_hash_expires_at`/`script_sha256`
   - 验证：`cargo test -p veil hash_change_three_state` 通过；三态后 `allow_mode`/`enabled`/`old_hash_expires_at` 终值符合 design D3
-- [x] 3.2 `src/handler/credential.rs:352-366 approve_hash_change_handler` 增 `reg_id`/`reaction` 可选入参：`reg_id` 缺省回退 `caller_path`，`reaction` 缺省按保持自动；`serde(default)` 不因缺参返回 `400`
+- [x] 3.2 `src/handler/credential.rs:294 approve_hash_change_handler` 增 `reg_id`/`reaction` 可选入参：`reg_id` 缺省回退 `caller_path`，`reaction` 缺省按保持自动；`serde(default)` 不因缺参返回 `400`
   - 验证：`cargo test -p veil approve_hash_change_handler_contract` 通过；缺 `reg_id`/`reaction` 行为与既有等价、返回成功
 - [x] 3.3 README §6/§7.5 登记哈希变更三态语义与 `reg_id`/`reaction` 契约
   - 验证：`grep -n "哈希变更" README.md` 命中三态描述

@@ -21,7 +21,7 @@
 - [x] 3.1 在 `src/service/llm_gateway/tool.rs` 建立单一三臂提取核心（以 `extract_tool_calls` 的 `Vec<ToolCall>` 为规范输出，覆盖两实现分支并集：Chat `delta`/`message`/`function_call`/`custom_tool_call`；Anthropic `content_block`/`delta`/`content`/`message.content`/`function_call`/`custom_tool_call`；Responses `function_call_arguments.delta/done`、检索事件、`output_item.added/done`、`output` 数组），`extract_tool_calls`（`tool.rs:196-578`）改调核心
   - 验证：`cargo test -p veil --lib service::llm_gateway::tool` 全绿（Chat/Anthropic/Responses 提取单测无回退）
   - 验证：`grep -n "pub fn extract_tool_calls" src/service/llm_gateway/tool.rs` 命中且函数体不含并行三臂重复 walk（改为调核心）
-- [x] 3.2 `src/handler/llm/pump/fragments.rs:20-376` 的 `extract_tool_fragments` 改薄适配：调用 3.1 核心后映射为既有元组 `(index, Some(id), name, args)`；保持 `spawn.rs:223/:315` 调用点与返回类型不变
+- [x] 3.2 `src/handler/llm/pump/fragments.rs:11-19` 的 `extract_tool_fragments` 改薄适配：调用 3.1 核心后映射为既有元组 `(index, Some(id), name, args)`；保持 `spawn.rs:223/:315` 调用点与返回类型不变
   - 验证：`cargo test -p veil --lib handler::llm::pump::fragments` 全绿（frag↔calls 等价对照用例如 `fragments/tests.rs` 无一回退）
   - 验证：`cargo test -p veil --lib pump::fragments` 与 `cargo test -p veil --test http_e2e_audit_approve` 全绿（流式审计/阻断路径行为不变）
 - [x] 3.3 重复面收敛确认：两路径三臂 walk 不再各存一份
@@ -46,7 +46,7 @@
 
 ## 5. 流泵按职责拆分（`ARC-1`）
 
-- [x] 5.1 聚合循环状态：将 `src/handler/llm/pump/spawn.rs:56-148` 的 `StreamPumpCtx` 解构与局部状态初始化收敛为 setup 构造器，返回 `PumpLoopState`（`forwarded`/`agg`/`terminal_sent`/`any_frame_sent`/`pending_tool_frames`/`hold`/`meta`/`carry` 等），置于 `spawn/setup.rs`
+- [x] 5.1 聚合循环状态：将 `src/handler/llm/pump/spawn/setup.rs:74-152` 的 `StreamPumpCtx` 解构与局部状态初始化收敛为 setup 构造器，返回 `PumpLoopState`（`forwarded`/`agg`/`terminal_sent`/`any_frame_sent`/`pending_tool_frames`/`hold`/`meta`/`carry` 等），置于 `spawn/setup.rs`
   - 验证：`grep -n "struct PumpLoopState" src/handler/llm/pump/spawn/setup.rs` 命中；`grep -n "PumpLoopState" src/handler/llm/pump/spawn.rs` 命中使用点<!-- doc-paths-ignore -->
   - 验证：`cargo build` 退出 0（状态聚合未改变语义）；`spawn.rs:49-699` 行数较拆分前下降
 - [x] 5.2 主循环薄层 + 单事件处理提取：`spawn.rs:149-658` 拆出 `run_pump(...)`（chunk 读取 `:150-163`、parser 喂入 `:169-173` 留薄层）与 `handle_event(&mut state, ev, &deps) -> ControlFlow`（现 `:174-654`），置于 `spawn/event_loop.rs`；单事件内部再按职责提取 Responses 控制动作（`:237-307`）、分片入 hold 与审计（`:370-489`）、还原/PII/发送（`:533-654`）

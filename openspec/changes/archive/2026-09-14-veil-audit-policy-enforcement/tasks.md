@@ -6,7 +6,7 @@
 - [x] 1.2 `src/main.rs` 启动序列在 `Config::from_env()` 与 `preflight_whitelist` 之后、`startup_tpm_in`/`init_sqlite`/`spawn_sweeper` 等副作用点之前调用 `AuditPolicy::load_startup(config.audit_policy_file...)`，失败 `eprintln! + ExitCode::from(1)`；把加载结果注入 `AppState`（`src/state.rs` 承载 `Arc<AuditPolicy>` 或等价字段），`src/state.rs` 构造/`build_router` 路径对齐
   - 验证：`cargo test -p veil startup_whitelist_fail_fast` 扩展/新增用例通过；断言策略加载调用点早于 `startup_tpm_in`/`init_sqlite`/`.spawn_sweeper()`（`include_str!("main.rs")` 位置断言）
   - 验证：`cargo build` 通过；`grep -n "load_startup" src/main.rs` 命中且 `grep -rn "audit_policy" src/state.rs` 命中注入字段
-- [x] 1.3 `src/handler/llm/pump/spawn.rs:99` 与 `src/handler/llm/nonstream.rs:174` 改为复用 `AppState` 注入的策略实例，删除请求期 `AuditPolicy::load_for_runtime`/`capture_process_env` 调用；确认请求路径不再 `std::fs::read_to_string` 策略文件
+- [x] 1.3 `src/handler/llm/pump/spawn/setup.rs:25-43` 与 `src/handler/llm/nonstream.rs:174` 改为复用 `AppState` 注入的策略实例，删除请求期 `AuditPolicy::load_for_runtime`/`capture_process_env` 调用；确认请求路径不再 `std::fs::read_to_string` 策略文件
   - 验证：`grep -n "load_for_runtime" src/handler/llm/` 无命中；`grep -n "audit_policy" src/handler/llm/pump/spawn.rs src/handler/llm/nonstream.rs` 命中复用点
   - 验证：新增用例断言同一策略实例跨流式/非流式请求复用（策略加载计数为 1）；`cargo test -p veil` 相关流式/非流式套件全绿
 - [x] 1.4 回归：损坏策略文件→启动失败（非静默空策略）；合法策略文件→`deny`/`allow`/`extra_dangerous`/`extra_block_substrings` 生效；`AUDIT_POLICY_FILE` 未设置→内建默认策略不回归

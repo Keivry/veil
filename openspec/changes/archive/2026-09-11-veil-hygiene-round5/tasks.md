@@ -9,7 +9,7 @@
 
 ## 2. `D2` `CallerRegistry::migrate_python_registry` 测试专用化
 
-- [x] 2.1 `src/registry.rs:372`：将 `migrate_python_registry` 移入 `#[cfg(test)]`（或等价测试专用模块），不选 `examples/`（无独立运行需求且新增构建目标）；确认 `load_from`（`registry.rs:208-240`）仍为生产唯一加载入口；若 change `veil-runtime-robustness` 的 B6 已先落地模块拆分，则以 `src/registry/migrate.rs` 为落点、行号以拆分后为准（避免引用失效）
+- [x] 2.1 `src/registry/migrate.rs:41`：将 `migrate_python_registry` 移入 `#[cfg(test)]`（或等价测试专用模块），不选 `examples/`（无独立运行需求且新增构建目标）；确认 `load_from`（`registry.rs:208-240`）仍为生产唯一加载入口；若 change `veil-runtime-robustness` 的 B6 已先落地模块拆分，则以 `src/registry/migrate.rs` 为落点、行号以拆分后为准（避免引用失效）
     - Verify: `grep -rn "pub fn migrate_python_registry" src/` 零命中；`grep -n "fn migrate_python_registry" src/registry.rs` 仅测试可见定义
     - Verify: `cargo build --release` 零告警（`RegistryFile`/`integrity_of` 仍被 `load_from` 使用，无 unused import）
 - [x] 2.2 保持迁移语义测试（`registry.rs:644`）：Python 旧格式（`version/callers/allowed_entries`）解析、字段映射、`.bak` 备份断言全绿

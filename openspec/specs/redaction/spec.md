@@ -17,12 +17,12 @@
 - **WHEN** 响应中出现请求期未注册的新 PII
 - **THEN** 系统以新占位符呈现，不还原为明文
 
-### Requirement: 6 recognizer + 联合正则 + 中文边界
+### Requirement: 7 recognizer + 联合正则 + 中文边界
 
-系统 SHALL 内置 6 recognizer：手机号、身份证、银行卡、邮箱、IP 地址、API 密钥；6 recognizer SHALL 联合为单一联合正则一次扫描；中文与 CJK 边界 SHALL 用 lookaround 表达，MUST NOT 用 `\b`（`\b` 对 CJK 无效）；含 `\b` 的自定义正则 SHALL 拒绝加载。
+系统 SHALL 内置 7 recognizer：手机号、身份证、银行卡、邮箱、IPv4、IPv6、API 密钥；7 recognizer SHALL 联合为单一联合正则一次扫描；中文与 CJK 边界 SHALL 用 lookaround 表达，MUST NOT 用 `\b`（`\b` 对 CJK 无效）；含 `\b` 的自定义正则 SHALL 拒绝加载。内置 recognizer 名单长度 SHALL 恒为 7（`email/phone/id_card/bank_card/ipv4/ipv6/api_key`），与实现/Python 一致。
 
 #### Scenario: 六类命中
-- **WHEN** 正文含上述六类之一
+- **WHEN** 正文含上述七类之一
 - **THEN** 联合正则一次扫描即命中对应 recognizer
 
 #### Scenario: \b 正则拒绝加载
@@ -32,6 +32,10 @@
 #### Scenario: CJK 边界正确
 - **WHEN** 敏感值紧贴中文字符
 - **THEN** lookaround 边界正确判定，不误报不断句
+
+#### Scenario: 内置计数为 7
+- **WHEN** 检查内置 recognizer 名单
+- **THEN** 其长度为 7（含 `ipv6`），与实现/Python 一致
 
 ### Requirement: Luhn 与 GB 校验位 + 保留豁免清单
 

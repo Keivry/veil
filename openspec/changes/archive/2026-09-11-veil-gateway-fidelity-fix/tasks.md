@@ -1,9 +1,9 @@
 ## 1. `H2` 流式还原破帧防护
 
-- [x] 1.1 `src/service/redaction/scope.rs`：新增 JSON 上下文还原变体（如 `restore_response_with_spans_json`，对外保留既有 `restore_response_with_spans`），写回明文按 RFC 8259 转义 `"`/`\`/控制字符；`src/handler/llm/pump/spawn.rs:450-460` 的 JSON 分支改用新入口，plain 分支（`:490-505`）维持字节级原样还原
+- [x] 1.1 `src/service/redaction/scope.rs`：新增 JSON 上下文还原变体（如 `restore_response_with_spans_json`，对外保留既有 `restore_response_with_spans`），写回明文按 RFC 8259 转义 `"`/`\`/控制字符；`src/handler/llm/pump/spawn/event_loop.rs:576-599` 的 JSON 分支改用新入口，plain 分支（`:490-505`）维持字节级原样还原
   - Verify: `cargo test -p veil stream_restore_quotes_escaped` 通过；构造注册明文 `pa"ss`，断言下游帧 `serde_json::from_str` 成功且 `["text"]=="pa\"ss"`（语义等价）
   - Verify: `grep -n "restore_response_with_spans_json" src/service/redaction/scope.rs src/handler/llm/pump/spawn.rs` 命中且仅 JSON 分支调用；`grep -n "restore_response_with_spans" src/handler/llm/pump/spawn.rs` 确认 plain 分支仍用旧入口
-- [x] 1.2 `src/handler/llm/pump/spawn.rs:450-460`：还原后逐帧 `jloads` 校验，失败回退还原前占位符帧（`ev.data`）+ `tracing::warn` + `gateway_metrics.record_restore_fallback()`；对齐非流 `src/handler/llm/nonstream.rs:235-245` 的 `retry_stripped` 回退语义
+- [x] 1.2 `src/handler/llm/pump/spawn/frame_feed.rs:50-62`：还原后逐帧 `jloads` 校验，失败回退还原前占位符帧（`ev.data`）+ `tracing::warn` + `gateway_metrics.record_restore_fallback()`；对齐非流 `src/handler/llm/nonstream.rs:235-245` 的 `retry_stripped` 回退语义
   - Verify: `cargo test -p veil stream_restore_fallback_keeps_token` 通过；断言失败路径下游帧含 `__VG_CRED_` 占位符、JSON 可解析、`restore_fallback` 计数 +1
   - Verify: `grep -n "record_restore_fallback" src/handler/llm/pump/spawn.rs` 命中新增调用点；`grep -n "fn retry_stripped" src/handler/llm/nonstream.rs` 命中且非流行为未改
 - [x] 1.3 补 `H2` 四场景测试：明文含双引号、反斜杠、换行控制字符、病态回退（还原后仍破损）
@@ -41,7 +41,7 @@
 
 ## 4. `M2` Responses 失败帧诊断保真
 
-- [x] 4.1 `src/handler/llm/pump/event.rs:137-145`：`responses_error_message` 扩展为提取 error 对象（`code`/`type`/`param`/`message` 存在即保留）；`src/handler/llm/pump/spawn.rs:226-252` 合成帧的 `response.error` 输出该对象
+- [x] 4.1 `src/handler/llm/pump/event.rs:137-145`：`responses_error_message` 扩展为提取 error 对象（`code`/`type`/`param`/`message` 存在即保留）；`src/handler/llm/pump/event.rs:151-173` 合成帧的 `response.error` 输出该对象
   - Verify: `cargo test -p veil responses_error_preserves_code_param` 通过；`response.failed` 的 `response.error.code=="rate_limit_exceeded"`、`param=="model"`
   - Verify: `cargo test -p veil responses_error_single_failed` 不回归；合成帧无 `output_index` 注入、无重复终端
 - [x] 4.2 缺失 `message`/非对象 error 的回退与 README §7.2 lossy 声明

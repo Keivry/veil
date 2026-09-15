@@ -7,7 +7,7 @@ docs/代码一致性复核（2026-09-11，只读）在「文档声明 vs 代码�
 - spec 引用门禁：`README.md:5`/`:203` 引 `openspec/changes/veil-hardening/specs/admin-ratelimit-contract/spec.md`（未归档，`veil-hardening` 13/16 in-progress）；`scripts/check_doc_paths.py` 仅匹配 `src/[A-Za-z0-9_./-]+\.rs`（`REF_RE`），spec 引用不在校验面（DOC3）。
 - 管理面路径：`src/router.rs:35-42` 注册 `/_admin/` 与 `/_admin` 同 handler，另有 `/_admin/{*rest}` 兜底 404；`src/service/admin/ratelimit.rs:21-24` 豁免集 `["/_admin/health"]`，接线 `src/handler/admin.rs:200-208`；README §1/§3 未写（DOC4）。
 - `TODO(metrics)`：`src/service/metrics.rs:7-12` 已声明「wont-measure、本模块不再持有 TODO、README §7.3 归 docs change 收尾」；`README.md:422` 仍写 `TODO(metrics)`（DOC5）。
-- 内部常量：`src/config/env_parse.rs:138/140/64/68/73`、`src/approval.rs:51`、`src/registry.rs:45`、`src/service/credential/ratelimit.rs:19-21`、`src/service/metrics/aggregate.rs:13` 的窗口/超时/容量常量未在 README §4 出现，也无「未列即内部实现细节」声明（DOC6）。
+- 内部常量：`src/config/env_parse.rs:138/140/64/68/73`、`src/approval.rs:51`、`src/registry/entry.rs:44`、`src/service/credential/ratelimit.rs:19-21`、`src/service/metrics/aggregate.rs:13` 的窗口/超时/容量常量未在 README §4 出现，也无「未列即内部实现细节」声明（DOC6）。
 - 行号引用：README 全文仅 2 处 `.rs:<行号>` 引用，均在 §7.1（`README.md:355` `hop.rs:7-16`、`:356` `handler/llm/mod.rs:34-46`）；`hop.rs:20` 的 `DECODE_ENABLED`（编解码配对标记）未被引用覆盖（DOC7）。
 - 占位符门控：`src/service/llm_gateway/placeholder.rs:25-33` 的 `match_cred_token` 要求 `\d{6,}`，为 vault 还原侧 `\d{4,}` 的严格子集；注释与 README:404-406 已同字声明，属有意保守（非缺陷）。
 

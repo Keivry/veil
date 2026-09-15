@@ -2,7 +2,7 @@
 
 独立六维审查（2026-09-13，LLM 网关三协议流式面）确认 11 项流式保真偏差（S1–S11），其中 2 项 critical、4 项 major，违反既有 spec/README 声明或官方流式规范：
 
-- **`S1`（critical）默认配置全流缓冲、非增量**：`src/service/audit/hold.rs:283` 的 `held()=!completed&&!rejected` 在流开始即真；`src/handler/llm/pump/decide.rs:108-114` 的抑制判定不含审计模式与 pending 判据；`src/handler/llm/pump/spawn.rs:532-538` 命中即 `continue` 跳过 `select_emit`；Chat `finish_reason:"stop"` 不触发 `mark_completed`（`hold.rs:188-235` 仅认 `tool_calls`/`message_stop`/`response.*`）。实测默认 `AUDIT_MODE=off` 的 Chat 流下游仅收到 1 帧（整段拼接），Anthropic/Responses 到 `message_stop`/`completed` 才放行。
+- **`S1`（critical）默认配置全流缓冲、非增量**：`src/service/audit/hold.rs:283` 的 `held()=!completed&&!rejected` 在流开始即真；`src/handler/llm/pump/decide.rs:108-114` 的抑制判定不含审计模式与 pending 判据；`src/handler/llm/pump/spawn/event_loop.rs:624-631` 命中即 `continue` 跳过 `select_emit`；Chat `finish_reason:"stop"` 不触发 `mark_completed`（`hold.rs:188-235` 仅认 `tool_calls`/`message_stop`/`response.*`）。实测默认 `AUDIT_MODE=off` 的 Chat 流下游仅收到 1 帧（整段拼接），Anthropic/Responses 到 `message_stop`/`completed` 才放行。
 - **`S2`（critical）Responses 多工具调用逃逸审计**：`hold.rs:116-122` 在 `completed` 时提前返回且不建槽；`hold.rs:222-233` 把 `response.output_item.done`/`response.function_call_arguments.done` 当全局完成（`spawn.rs:483-485` 随之 `mark_completed`）。实测 item0 良性完成后 item1 `exec {"command":"rm -rf /"}`（block 模式）无阻断帧、危险参数透传。
 - **`S3`（major）Responses 合成终端乱序**：`spawn.rs:258-284` 的 `SynthesizeFailed` 直接发送 `response.failed`，未 `boundary.flush()/clear()`，滞留帧在 EOF（`spawn.rs:642`）才落，实测帧序 `response.failed` 先于末段 delta。
 - **`S4`（major）跨帧切分占位符不还原**：`src/service/credential_vault.rs:40-51`、`src/service/pii/chunk.rs:124`、`src/service/redaction/leaf.rs:200-231`、`spawn.rs:486-510` 皆为逐帧还原无跨帧缝合；`src/service/redaction/seam.rs:177-197` 只掩码跨缝残片。实测 `__VG_CRE`+`D_000001__` 两帧前半被剥离、未还原明文。

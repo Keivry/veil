@@ -7,7 +7,7 @@
 - 超时叠加：`src/state.rs:154` 单 client `.timeout(HTTP_TIMEOUT_SECS=30)`（`src/config/env_parse.rs` 默认 `30`）经 reqwest `TotalTimeoutBody` 覆盖整响应体读取；`src/service/llm_gateway/mod.rs:207-245` 每次重试各重置 30s（`T3`）。
 - 非内存边界：`src/handler/llm/nonstream.rs:148` `up.bytes()` 全量读入，`:156` 才判 `len > ctx.nonstream_max_bytes`（`T4`）。
 - 协议宽容：`src/service/llm_gateway/protocol.rs:54-78` `lenient_match` 的「父路径 + 额外单段」分支把 `/v1/messages/count_tokens`、`/v1/responses/{id}` 判为对话协议（`T5`）。
-- 非流还原：`src/handler/llm/nonstream.rs:231` 用字节级 `restore_response_with_spans`，而流式用 `src/service/redaction/scope.rs:194 restore_response_with_spans_json`（`src/handler/llm/pump/spawn.rs:496`）（`T6`）。
+- 非流还原：`src/handler/llm/nonstream.rs:231` 用字节级 `restore_response_with_spans`，而流式用 `src/service/redaction/scope.rs:194 restore_response_with_spans_json`（`src/handler/llm/pump/spawn/event_loop.rs:576-584`）（`T6`）。
 - usage：`src/service/llm_gateway/usage.rs:71-75` 单事件缺 total 时按本事件 `prompt+completion` 派生，`:92-103` 五列各自 `max` → 派生 total 被当最终值（`T7`）。
 - skip 分段：`src/service/redaction/scope.rs:293-318` 按区间切段后逐段 `redact_response_new_pii_tracked`，各段为不完整 JSON 时 `json_walk` 不递归 stringified JSON（`T8`）。
 - 检索审计：`src/service/llm_gateway/tool.rs:109-130 retrieval_args` 只读顶层 `arguments/input/args` → `queries/query`（`T11`）。

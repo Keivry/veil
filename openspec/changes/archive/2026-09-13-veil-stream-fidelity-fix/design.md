@@ -2,7 +2,7 @@
 
 独立六维审查（2026-09-13）在 LLM 网关三协议流式面确认 11 项保真偏差（见 proposal Why 与覆盖表）。现状真相源：
 
-- 抑制判据过宽：`src/service/audit/hold.rs:283` 的 `held()=!completed&&!rejected` 在流开始即为真；`src/handler/llm/pump/decide.rs:108-114` 的 `should_suppress_held_output(!minor, hold_held, out_data_nonempty)` 不含审计模式与 pending 判据；`src/handler/llm/pump/spawn.rs:213-216` keepalive gate 与 `:532-538` 输出抑制同源（`S1`/`S8`）。
+- 抑制判据过宽：`src/service/audit/hold.rs:283` 的 `held()=!completed&&!rejected` 在流开始即为真；`src/handler/llm/pump/decide.rs:108-114` 的 `should_suppress_held_output(!minor, hold_held, out_data_nonempty)` 不含审计模式与 pending 判据；`src/handler/llm/pump/spawn/event_loop.rs:177-180` keepalive gate 与 `:532-538` 输出抑制同源（`S1`/`S8`）。
 - 全局完成误判：`hold.rs:188-235` 的 `is_complete_event` 把 `response.output_item.done`/`response.function_call_arguments.done` 当全局完成，且 `hold.rs:116-122` 在 `completed` 后提前返回（`S2`）。
 - 合成终端不 flush：`spawn.rs:258-284` 直接发送合成 `response.failed`，滞留帧拖到 `spawn.rs:642` EOF（`S3`）。
 - 逐帧还原无跨帧缝合：`src/service/credential_vault.rs:40-51`、`src/service/pii/chunk.rs:124` 的残缺剥离、`src/service/redaction/leaf.rs:200-231` 的形态扫描、`spawn.rs:486-510` 的还原调用；`src/service/redaction/seam.rs:177-197` 仅掩码跨缝残片（`S4`）。

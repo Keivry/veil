@@ -1,6 +1,6 @@
 ## 1. `B1` 注册表落盘移出 async 执行器与全局写锁
 
-- [x] 1.1 `src/registry.rs:228-253`：`save_to` 拆为锁内纯段 `to_file_bytes(&self) -> Result<Vec<u8>>`（entries 完整性 + `serde_json::to_vec_pretty`）与锁外纯字节 `write_atomic(path, &[u8]) -> Result<()>`（`create_dir_all` + tmp 写 + `ensure_0600` + rename + `ensure_0600`）；`save_to` 保留为两段组合的同步兼容入口（迁移路径/测试继续可用）
+- [x] 1.1 `src/registry/store.rs:236`：`save_to` 拆为锁内纯段 `to_file_bytes(&self) -> Result<Vec<u8>>`（entries 完整性 + `serde_json::to_vec_pretty`）与锁外纯字节 `write_atomic(path, &[u8]) -> Result<()>`（`create_dir_all` + tmp 写 + `ensure_0600` + rename + `ensure_0600`）；`save_to` 保留为两段组合的同步兼容入口（迁移路径/测试继续可用）
   - Verify: `cargo test -p veil atomic_save_and_integrity_check` 与 `cargo test -p veil saved_file_permissions_0600` 通过（既有原子落盘与 0600 权限语义不变）
   - Verify: `grep -n "fn to_file_bytes\|fn write_atomic" src/registry.rs` 命中，且 `write_atomic` 函数体内不引用 `CallerRegistry`（纯字节写盘）
 - [x] 1.2 `src/state.rs`/`src/service/credential/mod.rs:48-63`：新增写路径全序点（`AppState` 的 `Arc<tokio::sync::Mutex<()>>` + `AppStateParts` 访问器）；`src/service/credential/vault_ops.rs:184-190/195-201/245-251` 改为「全序点 → 写锁内改内存并取 bytes → 释放写锁 → `spawn_blocking(write_atomic).await` → 释放全序点」；失败由 `.ok()` 改显式 warn（design D1）
@@ -39,7 +39,7 @@
 
 ## 4. `B4` `integrity_of` 显式传播
 
-- [x] 4.1 `src/registry.rs:200-203`：`integrity_of` 改 `Result<String>`；`load_from:218`/`save_to:238`（拆分后 store.rs）/`migrate_python_registry:381` 调用点传播（加载拒绝、保存中止不落盘）；补 `#[cfg(test)]` 故障注入 seam
+- [x] 4.1 `src/registry/store.rs:189`：`integrity_of` 改 `Result<String>`；`load_from:218`/`save_to:238`（拆分后 store.rs）/`migrate_python_registry:381` 调用点传播（加载拒绝、保存中止不落盘）；补 `#[cfg(test)]` 故障注入 seam
   - Verify: `cargo test -p veil integrity_serialize_failure` 通过（注入序列化失败 → `load_from` 返回存储错误、`save_to` 不产生 tmp/rename）
   - Verify: `grep -n "unwrap_or_default" src/registry.rs` 不再命中完整性计算路径
 - [x] 4.2 既有完整性语义回归：sha 失配拒绝加载、原子保存后校验通过、Python 旧格式迁移保留 .bak
@@ -48,7 +48,7 @@
 
 ## 5. `B5` `bind_script_sha256` 阻塞化与输入校验
 
-- [x] 5.1 `src/registry.rs:191-198`：拆纯函数 `script_sha256_of_bytes` + async 读取入口（`spawn_blocking`）；加路径长度（≤4096）与大小上限（`BIND_SCRIPT_MAX_BYTES = 16 MiB`）校验，超限/不可读回退 `sha256(expected_hash:caller_path)` 并 warn
+- [x] 5.1 `src/registry/store.rs:59-80`：拆纯函数 `script_sha256_of_bytes` + async 读取入口（`spawn_blocking`）；加路径长度（≤4096）与大小上限（`BIND_SCRIPT_MAX_BYTES = 16 MiB`）校验，超限/不可读回退 `sha256(expected_hash:caller_path)` 并 warn
   - Verify: `cargo test -p veil bind_script_size_cap` 通过（超限不读全量、回退结果与派生公式一致）
   - Verify: `cargo test -p veil bind_script_path_length` 通过（超长路径不 panic、按回退处理）
 - [x] 5.2 `CallerRegistry` 增预计算入口（`register_extended`/`approve_hash_change` 的 `*_with_script_sha256` 变体，apply 时定）；`vault_ops.rs:184-192/245-251` 在取全序点/写锁前 await 读取，锁内无文件 I/O

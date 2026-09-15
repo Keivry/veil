@@ -3,7 +3,7 @@
 2026-09-13 凭据流水线六段独立审查确认 18 项偏差（`C1`–`C18`，见 proposal 覆盖表）。现状真相源与证据：
 
 - **审批链断链**：`register_caller_extended`（`src/service/credential/vault_ops.rs:181-224`）与 `revoke_caller`（`:226-237`）直接内存改 + 落盘返回，零 Matrix 交互；注册条目 `enabled=false`（`src/registry/store.rs:251-264`），全仓无「注册后启用」调用路径（`set_enabled` 仅测试与 `approve_hash_change` 调用）→ 条目长期 `disabled`（`C1`）。Python `_credential.py:617-721` 注册后等待 Matrix 300s 三态（🔓保持 disabled/✅启用/❎吊销，超时自动吊销）；`_credential.py:459-534` 吊销需 Matrix 确认（`C2`）。
-- **哈希变更三态缺失**：`approve_hash_change_with_script_sha256`（`src/registry/store.rs:292-313`）仅更新 hash/宽限/`enabled=true`，不改 `allow_mode`；`approve_hash_change_handler`（`src/handler/credential.rs:352-366`）仅收 `caller_path`/`new_hash`。Python `_registry.py:283-312`（🔓保持自动/✅降级 manual/❎禁用）+ handler 契约（`_credential.py:725-774`，`reg_id`/`reaction`）（`C3`）。
+- **哈希变更三态缺失**：`approve_hash_change_with_script_sha256`（`src/registry/store.rs:292-313`）仅更新 hash/宽限/`enabled=true`，不改 `allow_mode`；`approve_hash_change_handler`（`src/handler/credential.rs:294`）仅收 `caller_path`/`new_hash`。Python `_registry.py:283-312`（🔓保持自动/✅降级 manual/❎禁用）+ handler 契约（`_credential.py:725-774`，`reg_id`/`reaction`）（`C3`）。
 - **迁移未接线**：`load_from`（`src/registry/store.rs:167-185`）按新 `RegistryFile` 直接 `Err`；`migrate_python_registry`（`src/registry/migrate.rs:21-122`）模块级 `#[cfg(test)]` gating，生产零引用（`C4`）。
 - **name 语义缺失**：注册判重仅 path（`src/registry/store.rs:244-250`），`RevokeBody` 无 `name`（`src/handler/credential.rs:280-299`）→ `POST /revoke {name}` 404、重名不 409（`C5`）。
 - **lock/forget 未接线**：`handle_text_command_full`（`src/service/matrix/bot.rs:170-201`）只清审批单，注释明示网关侧须清口令缓存 + KeePass 会话 + PII scope / token 映射（`:162-169`），生产零调用（`C6`）。

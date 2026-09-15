@@ -4,7 +4,7 @@
 
 - **`R1` 脱敏次序回归**：`sanitize_for_log`（`src/service/audit/log.rs:44`）声明「先脱敏后截断」，但 `mask_secret_forms`（`:53`）在首行 `truncate_ref_chars(s, AUDIT_SUMMARY_TRUNCATE_CHARS)`（`:55`）先截断再脱敏。`private_key_block_at`（`:155`）需 `-----END` 收敛；>4096 字符 PEM 块截断后无 END → 不识别 → 前 4096 字符（含 base64 私钥材料）明文落盘。同时长输入输出不再逐字一致。此为 F6/D6「近似线性」修复的副作用。
 - **`R2` async 202 无消费方**：`approval_dual_mode`（`src/service/credential/approval.rs:117`）非阻塞分支 `:125-127` 仅 `return Err(record_pending(...))`；`await_credential_approval`（`:145`）生产零调用（仅 `src/service/credential/approval/tests.rs:188`）。重试重复建单，`✅` 落定无人读取。`vault_ops.rs:441` 紧急吊销转常规审批同。
-- **`R3` 规格与实现漂移**：change `veil-oracle-followup-fix` 的 spec/design/tasks 把 `audit-hold`/`unlock`/`hash-change` 列为 tracked-send 建单路径；生产实现中 `audit-hold`（`src/handler/llm/pump/spawn.rs:433/472`）仅 `audit_pending.insert(PendingRecord::new(...))`，`notify_hash_change`（`src/service/credential/approval.rs`）走 best-effort `notify_text`，无 unlock 建单路径。测试 `src/service/credential/approval/tests/f1.rs` 的 `audit_hold_approval_real_event_id` 只调通用 `submit_pending_with_branch`。
+- **`R3` 规格与实现漂移**：change `veil-oracle-followup-fix` 的 spec/design/tasks 把 `audit-hold`/`unlock`/`hash-change` 列为 tracked-send 建单路径；生产实现中 `audit-hold`（`src/handler/llm/pump/spawn/event_loop.rs:350-356/472`）仅 `audit_pending.insert(PendingRecord::new(...))`，`notify_hash_change`（`src/service/credential/approval.rs`）走 best-effort `notify_text`，无 unlock 建单路径。测试 `src/service/credential/approval/tests/f1.rs` 的 `audit_hold_approval_real_event_id` 只调通用 `submit_pending_with_branch`。
 - **`R4` 弱守护**：F9 引用的 `init_no_sync_sweeper` 在 `src/service/credential/approval.rs` 不存在；真实 `sweeper_spawn_count`/`init_no_sync_sweeper_observable` 在 `src/approval.rs`（`:102`/`:189`），断言对 `PendingApprovals::default()` 平凡，未覆盖 `src/main.rs:122-123` 的生产 init。F10 `src/main.rs:177 preflight_probe` 为测试内重实现（`:177-192`），副作用断言自证；仅 `include_str!`（`:193`）排序检查为真。
 - **`R5` 登记项**：F7 守护为名称/标记制（`src/service/tpm.rs`/`src/main.rs` 整文件豁免可绕）；F8「analyzer」为测试键名（`src/service/pii/detector/tests.rs`），生产为全局 `ValidationCache`（`src/service/pii/detector.rs:427`）。
 
@@ -48,7 +48,7 @@
 
 **决策**：选 (b)（修订规范使其与实现一致），理由：
 
-- `audit-hold`：README §6.4 明确「流式审批不挂起等待真人 `✅/❎`；拒绝/过期语义由凭据审批链承载」，`src/handler/llm/pump/spawn.rs:433/472` 仅写内存 `audit_pending`。若强行建 Matrix 单，将与「流式不挂起」声明冲突且无消费方（同 `R2`）。
+- `audit-hold`：README §6.4 明确「流式审批不挂起等待真人 `✅/❎`；拒绝/过期语义由凭据审批链承载」，`src/handler/llm/pump/spawn/event_loop.rs:350-356/472` 仅写内存 `audit_pending`。若强行建 Matrix 单，将与「流式不挂起」声明冲突且无消费方（同 `R2`）。
 - `unlock`：生产无 Matrix 建单路径（全仓 grep 无对应 `submit_*` 调用）。
 - `hash-change`：`notify_hash_change`（`src/service/credential/approval.rs`）为 best-effort `notify_text` 通知，非审批票。
 

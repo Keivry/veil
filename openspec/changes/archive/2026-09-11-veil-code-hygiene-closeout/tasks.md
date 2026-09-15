@@ -1,6 +1,6 @@
 ## 1. A1 层声明落地（D1）
 
-- [x] 1.1 新建 `src/handler/admin.rs`（或 `handler/admin/`），把实现 `State<AppState>` 的 handler（`src/service/admin/sse.rs:172-176` `admin_events_stream`、`src/service/admin/events.rs:180/211/240/303/379` 五个 handler）搬入，`src/service/admin/{sse,events}.rs` 仅留响应构造与纯逻辑
+- [x] 1.1 新建 `src/handler/admin.rs`（或 `handler/admin/`），把实现 `State<AppState>` 的 handler（`src/handler/admin.rs:601-620` `admin_events_stream`、`src/service/admin/events.rs:180/211/240/303/379` 五个 handler）搬入，`src/service/admin/{sse,events}.rs` 仅留响应构造与纯逻辑
   - 验证：`router.rs` 七路由经 `handler::admin::*` 注册，路径与状态码不变，`cargo test` 全绿
 - [x] 1.2 `PeerIp` 提取器（`src/service/admin/sse.rs:106-122` 与 `src/handler/credential.rs:297-315` 统一后）移入 handler 层公共模块，`service` 侧零 `use axum`
   - 验证：`grep -rn "use crate::state" src/service/` 零命中，`grep -rn "use axum" src/service/` 仅剩纯数据依赖（`llm_gateway/hop.rs`/`llm_gateway/mod.rs` 的 `HeaderMap`），逐项声明例外

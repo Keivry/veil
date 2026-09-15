@@ -4,7 +4,7 @@
 
 - **`F1`（critical）Matrix 审批反应绑定失效**：`src/service/credential/approval.rs:16-27` 的 `approval_event_id` 生成合成键 `$veil-{nanos}-{hash:08x}`，`:77` 用它建 pending；`src/service/matrix/notify.rs:29` 的 `NotificationSink::send_text` 返回 `()`（`bot.rs:110` 实为 `Result<String>` 却被丢弃），真实 Matrix event_id 未透传；`src/service/matrix/approval.rs:145-163` 却用反应回调的真实 `input.target_event_id` 查 pending → 永不匹配。后果：阻塞审批恒 300s 超时，注册→自动吊销、吊销→不执行、凭据→被拒绝等 202 异步任务恒超时；测试直接 resolve 合成 id 故全绿。
 - **`F2`（high）A5 规范化顺序绕过（审计漏拦）**：`src/service/audit/rules.rs:439` 先 `canonicalize_args`（含 `fold_bin_prefix`）再 `:494`/`:501` `split_chain`；`src/service/audit/normalize.rs:240-266` 仅空白算 word-start；`rules.rs:126-154` `word_after_command` 的 `pre_ok` 不含 `/` → `echo x;/bin/rm -rf tmp`（`;` + `/bin/rm` + 非 `/` 目标）绕过命中。
-- **`F3`（high）S2 Responses 工具参数先泄后审**：`src/handler/llm/pump/spawn.rs:324-325` `audit_hold_on` 仅 `!Off && matches!(protocol, Chat | Anthropic)` → Responses 工具 delta 不缓冲、直接下发；审计在 slot `.done` 才发生 → `response.function_call_arguments.delta` 携带的危险参数先于阻断帧透传，E2E 用 done-only 夹具掩盖。
+- **`F3`（high）S2 Responses 工具参数先泄后审**：`src/handler/llm/pump/spawn/event_loop.rs:308-312` `audit_hold_on` 仅 `!Off && matches!(protocol, Chat | Anthropic)` → Responses 工具 delta 不缓冲、直接下发；审计在 slot `.done` 才发生 → `response.function_call_arguments.delta` 携带的危险参数先于阻断帧透传，E2E 用 done-only 夹具掩盖。
 
 其余为中低危：`F4` PII 短名槽变量名实不符（README 称「内联」、实为文件路径别名）；`F5` 危险表裸子串 `"dd "` 使 `echo add` 误报；`F6` `mask_secret_forms` 摘要脱敏 O(n²)；`F7` TPM 同步子进程守护白名单整文件化可绕；`F8` hardening analyzer 缓存复用断言弱；`F9` `init_no_sync_sweeper` 未真验「无 spawn」；`F10` `startup_whitelist_fail_fast` 未验顺序（tautology）；`F11` `web_search_action_audit_both_paths` 仅提取单测、非 hold 集成；`F12` 自定义规则跨帧 hold 无 `feed_output_frame` 端到端；`F13` fuzzy 还原未覆盖 response 表/未知 seq；`F14`–`F17` 设计/注释/规格措辞漂移。
 
