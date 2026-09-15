@@ -200,17 +200,24 @@ def resp_stream_normal():
                                                         "output_index": 0,
                                                         "item": {"id": "msg_1", "type": "message",
                                                                  "role": "assistant", "content": []}}, 1)
+            + resp_frame("response.content_part.added", {"type": "response.content_part.added",
+                                                         "item_id": "msg_1", "output_index": 0,
+                                                         "content_index": 0,
+                                                         "part": {"type": "output_text", "text": "",
+                                                                  "annotations": []}}, 2)
             + resp_frame("response.output_text.delta", {"type": "response.output_text.delta",
                                                         "item_id": "msg_1", "output_index": 0,
-                                                        "content_index": 0, "delta": "hello veil"}, 2)
+                                                        "content_index": 0, "delta": "hello veil"}, 3)
             + resp_frame("response.output_text.done", {"type": "response.output_text.done",
                                                        "item_id": "msg_1", "output_index": 0,
-                                                       "content_index": 0, "text": "hello veil"}, 3)
+                                                       "content_index": 0, "text": "hello veil"}, 4)
             + resp_frame("response.output_item.done", {"type": "response.output_item.done",
-                                                       "output_index": 0, "item": RESP_OUT_TEXT}, 4)
+                                                       "output_index": 0, "item": RESP_OUT_TEXT}, 5)
             + resp_frame("response.completed", {"type": "response.completed",
-                                                "response": {"id": "resp_1", "status": "completed",
-                                                             "output": [RESP_OUT_TEXT]}}, 5))
+                                                "response": {"id": "resp_1", "object": "response",
+                                                             "created_at": 1, "model": "m",
+                                                             "status": "completed",
+                                                             "output": [RESP_OUT_TEXT]}}, 6))
 
 
 def resp_object(tool=False):
@@ -613,19 +620,16 @@ def run_normal_phase():
         assert "hello veil" in (r.output_text or ""), r
 
     def resp_stream():
-        s = oai.responses.create(model="m", input="hello veil", stream=True)
-        deltas, types = [], []
-        for e in s:
-            types.append(getattr(e, "type", ""))
-            d = getattr(e, "delta", "")
-            if isinstance(d, str) and d:
-                deltas.append(d)
-        assert "response.completed" in types, types
-        try:
+        types, deltas = [], []
+        with oai.responses.stream(model="m", input="hello veil") as s:
+            for e in s:
+                types.append(getattr(e, "type", ""))
+                d = getattr(e, "delta", "")
+                if isinstance(d, str) and d:
+                    deltas.append(d)
+            assert "response.completed" in types, types
             final = s.get_final_response()
             assert "hello veil" in (final.output_text or ""), final
-        except Exception:
-            assert "hello veil" in "".join(deltas), deltas
 
     def resp_tool_nonstream():
         r = oai.responses.create(model="m", input="TOOL_TEST run")

@@ -20,9 +20,16 @@
   与 `pykeepass`；Mock TPM 回退由 `api_conformance.py` 内建（`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
   跳过语义：缺 venv/SDK 默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1` 为显式跳过第 6 步
   并打印跳过理由（不静默）。文档口径见 README §8.5。
-- `check_doc_paths.py` — 文档源码路径校验（`veil-docs-contract-fix` 1.3）：扫描 `README.md` +
-  `openspec/**/*.md` + `scripts/*.md` 的 `src/...rs` 引用并断言存在，缺失即非零退出；
-  勘误注内旧路径与 `<!-- doc-paths-ignore -->` 行自动跳过。门禁调用：
+- `check_doc_paths.py` — 文档源码/spec 路径与行号校验（`veil-docs-contract-fix` 1.3；
+  `veil-docs-contract-resync` 3.1 扩展 spec 引用；`veil-audit-r2-remediation` 9.10 扩展行号语义）：
+  扫描 `README.md` + `openspec/**/*.md` + `scripts/*.md` 的 `src/...rs` 与 spec 完整路径引用并断言
+  存在，另解析 `path:line` / `path:start-end` 引用并校验行号落在目标文件实际行数内，任一缺失/越界即非零退出；
+  勘误注内旧路径与 `<!-- doc-paths-ignore -->` 行自动跳过。
+  `PENDING_REFS` 例外机制：仅登记**历史/情景性悬空引用**（其他 change 目录、已归档 change、
+  canonical 中的旧 change-local 路径），键为精确「源文件相对路径 + 引用原文」组合并附登记理由；
+  命中即打印 `PENDING` 且**不算失败**（可复核的例外名单，脚本内 `PENDING_REFS` 即权威来源）。
+  **`README.md` 的引用永不登记**：归档迁移致其悬空时必须 `FAIL`，防止静默通过；
+  其余未登记组合一律 `FAIL`。门禁调用：
   `python3 scripts/check_doc_paths.py`（仓库根目录执行，无额外依赖）。
 - `check_file_sizes.py` — 全仓单文件 800 行上限校验（`veil-arch-file-size-closeout` S2.1）：
   扫描 `src/**/*.rs`，任一文件总行（含测试与注释）超过 800 即非零退出并列出文件与行数，

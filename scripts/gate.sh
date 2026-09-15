@@ -5,7 +5,7 @@
 #   1) cargo fmt --check
 #   2) cargo clippy --tests --all-targets -- -D warnings
 #   3) cargo test
-#   4) python3 scripts/check_doc_paths.py
+#   4) python3 scripts/check_doc_paths.py（文档路径 + `path:line` 行号语义校验，9.10）
 #   5) python3 scripts/check_file_sizes.py
 #   6) scripts/api_conformance.py（真 SDK 一致性，23 项）
 #
