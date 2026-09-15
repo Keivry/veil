@@ -29,8 +29,9 @@ VEIL_ROOT = ac.VEIL_ROOT
 GATEWAY = ac.GATEWAY
 SECRET = "veil-conformance-secret"
 
-PROXY_ROOT = "/home/keivry/项目/Python/credential-proxy"
-GET_DIR = os.path.join(PROXY_ROOT, "get")
+# Go 客户端自 veil-audit-r2-remediation 起内置本仓 get/（不再取兄弟仓 credential-proxy/get）：
+# 按脚本所在位置解析绝对路径，不依赖当前工作目录（cwd）。
+GET_DIR = os.path.join(VEIL_ROOT, "get")
 GO_BIN = os.path.join(GET_DIR, "get-credential-linux-amd64")
 
 RESULTS = []
@@ -55,6 +56,7 @@ def check(name, fn):
 
 
 def build_all():
+    print("[go_interop] Go 客户端目录（本仓）: %s" % GET_DIR)
     build = subprocess.run(["cargo", "build", "--bin", "veil"], cwd=VEIL_ROOT,
                            capture_output=True, text=True)
     if build.returncode != 0:

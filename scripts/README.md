@@ -9,17 +9,22 @@
   5.2 `caller_hash` 冒用 `GET_BINARY_HASH` 1 项）；失败非零退出，前置不可得显式报错不静默跳过。
   用法（仓库根目录，复用 `api_conformance.py` 设施，须含 `pykeepass`）：
   `/home/keivry/项目/Python/credential-proxy/.venv/bin/python scripts/go_interop_e2e.py`。
-  前置：上述 venv、Go 工具链（`get` 目录 `make build` 产出 `get-credential-linux-amd64`）、
-  `cargo build --bin veil`；无 TPM 硬件时脚本内建 Mock TPM 回退（`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
+  Go 客户端自 `veil-audit-r2-remediation` 起内置本仓 `get/`（不再取兄弟仓 `credential-proxy/get`）：
+  脚本按自身位置解析 `get/` 绝对路径（不依赖 cwd）并打印所用目录，执行 `make -C get build`
+  产出 `get/get-credential-linux-amd64`，缺失时显式报错不静默跳过；兄弟仓 `.venv` 仅作 Python 解释器。
+  前置：上述 venv、Go 工具链、`cargo build --bin veil`；无 TPM 硬件时脚本内建 Mock TPM 回退
+  （`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
 - `gate.sh` — 发布/CI 统一门禁（`veil-test-coverage-fill` T3）：串联
   `cargo fmt --check`、`cargo clippy --tests --all-targets -- -D warnings`、`cargo test`、
-  `check_doc_paths.py`、`check_file_sizes.py`、`api_conformance.py`；任一子步骤失败整体非零退出。
+  `check_doc_paths.py`、`check_file_sizes.py`、`api_conformance.py` 与 `get/` 内
+  `go vet ./...`/`go test ./...` 共七步；任一子步骤失败整体非零退出。
   用法：`bash scripts/gate.sh`（仓库根目录执行）。
   前置条件（第 6 步）：Python venv（默认路径同 `api_conformance.py`，可用
   `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖）内含 SDK pin `openai==3.5.0`/`anthropic==1.1.0`
   与 `pykeepass`；Mock TPM 回退由 `api_conformance.py` 内建（`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
-  跳过语义：缺 venv/SDK 默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1` 为显式跳过第 6 步
-  并打印跳过理由（不静默）。文档口径见 README §8.5。
+  前置条件（第 7 步）：本机 Go 工具链（`get/go.mod` 要求 go 1.22），在 `get/` 目录内执行。
+  跳过语义：缺 venv/SDK/Go 默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与
+  `GATE_SKIP_GO=1`（第 7 步）为显式跳过并打印跳过理由（不静默）。文档口径见 README §8.5。
 - `check_doc_paths.py` — 文档源码/spec 路径与行号校验（`veil-docs-contract-fix` 1.3；
   `veil-docs-contract-resync` 3.1 扩展 spec 引用；`veil-audit-r2-remediation` 9.10 扩展行号语义）：
   扫描 `README.md` + `openspec/**/*.md` + `scripts/*.md` 的 `src/...rs` 与 spec 完整路径引用并断言
