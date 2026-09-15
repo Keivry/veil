@@ -208,7 +208,10 @@ fn looks_txt_list(text: &str) -> bool {
     any
 }
 
-fn strip_yaml_quotes(s: &str) -> String {
+/// YAML 名称去引号（`DCD-6` 单一实现）：trim 空白后剥离成对单/双引号，其余形态原样返回。
+/// `service::audit::policy`（原 `unquote`）与 `service::pii::custom`（原同名副本）均复用本实现，
+/// 行为逐字节不变。
+pub(crate) fn strip_yaml_quotes(s: &str) -> String {
     let t = s.trim();
     if t.len() >= 2
         && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
@@ -390,16 +393,13 @@ mod tests {
 
     mod f3;
     mod size_cap;
+    mod unquote;
 
     #[test]
-    fn file_len_under_800_or_split() {
-        // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，
-        // 须按 H1 门面+子模块模板拆分，不得只改数字放行。
-        const SELF_SRC: &str = include_str!("custom_file.rs");
-        let lines = SELF_SRC.lines().count();
-        assert!(
-            lines <= 800,
-            "custom_file.rs {lines} 行超 800 红线：须拆分（见 veil-review-followup-arch-hygiene H1/H2.1）"
+    fn file_len_redline() {
+        crate::test_support::file_len_under_800_or_split(
+            "custom_file.rs",
+            include_str!("custom_file.rs"),
         );
     }
 

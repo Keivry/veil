@@ -264,7 +264,9 @@ pub(crate) fn parse_whitelist(get: &dyn Fn(&str) -> Option<String>) -> Result<Ve
     Ok(out)
 }
 
-fn is_valid_mxid(s: &str) -> bool {
+/// DCD-4：MXID 校验唯一实现（canonical）；`service::matrix::branch` 经重导出复用，
+/// 禁止再复制第二份。
+pub(crate) fn is_valid_mxid(s: &str) -> bool {
     let rest = s.strip_prefix('@').unwrap_or("");
     // A12/D11：`@` 前缀之后（localpart + domain）不得再含 `@`
     // （等价 Python `s[1:].count('@') == 0`），否则 `@a@b:c` 被误放行。

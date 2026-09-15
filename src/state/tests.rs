@@ -426,3 +426,144 @@ fn audit_policy_injected_singleton_reused() {
     assert!(Arc::ptr_eq(&state.audit_policy, &cloned.audit_policy));
     assert!(Arc::ptr_eq(&state.audit_policy, &policy));
 }
+
+fn minimal_env() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        (
+            "HOMESERVER".to_string(),
+            "https://matrix.example.com".to_string(),
+        ),
+        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+        (
+            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+            "observability-admin-token-0123456789".to_string(),
+        ),
+    ])
+}
+
+fn outcome_for(dir: &Path) -> SqliteOutcome {
+    SqliteOutcome {
+        sqlite_ok: true,
+        sqlite_error: None,
+        db_path: dir.join("m.sqlite"),
+    }
+}
+
+/// `CRD-1`：损坏注册表加载失败须上抛拒启动（`error` 日志 + `new` panic），不得静默空表。
+#[test]
+fn registry_load_failure_fails_startup() {
+    let dir = unique_temp_dir();
+    let path = dir.join("caller_registry.json");
+    std::fs::write(&path, b"{ not a registry").unwrap();
+    let mut env = minimal_env();
+    env.insert(
+        "CALLER_REGISTRY_PATH".to_string(),
+        path.to_string_lossy().into_owned(),
+    );
+    let err = AppState::try_new(Config::load_from(&env).unwrap(), outcome_for(&dir)).unwrap_err();
+    assert!(
+        err.to_string().contains("注册表"),
+        "错误须指明注册表加载失败: {err}"
+    );
+    // 生产入口 `new` 以 panic 终止启动（fail-fast，exit 非零）。
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = AppState::new(Config::load_from(&env).unwrap(), outcome_for(&dir));
+    }));
+    assert!(panicked.is_err(), "损坏注册表须拒绝启动");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `CRD-1`：完整性 sha256 失配同样拒启动；合法注册表正常启动、行为不变。
+#[test]
+fn registry_corrupt_startup_rejected() {
+    let dir = unique_temp_dir();
+    let path = dir.join("caller_registry.json");
+    std::fs::write(&path, br#"{"entries":{},"sha256":"deadbeef"}"#).unwrap();
+    let mut env = minimal_env();
+    env.insert(
+        "CALLER_REGISTRY_PATH".to_string(),
+        path.to_string_lossy().into_owned(),
+    );
+    assert!(
+        AppState::try_new(Config::load_from(&env).unwrap(), outcome_for(&dir)).is_err(),
+        "sha256 失配须拒绝启动"
+    );
+    CallerRegistry::empty().save_to(&path).unwrap();
+    let state = AppState::try_new(Config::load_from(&env).unwrap(), outcome_for(&dir)).unwrap();
+    assert_eq!(state.registry_path, path, "合法注册表正常启动");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `DCD-1`：自定义 PII 规则在 `AppState` 构建时注入运行时检测器（非仅启动校验）。
+#[test]
+fn custom_pii_runtime_injected() {
+    let dir = unique_temp_dir();
+    let rules = dir.join("rules.json");
+    std::fs::write(
+        &rules,
+        r#"[{"name":"emp_no","pattern":"(?P<emp_no>工号\\d{6})"}]"#,
+    )
+    .unwrap();
+    let mut env = minimal_env();
+    env.insert(
+        "PII_CUSTOM_RULES_FILE".to_string(),
+        rules.to_string_lossy().into_owned(),
+    );
+    let state = AppState::try_new(Config::load_from(&env).unwrap(), outcome_for(&dir)).unwrap();
+    assert!(
+        state
+            .detector
+            .custom_names_snapshot()
+            .contains(&"emp_no".to_string()),
+        "配置的自定义规则须在运行时注入生效"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `DCD-1`：配置自定义规则/字典 → 运行时命中 → 健康面可观测的端到端回归。
+#[tokio::test]
+async fn custom_pii_e2e_hit_visible() {
+    let dir = unique_temp_dir();
+    let rules = dir.join("rules.json");
+    std::fs::write(
+        &rules,
+        r#"[{"name":"emp_no","pattern":"(?P<emp_no>工号\\d{6})"}]"#,
+    )
+    .unwrap();
+    let dict = dir.join("dict.txt");
+    std::fs::write(&dict, "张三\n").unwrap();
+    let mut env = minimal_env();
+    env.insert(
+        "PII_CUSTOM_RULES_FILE".to_string(),
+        rules.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "PII_CUSTOM_DICT_FILE".to_string(),
+        dict.to_string_lossy().into_owned(),
+    );
+    let state = AppState::try_new(Config::load_from(&env).unwrap(), outcome_for(&dir)).unwrap();
+    let hits = state
+        .detector
+        .scan_spans(
+            "员工工号123456，联系张三。",
+            &std::collections::HashMap::new(),
+        )
+        .await;
+    assert!(
+        hits.iter().any(|h| h.0 == "emp_no"),
+        "运行时命中须含自定义 kind: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.1 == "张三"),
+        "字典命中须在运行时可见: {hits:?}"
+    );
+    let body = crate::handler::health_handler(axum::extract::State(state.clone()))
+        .await
+        .0;
+    assert_eq!(
+        body["pii_custom_disabled"], 0,
+        "命中在健康面可见且无停用: {body}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

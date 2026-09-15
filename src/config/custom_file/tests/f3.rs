@@ -95,7 +95,7 @@ fn pii_dict_file_alias_equivalent_hits_and_redaction() {
         let d = PiiDetector::new();
         d.load_dict(entries);
         let scope = PiiScope::new();
-        let out = crate::service::redaction::redact_leaf(
+        let out = crate::service::redaction::leaf::redact_leaf(
             &scope,
             &d,
             &crate::service::credential_vault::P2tSnapshot::empty(),

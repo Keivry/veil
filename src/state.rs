@@ -71,9 +71,24 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// 生产入口：以 fail-fast 语义构造。任一辈子系统加载失败（注册表损坏、
+    /// 自定义 PII 文件再读失败）记 `error` 日志并 panic 终止启动（`CRD-1`/`DCD-1`）。
     pub fn new(config: Config, outcome: SqliteOutcome) -> Self {
+        match Self::try_new(config, outcome) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!("AppState 初始化失败，拒绝启动: {err:#}");
+                panic!("AppState 初始化失败，拒绝启动: {err:#}");
+            }
+        }
+    }
+
+    /// 可测的 fail-fast 构造核心：注册表加载错误上抛（不再 `.unwrap_or_default()`
+    /// 静默吞空表），并把已校验的自定义 PII 文件注入运行时检测器。
+    pub fn try_new(config: Config, outcome: SqliteOutcome) -> Result<Self> {
         let registry_path = config.registry_path.clone();
-        let registry = CallerRegistry::load_from(&registry_path).unwrap_or_default();
+        // `CRD-1`/C14：加载失败（解析失败或完整性失配）一律上抛拒启动，不以空表放行。
+        let registry = CallerRegistry::load_from(&registry_path)?;
         let admin = Arc::new(crate::service::admin::AdminState::new(
             outcome.db_path.clone(),
             PiiSamplerConfig::from_config(&config),
@@ -103,7 +118,22 @@ impl AppState {
         let vault = Arc::new(crate::service::credential_vault::CredentialVault::new());
         let detector = Arc::new(crate::service::pii::PiiDetector::new());
         detector.set_hardening(config.pii_detection_hardening);
-        Self {
+        // `DCD-1`：把配置期已 fail-closed 校验的自定义规则/字典在启动装配时注入
+        // 运行时检测器（此前仅校验、从不生效）；再读/解析失败仍拒启动。
+        let (custom_patterns, custom_dict) = crate::service::pii::custom::load_custom_from_paths(
+            config.pii_custom_rules_file.as_deref(),
+            config.pii_custom_patterns_file.as_deref(),
+            config.pii_custom_dict_file.as_deref(),
+        )
+        .map_err(|message| VeilError::Config {
+            var: "PII_CUSTOM_*".to_string(),
+            message,
+        })?;
+        if !custom_patterns.is_empty() || !custom_dict.is_empty() {
+            let (rules, dict) = detector.load_custom_all(&custom_patterns, &custom_dict);
+            tracing::info!("PII 自定义规则运行时注入: 正则 {rules} 条、字典 {dict} 条");
+        }
+        Ok(Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),
             sqlite_error: Arc::new(Mutex::new(outcome.sqlite_error)),
@@ -129,7 +159,7 @@ impl AppState {
             vault,
             detector,
             notify,
-        }
+        })
     }
 
     pub fn sqlite_ok(&self) -> bool { self.sqlite_ok.load(Ordering::SeqCst) }

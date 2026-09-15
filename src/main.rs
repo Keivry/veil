@@ -7,6 +7,7 @@ use {
         keepass::{RealKeePass, tpm_password_provider_with_cache},
         router::build_router,
         service::{
+            admin::ADMIN_RATE_SWEEP_SECS,
             audit::AuditPolicy,
             metrics::METRICS_FLUSH_INTERVAL_SECS,
             tpm::{allow_mock_from_env, startup_tpm_in},
@@ -62,6 +63,38 @@ async fn flush_on_shutdown(store: Arc<veil::service::metrics::MetricsStore>) -> 
             tracing::warn!("关闭刷盘超时（5s），跳过最终刷盘");
             false
         }
+    }
+}
+
+/// ARH-12（7.9）：网关清理回调持有既有 `AppState` 的共享子句柄（`Arc` 克隆），
+/// 不再整体克隆/构造第二个 `AppState`。
+#[derive(Clone)]
+struct CleanupHandles {
+    keepass: std::sync::Arc<dyn veil::keepass::KeePassBackend>,
+    vault: std::sync::Arc<veil::service::credential_vault::CredentialVault>,
+    pending: std::sync::Arc<veil::approval::PendingApprovals>,
+}
+
+impl veil::service::matrix::GatewayCleanup for CleanupHandles {
+    fn keepass_unlocked(&self) -> bool { self.keepass.is_unlocked() }
+
+    fn vault_len(&self) -> usize { self.vault.len() }
+
+    fn lock_cleanup(&self) -> usize {
+        let cleared = self.vault.clear();
+        self.keepass.clear_cache();
+        let master_cleared = self.keepass.clear_master_password();
+        let pending = self.pending.clear_all();
+        tracing::info!(
+            "lock 清理: 口令缓存 {cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}"
+        );
+        cleared
+    }
+
+    fn forget_cleanup(&self) -> usize {
+        let cleared = self.vault.clear();
+        tracing::info!("forget 清理: token 映射 {cleared} 条");
+        cleared
     }
 }
 
@@ -200,6 +233,10 @@ async fn main() -> ExitCode {
         .admin
         .metrics
         .spawn_flush_driver(std::time::Duration::from_secs(METRICS_FLUSH_INTERVAL_SECS));
+    // DCD-3：管理面限流周期清扫生产接线（与容量驱逐共同构成有界策略）。
+    let _admin_rate_sweep = state
+        .admin
+        .spawn_rate_sweeper(std::time::Duration::from_secs(ADMIN_RATE_SWEEP_SECS));
     // 指标重启回填：sqlite 聚合覆盖式恢复内存窗口；失败仅 warn（内存-only 照常服务）。
     match state.admin.metrics.backfill_from_sqlite().await {
         Ok(n) => tracing::info!("指标回填完成: {n} 个聚合窗口"),
@@ -217,7 +254,11 @@ async fn main() -> ExitCode {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let gateway_cleanup: std::sync::Arc<dyn veil::service::matrix::GatewayCleanup> =
-        std::sync::Arc::new(state.clone());
+        std::sync::Arc::new(CleanupHandles {
+            keepass: state.keepass.clone(),
+            vault: state.vault.clone(),
+            pending: state.pending.clone(),
+        });
     let _matrix_sync = sync_bot.spawn_sync_loop(
         std::sync::Arc::clone(&state.approval),
         gateway_cleanup,
@@ -243,12 +284,36 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let _ = flush_on_shutdown(state.admin.metrics.clone()).await;
+    // ARH-12（7.9）：优雅停机——abort 通知消费者（剩余队列 best-effort 丢弃）。
+    state.notify.shutdown();
     ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 mod tests {
     use super::{flush_on_shutdown, preflight_whitelist};
+
+    #[test]
+    fn shutdown_wired() {
+        // ARH-12（7.9）：停机须实际触发 notify.shutdown；清理不得整体克隆 AppState。
+        let src = include_str!("main.rs");
+        let serve = src
+            .find("with_graceful_shutdown")
+            .expect("优雅关闭 serve 调用点");
+        let shutdown = src
+            .find("state.notify.shutdown()")
+            .expect("notify.shutdown 接线点");
+        assert!(serve < shutdown, "停机通知须在 serve 返回后触发");
+        let banned = format!("Arc::new(state{})", ".clone())");
+        assert!(
+            !src.contains(&banned),
+            "GatewayCleanup 不得构造第二个 AppState"
+        );
+        assert!(
+            src.contains("CleanupHandles"),
+            "清理须复用既有 AppState 的共享子句柄"
+        );
+    }
 
     #[tokio::test]
     async fn metrics_flush_on_shutdown() {

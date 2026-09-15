@@ -292,3 +292,69 @@ fn hardening_toggle_matrix() {
         assert!(!cfg.pii_detection_hardening, "非真值 {raw:?} 须关闭");
     }
 }
+
+#[test]
+fn disable_skips_token_requirement() {
+    // OBSERVABILITY_DISABLE=1 且缺 token：不拒启动，observability_disabled 置位。
+    let mut env = base_env();
+    env.remove("OBSERVABILITY_ADMIN_TOKEN");
+    env.insert("OBSERVABILITY_DISABLE".to_string(), "1".to_string());
+    let cfg = Config::load_from(&env).expect("DISABLE=1 缺 token 不得拒启动");
+    assert!(cfg.observability_disabled);
+    assert!(cfg.observability_admin_token.is_empty());
+
+    // 非 =1（未设/其它值）仍按既有必填语义拒启动。
+    for value in ["", "0", "true", "yes", "2"] {
+        let mut env = base_env();
+        env.remove("OBSERVABILITY_ADMIN_TOKEN");
+        if !value.is_empty() {
+            env.insert("OBSERVABILITY_DISABLE".to_string(), value.to_string());
+        }
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("OBSERVABILITY_ADMIN_TOKEN"),
+            "值 {value:?} 缺 token 须拒启动"
+        );
+    }
+}
+
+#[test]
+fn pii_hold_max_upper_bound() {
+    // 默认与合法小值不变。
+    assert_eq!(
+        Config::load_from(&base_env()).unwrap().pii_hold_max,
+        PII_HOLD_MAX_DEFAULT
+    );
+    let mut env = base_env();
+    env.insert("PII_HOLD_MAX".to_string(), "4096".to_string());
+    assert_eq!(Config::load_from(&env).unwrap().pii_hold_max, 4096);
+
+    // 恰上界放行、超上界钳位到上界。
+    let mut env = base_env();
+    env.insert(
+        "PII_HOLD_MAX".to_string(),
+        PII_HOLD_MAX_UPPER_BOUND.to_string(),
+    );
+    assert_eq!(
+        Config::load_from(&env).unwrap().pii_hold_max,
+        PII_HOLD_MAX_UPPER_BOUND
+    );
+    let mut env = base_env();
+    env.insert(
+        "PII_HOLD_MAX".to_string(),
+        (PII_HOLD_MAX_UPPER_BOUND + 1).to_string(),
+    );
+    assert_eq!(
+        Config::load_from(&env).unwrap().pii_hold_max,
+        PII_HOLD_MAX_UPPER_BOUND,
+        "超上界须钳位"
+    );
+
+    // 非法值（零/负/非整数）仍拒启动（现有 fail-closed 不变）。
+    for raw in ["0", "-1", "abc"] {
+        let mut env = base_env();
+        env.insert("PII_HOLD_MAX".to_string(), raw.to_string());
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("PII_HOLD_MAX"), "{raw}");
+    }
+}

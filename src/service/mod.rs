@@ -13,6 +13,8 @@ pub mod credential;
 pub mod credential_vault;
 pub mod json_walk;
 pub mod llm_gateway;
+/// `DCD-7` 锁中毒恢复单一实现（`pub(crate)`，非对外 API）。
+pub(crate) mod lock_recover;
 pub mod matrix;
 pub mod metrics;
 pub mod pii;

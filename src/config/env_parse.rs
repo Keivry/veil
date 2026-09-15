@@ -40,6 +40,9 @@ pub const AUDIT_TIMEOUT_RACE_MIN: i64 = 110;
 pub const AUDIT_TIMEOUT_RACE_MAX: i64 = 130;
 /// `PII_HOLD_MAX` 默认值。
 pub const PII_HOLD_MAX_DEFAULT: i64 = 64;
+/// `PII_HOLD_MAX` 上界（1MB，`ARH-6`/D32）：超上界钳位并 warn，防无界缝窗缓冲；
+/// 与 `AUDIT_HOLD_MAX_BYTES` 默认值同值，但维度不同（响应侧缝窗字符 vs 审计 hold 字节）。
+pub const PII_HOLD_MAX_UPPER_BOUND: i64 = 1_048_576;
 /// `AUDIT_HOLD_MAX_BYTES` 默认值。
 pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: i64 = 1_048_576;
 /// 管理 token 建议最小长度，不足仅告警不断链。
@@ -67,8 +70,8 @@ pub const LINE_LIMIT_BYTES: usize = 16 * 1024;
 /// 理由：与 `HTTP_TIMEOUT_SECS`（默认 30s）同数量级有意对齐，任一先到先收尾。
 pub const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 流内保活帧间隔 10s（D5 下沉自 `service::sse`，只搬不改值；`sse.rs` 原位转发；
-/// `service::audit::RequestKeepalive` 经 `pump.rs::spawn_gated` 接线消费）：
-/// 理由：10s 远小于常见代理 NAT 空闲超时（60s+）且带宽可忽略，
+/// `service::audit::RequestKeepalive::spawn_gated` 接线、于 `src/handler/llm/pump/spawn/setup.rs`
+/// 消费）： 理由：10s 远小于常见代理 NAT 空闲超时（60s+）且带宽可忽略，
 /// 与管理面 60s SSE ping 分属不同链路（流内保活 vs 管理推送），差异有意。
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// 上游转发 `reqwest::Client` 整体超时默认值（秒，保守值）。
@@ -287,12 +290,19 @@ impl Config {
             tracing::warn!("{name} 已置位但二进制不读取（沿用旧名静默不生效）：{hint}");
         }
 
+        // 可观测性总开关：仅精确 `1`（去空白后）生效，其余值（含 true/yes）不触发，
+        // 与 B1 Verify 边缘（值非 1 时不 404）对齐；提前求值以豁免 token 门禁。
+        let observability_disabled = matches!(
+            get("OBSERVABILITY_DISABLE").as_deref().map(str::trim),
+            Some("1")
+        );
+
         let AuthParts {
             observability_admin_token,
             homeserver,
             room_id,
             matrix_access_token,
-        } = load_auth(&get)?;
+        } = load_auth(&get, observability_disabled)?;
         let LimitParts {
             pii_hold_max,
             audit_hold_max_bytes,
@@ -339,12 +349,6 @@ impl Config {
             http_pool_idle_timeout_secs,
         } = load_llm(env, &get)?;
         let keepass_backend = load_keepass_backend(&get)?;
-        // 可观测性总开关：仅精确 `1`（去空白后）生效，其余值（含 true/yes）不触发，
-        // 与 B1 Verify 边缘（值非 1 时不 404）对齐。
-        let observability_disabled = matches!(
-            get("OBSERVABILITY_DISABLE").as_deref().map(str::trim),
-            Some("1")
-        );
 
         Ok(Self {
             homeserver,
@@ -401,9 +405,19 @@ struct AuthParts {
     matrix_access_token: String,
 }
 
-fn load_auth(get: &dyn Fn(&str) -> Option<String>) -> Result<AuthParts> {
-    let observability_admin_token = require_non_empty(get, "OBSERVABILITY_ADMIN_TOKEN")?;
-    if let Some(cred) = get("CREDENTIAL_ADMIN_TOKEN")
+fn load_auth(
+    get: &dyn Fn(&str) -> Option<String>,
+    observability_disabled: bool,
+) -> Result<AuthParts> {
+    // `OBSERVABILITY_DISABLE=1`（精确）时管理面全 404，token 非必填：缺 token 不拒启动，
+    // 也不做独立/长度校验（禁用即不要求 token，见 config-legacy-compat spec）。
+    let observability_admin_token = if observability_disabled {
+        get("OBSERVABILITY_ADMIN_TOKEN").unwrap_or_default()
+    } else {
+        require_non_empty(get, "OBSERVABILITY_ADMIN_TOKEN")?
+    };
+    if !observability_disabled
+        && let Some(cred) = get("CREDENTIAL_ADMIN_TOKEN")
         && !cred.is_empty()
         && cred == observability_admin_token
     {
@@ -415,13 +429,13 @@ fn load_auth(get: &dyn Fn(&str) -> Option<String>) -> Result<AuthParts> {
     let homeserver = require_non_empty(get, "HOMESERVER")?;
     let room_id = require_non_empty(get, "ROOM_ID")?;
     let matrix_access_token = require_non_empty(get, "MATRIX_ACCESS_TOKEN")?;
-    if observability_admin_token == matrix_access_token {
+    if !observability_disabled && observability_admin_token == matrix_access_token {
         return Err(config_error(
             "OBSERVABILITY_ADMIN_TOKEN",
             "OBSERVABILITY_ADMIN_TOKEN 须独立，不得复用 MATRIX_ACCESS_TOKEN",
         ));
     }
-    if observability_admin_token.len() < ADMIN_TOKEN_MIN_LEN {
+    if !observability_disabled && observability_admin_token.len() < ADMIN_TOKEN_MIN_LEN {
         tracing::warn!(
             "OBSERVABILITY_ADMIN_TOKEN 长度不足 {ADMIN_TOKEN_MIN_LEN}，建议使用更长随机值"
         );
@@ -442,8 +456,17 @@ struct LimitParts {
 }
 
 fn load_limits(get: &dyn Fn(&str) -> Option<String>) -> Result<LimitParts> {
+    let pii_hold_max = parse_positive(get, "PII_HOLD_MAX", PII_HOLD_MAX_DEFAULT)?;
+    let pii_hold_max = if pii_hold_max > PII_HOLD_MAX_UPPER_BOUND {
+        tracing::warn!(
+            "PII_HOLD_MAX={pii_hold_max} 超上界 {PII_HOLD_MAX_UPPER_BOUND}，已钳位（ARH-6，防无界缝窗缓冲）"
+        );
+        PII_HOLD_MAX_UPPER_BOUND
+    } else {
+        pii_hold_max
+    };
     Ok(LimitParts {
-        pii_hold_max: parse_positive(get, "PII_HOLD_MAX", PII_HOLD_MAX_DEFAULT)?,
+        pii_hold_max,
         audit_hold_max_bytes: parse_positive(
             get,
             "AUDIT_HOLD_MAX_BYTES",
@@ -724,15 +747,10 @@ mod tests;
 #[cfg(test)]
 mod redline {
     #[test]
-    fn file_len_under_800_or_split() {
-        // H2.1 红线看护（口径=文件总行，含测试与注释）：超 800 即失败，
-        // 须按 H1 门面+子模块模板拆分，不得只改数字放行。
-        // G8.7：本测试为文件大小守护，非行为覆盖（不校验业务语义）。
-        const SELF_SRC: &str = include_str!("env_parse.rs");
-        let lines = SELF_SRC.lines().count();
-        assert!(
-            lines <= 800,
-            "env_parse.rs {lines} 行超 800 红线：须拆分（见 veil-review-followup-arch-hygiene H1/H2.1）"
+    fn file_len_redline() {
+        crate::test_support::file_len_under_800_or_split(
+            "env_parse.rs",
+            include_str!("env_parse.rs"),
         );
     }
 }
