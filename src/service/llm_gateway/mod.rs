@@ -148,13 +148,15 @@ impl GatewayMetrics {
 
     pub fn record_conv_missing(&self, reason: &str) { self.conv_missing.record(reason, 1); }
 
-    pub fn conv_missing_count(&self, reason: &str) -> u64 { self.conv_missing.get(reason) }
+    #[cfg(test)]
+    pub(crate) fn conv_missing_count(&self, reason: &str) -> u64 { self.conv_missing.get(reason) }
 
     pub fn record_truncated_tool_dropped(&self, n: u64) {
         self.truncated_tool_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn truncated_tool_dropped_count(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn truncated_tool_dropped_count(&self) -> u64 {
         self.truncated_tool_dropped.load(Ordering::Relaxed)
     }
 
@@ -175,11 +177,17 @@ impl GatewayMetrics {
         self.terminal_fallback.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn terminal_fallback_count(&self) -> u64 { self.terminal_fallback.load(Ordering::Relaxed) }
+    #[cfg(test)]
+    pub(crate) fn terminal_fallback_count(&self) -> u64 {
+        self.terminal_fallback.load(Ordering::Relaxed)
+    }
 
     pub fn record_restore_fallback(&self) { self.restore_fallback.fetch_add(1, Ordering::Relaxed); }
 
-    pub fn restore_fallback_count(&self) -> u64 { self.restore_fallback.load(Ordering::Relaxed) }
+    #[cfg(test)]
+    pub(crate) fn restore_fallback_count(&self) -> u64 {
+        self.restore_fallback.load(Ordering::Relaxed)
+    }
 
     pub fn record_admin_rate_evicted(&self, n: u64) {
         self.admin_rate_evicted.fetch_add(n, Ordering::Relaxed);
@@ -196,6 +204,28 @@ impl GatewayMetrics {
     pub fn upstream_read_error_count(&self) -> u64 {
         self.upstream_read_errors.load(Ordering::Relaxed)
     }
+}
+
+/// ARH-10（7.7）：上游状态码受约束类型——仅接受 `100..=599` 的合法 HTTP 状态，
+/// 服务层不再以裸 `u16` 无约束传递；非法值在构造处即被拒（返回 `None`），
+/// 调用方按既有回退（`502`）处理，不 panic、不改写对外语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamStatus(u16);
+
+impl UpstreamStatus {
+    pub const fn new(code: u16) -> Option<Self> {
+        if code >= 100 && code <= 599 {
+            Some(Self(code))
+        } else {
+            None
+        }
+    }
+
+    pub const fn as_u16(self) -> u16 { self.0 }
+
+    pub const fn is_error(self) -> bool { self.0 >= 400 }
+
+    pub const fn is_success(self) -> bool { self.0 < 400 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +251,13 @@ pub fn classify_empty(
         // N2/D6：`status>=400` 恒豁免合成 502（JSON 走调用方完整后处理链，
         // 非 JSON 含空体原样透传状态码与正文字节，不再吞错转 `E_EMPTY_BODY`）。
         return EmptyAction::PassthroughErrorStatus;
+    }
+    // NLP-6/D：「空体/非 JSON→502」门控 SHALL 仅对 `upstream_status == 200` 生效
+    // （对齐 Python `_llm.py:3009-3013` 的 `upstream_resp.status == 200` 守卫）。
+    // 其余非错误状态（201/204/304 等，均可能合法携带空体）按原状态码与正文字节
+    // 透传，不合成 502；`status>=400` 错误体由上方分支透传，不受本门控影响。
+    if upstream_status != 200 {
+        return EmptyAction::PassthroughOk;
     }
     if body_len == 0 || !is_json {
         return EmptyAction::NonStreamTo502;
@@ -267,6 +304,9 @@ pub async fn fetch_upstream_with_retry(
     headers: HeaderMap,
     body: Vec<u8>,
 ) -> anyhow::Result<reqwest::Response> {
+    // ARH-7（7.4）：请求体转共享 `Bytes`，重试时按引用计数克隆（零字节拷贝），
+    // 不再对 `Vec<u8>` 逐次深拷贝；拿头前重试分类/退避语义不变。
+    let body = axum::body::Bytes::from(body);
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 0..=MAX_RETRY_ATTEMPTS {
         let mut req = client.request(method.clone(), url);
@@ -723,5 +763,24 @@ mod tests {
         assert_eq!(m.upstream_read_error_count(), 1, "成功路径不递增");
         m.record_upstream_read_error();
         assert_eq!(m.upstream_read_error_count(), 2);
+    }
+
+    #[test]
+    fn upstream_status_constrained() {
+        // ARH-10（7.7）：状态码经受约束类型——合法区间接受，非法值拒绝（不 panic）。
+        assert_eq!(
+            UpstreamStatus::new(200).map(UpstreamStatus::as_u16),
+            Some(200)
+        );
+        assert_eq!(
+            UpstreamStatus::new(599).map(UpstreamStatus::as_u16),
+            Some(599)
+        );
+        assert!(UpstreamStatus::new(99).is_none(), "低于 100 非法");
+        assert!(UpstreamStatus::new(600).is_none(), "高于 599 非法");
+        assert!(!UpstreamStatus::new(200).expect("合法").is_error());
+        assert!(UpstreamStatus::new(200).expect("合法").is_success());
+        assert!(UpstreamStatus::new(500).expect("合法").is_error());
+        assert!(!UpstreamStatus::new(500).expect("合法").is_success());
     }
 }

@@ -1,15 +1,8 @@
 use super::*;
 
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 hygiene-round4 模板）：
-    // 超 800 即失败，须按模板拆分，不得只改数字放行。
-    const SELF_SRC: &str = include_str!("../hold.rs");
-    let lines = SELF_SRC.lines().count();
-    assert!(
-        lines <= 800,
-        "hold.rs {lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("hold.rs", include_str!("../hold.rs"));
 }
 
 #[test]
@@ -52,6 +45,24 @@ fn responses_three_fragments_ordered_single_flush_no_audit_during_delta() {
 }
 
 #[test]
+fn hold_preserves_sequence_order() {
+    // RSP-5/2.29：并行 item 交错导致分片乱序到达时，同槽按 `sequence_number`
+    // 升序缝合，放行结果不放乱相对次序。
+    let mut hold = AuditHold::new(4096);
+    let key = AuditHold::responses_key(Some("item-x"), 0);
+    for (seq, frag) in [(2u64, "c"), (0u64, "a"), (1u64, "b")] {
+        assert_eq!(
+            hold.push_responses_fragment(&key, 0, Some(seq), Some("item-x"), Some("run"), frag),
+            HoldVerdict::Approved
+        );
+    }
+    hold.mark_responses_done(&key, None);
+    let triples = hold.tool_triples();
+    assert_eq!(triples.len(), 1);
+    assert_eq!(triples[0].2, "abc", "须按 sequence_number 升序缝合");
+}
+
+#[test]
 fn responses_slot_isolated() {
     // D2/S2：per-item `.done` 只完成该槽，不置全局完成；后续 item 分片照常
     // 累积（旧实现首个 done 即置全局完成，后续分片被 `completed` 早退跳过）。
@@ -62,9 +73,6 @@ fn responses_slot_isolated() {
         "槽级 done 不得置全局完成"
     );
     let mut hold = AuditHold::new(1024);
-    if AuditHold::is_complete_event(&done) {
-        hold.mark_completed();
-    }
     let k0 = AuditHold::responses_key(Some("item-0"), 0);
     hold.push_responses_fragment(&k0, 0, Some(0), Some("item-0"), Some("run"), "{\"x\":1}");
     hold.mark_responses_done(&k0, Some("{\"x\":1}"));
@@ -702,4 +710,64 @@ fn responses_dedup_keeps_audit_verdict() {
     assert_eq!(triples.len(), 1);
     assert_eq!(triples[0].1, "exec");
     assert_eq!(triples[0].2, "{\"command\":\"rm -rf /\"}");
+}
+
+#[test]
+fn hold_zero_byte_flood_bounded() {
+    // STP-5/D6：零字节分片洪泛（不同 index）不增 `total_bytes`，
+    // 条目数维度须独立 fail-closed 清仓，使内存有界。
+    let mut hold = AuditHold::new(1024);
+    for idx in 0..AUDIT_HOLD_MAX_ENTRIES as u32 {
+        assert_eq!(
+            hold.push_fragment(idx, None, None, ""),
+            HoldVerdict::Approved,
+            "未达条目上限不得拒绝"
+        );
+    }
+    assert!(!hold.is_rejected());
+    assert_eq!(hold.total_bytes, 0, "零字节分片不增总字节");
+    assert_eq!(
+        hold.push_fragment(AUDIT_HOLD_MAX_ENTRIES as u32, None, None, ""),
+        HoldVerdict::Rejected,
+        "超条目上限须 fail-closed"
+    );
+    assert!(hold.is_rejected());
+    assert!(hold.tool_triples().is_empty(), "清仓后无残留条目");
+}
+
+#[test]
+fn hold_entry_cap_and_byte_cap() {
+    // STP-5/D6：字节与条目两维度均触发有界策略（同 Rejected 语义、非 panic）。
+    let mut bytes = AuditHold::new(4);
+    assert_eq!(
+        bytes.push_fragment(0, None, None, "ab"),
+        HoldVerdict::Approved
+    );
+    assert_eq!(
+        bytes.push_fragment(0, None, None, "cde"),
+        HoldVerdict::Rejected
+    );
+    assert!(bytes.is_rejected());
+    let mut entries = AuditHold::new(1024);
+    let key = |i: u32| AuditHold::responses_key(Some(&format!("item-{i}")), i);
+    for i in 0..AUDIT_HOLD_MAX_ENTRIES as u32 {
+        assert_eq!(
+            entries.push_responses_fragment(&key(i), i, Some(0), None, None, ""),
+            HoldVerdict::Approved
+        );
+    }
+    assert_eq!(
+        entries.push_responses_fragment(
+            &key(AUDIT_HOLD_MAX_ENTRIES as u32),
+            AUDIT_HOLD_MAX_ENTRIES as u32,
+            Some(0),
+            None,
+            None,
+            ""
+        ),
+        HoldVerdict::Rejected,
+        "Responses 零字节槽洪泛须受条目上限约束"
+    );
+    assert!(entries.is_rejected());
+    assert!(entries.responses_triples().is_empty());
 }

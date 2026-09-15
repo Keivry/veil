@@ -19,6 +19,30 @@ impl Protocol {
             Self::NonDialog => "non-dialog",
         }
     }
+
+    /// 协议线级标签的单一来源：下游 `x-veil-protocol` 头值（`NonDialog` 对外为
+    /// `passthrough`）。收敛 `handler/llm/mod.rs::protocol_header_value` 的重复 match。
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Anthropic => "anthropic",
+            Self::Responses => "responses",
+            Self::NonDialog => "passthrough",
+        }
+    }
+
+    /// 类型化分派谓词：全仓 `protocol == Protocol::X` 比较统一经此收敛，
+    /// 新增变体只改本组方法（穷举 `match` 臂仍由编译器强制）。
+    pub fn is_chat(self) -> bool { matches!(self, Self::Chat) }
+
+    pub fn is_anthropic(self) -> bool { matches!(self, Self::Anthropic) }
+
+    pub fn is_responses(self) -> bool { matches!(self, Self::Responses) }
+
+    pub fn is_nondialog(self) -> bool { matches!(self, Self::NonDialog) }
+
+    /// 对话协议（`Chat`/`Anthropic`/`Responses`）——`NonDialog` 为唯一字节透传协议。
+    pub fn is_dialog(self) -> bool { !self.is_nondialog() }
 }
 
 // 新增协议检查清单（D6/hygiene-round5）：新增第 4 协议时，除本表外还须同步：
@@ -38,7 +62,10 @@ fn strip_query(path: &str) -> &str { path.split(['?', '#']).next().unwrap_or(pat
 fn strict_match(path: &str) -> Option<Protocol> {
     let p = strip_query(path);
     for (suffix, proto) in STRICT_TAILS {
-        if p == format!("/{suffix}") || p == suffix {
+        // NLP-7/D-gateway-protocol-fix：宽容匹配大小写不敏感为**有意声明**
+        // （见 change `veil-audit-r2-remediation` `gateway-protocol-fix` spec）——
+        // 仅大小写不同的同一对话尾 SHALL 归类一致，不得回落 `NonDialog`。
+        if p.eq_ignore_ascii_case(&format!("/{suffix}")) || p.eq_ignore_ascii_case(suffix) {
             return Some(proto);
         }
         if p.len() > suffix.len() + 1
@@ -60,13 +87,10 @@ fn strict_match(path: &str) -> Option<Protocol> {
 ///
 /// Chat 无同类官方子资源，保留一层宽容（`/v1/chat/completions/extra` 仍命中）。
 fn is_official_subresource(proto: Protocol, seg: &str) -> bool {
-    match proto {
-        Protocol::Anthropic => {
-            seg.eq_ignore_ascii_case("count_tokens") || seg.eq_ignore_ascii_case("batches")
-        }
-        Protocol::Responses => true,
-        Protocol::Chat | Protocol::NonDialog => false,
+    if proto.is_anthropic() {
+        return seg.eq_ignore_ascii_case("count_tokens") || seg.eq_ignore_ascii_case("batches");
     }
+    proto.is_responses()
 }
 
 fn lenient_match(path: &str) -> Option<(Protocol, String)> {
@@ -126,7 +150,7 @@ pub fn resolve_protocol(
 
 /// D4 透传谓词：`NonDialog` 为唯一字节透传协议（无用量/审计/还原）。
 /// 全仓布尔判定统一经此函数，新增协议变体只改一处；穷举 `match` 臂保留模式。
-pub fn is_passthrough(protocol: Protocol) -> bool { protocol == Protocol::NonDialog }
+pub fn is_passthrough(protocol: Protocol) -> bool { protocol.is_nondialog() }
 
 pub fn is_stream_body(body: &Value) -> bool {
     body.as_object().is_some_and(|m| {
@@ -140,7 +164,7 @@ pub fn should_inject_stream_options(protocol: Protocol, body: &Value) -> bool {
     // 无 `include_usage`，故注入收窄为仅 `Protocol::Chat`。Responses 流式用量经
     // `response.completed.response.usage` 携带，由 `extract_usage_stream` 三级回退
     // 闭环（见 `usage.rs`），不依赖请求注入；用户自带 `stream_options` 原样保留。
-    if protocol != Protocol::Chat {
+    if !protocol.is_chat() {
         return false;
     }
     if !is_stream_body(body) {
@@ -254,6 +278,47 @@ mod tests {
             assert!(hit && proto == want, "{path} 须 {want:?}");
         }
         assert!(!is_chat_tail("/v1/models", Some(&m)).0);
+    }
+
+    #[test]
+    fn protocol_path_case_sensitivity() {
+        // NLP-7（3.8）：协议尾判定宽容匹配大小写不敏感为有意裁决（见
+        // `gateway-protocol-fix` spec）——仅大小写不同的同一路径归类一致，
+        // 不回落 `NonDialog`；且不因此放宽官方子资源排除。
+        let m = GatewayMetrics::default();
+        for (path, want) in [
+            ("/V1/Chat/Completions", Protocol::Chat),
+            ("/v1/MESSAGES", Protocol::Anthropic),
+            ("/V1/messages", Protocol::Anthropic),
+            ("/v1/RESPONSES", Protocol::Responses),
+            ("/V1/Chat/Completions/extra", Protocol::Chat),
+        ] {
+            let (hit, proto) = is_chat_tail(path, Some(&m));
+            assert!(hit && proto == want, "{path} 须为 {want:?}，实得 {proto:?}");
+        }
+        // 大小写变体归类不变（同尾不同 case）。
+        for pair in [
+            ("/v1/chat/completions", "/V1/CHAT/COMPLETIONS"),
+            ("/v1/messages", "/V1/MESSAGES"),
+            ("/v1/responses", "/V1/RESPONSES"),
+        ] {
+            assert_eq!(
+                is_chat_tail(pair.0, Some(&m)).1,
+                is_chat_tail(pair.1, Some(&m)).1,
+                "{} 与 {} 归类须一致",
+                pair.0,
+                pair.1
+            );
+        }
+        // 大小写宽容不放宽官方子资源排除。
+        for path in [
+            "/v1/MESSAGES/count_tokens",
+            "/v1/MESSAGES/batches",
+            "/V1/RESPONSES/abc123",
+        ] {
+            let (hit, proto) = is_chat_tail(path, Some(&m));
+            assert!(!hit && proto == Protocol::NonDialog, "{path} 须 NonDialog");
+        }
     }
 
     #[test]

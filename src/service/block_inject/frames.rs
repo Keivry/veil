@@ -5,7 +5,7 @@
 //!   Chat/Anthropic 真空补最小线级终止，不伪造内容/usage/成功语义）。
 //! - 非流体：`nonstream_block_body` 三协议 JSON 形态 + `evaluate_nonstream` tool 提取与审计（仅
 //!   `Block` 合成阻断体，`NeedApproval` 记 pending 透传）。
-//! - `ensure_event_lines` 归一化（Chat/`[DONE]` 豁免补 `event:` 行）。
+//! - `ensure_event_lines` 归一化（RSP-7：不注入 `event: message`，保持原 data 帧形态）。
 //! - 对外路径不变：经 `super`（`service::block_inject`）重导出，调用方零改。
 
 use {
@@ -14,7 +14,12 @@ use {
         config::AuditMode,
         service::{
             audit::{AuditPolicy, AuditVerdict, evaluate_with_whitelist},
-            llm_gateway::{Protocol as GatewayProtocol, extract_tool_calls},
+            llm_gateway::{
+                GatewayMetrics,
+                Protocol as GatewayProtocol,
+                extract_tool_calls,
+                resolve_conv_id,
+            },
             metrics::normalize_model,
         },
     },
@@ -26,15 +31,42 @@ use {
 /// 三帧：`delta{role,content}` 首帧 + `delta{} finish_reason:stop` 终端
 /// + 裸 `data: [DONE]`（`count_done==1`）。全帧恒为纯 `data:` 形态， 不得带 `event:` 行（见
 ///   `ensure_event_lines` 的 Chat 豁免）。 阻断文案 `[blocked: reason]` 不变。
+///
+/// CHC-6/2.25 声明覆盖范围：合成阻断帧仅覆盖 `choices[].index == 0` 单 choice 面；
+/// 审计阻断为流级动作（替换整条流），多 choice 流的其余 choice 不再逐条重建。
+/// 该声明由 `block_frame_choice_coverage` 测试锁定。
 pub fn chat_block_frames(reason: &str) -> Vec<String> {
+    // CHC-3/D8：补齐 OpenAI 流式对象必需字段 `id`/`object`/`created`/`model`，
+    // 使官方 SDK 可解析（`object` 为流式 `chat.completion.chunk`）。
+    let created = now_created();
+    let head = serde_json::json!({
+        "id": "blocked-0",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": "unknown_model",
+        "choices": [{"index": 0,
+            "delta": {"role": "assistant", "content": format!("[blocked: {reason}]")}}]
+    });
+    let tail = serde_json::json!({
+        "id": "blocked-0",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": "unknown_model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
     vec![
-        format!(
-            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"[blocked: {reason}]\"}}}}]}}\n\n"
-        ),
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
-            .to_string(),
+        format!("data: {head}\n\n"),
+        format!("data: {tail}\n\n"),
         "data: [DONE]\n\n".to_string(),
     ]
+}
+
+/// Unix 秒时间戳（合成 `created`/`created_at` 的合规默认值）。
+fn now_created() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn anthropic_block_frames(reason: &str, index: u32) -> Vec<String> {
@@ -60,6 +92,30 @@ pub fn responses_block_frames(response_id: &str) -> Vec<String> {
     responses_sequence(response_id, text, true)
 }
 
+/// 协议阻断帧的单一声明式分派（7.6）：收敛泵内两处重复的
+/// `match protocol { .. chat/anthropic/responses_block_frames }`。`blocked_index` 为触发
+/// 阻断的真实 content block index（Anthropic 专用，其余协议忽略）；`conv_id` 缺失时
+/// Responses 走归档回退（`metrics` 仅参与该回退计数）。
+pub fn protocol_block_frames(
+    protocol: GatewayProtocol,
+    reason: &str,
+    conv_id: Option<&str>,
+    blocked_index: u32,
+    metrics: Option<&GatewayMetrics>,
+) -> Vec<String> {
+    match protocol {
+        GatewayProtocol::Chat => chat_block_frames(reason),
+        GatewayProtocol::Anthropic => anthropic_block_frames(reason, blocked_index),
+        GatewayProtocol::Responses => {
+            let bid = conv_id
+                .map(str::to_string)
+                .unwrap_or_else(|| resolve_conv_id(None, &Value::Null, metrics, "block").0);
+            responses_block_frames(&bid)
+        }
+        GatewayProtocol::NonDialog => vec![],
+    }
+}
+
 /// Responses 截断全序列（D3）：与阻断同序列，尾帧改 `response.failed`
 /// （失败语义，不伪造完成），`terminal_count==1` 且不含 `completed`。
 /// P4/D4：本全序列**仅真空流**（`empty_stream_frames`）使用——含 `output_index`
@@ -80,7 +136,12 @@ pub fn responses_failed_frame(
     error: Option<&Value>,
     sequence_number: Option<u64>,
 ) -> String {
-    let mut response = serde_json::json!({"id": response_id, "status": "failed"});
+    // RSP-4/D9：合成 `response` 对象补齐必需字段（`object`/`created_at`/`model`/
+    // `output`/`status`），使 SDK 解析不因缺 `output` 抛 `TypeError`。
+    let mut response = serde_json::json!({
+        "id": response_id, "object": "response", "created_at": now_created(),
+        "model": "unknown_model", "status": "failed", "output": []
+    });
     if let Some(err) = error {
         response["error"] = err.clone();
     }
@@ -91,71 +152,107 @@ pub fn responses_failed_frame(
     format!("event: response.failed\ndata: {payload}\n\n")
 }
 
+/// RSP-3/D8：合成 Responses 帧统一写入单调 `sequence_number`（0 起、逐帧 +1、无缺口）。
+fn responses_frame(event: &str, mut payload: Value, seq: u64) -> String {
+    payload["sequence_number"] = serde_json::json!(seq);
+    format!("event: {event}\ndata: {payload}\n\n")
+}
+
 fn responses_sequence(response_id: &str, text: &str, completed: bool) -> Vec<String> {
-    let tail = if completed {
-        format!(
-            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\",\"status\":\"completed\"}}}}\n\n"
-        )
+    let created = now_created();
+    let output_item = serde_json::json!({
+        "id": response_id, "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}]
+    });
+    // RSP-4/D9：终端 `response` 对象补齐必需字段（含 `output`/`status`），
+    // `object` 恒为 `response`，使 SDK `get_final_response().output_text` 可达。
+    let terminal = if completed {
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id, "object": "response", "created_at": created,
+                "model": "unknown_model", "status": "completed",
+                "output": [output_item.clone()],
+                "parallel_tool_calls": false, "tool_choice": "auto", "tools": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            }
+        })
     } else {
-        format!(
-            "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"{response_id}\",\"status\":\"failed\"}}}}\n\n"
-        )
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": response_id, "object": "response", "created_at": created,
+                "model": "unknown_model", "status": "failed",
+                "output": [output_item.clone()],
+                "error": {"message": text},
+                "parallel_tool_calls": false, "tool_choice": "auto", "tools": []
+            }
+        })
+    };
+    let terminal_event = if completed {
+        "response.completed"
+    } else {
+        "response.failed"
     };
     vec![
-        format!(
-            "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{response_id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}}}\n\n"
+        responses_frame(
+            "response.output_item.added",
+            serde_json::json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": response_id, "type": "message", "role": "assistant", "content": []}
+            }),
+            0,
         ),
-        format!(
-            "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"item_id\":\"{response_id}\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}\n\n"
+        responses_frame(
+            "response.content_part.added",
+            serde_json::json!({
+                "type": "response.content_part.added", "item_id": response_id,
+                "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []}
+            }),
+            1,
         ),
-        format!(
-            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"{response_id}\",\"output_index\":0,\"content_index\":0,\"delta\":\"{text}\"}}\n\n"
+        responses_frame(
+            "response.output_text.delta",
+            serde_json::json!({
+                "type": "response.output_text.delta", "item_id": response_id,
+                "output_index": 0, "content_index": 0, "delta": text
+            }),
+            2,
         ),
-        format!(
-            "event: response.output_text.done\ndata: {{\"type\":\"response.output_text.done\",\"item_id\":\"{response_id}\",\"output_index\":0,\"content_index\":0,\"text\":\"{text}\"}}\n\n"
+        responses_frame(
+            "response.output_text.done",
+            serde_json::json!({
+                "type": "response.output_text.done", "item_id": response_id,
+                "output_index": 0, "content_index": 0, "text": text
+            }),
+            3,
         ),
-        format!(
-            "event: response.content_part.done\ndata: {{\"type\":\"response.content_part.done\",\"item_id\":\"{response_id}\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"{text}\",\"annotations\":[]}}}}\n\n"
+        responses_frame(
+            "response.content_part.done",
+            serde_json::json!({
+                "type": "response.content_part.done", "item_id": response_id,
+                "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []}
+            }),
+            4,
         ),
-        format!(
-            "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{response_id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{text}\",\"annotations\":[]}}]}}}}\n\n"
+        responses_frame(
+            "response.output_item.done",
+            serde_json::json!({
+                "type": "response.output_item.done", "output_index": 0, "item": output_item
+            }),
+            5,
         ),
-        tail,
+        responses_frame(terminal_event, terminal, 6),
     ]
 }
 
-/// Chat 帧判定（D1）：Chat Completions 流式分片载荷恒含 `choices`
-/// （`data: {"choices":...}`），或为裸 `[DONE]` 终止帧；此类帧按规范恒为
-/// 纯 `data:` 形态，`ensure_event_lines` 不得补 `event:` 行。
-/// 仅检查 `data:` 行载荷，避免 `event:` 行名干扰。
-fn is_chat_frame(frame: &str) -> bool {
-    if is_done_frame(frame) {
-        return true;
-    }
-    frame
-        .lines()
-        .filter(|l| l.trim_start().starts_with("data:"))
-        .any(|l| l.contains("\"choices\""))
-}
-
-pub fn ensure_event_lines(frames: Vec<String>) -> Vec<String> {
-    frames
-        .into_iter()
-        .map(|f| {
-            // DONE 裸帧豁免：Chat 终止符恒为裸 `data: [DONE]`，不得补 `event:`。
-            // D1：Chat 分片帧（`choices` 载荷）同样豁免补全；
-            // Anthropic/Responses 缺 `event:` 行仍按原语义补全。
-            if is_done_frame(&f) || is_chat_frame(&f) || f.lines().any(|l| l.starts_with("event:"))
-            {
-                f
-            } else if let Some(pos) = f.find("data:") {
-                format!("event: message\n{}", &f[pos..])
-            } else {
-                f
-            }
-        })
-        .collect()
-}
+/// RSP-7/2.31：SSE 出口/合成不得为缺 `event:` 行的 data 帧注入 `event: message`——
+/// 保持原 data 帧形态（WHATWG 无 `event:` 即默认事件类型，由下游自行处理）。
+/// 合成帧（Anthropic/Responses）均自带 `event:`；Chat/`[DONE]` 恒为纯 `data:` 形态。
+/// 本入口保留为显式归一化点，语义为原样透传。
+pub fn ensure_event_lines(frames: Vec<String>) -> Vec<String> { frames }
 
 pub fn chat_done_frame() -> String { "data: [DONE]\n\n".to_string() }
 
@@ -306,16 +403,14 @@ pub fn evaluate_nonstream(
 /// 不合成成功终止（open-ended，以已透传块收尾；残缺分片由泵内 TSS-03 缓冲丢弃）。
 /// 返回帧由调用方经 `ensure_event_lines` 归一化后发送。
 pub fn synthesize_truncation(protocol: GatewayProtocol, conv_id: &str) -> Vec<String> {
-    match protocol {
-        GatewayProtocol::Responses => vec![responses_failed_frame(
-            conv_id,
-            Some(&serde_json::json!({"message": "truncated"})),
-            None,
-        )],
-        GatewayProtocol::Chat | GatewayProtocol::Anthropic | GatewayProtocol::NonDialog => {
-            vec![]
-        }
+    if !protocol.is_responses() {
+        return vec![];
     }
+    vec![responses_failed_frame(
+        conv_id,
+        Some(&serde_json::json!({"message": "truncated"})),
+        None,
+    )]
 }
 
 /// 空流合成（P2/D2/D3，对标 Python `_synthesize_truncation`）：
@@ -357,4 +452,167 @@ fn anthropic_vacuum_frames(conv_id: &str) -> Vec<String> {
         format!("event: message_start\ndata: {start}\n\n"),
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::service::block_inject::{count_done, ensure_event_lines},
+    };
+
+    /// 抽取帧内所有 `data:` 行的合法 JSON 载荷（`[DONE]` 跳过）。
+    fn data_payloads(frame: &str) -> Vec<Value> {
+        frame
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|p| p.trim() != "[DONE]")
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .collect()
+    }
+
+    #[test]
+    fn synth_chat_frame_fields_complete() {
+        // CHC-3/D8：合成 chat 流帧补齐 id/object/created/model 四字段且类型正确。
+        let frames = chat_block_frames("policy");
+        assert_eq!(frames.len(), 3);
+        for (i, expected_content) in [(0usize, true), (1, false)] {
+            let payload = data_payloads(&frames[i]).remove(0);
+            assert!(
+                payload["id"].as_str().is_some_and(|s| !s.is_empty()),
+                "id 非空: {payload}"
+            );
+            assert_eq!(payload["object"], "chat.completion.chunk");
+            assert!(payload["created"].is_u64(), "created 为整数: {payload}");
+            assert!(
+                payload["model"].as_str().is_some_and(|s| !s.is_empty()),
+                "model 非空: {payload}"
+            );
+            assert_eq!(payload["choices"][0]["index"], 0);
+            if expected_content {
+                assert!(payload["choices"][0]["delta"]["content"].is_string());
+            } else {
+                assert_eq!(payload["choices"][0]["finish_reason"], "stop");
+            }
+        }
+    }
+
+    #[test]
+    fn no_synthetic_event_message() {
+        // RSP-7/2.31：缺 `event:` 的 data 帧保持原形态，不注入 `event: message`。
+        let raw = vec!["data: {\"a\":1}\n\n".to_string()];
+        let out = ensure_event_lines(raw.clone());
+        assert_eq!(out, raw, "不得注入 event: 行");
+        assert!(!out[0].contains("event:"), "{}", out[0]);
+        let with_event = vec!["event: x\ndata: {\"a\":1}\n\n".to_string()];
+        assert_eq!(ensure_event_lines(with_event.clone()), with_event);
+    }
+
+    #[test]
+    fn block_frame_choice_coverage() {
+        // CHC-6/2.25：合成 Chat 阻断帧的声明覆盖范围为单 choice index 0，锁定之。
+        let frames = ensure_event_lines(chat_block_frames("policy"));
+        let mut choice_indices = Vec::new();
+        for f in &frames {
+            for payload in data_payloads(f) {
+                let choices = payload["choices"].as_array().expect("choices 须为数组");
+                assert_eq!(choices.len(), 1, "声明覆盖单 choice: {payload}");
+                choice_indices.push(choices[0]["index"].as_u64().expect("index 须为整数"));
+            }
+        }
+        assert_eq!(choice_indices.len(), 2, "两数据帧各一个 choice");
+        assert!(
+            choice_indices.iter().all(|i| *i == 0),
+            "声明覆盖 choices[].index == 0: {choice_indices:?}"
+        );
+    }
+
+    #[test]
+    fn synth_chat_frame_sdk_parse() {
+        // CHC-3/D8（SDK 等价）：规范流式增量为 `choices[].delta`，恰一裸 `[DONE]`。
+        let frames = ensure_event_lines(chat_block_frames("policy"));
+        assert_eq!(count_done(&frames), 1, "恰一 [DONE]");
+        assert!(
+            frames.iter().all(|f| !f.contains("event:")),
+            "Chat 帧恒为纯 data: 形态"
+        );
+        let head = data_payloads(&frames[0]).remove(0);
+        assert_eq!(head["object"], "chat.completion.chunk");
+        assert_eq!(head["choices"][0]["delta"]["role"], "assistant");
+        assert!(
+            head["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[blocked: policy]")
+        );
+        assert!(head["created"].is_u64() && head["model"].as_str().is_some());
+        let tail = data_payloads(&frames[1]).remove(0);
+        assert_eq!(tail["choices"][0]["finish_reason"], "stop");
+        assert_eq!(tail["object"], "chat.completion.chunk");
+    }
+
+    #[test]
+    fn synth_frames_sequence_number_monotonic() {
+        // RSP-3/D8：阻断与真空流全序列均自 0 单调递增、无缺口。
+        for frames in [
+            ensure_event_lines(responses_block_frames("r1")),
+            ensure_event_lines(responses_truncated_frames("r1")),
+        ] {
+            let seqs: Vec<u64> = frames
+                .iter()
+                .flat_map(|f| data_payloads(f))
+                .filter_map(|p| p["sequence_number"].as_u64())
+                .collect();
+            assert_eq!(seqs.len(), 7, "7 帧均须带序号: {seqs:?}");
+            assert_eq!(
+                seqs,
+                (0..7u64).collect::<Vec<u64>>(),
+                "须自 0 单调无缺口: {seqs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn synth_frames_sequence_number_required() {
+        // RSP-3/D8：每帧结构断言含 `sequence_number`，不得省略。
+        let frames = ensure_event_lines(responses_block_frames("r1"));
+        assert_eq!(frames.len(), 7);
+        for f in &frames {
+            let payload = data_payloads(f).remove(0);
+            assert!(
+                payload.get("sequence_number").is_some(),
+                "缺 sequence_number: {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn synth_response_required_fields() {
+        // RSP-4/D9：合成 `response` 对象含 `output`/`status`，
+        // `output_text` 语义可达（`output` 为数组且含 output_text part）。
+        let frames = ensure_event_lines(responses_block_frames("r1"));
+        let completed = frames
+            .iter()
+            .find(|f| f.contains("response.completed"))
+            .expect("须含 response.completed");
+        let payload = data_payloads(completed).remove(0);
+        let response = &payload["response"];
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["status"], "completed");
+        assert!(response["created_at"].is_number());
+        assert!(response["model"].as_str().is_some_and(|s| !s.is_empty()));
+        let output = response["output"].as_array().expect("output 须为数组");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["type"], "output_text");
+        assert!(
+            output[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[blocked:")
+        );
+        let failed = ensure_event_lines(responses_truncated_frames("r1"));
+        let payload = data_payloads(failed.last().unwrap()).remove(0);
+        assert_eq!(payload["response"]["status"], "failed");
+        assert!(payload["response"]["output"].is_array());
+    }
 }

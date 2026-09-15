@@ -12,12 +12,21 @@ use {
     },
 };
 
+/// STP-5/D6：hold **条目数上限**——与字节上限（`AUDIT_HOLD_MAX_BYTES`）并行的
+/// 独立维度。零字节分片（`output_item.added`、空 `function_call` 等不计
+/// `total_bytes` 的碎片）若只按字节记账可无限创建槽/条目，故以本上限约束活跃
+/// 条目数（Chat/Anthropic 的 `args_by_index` + Responses 的 `responses_slots`）；
+/// 超限与字节超限同语义 fail-closed 并清仓，使零字节洪泛下内存有界。
+const AUDIT_HOLD_MAX_ENTRIES: usize = 4096;
+
 /// D3 hold 累积与流内保活（自 `audit_hold.rs` 并入，判定归属本模块）：
 /// `AuditHold` 只累积不合成帧，`RequestKeepalive` 为流内保活唯一实现。
 #[derive(Debug, Default)]
 struct ResponsesSlot {
     output_index: u32,
     name: Option<String>,
+    /// RSP-5/2.29：以 `sequence_number` 为键（缺失按到达序补号），`full_args`
+    /// 按键升序缝合——乱序/交错到达不放乱相对次序。
     frags: std::collections::BTreeMap<u64, String>,
     next_seq: u64,
     done_args: Option<String>,
@@ -95,16 +104,26 @@ impl AuditHold {
         let entry = self.args_by_index.entry(index).or_default();
         entry.push_str(args_delta);
         self.total_bytes += args_delta.len();
-        if self.total_bytes > self.max_bytes {
-            self.rejected = true;
-            self.total_bytes = 0;
-            self.args_by_index.clear();
-            self.name_by_index.clear();
-            self.id_by_index.clear();
-            self.responses_slots.clear();
-            return HoldVerdict::Rejected;
+        if self.total_bytes > self.max_bytes || self.entries_over_cap() {
+            return self.reject_and_clear();
         }
         HoldVerdict::Approved
+    }
+
+    /// 条目数维度是否超限（零字节分片同样计入，见 [`AUDIT_HOLD_MAX_ENTRIES`]）。
+    fn entries_over_cap(&self) -> bool {
+        self.args_by_index.len() + self.responses_slots.len() > AUDIT_HOLD_MAX_ENTRIES
+    }
+
+    /// 字节或条目超限共用的 fail-closed 清仓（拒绝态 + 归零 + 清空全部槽）。
+    fn reject_and_clear(&mut self) -> HoldVerdict {
+        self.rejected = true;
+        self.total_bytes = 0;
+        self.args_by_index.clear();
+        self.name_by_index.clear();
+        self.id_by_index.clear();
+        self.responses_slots.clear();
+        HoldVerdict::Rejected
     }
 
     pub fn responses_key(item_id: Option<&str>, output_index: u32) -> String {
@@ -154,14 +173,8 @@ impl AuditHold {
             std::collections::btree_map::Entry::Occupied(_) => 0,
         };
         self.total_bytes += added_bytes;
-        if self.total_bytes > self.max_bytes {
-            self.rejected = true;
-            self.total_bytes = 0;
-            self.args_by_index.clear();
-            self.name_by_index.clear();
-            self.id_by_index.clear();
-            self.responses_slots.clear();
-            return HoldVerdict::Rejected;
+        if self.total_bytes > self.max_bytes || self.entries_over_cap() {
+            return self.reject_and_clear();
         }
         HoldVerdict::Approved
     }
@@ -184,17 +197,13 @@ impl AuditHold {
             .total_bytes
             .saturating_sub(old)
             .saturating_add(args.len());
-        if self.total_bytes > self.max_bytes {
-            self.rejected = true;
-            self.total_bytes = 0;
-            self.args_by_index.clear();
-            self.name_by_index.clear();
-            self.id_by_index.clear();
-            self.responses_slots.clear();
+        if self.total_bytes > self.max_bytes || self.entries_over_cap() {
+            self.reject_and_clear();
         }
     }
 
-    pub fn is_responses_complete(&self, item_key: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_responses_complete(&self, item_key: &str) -> bool {
         self.responses_slots
             .get(item_key)
             .is_some_and(|s| s.done_seen)
@@ -204,6 +213,23 @@ impl AuditHold {
         self.responses_slots
             .values()
             .filter(|s| s.done_seen)
+            .map(|s| {
+                (
+                    s.output_index,
+                    s.name.clone().unwrap_or_default(),
+                    s.full_args(),
+                )
+            })
+            .collect()
+    }
+
+    /// D5/STP-1：仍缺 per-item `.done` 的 Responses 槽三元组（按已累积参数）。
+    /// 供全局完成路径「先审后放」——与 [`AuditHold::responses_triples`] 的 done 槽
+    /// 口径同源，仅筛选条件相反。
+    pub fn responses_pending_triples(&self) -> Vec<(u32, String, String)> {
+        self.responses_slots
+            .values()
+            .filter(|s| !s.done_seen)
             .map(|s| {
                 (
                     s.output_index,
@@ -259,6 +285,12 @@ impl AuditHold {
             return has_nonempty_finish_reason(payload);
         }
         Self::is_complete_event(payload)
+    }
+
+    /// CHC-5/2.24：Chat 任一非空 `finish_reason`（成功收尾信号）判定，供干净 EOF
+    /// 与异常截断区分——干净收尾 SHALL NOT 记 `open_ended`。
+    pub fn chat_finish_reason_present(payload: &Value) -> bool {
+        has_nonempty_finish_reason(payload)
     }
 
     /// D2 槽级完成事件判定：`response.output_item.done`/
@@ -332,7 +364,8 @@ impl AuditHold {
         triples
     }
 
-    pub fn held(&self) -> bool { !self.completed && !self.rejected }
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> bool { !self.completed && !self.rejected }
 
     /// D1 pending 判据：Chat/Anthropic 存在未释放的 `args_by_index` 分片；
     /// Responses 存在 `!done_seen` 的槽。用于把抑制/keepalive 门控从流级
@@ -368,7 +401,8 @@ impl AuditHold {
 
     pub fn is_rejected(&self) -> bool { self.rejected }
 
-    pub fn accumulated(&self, index: u32) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn accumulated(&self, index: u32) -> Option<&str> {
         self.args_by_index.get(&index).map(|s| s.as_str())
     }
 }
@@ -444,7 +478,8 @@ impl RequestKeepalive {
         }
     }
 
-    pub fn is_live(&self) -> bool { self.live.load(Ordering::Relaxed) }
+    #[cfg(test)]
+    pub(crate) fn is_live(&self) -> bool { self.live.load(Ordering::Relaxed) }
 }
 
 impl Drop for RequestKeepalive {

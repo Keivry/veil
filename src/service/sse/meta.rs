@@ -35,7 +35,7 @@ pub fn set_truncated(
     mode: TruncatedMode,
     metrics: Option<&GatewayMetrics>,
 ) -> bool {
-    if mode == TruncatedMode::SynthesizedFailed && protocol != Protocol::Responses {
+    if mode == TruncatedMode::SynthesizedFailed && !protocol.is_responses() {
         return false;
     }
     meta.truncated_mode = Some(mode);

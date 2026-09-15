@@ -14,6 +14,11 @@ use {
     std::{collections::VecDeque, time::Instant},
 };
 
+/// D2/STP-2：`text_carry`（未终结行尾）总字节上限——与单行上限同源，防止无行
+/// 终止的畸形流（含持续无效 UTF-8）在 `feed_line` 生效前无界累积；超限丢弃尾部
+/// 并计入 `truncated_line_dropped_bytes`（与行截断同口径）。
+const TEXT_CARRY_MAX_BYTES: usize = LINE_LIMIT_BYTES;
+
 #[derive(Debug, Default)]
 pub struct Utf8ByteBuffer {
     buf: Vec<u8>,
@@ -24,26 +29,46 @@ impl Utf8ByteBuffer {
 
     /// D6：仅单测使用，降级为测试可见（生产经 `SseParser` 只用 `push`/`flush_text`）。
     #[cfg(test)]
-    pub fn pending_len(&self) -> usize { self.buf.len() }
+    pub(crate) fn pending_len(&self) -> usize { self.buf.len() }
 
     pub fn push(&mut self, chunk: &[u8]) -> String {
         self.buf.extend_from_slice(chunk);
-        let valid_up_to = match std::str::from_utf8(&self.buf) {
-            Ok(_) => self.buf.len(),
-            Err(e) => {
-                let valid = e.valid_up_to();
-                if e.error_len().is_none() {
-                    valid
-                } else {
-                    match std::str::from_utf8(&self.buf[..valid]) {
-                        Ok(_) => valid,
-                        Err(_) => 0,
+        // D2/STP-2：逐序列推进直至整块消费完——真无效序列（`error_len().is_some()`）
+        // 连同该序列一并按替换语义消费（对齐 Python `errors='replace'`），仅合法但
+        // 不完整的前缀（`error_len().is_none()`）保留至下一块拼接。旧实现单轮只返回
+        // `valid_up_to` 且对真无效字节不前进，导致解析器卡死、缓冲无界增长。
+        let mut out = String::new();
+        let mut consumed = 0usize;
+        while consumed < self.buf.len() {
+            match std::str::from_utf8(&self.buf[consumed..]) {
+                Ok(_) => {
+                    out.push_str(&String::from_utf8_lossy(&self.buf[consumed..]));
+                    consumed = self.buf.len();
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        out.push_str(&String::from_utf8_lossy(
+                            &self.buf[consumed..consumed + valid],
+                        ));
+                    }
+                    match e.error_len() {
+                        Some(len) => {
+                            let end = consumed + valid + len;
+                            out.push_str(&String::from_utf8_lossy(
+                                &self.buf[consumed + valid..end],
+                            ));
+                            consumed = end;
+                        }
+                        None => {
+                            consumed += valid;
+                            break;
+                        }
                     }
                 }
             }
-        };
-        let out = String::from_utf8_lossy(&self.buf[..valid_up_to]).into_owned();
-        self.buf.drain(..valid_up_to);
+        }
+        self.buf.drain(..consumed);
         out
     }
 
@@ -75,6 +100,10 @@ pub struct SseParser {
     block_comments: Vec<String>,
     line_bytes: usize,
     event_start: Option<Instant>,
+    /// STP-10：统一事件计数口径——解析出的数据事件与经
+    /// [`SseParser::record_injected_event`] 纳入的注入合成帧（审计阻断/截断收尾等）
+    /// 共用本计数，与生产指标 `GatewayMetrics::add_sse_event()` 逐一致；纯注释块与
+    /// 纯信封块不计入。生产注入点 SHALL 经 `record_injected_event` 计数。
     pub sse_event_count: u64,
     pub line_overflow: bool,
     /// C11：超长行截断丢弃的尾部字节累计（调用方经
@@ -124,6 +153,15 @@ impl SseParser {
         std::mem::take(&mut self.truncated_line_dropped_bytes)
     }
 
+    /// STP-10：把注入的合成帧并入统一事件计数（与解析事件同源），
+    /// 使 `sse_event_count` 与生产指标 `GatewayMetrics::add_sse_event()` 一致。
+    #[cfg(test)]
+    pub(crate) fn record_injected_event(&mut self) { self.sse_event_count += 1; }
+
+    /// D2/STP-2：仅单测使用，暴露未终结行尾缓冲长度以断言有界。
+    #[cfg(test)]
+    pub fn text_carry_len(&self) -> usize { self.text_carry.len() }
+
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         let text = self.byte_buf.push(chunk);
         self.push_text(&text)
@@ -169,6 +207,17 @@ impl SseParser {
             self.swallow_lf = bytes.last() == Some(&b'\r');
             rest = s[start..].to_string();
         }
+        // D2/STP-2：未终结行尾总上限——超限按字符边界截断尾部并计数，防止
+        // 无行终止的畸形流在 `feed_line` 生效前无界累积。
+        let rest = if rest.len() > TEXT_CARRY_MAX_BYTES {
+            let boundary = rest.floor_char_boundary(TEXT_CARRY_MAX_BYTES);
+            self.truncated_line_dropped_bytes += (rest.len() - boundary) as u64;
+            self.line_overflow = true;
+            self.block_truncated = true;
+            rest[..boundary].to_string()
+        } else {
+            rest
+        };
         self.text_carry = rest;
         for line in lines {
             if let Some(ev) = self.feed_line(&line) {
@@ -217,18 +266,10 @@ impl SseParser {
             return self.dispatch_block();
         }
         if let Some(comment) = line.strip_prefix(':') {
+            // STP-7：块内注释一律累积到本块，待块终止时随块聚合分发——首注释不再
+            // 被提前拆为独立事件，同块多注释合为恰一注释事件；含数据块的注释经
+            // `SseEvent::comments` 保真，不丢失、不额外多事件。
             self.block_comments.push(comment.to_string());
-            if self.block_lines.is_empty() && self.block_comments.len() == 1 {
-                let ev = SseEvent {
-                    comments: std::mem::take(&mut self.block_comments),
-                    is_comment_only: true,
-                    truncated: std::mem::take(&mut self.block_truncated),
-                    ..Default::default()
-                };
-                self.line_bytes = 0;
-                self.event_start = None;
-                return Some(ev);
-            }
             return None;
         }
         self.block_lines.push(line.to_string());
@@ -287,6 +328,12 @@ impl SseParser {
                 if ev.retry.is_some() {
                     self.pending_retry = ev.retry.take();
                 }
+            }
+            // STP-7：纯注释块按块聚合为恰一注释事件（不计入 `sse_event_count`），
+            // 不再逐行拆分；同块多注释合并为同一事件。
+            if !ev.comments.is_empty() {
+                ev.is_comment_only = true;
+                return Some(ev);
             }
             return None;
         }

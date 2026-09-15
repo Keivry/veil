@@ -39,10 +39,13 @@ pub fn filter_hop_headers_counted(
     decode_enabled: bool,
     metrics: Option<&GatewayMetrics>,
 ) -> u64 {
-    use std::collections::HashSet;
-    let mut hop: HashSet<String> = HOP_HEADERS.iter().map(|s| s.to_string()).collect();
-    // `Connection` 头内动态项（逗号分隔，大小写不敏感）。
-    let conn_vals: Vec<String> = headers
+    debug_assert!(
+        dir == "upstream" || dir == "downstream",
+        "hop 过滤方向须为 upstream/downstream"
+    );
+    // ARH-8（7.5）：固定 hop 集用常量数组匹配，动态项用小 `Vec` 线性比较——
+    // 不再每请求构造 `HashSet`（零堆分配于无 `Connection` 动态项的常见路径）。
+    let dynamic: Vec<String> = headers
         .get_all("connection")
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -50,14 +53,12 @@ pub fn filter_hop_headers_counted(
         .map(|t| t.trim().to_lowercase())
         .filter(|t| !t.is_empty())
         .collect();
-    for t in conn_vals {
-        hop.insert(t);
-    }
+    let is_hop = |k: &str| HOP_HEADERS.contains(&k) || dynamic.iter().any(|d| d == k);
     // 快照键后逐个移除（`HeaderMap` 键已规范小写，比较用小写）。
     let keys: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
     let mut removed: u64 = 0;
     for k in keys {
-        if hop.contains(&k.to_lowercase()) && headers.remove(k.as_str()).is_some() {
+        if is_hop(&k.to_lowercase()) && headers.remove(k.as_str()).is_some() {
             removed += 1;
         }
     }
@@ -221,5 +222,34 @@ mod tests {
             assert!(h.get("authorization").is_some(), "端到端鉴权头须透传");
             assert_eq!(m.hop_filtered_count("upstream"), 1);
         }
+    }
+
+    #[test]
+    fn hashset_reuse_equivalence() {
+        // ARH-8（7.5）：改用常量数组 + 动态项 `Vec` 后过滤集合等价（无 `HashSet` 分配）。
+        use axum::http::{HeaderMap, HeaderValue};
+        let m = GatewayMetrics::default();
+        let mut h = HeaderMap::new();
+        h.insert("connection", HeaderValue::from_static("x-hop, X-Other"));
+        h.insert("x-hop", HeaderValue::from_static("1"));
+        h.insert("x-other", HeaderValue::from_static("2"));
+        h.insert("te", HeaderValue::from_static("trailers"));
+        h.insert("x-real", HeaderValue::from_static("keep"));
+        let n = filter_hop_headers_counted(&mut h, "upstream", false, Some(&m));
+        assert_eq!(n, 4, "connection 自身 + 动态项 + 固定项各剥一次");
+        assert!(h.get("x-hop").is_none());
+        assert!(h.get("x-other").is_none());
+        assert!(h.get("connection").is_none());
+        assert!(h.get("te").is_none());
+        assert!(h.get("x-real").is_some());
+        assert_eq!(m.hop_filtered_count("upstream"), 4);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "hop 过滤方向")]
+    fn service_invariant_guards() {
+        // ARH-11（7.8）：服务层方向不变量以 `debug_assert` 守护，debug 下违约即暴露。
+        filter_hop_headers_counted(&mut HeaderMap::new(), "bogus", false, None);
     }
 }

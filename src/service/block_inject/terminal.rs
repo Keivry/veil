@@ -58,7 +58,8 @@ pub fn dedupe_terminal_frames(frames: Vec<String>, protocol: &str) -> Vec<String
 
 /// 协议级终端计数（D6 帧级）：chat 数 `[DONE]` 帧、anthropic 数 `message_stop`、
 /// responses 数 `completed/failed`；恰一约束的计数口径。
-pub fn terminal_count(frames: &[String], protocol: &str) -> usize {
+#[cfg(test)]
+pub(crate) fn terminal_count(frames: &[String], protocol: &str) -> usize {
     match protocol {
         "chat" => count_done(frames),
         "anthropic" => frames.iter().filter(|f| f.contains("message_stop")).count(),

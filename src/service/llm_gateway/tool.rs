@@ -140,10 +140,15 @@ pub fn retrieval_args(obj: &serde_json::Map<String, Value>) -> String {
     String::new()
 }
 
-/// Chat 桶键混入 choice 序号（F-P1b）：`ci*64+index`，`n>1` 时跨 choice
-/// 同 `index` 分桶隔离；`ci=0` 时与旧键等值，单 choice 快照不变。
+/// Chat 桶键（F-P1b + CHC-6/2.25）：`choice` 序号与 tool `index` 位域拼接，
+/// 声明域内 `ci < 2^16 && idx < 2^16` 单射无碰撞。旧实现 `ci*64+idx` 在
+/// `idx >= 64` 时与下一 choice 的桶 0 碰撞（64 步长饱和）；`ci = 0` 时本键
+/// 与旧实现等值，单 choice 快照不变。
 pub fn chat_bucket(ci: usize, idx: u32) -> u32 {
-    (ci as u32).saturating_mul(64).saturating_add(idx)
+    let ci = ci as u32;
+    debug_assert!(ci < (1 << 16), "choice index 超出位域: {ci}");
+    debug_assert!(idx < (1 << 16), "tool index 超出位域: {idx}");
+    (ci << 16) | (idx & 0xFFFF)
 }
 
 /// P9/X2：Responses `output[]` 桶号唯一实现（流/非流同键）：`item.output_index`
@@ -202,6 +207,23 @@ pub(crate) fn responses_derived_tool_kind(ev_type: &str) -> Option<&'static str>
     } else if ev_type.contains("mcp_call_arguments") {
         Some("mcp")
     } else if ev_type.contains("custom_tool_call_input") {
+        Some("custom_tool")
+    } else {
+        None
+    }
+}
+
+/// RSP-6/2.30：`response.output_item.done` 的非 function_call 工具 item 类型
+/// → 派生工具名，覆盖内置工具（与 [`responses_derived_tool_kind`] 的 delta
+/// 路径同名，保证 item-done 路径与 delta/非流路径同结论）。
+pub(crate) fn responses_item_tool_name(item_type: &str) -> Option<&'static str> {
+    if item_type.contains("code_interpreter") {
+        Some("code_interpreter")
+    } else if item_type.contains("shell") {
+        Some("shell")
+    } else if item_type.contains("mcp") {
+        Some("mcp")
+    } else if item_type.contains("custom_tool") {
         Some("custom_tool")
     } else {
         None
@@ -393,6 +415,7 @@ pub(crate) fn extract_tool_calls_with(
                     Value::Null => true,
                     Value::String(s) => s.is_empty(),
                     Value::Object(m) => m.is_empty(),
+                    Value::Array(a) => a.is_empty(),
                     _ => false,
                 };
                 let args_raw = if let Some(pj) = b.get("partial_json") {
@@ -518,48 +541,64 @@ pub(crate) fn extract_tool_calls_with(
             }
             if ev_type == "response.output_item.done"
                 && let Some(item) = payload.get("item")
-                && let Some(type_str) = item.get("type").and_then(|v| v.as_str())
-                && (type_str == "function_call" || retrieval_tool_name(type_str).is_some())
             {
-                let idx = payload
-                    .get("output_index")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(0);
-                let mut args = item
-                    .get("arguments")
-                    .map(|a| {
-                        if let Some(s) = a.as_str() {
-                            s.to_string()
-                        } else {
-                            a.to_string()
-                        }
-                    })
-                    .unwrap_or_default();
-                // C10：检索完成项参按 queries 回退（与流式分片同结论）。
-                if args.is_empty()
-                    && let Some(obj) = item.as_object()
-                {
-                    args = retrieval_args(obj);
-                }
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| retrieval_tool_name(type_str).map(|s| s.to_string()));
-                let id_raw = item
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
-                if !args.is_empty() || name.is_some() {
-                    let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
-                    out.push(ToolCall {
-                        index: idx,
-                        id,
-                        name,
-                        args,
-                        id_synth,
-                    });
+                let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let derived = responses_item_tool_name(type_str);
+                let is_tool = type_str.contains("function_call")
+                    || derived.is_some()
+                    || retrieval_tool_name(type_str).is_some()
+                    || item.get("name").is_some()
+                    || item.get("arguments").is_some()
+                    || item.get("input").is_some();
+                if is_tool {
+                    let idx = payload
+                        .get("output_index")
+                        .and_then(|x| x.as_u64())
+                        .map(|n| n as u32)
+                        .unwrap_or(0);
+                    let mut args = ["arguments", "code", "command", "input"]
+                        .iter()
+                        .find_map(|k| item.get(*k))
+                        .map(|a| {
+                            if let Some(s) = a.as_str() {
+                                s.to_string()
+                            } else {
+                                a.to_string()
+                            }
+                        })
+                        .unwrap_or_default();
+                    // C10：检索完成项参按 queries 回退（与流式分片同结论）；
+                    // RSP-6：shell 等内置工具参数位于 `action` 对象内。
+                    if args.is_empty()
+                        && let Some(obj) = item.as_object()
+                    {
+                        args = retrieval_args(obj);
+                    }
+                    if args.is_empty()
+                        && let Some(action) = item.get("action")
+                    {
+                        args = serde_json::to_string(action).unwrap_or_default();
+                    }
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| derived.map(str::to_string))
+                        .or_else(|| retrieval_tool_name(type_str).map(|s| s.to_string()));
+                    let id_raw = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.get("call_id").and_then(|v| v.as_str()));
+                    if !args.is_empty() || name.is_some() {
+                        let (id, id_synth) = synth_tool_id_with(emit_warn, idx, id_raw);
+                        out.push(ToolCall {
+                            index: idx,
+                            id,
+                            name,
+                            args,
+                            id_synth,
+                        });
+                    }
                 }
                 return out;
             }

@@ -16,11 +16,13 @@ pub enum Speed {
 /// 硬编码理由：经验值平衡首字延迟与 SSE 帧数，调整须同步复核续跑测试。
 pub const FAST_EMIT_THRESHOLD_BYTES: usize = 4096;
 
+/// STP-6/2.18：标点边界判定不含 `\n`——SSE 聚合缓冲（`agg`）尾恒为帧终止
+/// `\n\n`，若把 `\n` 计入边界会使 `Speed::Fast` 每帧即吐、攒批恒不生效。
 pub fn is_punct_boundary(text: &str) -> bool {
     text.chars().last().is_some_and(|c| {
         matches!(
             c,
-            '。' | '！' | '？' | '.' | '!' | '?' | ',' | '，' | ';' | '；' | ':' | '：' | '\n'
+            '。' | '！' | '？' | '.' | '!' | '?' | ',' | '，' | ';' | '；' | ':' | '：'
         )
     })
 }

@@ -111,18 +111,15 @@ mod tests {
 
     #[test]
     fn missing_event_line_completed_per_protocol() {
-        // Chat（`choices` 载荷）：豁免补全，恒为纯 `data:` 形态。
-        let chat_raw = vec!["data: {\"choices\":[{\"index\":0}]}\n\n".to_string()];
-        let chat_fixed = ensure_event_lines(chat_raw);
-        assert!(!chat_fixed[0].contains("event:"), "Chat 帧不得补 event: 行");
-        assert!(chat_fixed[0].contains("data:"));
-        // Anthropic/Responses 缺 `event:` 行仍被补全。
+        // RSP-7/2.31：缺 `event:` 的 data 帧一律保持原形态，不注入事件名。
         for raw in [
+            "data: {\"choices\":[{\"index\":0}]}\n\n".to_string(),
             "data: {\"type\":\"message_delta\"}\n\n".to_string(),
             "data: {\"type\":\"response.completed\"}\n\n".to_string(),
         ] {
-            let fixed = ensure_event_lines(vec![raw]);
-            assert!(fixed[0].lines().any(|l| l.starts_with("event:")));
+            let fixed = ensure_event_lines(vec![raw.clone()]);
+            assert_eq!(fixed[0], raw, "缺 event: 须保持原形态: {fixed:?}");
+            assert!(!fixed[0].contains("event:"), "不得注入 event: 行");
             assert!(fixed[0].contains("data:"));
         }
     }
@@ -599,5 +596,113 @@ mod tests {
             f5.contains("\"index\":5") && !f5.contains("\"index\":0"),
             "{f5}"
         );
+    }
+
+    #[test]
+    fn protocol_dispatch_equivalence() {
+        // 7.6：收敛为 `Protocol::wire_name`/类型化谓词 + `protocol_block_frames` 后，
+        // 与收敛前各站点内联 `match`/比较逐点等价。合成帧含 `created`/`created_at`
+        // 时间戳（生产本身即非确定），比较前统一归零该两类字段。
+        use crate::service::llm_gateway::{GatewayMetrics, Protocol as P, resolve_protocol};
+
+        fn zero_ts(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for k in ["created", "created_at"] {
+                        if m.contains_key(k) {
+                            m.insert(k.to_string(), serde_json::Value::from(0));
+                        }
+                    }
+                    for (_, child) in m.iter_mut() {
+                        zero_ts(child);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(zero_ts),
+                _ => {}
+            }
+        }
+
+        fn stable(frames: &[String]) -> Vec<String> {
+            frames
+                .iter()
+                .map(|f| {
+                    f.lines()
+                        .map(|l| match l.strip_prefix("data: ") {
+                            Some(j) => match serde_json::from_str::<serde_json::Value>(j) {
+                                Ok(mut v) => {
+                                    zero_ts(&mut v);
+                                    format!("data: {}", serde_json::to_string(&v).unwrap())
+                                }
+                                Err(_) => l.to_string(),
+                            },
+                            None => l.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .collect()
+        }
+
+        // 线级标签等价：`wire_name` == 收敛前 `protocol_header_value` 硬编码分支。
+        for (p, want) in [
+            (P::Chat, "chat"),
+            (P::Anthropic, "anthropic"),
+            (P::Responses, "responses"),
+            (P::NonDialog, "passthrough"),
+        ] {
+            assert_eq!(p.wire_name(), want, "{p:?}");
+        }
+
+        // 谓词等价：三对话协议互斥，`NonDialog` 为唯一透传类。
+        for p in [P::Chat, P::Anthropic, P::Responses] {
+            assert!(p.is_dialog() && !p.is_nondialog(), "{p:?}");
+        }
+        assert!(P::NonDialog.is_nondialog());
+
+        // 阻断帧分派等价：`protocol_block_frames` == 各站点内联 match 的逐协议结果。
+        assert_eq!(
+            stable(&protocol_block_frames(
+                P::Chat,
+                "policy",
+                Some("c1"),
+                0,
+                None
+            )),
+            stable(&chat_block_frames("policy"))
+        );
+        assert_eq!(
+            protocol_block_frames(P::Anthropic, "policy", Some("a1"), 2, None),
+            anthropic_block_frames("policy", 2)
+        );
+        assert_eq!(
+            stable(&protocol_block_frames(
+                P::Responses,
+                "policy",
+                Some("r1"),
+                0,
+                None
+            )),
+            stable(&responses_block_frames("r1"))
+        );
+        assert!(protocol_block_frames(P::NonDialog, "policy", None, 0, None).is_empty());
+
+        // 截断分派等价：仅 Responses 合成 failed 单帧，其余协议空实现。
+        let trunc = synthesize_truncation(P::Responses, "r1");
+        assert_eq!(trunc.len(), 1);
+        assert!(trunc[0].contains("response.failed") && trunc[0].contains("truncated"));
+        for p in [P::Chat, P::Anthropic, P::NonDialog] {
+            assert!(synthesize_truncation(p, "x").is_empty(), "{p:?}");
+        }
+
+        // 路径分派等价：尾缀解析到同一协议（含未知回落 `NonDialog`）。
+        let m = GatewayMetrics::default();
+        for (path, want) in [
+            ("/v1/chat/completions", P::Chat),
+            ("/v1/messages", P::Anthropic),
+            ("/v1/responses", P::Responses),
+            ("/v1/unknown-model-list", P::NonDialog),
+        ] {
+            assert_eq!(resolve_protocol(path, None, Some(&m)), want, "{path}");
+        }
     }
 }

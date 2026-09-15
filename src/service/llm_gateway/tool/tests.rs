@@ -1,19 +1,7 @@
 #[test]
-fn file_len_under_800_or_split() {
-    // 红线看护（口径=文件总行，含测试与注释，见 veil-arch-file-size-closeout / hygiene-round4）：
-    // 超 800 即失败，须按测试外迁模板拆分，不得只改数字放行。
-    const MAIN_SRC: &str = include_str!("../tool.rs");
-    let main_lines = MAIN_SRC.lines().count();
-    assert!(
-        main_lines <= 800,
-        "tool.rs {main_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
-    const TESTS_SRC: &str = include_str!("tests.rs");
-    let tests_lines = TESTS_SRC.lines().count();
-    assert!(
-        tests_lines <= 800,
-        "tool/tests.rs {tests_lines} 行超 800 红线：须拆分（见 veil-arch-file-size-closeout / hygiene-round4）"
-    );
+fn file_len_redline() {
+    crate::test_support::file_len_under_800_or_split("tool.rs", include_str!("../tool.rs"));
+    crate::test_support::file_len_under_800_or_split("tool/tests.rs", include_str!("tests.rs"));
 }
 
 use super::*;
@@ -67,6 +55,97 @@ fn chat_multi_choice_same_index_isolated_by_ci() {
     let lc = extract_tool_calls(Protocol::Chat, &legacy);
     assert_eq!(lc.len(), 1);
     assert_eq!(lc[0].index, chat_bucket(0, 0));
+}
+
+#[test]
+fn item_done_type_coverage() {
+    // RSP-6/2.30：`output_item.done` 覆盖非 function_call 工具 item 类型，
+    // 各类型均派生工具名并携带非空参数（与 delta/非流路径同结论）。
+    let cases = [
+        (
+            serde_json::json!({"type":"function_call","id":"i1","name":"run","arguments":"{\"x\":1}"}),
+            "run",
+        ),
+        (
+            serde_json::json!({"type":"custom_tool_call","id":"i2","input":"{\"y\":2}"}),
+            "custom_tool",
+        ),
+        (
+            serde_json::json!({"type":"code_interpreter_call","id":"i3","code":"print(1)"}),
+            "code_interpreter",
+        ),
+        (
+            serde_json::json!({"type":"shell_call","id":"i4","action":{"command":"ls"}}),
+            "shell",
+        ),
+        (
+            serde_json::json!({"type":"mcp_call","id":"i5","arguments":"{\"p\":1}"}),
+            "mcp",
+        ),
+        (
+            serde_json::json!({"type":"file_search_call","id":"i6","queries":["q"]}),
+            "file_search",
+        ),
+        (
+            serde_json::json!({"type":"web_search_call","id":"i7","action":{"query":"q"}}),
+            "web_search",
+        ),
+    ];
+    for (item, expect_name) in cases {
+        let ty = item["type"].as_str().expect("item type").to_string();
+        let payload =
+            serde_json::json!({"type":"response.output_item.done","output_index":3,"item":item});
+        let calls = extract_tool_calls(Protocol::Responses, &payload);
+        assert_eq!(calls.len(), 1, "{ty} 须进 item-done 审计: {calls:?}");
+        assert_eq!(calls[0].index, 3, "{ty} 桶号");
+        assert_eq!(
+            calls[0].name.as_deref(),
+            Some(expect_name),
+            "{ty} 派生名须一致"
+        );
+        assert!(!calls[0].args.is_empty(), "{ty} 参非空: {calls:?}");
+    }
+}
+
+#[test]
+fn chat_bucket_no_collision() {
+    // CHC-6/2.25：声明域内 (ci, idx) 单射无碰撞；覆盖旧 64 步长碰撞点。
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for ci in 0..8usize {
+        for idx in 0..256u32 {
+            assert!(
+                seen.insert(chat_bucket(ci, idx)),
+                "分桶碰撞: ci={ci} idx={idx}"
+            );
+        }
+    }
+    assert_ne!(
+        chat_bucket(0, 64),
+        chat_bucket(1, 0),
+        "64 步长旧碰撞点须消除"
+    );
+    assert_ne!(chat_bucket(0, 4096), chat_bucket(64, 0));
+    assert_eq!(chat_bucket(0, 0), 0, "单 choice 键值不变");
+}
+
+#[test]
+fn empty_placeholder_covers_empty_array() {
+    // STP-9/2.21：`content_block_start` 空数组占位 `input:[]` 不计入参数累积，
+    // 不与后续 `partial_json` 拼成 `[]...` 前缀污染。
+    let start = serde_json::json!({"type":"content_block_start","index":0,
+        "content_block":{"type":"tool_use","id":"t1","name":"run","input":[]}});
+    let calls = extract_tool_calls(Protocol::Anthropic, &start);
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].args.is_empty(),
+        "空数组占位不得计为参数: {:?}",
+        calls[0].args
+    );
+    let partial = serde_json::json!({"type":"content_block_delta","index":0,
+        "delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}});
+    let rest = extract_tool_calls(Protocol::Anthropic, &partial);
+    assert_eq!(rest[0].args, "{\"x\":1}");
 }
 
 #[test]

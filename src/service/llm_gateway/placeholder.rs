@@ -138,7 +138,7 @@ fn inject_responses_text_field(field: &mut Value, key: &str, prompt: &str) -> bo
 /// anthropic 合并 `system`；responses 对 `input` 与 `instructions`
 /// 同等注入（string 追加 / array 前插），非法形态 warn 后不注入。
 pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol) -> bool {
-    if protocol == Protocol::Anthropic {
+    if protocol.is_anthropic() {
         let Some(map) = body.as_object_mut() else {
             return false;
         };
@@ -156,7 +156,7 @@ pub fn placeholder_inject_obj(body: &mut Value, prompt: &str, protocol: Protocol
     // §2.1：Responses `input` 与 `instructions` 同等注入；string 按串追加、
     // array 按首条前插；E2 独立回退：非法字段 warn 后保持原值，仅双字段
     // 均无注入时整体不注入。
-    if protocol == Protocol::Responses {
+    if protocol.is_responses() {
         let Some(map) = body.as_object_mut() else {
             return false;
         };
@@ -262,7 +262,7 @@ pub fn inject_placeholder_prompt(
     // `placeholder_schema_ok` 保留作他协议与单测的最终兜底。
     // F-P2a 幂等守卫：目标位置已含说明不再重复前插，返回 `None`
     // 使调用方保留原字节（字节等价透传，不置位 normalized）。
-    if protocol == Protocol::Responses {
+    if protocol.is_responses() {
         let already = ["input", "instructions"].iter().all(|key| {
             obj.as_object()
                 .and_then(|m| m.get(*key))
@@ -290,7 +290,7 @@ pub fn inject_placeholder_prompt(
         }
         return serde_json::to_string(&obj).ok();
     }
-    if protocol == Protocol::Anthropic
+    if protocol.is_anthropic()
         && obj
             .as_object()
             .and_then(|m| m.get("system"))
@@ -298,7 +298,7 @@ pub fn inject_placeholder_prompt(
     {
         return None;
     }
-    if protocol == Protocol::Chat
+    if protocol.is_chat()
         && obj
             .as_object()
             .is_some_and(|m| first_system_has_prompt(m, "messages", prompt))
