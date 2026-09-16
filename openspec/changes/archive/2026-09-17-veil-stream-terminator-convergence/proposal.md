@@ -2,7 +2,7 @@
 
 本 change 是 `veil-audit-r4-remediation`（2026-09-16 归档）中**显式延后的架构收敛项**：该轮 Oracle 架构审查识别出「阻断/终止帧注入逻辑跨模块重复、且『恰一终端』不变量由跨模块 flag 协调维持」的结构性风险，当时以「收敛面大、触及三协议终止语义（高风险），须独立 change + 独立评审」为由登记为**后续独立 change**（见归档 `design.md` §K 与 §10 Non-goals 第 3 条、`tasks.md` 9.1）。本 change 即该延后项。
 
-现状风险（只读核验，逐条 `file:line` 见 `design.md` §1）：流式阻断帧在**两处**独立构造并注入——流内阻断臂 `src/handler/llm/pump/spawn/event_loop.rs:160-173`（`apply_reject_block`）与收尾终审臂 `src/handler/llm/pump/spawn/terminal.rs:158-171`；终止帧合成另在 `src/handler/llm/pump/synth_flush.rs:71-160`（中途断流）与 `src/handler/llm/pump/spawn/terminal.rs:283-312`（真空流）各成一路。同时「恰一终端」由 `PumpLoopState`（`src/handler/llm/pump/spawn/setup.rs:64-70`）中 6 枚 bool（`any_frame_sent`/`terminated`/`rejected_sticky`/`block_injected`/`audit_blocked`/`terminal_sent`/`responses_failed_sent`）跨 `event_loop.rs`、`terminal.rs`、`synth_flush.rs`、`finish.rs` 四处读写协调，另叠 `StreamMeta.terminal_injected`（`src/service/sse/meta.rs:30-34`）与 `truncated_mode` 两个随流标记。**不变量因此不是结构性的，而是约定性的**：任一处漏置/错置 flag 即可产生重复或缺失终端，且没有单一类型可承载「注入恰一次」的保证。
+现状风险（只读核验，逐条 `file:line` 见 `design.md` §1）：流式阻断帧在**两处**独立构造并注入——流内阻断臂 `src/handler/llm/pump/spawn/event_loop.rs:160-173`（`apply_reject_block`）与收尾终审臂 `src/handler/llm/pump/spawn/terminal.rs:158-171`；终止帧合成另在 `src/handler/llm/pump/synth_flush.rs:71-160`（中途断流）与 `src/handler/llm/pump/spawn/terminal.rs:283-312`（真空流）各成一路。同时「恰一终端」由 `PumpLoopState`（`src/handler/llm/pump/spawn/setup.rs:64-70`）中 7 枚 bool（`any_frame_sent`/`terminated`/`rejected_sticky`/`block_injected`/`audit_blocked`/`terminal_sent`/`responses_failed_sent`）跨 `event_loop.rs`、`terminal.rs`、`synth_flush.rs`、`finish.rs` 四处读写协调，另叠 `StreamMeta.terminal_injected`（`src/service/sse/meta.rs:30-34`）与 `truncated_mode` 两个随流标记。**不变量因此不是结构性的，而是约定性的**：任一处漏置/错置 flag 即可产生重复或缺失终端，且没有单一类型可承载「注入恰一次」的保证。
 
 ## What Changes
 
@@ -43,6 +43,6 @@
 
 - 每任务实施后跑 `bash scripts/gate.sh` 七步（fmt / clippy `-D warnings` / test / doc-paths / file-sizes / conformance / go vet+test），任一步非零即未完成。
 - `python3 scripts/check_doc_paths.py`：本 change 内所有 `src/...rs:NNN` 锚点须存在且在界；规划期新建路径（`terminator.rs`、`terminator_tests.rs`）以 `<!-- doc-paths-ignore -->` 标注。
-- `python3 scripts/check_file_sizes.py`：`src/handler/llm/pump/spawn/event_loop.rs`（782 行）与 `spawn_tests.rs`（784 行）逼近 800 上限——本 change **须降低** `event_loop.rs`/`terminal.rs` 行数（迁出注入逻辑），新测试**不得**追加进 `spawn_tests.rs`，应落新 sibling `src/handler/llm/pump/terminator_tests.rs`<!-- doc-paths-ignore -->（在 `src/handler/llm/pump.rs:33-46` 注册）。
+- `python3 scripts/check_file_sizes.py`：`src/handler/llm/pump/spawn/event_loop.rs`（782 行）、`src/handler/llm/pump/event.rs`（787 行）与 `spawn_tests.rs`（784 行）逼近 800 上限——本 change **须降低** `event_loop.rs`/`terminal.rs` 行数（迁出注入逻辑），且对 `event.rs:79` 的就地改写**不得新增行**；新测试**不得**追加进 `spawn_tests.rs`，应落新 sibling `src/handler/llm/pump/terminator_tests.rs`<!-- doc-paths-ignore -->（在 `src/handler/llm/pump.rs:33-46` 注册）。
 - `openspec validate veil-stream-terminator-convergence --strict` 通过（`openspec/specs/architecture-cleanup/spec.md` 既有 requirement header/场景名不受影响——本 change 仅 `## ADDED Requirements`，无 MODIFIED）。
 - **本 change 为 artifacts-only（规划）**：规划期不改 `src/**`、`tests/**`、`scripts/**`、`README.md`、`openspec/specs/**` 与任何其他 change 目录；不归档、不 `git add/commit`、不运行 `cargo`。
