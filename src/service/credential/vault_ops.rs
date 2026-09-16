@@ -323,6 +323,11 @@ pub async fn register_caller_with_approval(
                 message: format!("注册已转 Matrix 人工审批: {}", params.caller_path.trim()),
             });
         }
+        Some(BeginOutcome::Saturated) => {
+            return Err(VeilError::RateLimited {
+                retry_after_secs: 60,
+            });
+        }
         Some(BeginOutcome::Decided(CredentialDecision::Approved)) => {
             return read_registration_view(state, params.caller_path.trim()).await;
         }
@@ -437,6 +442,11 @@ pub async fn revoke_caller_with_approval(
         Some(BeginOutcome::Busy) => {
             return Err(VeilError::PendingApproval {
                 message: format!("吊销已转 Matrix 人工审批: {caller_path}"),
+            });
+        }
+        Some(BeginOutcome::Saturated) => {
+            return Err(VeilError::RateLimited {
+                retry_after_secs: 60,
             });
         }
         Some(BeginOutcome::Decided(CredentialDecision::Approved)) => {

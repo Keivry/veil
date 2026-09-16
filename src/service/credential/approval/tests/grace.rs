@@ -64,3 +64,60 @@ async fn grace_notification_dedup() {
     );
     state.notify.shutdown();
 }
+
+#[test]
+fn grace_dedup_ttl_eviction() {
+    // `CRD-12`/D6：满表先清扫过期、仍满逐出 `expires_at` 最小者、SHALL NOT 整表清空。
+    use super::super::{GRACE_NOTIFY_DEDUP_MAX, first_grace_notification};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let prefix = format!("grace-ttl-{}", std::process::id());
+    let key = |tag: &str, i: usize| format!("{prefix}-{tag}-{i}");
+    let probe =
+        |dedup_key: &str, expires_at: u64| first_grace_notification(dedup_key, expires_at, now);
+
+    // ① 先清扫过期：过期条目不得挤占容量，也不得触发整表清空。
+    let survivor = format!("{prefix}-survivor");
+    assert!(probe(&survivor, now + 3600), "预热活键须首插成功");
+    for i in 0..GRACE_NOTIFY_DEDUP_MAX {
+        assert!(
+            first_grace_notification(&key("expired", i), 0, 0),
+            "过期条目首插须 true（i={i}）"
+        );
+    }
+    assert!(
+        probe(&format!("{prefix}-probe"), now + 600),
+        "满表活键插入须成功"
+    );
+    assert!(
+        !probe(&survivor, now + 3600),
+        "清扫只淘汰过期条目，SHALL NOT 整表清空（既有活键须保留）"
+    );
+    assert!(
+        first_grace_notification(&key("expired", 0), 0, 0),
+        "过期条目须已被清扫（重插返回 true）"
+    );
+
+    // ② 仍满逐出 `expires_at` 最小者：升序活键溢出容量后，最小活键被逐、最大活键保留。
+    for i in 0..(GRACE_NOTIFY_DEDUP_MAX + 16) {
+        assert!(
+            probe(&key("live", i), now + 1000 + i as u64),
+            "活键首插须 true（i={i}）"
+        );
+    }
+    let last = GRACE_NOTIFY_DEDUP_MAX - 1;
+    assert!(
+        !probe(&key("live", last), now + 1000 + last as u64),
+        "最大 expires_at 键须保留（不清表）"
+    );
+    assert!(
+        !probe(&survivor, now + 3600),
+        "逐出单条而非整表清空（早期活键须保留）"
+    );
+    assert!(
+        probe(&key("live", 0), now + 1000),
+        "满表逐出须命中 expires_at 最小者（最小键被逐后重插返回 true）"
+    );
+}

@@ -158,26 +158,19 @@ pub async fn register_caller_handler(
         .source
         .clone()
         .or_else(|| header_str(&headers, "x-source").or_else(|| Some("unknown".to_string())));
-    let params = crate::registry::RegisterParams {
-        caller_path: if body.caller_path.trim().is_empty() {
-            String::new()
-        } else {
-            body.caller_path.trim().to_string()
-        },
-        caller_hash: body.caller_hash.trim().to_string(),
-        name: body.name.trim().to_string(),
-        description: body.description.trim().to_string(),
-        entries: service::register_map::parse_register_entries(
-            body.entries.as_ref(),
-            body.entry.as_deref(),
-            body.field.as_deref(),
-            body.fields.as_ref(),
-        ),
-        allow_mode: service::register_map::parse_register_allow_mode(
-            body.allow_mode.as_deref(),
-            body.auto,
-        ),
-    };
+    let params =
+        service::register_map::parse_register_params(service::register_map::RegisterInputs {
+            caller_path: &body.caller_path,
+            caller_hash: &body.caller_hash,
+            name: &body.name,
+            description: &body.description,
+            entries: body.entries.as_ref(),
+            entry: body.entry.as_deref(),
+            field: body.field.as_deref(),
+            fields: body.fields.as_ref(),
+            allow_mode: body.allow_mode.as_deref(),
+            auto: body.auto,
+        });
     let view = service::register_caller_with_approval(
         &state,
         &params,
@@ -304,6 +297,9 @@ pub async fn approve_hash_change_handler(
     } else {
         body.reg_id.trim()
     };
+    // D-4（6.6）声明边界：`HashChangeOutcome::from_reaction` 为**领域解析器**
+    //（reaction 字面 → 领域枚举），保留于 handler 调用点；越层收敛对象仅为注册
+    // DTO 字段 trim 与 `RegisterParams` 构造（已下沉 `service::register_map`）。
     let outcome = crate::registry::HashChangeOutcome::from_reaction(body.reaction.as_deref())
         .ok_or_else(|| VeilError::BadRequest {
             message: "reaction 必须为 🔓/✅/❎".to_string(),

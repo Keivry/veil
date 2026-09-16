@@ -11,32 +11,49 @@ use {
         error::{Result, VeilError},
     },
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashMap,
         sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     },
 };
 
-/// `CRD-12`：宽限通知去重上限（进程级，防无界增长；超限清空重建）。
+/// `CRD-12`：宽限通知去重上限（进程级，防无界增长；容量触发 TTL 清扫 + 逐出最小 `expires_at`）。
 const GRACE_NOTIFY_DEDUP_MAX: usize = 4096;
 
-/// `CRD-12`：宽限通知去重表（键 = 条目 + 宽限窗口），同窗口仅首次通知。
-static GRACE_NOTIFY_DEDUP: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// `CRD-12`/D6：宽限通知去重表（键 = 条目 + 宽限窗口，value = 该窗口 `expires_at` 秒），
+/// 同窗口仅首次通知。
+static GRACE_NOTIFY_DEDUP: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
-/// `CRD-12`：`dedup_key` 是否首次出现（同窗口重复返回 `false`，不重复通知）。
-fn first_grace_notification(dedup_key: &str) -> bool {
-    let set = GRACE_NOTIFY_DEDUP.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = match set.lock() {
+/// `CRD-12`/D6：`dedup_key` 是否首次出现（同窗口重复返回 `false`，不重复通知）。
+/// 容量满（`>= GRACE_NOTIFY_DEDUP_MAX`）时先 `retain` 清扫过期条目（`expires_at <= now_secs`），
+/// 仍满则逐出 `expires_at` 最小者并记 warn，**SHALL NOT** 整表清空（与
+/// `ratelimit::RateTable` 的「容量触发清扫 + 硬上限逐出」同模式）。
+fn first_grace_notification(dedup_key: &str, expires_at: u64, now_secs: u64) -> bool {
+    let map = GRACE_NOTIFY_DEDUP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if guard.contains(dedup_key) {
+    if guard.contains_key(dedup_key) {
         return false;
     }
     if guard.len() >= GRACE_NOTIFY_DEDUP_MAX {
-        guard.clear();
+        guard.retain(|_, e| *e > now_secs);
+        if guard.len() >= GRACE_NOTIFY_DEDUP_MAX
+            && let Some(victim) = guard
+                .iter()
+                .min_by_key(|(_, e)| **e)
+                .map(|(k, _)| k.clone())
+        {
+            guard.remove(&victim);
+            tracing::warn!(
+                entries = guard.len(),
+                max = GRACE_NOTIFY_DEDUP_MAX,
+                "宽限通知去重表满，逐出 expires_at 最小条目"
+            );
+        }
     }
-    guard.insert(dedup_key.to_string());
+    guard.insert(dedup_key.to_string(), expires_at);
     true
 }
 
@@ -177,12 +194,15 @@ pub(crate) enum DecisionSlot {
     TimedOut,
 }
 
-/// `begin` 结果：新占位（须建单）/ 已在途（复用既有票，不再建单）/ 已决（终态待显式消费）。
+/// `begin` 结果：新占位（须建单）/ 已在途（复用既有票，不再建单）/ 已决（终态待显式消费）/
+/// 饱和（满表且仅余 `InFlight`，调用点按 `429 + Retry-After` 拒绝新键）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BeginOutcome {
     Reserved,
     Busy,
     Decided(CredentialDecision),
+    /// `D4`：满表仅余 `InFlight`——新键无票，SHALL NOT 伪造 `202 + E_PENDING`。
+    Saturated,
 }
 
 #[derive(Debug)]
@@ -196,12 +216,13 @@ enum DecisionEntry {
     },
 }
 
-/// `ARC-2`：审批决策表（键 = `pending_key`），由 `AppState` 以
-/// `Arc<Mutex<DecisionTable>>` 承载（进程级 `static` 已移除）。容量为**软上限**：
-/// 仅驱逐终态 `Decided`（按 `created` 升序，同刻以 key 字典序 tie-break），
-/// `InFlight` 永不驱逐；软上限不可满足时记 warn、递增 `overflow_count`
-/// （`approval_decision_overflow_total`）并允许暂时超出——`InFlight` 受 Matrix
-/// 审批票并发度约束，是软上限不被突破的最终 backstop。
+/// `ARC-2`/D4：审批决策表（键 = `pending_key`），由 `AppState` 以
+/// `Arc<Mutex<DecisionTable>>` 承载（进程级 `static` 已移除）。容量约束仅作用于终态：
+/// `begin` 满表时先驱逐终态 `Decided`（按 `created` 升序，同刻以 key 字典序 tie-break）
+/// 腾位，仅余 `InFlight` 时返回 [`BeginOutcome::Saturated`]（调用点映射
+/// `429 + Retry-After: 60`，不插入、不伪造 `202`），`InFlight` 永不驱逐；`resolve`
+/// 落定终态同受驱逐约束，无可驱逐终态时记 warn 并递增 `overflow_count`
+/// （`approval_decision_overflow_total`）。
 #[derive(Debug)]
 pub struct DecisionTable {
     entries: HashMap<String, DecisionEntry>,
@@ -234,6 +255,9 @@ impl DecisionTable {
         });
     }
 
+    /// `CRD-6`/D4：占位入口。顺序为 `sweep(now)` → 满表时循环驱逐最早终态 `Decided`
+    /// 腾位 → 满表且仅余 `InFlight` 时饱和拒绝（不插入、不驱逐在途）；同键在途仍
+    /// [`BeginOutcome::Busy`]，同键终态仍只读 [`BeginOutcome::Decided`]。
     fn begin(&mut self, key: &str) -> BeginOutcome {
         let now = Instant::now();
         self.sweep(now);
@@ -241,6 +265,19 @@ impl DecisionTable {
             Some(DecisionEntry::Decided { decision, .. }) => BeginOutcome::Decided(*decision),
             Some(DecisionEntry::InFlight { .. }) => BeginOutcome::Busy,
             None => {
+                while self.entries.len() >= self.max_entries {
+                    if self.evict_oldest_decided() {
+                        continue;
+                    }
+                    self.overflow_count = self.overflow_count.saturating_add(1);
+                    tracing::warn!(
+                        entries = self.entries.len(),
+                        max = self.max_entries,
+                        metric = "approval_decision_overflow_total",
+                        "决策表满且仅余 InFlight，新键拒绝为 429 且不驱逐在途审批"
+                    );
+                    return BeginOutcome::Saturated;
+                }
                 self.entries
                     .insert(key.to_string(), DecisionEntry::InFlight { event_id: None });
                 BeginOutcome::Reserved
@@ -260,34 +297,40 @@ impl DecisionTable {
 
     fn cancel(&mut self, key: &str) { self.entries.remove(key); }
 
-    /// `ARC-2`：软上限驱逐——仅命中终态 `Decided`，按 `created` 升序（同刻以 key
-    /// 字典序 tie-break）驱逐最早者并循环至不超软上限；驱逐尽仍超限（仅余
-    /// `InFlight`）时不驱逐、记 warn 并递增 `overflow_count`。
+    /// `ARC-2`/D4：驱逐 `created` 最早的终态 `Decided`（同刻以 key 字典序 tie-break）；
+    /// 仅余 `InFlight` 时返回 `false`（在途永不驱逐）。
+    fn evict_oldest_decided(&mut self) -> bool {
+        let victim = self
+            .entries
+            .iter()
+            .filter_map(|(k, e)| match e {
+                DecisionEntry::Decided { created, .. } => Some((k.clone(), *created)),
+                DecisionEntry::InFlight { .. } => None,
+            })
+            .min_by(|(ka, ca), (kb, cb)| ca.cmp(cb).then_with(|| ka.cmp(kb)))
+            .map(|(k, _)| k);
+        match victim {
+            Some(k) => {
+                self.entries.remove(&k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `ARC-2`/D4：软上限驱逐——循环驱逐终态 `Decided` 至不超上限；驱逐尽仍超限
+    /// （仅余 `InFlight`）时不驱逐、记 warn 并递增 `overflow_count`。
     fn enforce_soft_cap(&mut self) {
         while self.entries.len() > self.max_entries {
-            let victim = self
-                .entries
-                .iter()
-                .filter_map(|(k, e)| match e {
-                    DecisionEntry::Decided { created, .. } => Some((k.clone(), *created)),
-                    DecisionEntry::InFlight { .. } => None,
-                })
-                .min_by(|(ka, ca), (kb, cb)| ca.cmp(cb).then_with(|| ka.cmp(kb)))
-                .map(|(k, _)| k);
-            match victim {
-                Some(k) => {
-                    self.entries.remove(&k);
-                }
-                None => {
-                    self.overflow_count = self.overflow_count.saturating_add(1);
-                    tracing::warn!(
-                        entries = self.entries.len(),
-                        max = self.max_entries,
-                        metric = "approval_decision_overflow_total",
-                        "决策表仅余 InFlight，软上限暂时超出且不驱逐在途审批"
-                    );
-                    break;
-                }
+            if !self.evict_oldest_decided() {
+                self.overflow_count = self.overflow_count.saturating_add(1);
+                tracing::warn!(
+                    entries = self.entries.len(),
+                    max = self.max_entries,
+                    metric = "approval_decision_overflow_total",
+                    "决策表仅余 InFlight，软上限暂时超出且不驱逐在途审批"
+                );
+                break;
             }
         }
     }
@@ -404,7 +447,8 @@ fn pending_error(reason: &str) -> VeilError {
 /// [`await_credential_approval`] 与 [`clear_terminal_pending`] 终态清理，仅「批准后动作」
 /// 由调用方注入（凭据取库 [`query_keepass`] / 吊销注册 `revoke_caller`）。三态对外一致：
 /// 批准 → 执行动作并返回成功；拒绝/超时 → `403`；未决 → `202 + E_PENDING` 复用既有票
-/// （不重复建单、不叠加 Matrix 消息）。`lane` 提供终态文案与自动放行策略。
+/// （不重复建单、不叠加 Matrix 消息）；满表仅余在途 → `429 + Retry-After: 60`
+/// （`D4`，不伪造未决票）。`lane` 提供终态文案与自动放行策略。
 /// `S3`/D3：批准动作成功后方消费决策表项，动作失败保留批准态供重试。
 pub(crate) async fn approval_decision_closure<T, F, Fut>(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
@@ -446,6 +490,11 @@ where
             });
         }
         Some(BeginOutcome::Busy) => return Err(pending_error(reason)),
+        Some(BeginOutcome::Saturated) => {
+            return Err(VeilError::RateLimited {
+                retry_after_secs: 60,
+            });
+        }
         Some(BeginOutcome::Reserved) => {}
     }
     match submit_pending_with_branch(state, key, reason, lane.branch, entry, field).await {
@@ -577,7 +626,11 @@ pub(crate) fn notify_hash_grace_once(
     expires_at: u64,
 ) {
     let dedup_key = format!("{entry}\u{1}{old_hash}\u{1}{expires_at}");
-    if !first_grace_notification(&dedup_key) {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    if !first_grace_notification(&dedup_key, expires_at, now_secs) {
         return;
     }
     notify_hash_change(state, entry, "old_hash宽限内放行");

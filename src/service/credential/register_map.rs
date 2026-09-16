@@ -140,6 +140,39 @@ pub fn parse_register_allow_mode(
     })
 }
 
+/// 注册 DTO 原始字段束（service 侧构造输入；长参数表以结构承载）。
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterInputs<'a> {
+    pub caller_path: &'a str,
+    pub caller_hash: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub entries: Option<&'a Value>,
+    pub entry: Option<&'a str>,
+    pub field: Option<&'a str>,
+    pub fields: Option<&'a Value>,
+    pub allow_mode: Option<&'a str>,
+    pub auto: Option<bool>,
+}
+
+/// D-4（6.6）越层收敛：字段 trim 与 [`crate::registry::RegisterParams`] 构造
+/// 下沉本模块，handler 仅提取原始字段并委派；逐字段语义与旧 handler 实现等价
+/// （`caller_path` 空白归一空串，其余 trim；`entries`/`allow_mode` 复用同批解析）。
+pub fn parse_register_params(input: RegisterInputs<'_>) -> crate::registry::RegisterParams {
+    crate::registry::RegisterParams {
+        caller_path: if input.caller_path.trim().is_empty() {
+            String::new()
+        } else {
+            input.caller_path.trim().to_string()
+        },
+        caller_hash: input.caller_hash.trim().to_string(),
+        name: input.name.trim().to_string(),
+        description: input.description.trim().to_string(),
+        entries: parse_register_entries(input.entries, input.entry, input.field, input.fields),
+        allow_mode: parse_register_allow_mode(input.allow_mode, input.auto),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {super::*, crate::config::AutoApprove, serde_json::json, std::collections::BTreeMap};
@@ -149,6 +182,54 @@ mod tests {
             entry.to_string(),
             fields.iter().map(|s| (*s).to_string()).collect(),
         )])
+    }
+
+    #[test]
+    fn parse_register_params_trim() {
+        // D-4（6.6）：字段 trim 与构造下沉后语义不变——四字段 trim、空白
+        // `caller_path` 归一空串、`entries`/`allow_mode` 复用同批解析。
+        let p = parse_register_params(RegisterInputs {
+            caller_path: "  /srv/job.sh  ",
+            caller_hash: " hash1 ",
+            name: " 网易 ",
+            description: " desc ",
+            entries: None,
+            entry: Some(" 网易 "),
+            field: Some(" 授权码 "),
+            fields: Some(&json!(["密码", " 授权码 "])),
+            allow_mode: Some(" auto "),
+            auto: Some(false),
+        });
+        assert_eq!(p.caller_path, "/srv/job.sh");
+        assert_eq!(p.caller_hash, "hash1");
+        assert_eq!(p.name, "网易");
+        assert_eq!(p.description, "desc");
+        assert_eq!(p.entries, expected("网易", &["授权码", "密码"]));
+        assert_eq!(
+            p.allow_mode,
+            Some(AutoApprove::Allow),
+            "auto 须优先布尔回退"
+        );
+
+        let p2 = parse_register_params(RegisterInputs {
+            caller_path: "   ",
+            caller_hash: "",
+            name: "",
+            description: "",
+            entries: Some(&json!({" 腾讯 ": " 微信 "})),
+            entry: None,
+            field: None,
+            fields: None,
+            allow_mode: Some("bogus"),
+            auto: Some(true),
+        });
+        assert_eq!(p2.caller_path, "", "空白 caller_path 归一空串");
+        assert_eq!(p2.entries, expected("腾讯", &["微信"]));
+        assert_eq!(
+            p2.allow_mode,
+            Some(AutoApprove::Allow),
+            "非法 allow_mode 回退 auto"
+        );
     }
 
     #[test]
