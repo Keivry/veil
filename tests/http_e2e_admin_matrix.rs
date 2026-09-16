@@ -238,6 +238,8 @@ async fn b1_env_token_independent_of_admin_token_file() {
 }
 
 // B1.3：OBSERVABILITY_DISABLE=1 时管理面全 404，与 token 有效性无关。
+// E-3（8.3）：门控 404 复用 `with_security_headers`，authed/anon 均须含
+// `cache-control: no-store`。
 #[tokio::test]
 async fn b1_disable_all_admin_404_regardless_of_token() {
     let (base, handle) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", "1")])).await;
@@ -250,12 +252,68 @@ async fn b1_disable_all_admin_404_regardless_of_token() {
             .await
             .unwrap();
         assert_eq!(authed.status().as_u16(), 404, "{path}");
+        assert!(
+            authed
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("no-store")),
+            "{path} authed 404 须含 cache-control: no-store"
+        );
         let anon = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(anon.status().as_u16(), 404, "{path}");
+        assert!(
+            anon.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("no-store")),
+            "{path} anon 404 须含 cache-control: no-store"
+        );
     }
     // 非管理面不受影响。
     let health = client.get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(health.status().as_u16(), 200);
+    assert!(
+        !health.headers().contains_key("x-frame-options"),
+        "非管理面不得被加管理安全头"
+    );
+    handle.abort();
+}
+
+// E-3（8.3）：OBSERVABILITY_DISABLE=1 的门控 404 五项安全头齐全，
+// 非 `/_admin` 路径不受该分支影响。
+#[tokio::test]
+async fn admin_gate_404_security_headers() {
+    let (base, handle) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", "1")])).await;
+    let client = reqwest::Client::new();
+    for path in ["/_admin/metrics", "/_admin/events/stream", "/_admin/health"] {
+        for authed in [true, false] {
+            let mut req = client.get(format!("{base}{path}"));
+            if authed {
+                req = req.header("X-Admin-Token", ADMIN_TOKEN);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 404, "{path} authed={authed}");
+            let h = resp.headers();
+            for name in [
+                "pragma",
+                "x-content-type-options",
+                "x-frame-options",
+                "referrer-policy",
+            ] {
+                assert!(h.contains_key(name), "{path} authed={authed} 缺 {name}");
+            }
+            assert_eq!(
+                h.get("x-content-type-options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+                "{path} authed={authed}"
+            );
+        }
+    }
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status().as_u16(), 200);
+    assert!(!health.headers().contains_key("x-frame-options"));
     handle.abort();
 }
 

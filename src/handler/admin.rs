@@ -44,13 +44,22 @@ const ADMIN_SECURITY_HEADERS: [(&str, &str); 5] = [
 ];
 
 /// 给响应补管理面统一安全头（幂等；已存在同名头则覆盖为契约值）。
-fn with_security_headers(mut resp: Response) -> Response {
+pub(crate) fn with_security_headers(mut resp: Response) -> Response {
     for (name, value) in ADMIN_SECURITY_HEADERS {
         if let Ok(v) = axum::http::HeaderValue::from_str(value) {
             resp.headers_mut().insert(name, v);
         }
     }
     resp
+}
+
+/// D5（8.1）：`series?since=` 取值形态校验——仅 `[dhm]<整数>`（与
+/// `day_key`/`hour_key`/`five_min_key` 产出同形）；epoch/日期形态另立 change。
+fn valid_since_shape(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some('d' | 'h' | 'm'))
+        && !chars.as_str().is_empty()
+        && chars.as_str().bytes().all(|b| b.is_ascii_digit())
 }
 
 /// 管理面业务事件帧：SSE 事件名 `event`（对齐 Python `_admin.py`，MUST NOT 用 `message`）。
@@ -452,6 +461,17 @@ pub async fn admin_series(
         },
     };
     let since = query.get("since").cloned();
+    // D5（8.1）：`since` 仅接受 `[dhm]<整数>` 形态；非法值 400（与
+    // `granularity`/`range` 同口径），不得以 `i64::MIN` 回退为全量无过滤。
+    if let Some(s) = since.as_deref()
+        && !valid_since_shape(s)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "since 取值 [dhm]<整数>（如 d10/h36/m720，与 day_key/hour_key/five_min_key 同形）"}})),
+        )
+            .into_response();
+    }
     let protocol = query.get("protocol").cloned();
     let mut compat: HashMap<&str, &String> = HashMap::new();
     if let Some(r) = range.as_ref() {

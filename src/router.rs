@@ -25,11 +25,15 @@ use {
 
 async fn observability_gate(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if state.config().observability_disabled && req.uri().path().starts_with("/_admin") {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": {"code": "E_NOT_FOUND", "message": "管理面已禁用"}})),
-        )
-            .into_response();
+        // OPS/E-3：禁用期 404 复用管理面统一安全头（五项通用头，不泄露
+        // 管理面存在性；与 `admin_not_found` 同语义）。
+        return admin::with_security_headers(
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": {"code": "E_NOT_FOUND", "message": "管理面已禁用"}})),
+            )
+                .into_response(),
+        );
     }
     next.run(req).await
 }

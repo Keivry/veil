@@ -257,8 +257,61 @@ async fn series_model_upstream_compat_annotates_without_filtering() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-const ADMIN_TOKEN_T: &str = "observability-admin-token-0123456789";
+#[tokio::test]
+async fn admin_series_since_invalid_400() {
+    // D5（8.1）：`since` 非法形态恒 400 + `E_BAD_REQUEST` 且消息列明合法形态；
+    // 不得以 `i64::MIN` 回退为全量无过滤（合法形态仍放行 200）。
+    let dir = metrics_test_dir("series-since");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    // 每请求独立源 IP：避免 10/min 限流干扰形态判定（本用例不测限流）。
+    let mut seq: u8 = 10;
+    for bad in ["abc", "x10", "d", "d1x", "-1", "", "10", "d 1", "d1.5"] {
+        seq += 1;
+        let mut q: HashMap<String, String> = HashMap::new();
+        q.insert("since".to_string(), bad.to_string());
+        let resp = admin_series(
+            State(state.clone()),
+            PeerIp(Some(IpAddr::from([127, 0, 0, seq]))),
+            headers_with(Some(ADMIN_TOKEN_T), None),
+            Query(q),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "since={bad:?} 须 400"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "E_BAD_REQUEST", "since={bad:?}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("[dhm]"),
+            "消息须列明合法形态: {v}"
+        );
+    }
+    for good in ["d0", "h12", "m720"] {
+        seq += 1;
+        let mut q: HashMap<String, String> = HashMap::new();
+        q.insert("since".to_string(), good.to_string());
+        q.insert("granularity".to_string(), "daily".to_string());
+        let resp = admin_series(
+            State(state.clone()),
+            PeerIp(Some(IpAddr::from([127, 0, 0, seq]))),
+            headers_with(Some(ADMIN_TOKEN_T), None),
+            Query(q),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "since={good:?} 须放行");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
 
+const ADMIN_TOKEN_T: &str = "observability-admin-token-0123456789";
 fn admin_test_state(data_dir: std::path::PathBuf, db_path: std::path::PathBuf) -> AppState {
     let env = HashMap::from([
         (

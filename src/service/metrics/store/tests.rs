@@ -103,8 +103,9 @@ fn b5_ring_overflow_newest_retained_queryable() {
 
 #[tokio::test]
 async fn b5_repeat_flush_aux_no_double_count() {
-    // B5.1/B5.3：重复触发 flush 不翻倍（含附属列）；store 层无定时去抖，
-    // 覆盖式 UPSERT 使多次触发效果等价一次（2s 节流锚在 SSE 层，见 sse.rs）。
+    // B5.1/B5.3：重复触发 flush 不翻倍（含附属列）；store 层无定时去抖
+    // （Python 原仓 2s 去抖未迁移，本仓事件驱动批量等价，见 `flush_idempotent_window`），
+    // 覆盖式 UPSERT 使多次触发效果等价一次。
     let db = tmp_db("b5-flush-aux");
     let _ = std::fs::remove_file(&db);
     let ts = now();
