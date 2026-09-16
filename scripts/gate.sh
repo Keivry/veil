@@ -5,7 +5,8 @@
 #   1) cargo fmt --check
 #   2) cargo clippy --tests --all-targets -- -D warnings
 #   3) cargo test
-#   4) python3 scripts/check_doc_paths.py（文档路径 + `path:line` 行号语义校验，9.10）
+#   4) python3 scripts/check_doc_paths.py（文档路径 + `path:line` 行号范围校验（存在性 + 在界内；归档
+#      change 目录行号免校验并按处数打印），9.10；内容语义一致性由 code review 保证，脚本不校验）
 #   5) python3 scripts/check_file_sizes.py
 #   6) scripts/api_conformance.py（真 SDK 一致性，23 项）
 #   7) get/ 内 go vet ./... + go test ./...（内置 Go 客户端静态检查与单测）
@@ -19,8 +20,12 @@
 #     生产必须接 TPM 2.0 硬件）。
 #
 # 前置条件（第 7 步）：
-#   - Go 工具链：`go vet`/`go test` 需本机 Go 可执行文件（`get/go.mod` 要求 go 1.22），
-#     在 `get/` 目录内执行；缺失且未显式跳过时 fail-fast 非零退出。
+#   - Go 工具链：`go vet`/`go test` 需本机 Go 可执行文件，在 `get/` 目录内执行；
+#     缺失且未显式跳过时 fail-fast 非零退出。
+#   - Go 版本由 `get/go.mod`（`go 1.22`）在 `vet`/`test` 阶段强制：Go ≥1.21 的
+#     `GOTOOLCHAIN=auto` 会依 `go.mod` 自动选型/下载；<1.21 时版本指令在 `vet`/`test`
+#     阶段明确报错并非零退出（fail-closed）。本脚本 SHALL NOT 增加版本字符串比较
+#     （会把本可成功的环境误判失败）。
 #
 # 跳过语义（不静默）：
 #   - `GATE_SKIP_CONFORMANCE=1`：显式跳过第 6 步并在输出打印跳过理由与文档位置；

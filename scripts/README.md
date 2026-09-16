@@ -22,17 +22,26 @@
   前置条件（第 6 步）：Python venv（默认路径同 `api_conformance.py`，可用
   `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖）内含 SDK pin `openai==3.5.0`/`anthropic==1.1.0`
   与 `pykeepass`；Mock TPM 回退由 `api_conformance.py` 内建（`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
-  前置条件（第 7 步）：本机 Go 工具链（`get/go.mod` 要求 go 1.22），在 `get/` 目录内执行。
+  前置条件（第 7 步）：本机 Go 工具链，在 `get/` 目录内执行；Go 版本由 `get/go.mod`（`go 1.22`）
+  在 `vet`/`test` 阶段强制（Go ≥1.21 的 `GOTOOLCHAIN=auto` 依 `go.mod` 自动选型/下载；<1.21 时
+  版本指令明确报错并非零退出，fail-closed），脚本 **SHALL NOT** 增加版本字符串比较。
   跳过语义：缺 venv/SDK/Go 默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与
   `GATE_SKIP_GO=1`（第 7 步）为显式跳过并打印跳过理由（不静默）。文档口径见 README §8.5。
 - `check_doc_paths.py` — 文档源码/spec 路径与行号校验（`veil-docs-contract-fix` 1.3；
-  `veil-docs-contract-resync` 3.1 扩展 spec 引用；`veil-audit-r2-remediation` 9.10 扩展行号语义）：
+  `veil-docs-contract-resync` 3.1 扩展 spec 引用；`veil-audit-r2-remediation` 9.10 扩展行号引用；
+  `veil-audit-r3-remediation` 7.4 降级措辞为行号范围校验（存在性 + 在界内）——
+  被引行内容与文档语义的一致性由 code review 保证，脚本不校验）：
   扫描 `README.md` + `openspec/**/*.md` + `scripts/*.md` 的 `src/...rs` 与 spec 完整路径引用并断言
   存在，另解析 `path:line` / `path:start-end` 引用并校验行号落在目标文件实际行数内，任一缺失/越界即非零退出；
   勘误注内旧路径与 `<!-- doc-paths-ignore -->` 行自动跳过。
+  归档 change 目录（`openspec/changes/archive/**`）的行号引用为归档时刻冻结快照，整体豁免行号在界
+  校验并按处数打印 `归档文档行号引用 N 处未校验`；其 `src/...rs` 路径存在性仍校验（悬空须按 `PENDING_REFS` 登记）。
   `PENDING_REFS` 例外机制：仅登记**历史/情景性悬空引用**（其他 change 目录、已归档 change、
   canonical 中的旧 change-local 路径），键为精确「源文件相对路径 + 引用原文」组合并附登记理由；
   命中即打印 `PENDING` 且**不算失败**（可复核的例外名单，脚本内 `PENDING_REFS` 即权威来源）。
+  `PENDING_LINE_REFS` 例外机制：非本 change 范围的历史/规划快照（canonical 旧行号、
+  在途 change 规划快照）的行号越界，按精确「引用所在文件 + 目标文件」组合登记并打印 `PENDING`，
+  其余越界一律 `FAIL`（对应文档正文不由本任务改写）。
   **`README.md` 的引用永不登记**：归档迁移致其悬空时必须 `FAIL`，防止静默通过；
   其余未登记组合一律 `FAIL`。门禁调用：
   `python3 scripts/check_doc_paths.py`（仓库根目录执行，无额外依赖）。

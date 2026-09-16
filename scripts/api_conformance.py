@@ -11,8 +11,9 @@
 # TPM 说明：无硬件 TPM 的开发机/CI 默认以 VEIL_ALLOW_MOCK_TPM=1 启动（仅开发）；
 # 若 TPM 门禁失败，脚本自动回退到 mock-TPM 重试一次并打印指引（生产必须接 TPM 硬件）。
 # 阻断触发说明：网关流式阻断由审计 hold 超限 fail-closed 触发（AUDIT_HOLD_MAX_BYTES=16
-# 极小值 + 危险 tool args），阻断相以 AUDIT_MODE=block 运行；responses 协议无 tool
-# 输出数组可供 hold 捕获，阻断相取空流截断合成 response.failed 路径。
+# 极小值 + 危险 tool args），阻断相以 AUDIT_MODE=block 运行；responses 流式无 tool
+# 输出数组可供 hold 捕获，取空流截断合成 response.failed 路径；responses 非流阻断由
+# 非流审计提取危险 function_call 触发，断言阻断体经真 SDK 解析（11.1）。
 # NON_GOAL 豁免：独立 admin.html 静态控制台不在本仓交付（见 README 管理控制台说明），
 # 本脚本不覆盖其前端行为（静态页/CSP/Chart），仅覆盖后端管理面 API。
 
@@ -220,8 +221,11 @@ def resp_stream_normal():
                                                              "output": [RESP_OUT_TEXT]}}, 6))
 
 
-def resp_object(tool=False):
-    if tool:
+def resp_object(tool=False, dangerous=False):
+    if dangerous:
+        output = [{"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                   "name": "exec", "arguments": '{"command":"rm -rf /"}'}]
+    elif tool:
         output = [{"type": "function_call", "id": "fc_1", "call_id": "call_1",
                    "name": "get_weather", "arguments": '{"city":"Paris"}'}]
     else:
@@ -289,7 +293,7 @@ class MockUpstream(BaseHTTPRequestHandler):
             elif stream:
                 self._send(resp_stream_normal(), "text/event-stream")
             else:
-                self._send(resp_object(tool=tool), "application/json")
+                self._send(resp_object(tool=tool, dangerous=dangerous), "application/json")
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -715,11 +719,20 @@ def run_block_phase():
         assert "rm -rf" not in raw, raw
 
     def anth_block():
-        s = ant.messages.create(model="m", max_tokens=64, messages=[{"role": "user",
-                                                                     "content": "DANGEROUS_TEST run"}],
-                                stream=True)
-        for _ in s:
-            pass
+        # 11.1/A-3：阻断五件套（message_start → content_block_start →
+        # content_block_stop → message_delta → message_stop）经 SDK 累加器解析；
+        # 缺 message_start 时首事件断言失败、`get_final_message` 无初始快照。
+        types = []
+        with ant.messages.stream(model="m", max_tokens=64,
+                                 messages=[{"role": "user",
+                                            "content": "DANGEROUS_TEST run"}]) as s:
+            for e in s:
+                types.append(getattr(e, "type", ""))
+            final = s.get_final_message()
+        assert types == ["message_start", "content_block_start", "content_block_stop",
+                         "message_delta", "message_stop"], types
+        texts = [b.text for b in final.content if getattr(b, "type", "") == "text"]
+        assert any("[blocked:" in t for t in texts), texts
         raw = raw_post("/v1/messages", {"model": "m", "max_tokens": 64,
                                         "messages": [{"role": "user",
                                                       "content": "DANGEROUS_TEST run"}],
@@ -736,8 +749,18 @@ def run_block_phase():
                                          "stream": True})
         assert "response.failed" in raw, raw
 
+    def resp_block_nonstream():
+        # 11.1/A-1：非流 Responses 阻断体经真 SDK 解析——`output`/`status` 可读、
+        # `output_text` 不抛错（canonical `llm-protocol-hardening` 必需字段完整）。
+        r = oai.responses.create(model="m", input="DANGEROUS_TEST run")
+        assert r.status == "failed", r
+        assert r.output == [], r
+        assert r.output_text == "", r
+        assert r.error is not None and "[blocked:" in (r.error.message or ""), r
+
     for name, fn in [("chat 阻断", chat_block), ("anthropic 阻断", anth_block),
-                     ("responses 截断", resp_truncated)]:
+                     ("responses 截断", resp_truncated),
+                     ("responses 非流阻断", resp_block_nonstream)]:
         check(name, fn)
 
 
