@@ -11,6 +11,9 @@ pub enum TruncatedMode {
     SilentDiscard,
     OpenEnded,
     SynthesizedFailed,
+    /// A-6/F-08：上游错误载荷帧即终端（带顶层 `error` 且无 `choices`），
+    /// 与中途截断的 `open_ended` 区分。
+    UpstreamError,
 }
 
 impl TruncatedMode {
@@ -19,6 +22,7 @@ impl TruncatedMode {
             Self::SilentDiscard => "silent_discard",
             Self::OpenEnded => "open_ended",
             Self::SynthesizedFailed => "synthesized_failed",
+            Self::UpstreamError => "upstream_error",
         }
     }
 }

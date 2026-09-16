@@ -6,6 +6,23 @@
 
 pub fn keepalive_frame() -> String { ": keepalive\n\n".to_string() }
 
+/// A-5/F-07：SSE 出口 `data:` 帧唯一构造——含换行载荷按 `\n` 拆为多条带
+/// `data: ` 前缀的行后再补块终止空行，与解析侧 WHATWG 单 `\n` 连接
+/// （`parser.rs::feed_line` 多 `data:` 行合并）严格互逆；`prefix` 为
+/// `event:`/`id:`/`retry:` 信封前缀（原样透出，不受拆分影响），SHALL NOT
+/// 输出无前缀裸行（否则消费者静默截断到首行）。
+pub(crate) fn data_frame(prefix: &str, data: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + data.len() + data.matches('\n').count() + 8);
+    out.push_str(prefix);
+    for line in data.split('\n') {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speed {
     Slow,

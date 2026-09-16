@@ -55,9 +55,11 @@ mod tests {
 
     #[test]
     fn anthropic_four_part_termination_order_locked() {
+        // A-3/F-04：口径扩为五件套（首帧 `message_start`），原四帧内容/顺序不动。
         let frames = ensure_event_lines(anthropic_block_frames("policy", 0));
         let joined = frames.join("");
         for key in [
+            "message_start",
             "content_block_start",
             "content_block_stop",
             "message_delta",
@@ -67,10 +69,11 @@ mod tests {
         }
         let pos = |k: &str| joined.find(k).unwrap();
         assert!(
-            pos("content_block_start") < pos("content_block_stop")
+            pos("message_start") < pos("content_block_start")
+                && pos("content_block_start") < pos("content_block_stop")
                 && pos("content_block_stop") < pos("message_delta")
                 && pos("message_delta") < pos("message_stop"),
-            "顺序恒为 start/stop/delta/message_stop"
+            "顺序恒为 message_start/start/stop/delta/message_stop"
         );
         assert!(
             frames
@@ -78,10 +81,21 @@ mod tests {
                 .all(|f| f.lines().any(|l| l.starts_with("event:")))
         );
         assert!(
-            frames[0].contains("\"type\":\"text\""),
-            "首块恒为 text 文本块"
+            frames[0].contains("\"type\":\"message_start\"")
+                && frames[0].contains("\"content\":[]")
+                && frames[0].contains("\"stop_reason\":null"),
+            "首帧恒为 message_start（空 content、null stop_reason）"
         );
-        assert!(frames[0].contains("[blocked: policy]"));
+        assert_eq!(
+            frames[0].matches("message_start").count(),
+            2,
+            "恰一 message_start（event 行 + 载荷 type）"
+        );
+        assert!(
+            frames[1].contains("\"type\":\"text\""),
+            "第二帧恒为 text 文本块"
+        );
+        assert!(frames[1].contains("[blocked: policy]"));
         assert!(!joined.contains("tool_use"), "文本阻断不得伪装 tool_use");
         let stop = frames
             .iter()
@@ -157,8 +171,11 @@ mod tests {
         // P0-3.2 + P4/D4：responses 合成单帧 failed（`error.message="truncated"`，
         // 不注入 output_index 全序列）；chat/anthropic open-ended 空实现
         // （不伪造成功终止）。
-        let failed =
-            ensure_event_lines(synthesize_truncation(GatewayProtocol::Responses, "r-drop"));
+        let failed = ensure_event_lines(synthesize_truncation(
+            GatewayProtocol::Responses,
+            "r-drop",
+            None,
+        ));
         assert_eq!(failed.len(), 1, "截断合成为单帧: {failed:?}");
         assert!(failed.join("").contains("response.failed"));
         assert!(failed.join("").contains("\"message\":\"truncated\""));
@@ -169,7 +186,7 @@ mod tests {
         );
         for proto in [GatewayProtocol::Chat, GatewayProtocol::Anthropic] {
             assert!(
-                synthesize_truncation(proto, "x").is_empty(),
+                synthesize_truncation(proto, "x", None).is_empty(),
                 "chat/anthropic 截断不合成成功终止"
             );
         }
@@ -461,8 +478,8 @@ mod tests {
     #[test]
     fn approve_empty_whitelist_direct_call_downgrades_to_block() {
         // T4.2/D2：approve + 空白名单直调 → Block 降级（与流式同口径）。
-        // 生产不可达：启动门禁拒绝 approve 空白名单（`src/config/env_parse.rs:469-478`
-        // 的 `validate_approve_whitelist` 与 `src/main.rs:45` 的 `preflight_whitelist`），
+        // 生产不可达：启动门禁拒绝 approve 空白名单（`src/config/env_parse.rs:493`
+        // 的 `validate_approve_whitelist` 与 `src/main.rs:46` 的 `preflight_whitelist`），
         // 本用例锁定降级语义本身。
         use {
             super::super::{audit::AuditPolicy, llm_gateway::Protocol},
@@ -659,20 +676,22 @@ mod tests {
         }
         assert!(P::NonDialog.is_nondialog());
 
-        // 阻断帧分派等价：`protocol_block_frames` == 各站点内联 match 的逐协议结果。
+        // 阻断帧分派等价：`protocol_block_frames` == 各站点内联 match 的逐协议结果
+        // （A-2/F-02：`seq_cursor = None` 与既有 0 基序列等价）。
         assert_eq!(
             stable(&protocol_block_frames(
                 P::Chat,
                 "policy",
                 Some("c1"),
                 0,
+                None,
                 None
             )),
             stable(&chat_block_frames("policy"))
         );
         assert_eq!(
-            protocol_block_frames(P::Anthropic, "policy", Some("a1"), 2, None),
-            anthropic_block_frames("policy", 2)
+            protocol_block_frames(P::Anthropic, "policy", Some("a1"), 2, None, None),
+            anthropic_block_frames_full("policy", 2, Some("a1"))
         );
         assert_eq!(
             stable(&protocol_block_frames(
@@ -680,18 +699,19 @@ mod tests {
                 "policy",
                 Some("r1"),
                 0,
+                None,
                 None
             )),
             stable(&responses_block_frames("r1"))
         );
-        assert!(protocol_block_frames(P::NonDialog, "policy", None, 0, None).is_empty());
+        assert!(protocol_block_frames(P::NonDialog, "policy", None, 0, None, None).is_empty());
 
         // 截断分派等价：仅 Responses 合成 failed 单帧，其余协议空实现。
-        let trunc = synthesize_truncation(P::Responses, "r1");
+        let trunc = synthesize_truncation(P::Responses, "r1", None);
         assert_eq!(trunc.len(), 1);
         assert!(trunc[0].contains("response.failed") && trunc[0].contains("truncated"));
         for p in [P::Chat, P::Anthropic, P::NonDialog] {
-            assert!(synthesize_truncation(p, "x").is_empty(), "{p:?}");
+            assert!(synthesize_truncation(p, "x", None).is_empty(), "{p:?}");
         }
 
         // 路径分派等价：尾缀解析到同一协议（含未知回落 `NonDialog`）。
