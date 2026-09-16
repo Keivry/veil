@@ -50,12 +50,12 @@
 
 ### Requirement: 真 SDK 脚本纳入门禁
 
-系统 SHALL 为 `scripts/api_conformance.py`（23 项：14 常规 + 3 阻断 + 5 取用 + 1 无库 503）提供显式 gate 步骤（`scripts/gate.sh` 或等价可执行步骤），串联格式化、lint、单测、文档路径校验、文件大小校验与真 SDK 一致性；SHALL 声明前置条件（Python venv、SDK pin `openai==3.5.0`/`anthropic==1.1.0`、Mock TPM 回退）与失败非零退出语义；缺前置时 SHALL 显式报错或经参数显式跳过并打印理由，SHALL NOT 静默跳过。SHALL 保留脚本口径，SHALL NOT 改写为 cargo 测试。
+系统 SHALL 为 `scripts/api_conformance.py`（24 项：14 常规 + 4 阻断 + 5 取用 + 1 无库 503）提供显式 gate 步骤（`scripts/gate.sh` 或等价可执行步骤），串联格式化、lint、单测、文档路径校验、文件大小校验与真 SDK 一致性；SHALL 声明前置条件（Python venv、SDK pin `openai==3.5.0`/`anthropic==1.1.0`、Mock TPM 回退）与失败非零退出语义；缺前置时 SHALL 显式报错或经参数显式跳过并打印理由，SHALL NOT 静默跳过。SHALL 保留脚本口径，SHALL NOT 改写为 cargo 测试。
 
 #### Scenario: gate 步骤可执行且失败非零
 
 - **WHEN** 在具备前置条件的环境执行 gate
-- **THEN** 六步全绿退出码 0；真 SDK 脚本输出「共 23 项，失败 0 项」；任一子步骤失败即整体非零退出
+- **THEN** 六步全绿退出码 0；真 SDK 脚本输出「共 24 项，失败 0 项」；任一子步骤失败即整体非零退出
 
 #### Scenario: 前置条件与显式跳过
 
@@ -65,7 +65,7 @@
 #### Scenario: 文档口径同步
 
 - **WHEN** 查阅 README §8.5 与 `scripts/README.md`
-- **THEN** 命中「已纳入 gate 步骤 + 前置条件 + 跳过语义」表述，且本仓口径为真 SDK 脚本 23 项（14 常规 + 3 阻断 + 5 取用 + 1 无库 503）；README §8.5 的 23 项明细与脚本输出一致，原仓 12 项（cargo）对照标签不与之冲突
+- **THEN** 命中「已纳入 gate 步骤 + 前置条件 + 跳过语义」表述，且本仓口径为真 SDK 脚本 24 项（14 常规 + 4 阻断 + 5 取用 + 1 无库 503）；README §8.5 的 24 项明细与脚本输出一致，原仓 12 项（cargo）对照标签不与之冲突
 
 ### Requirement: 可观测性测试粒度恢复
 

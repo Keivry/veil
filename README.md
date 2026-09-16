@@ -62,6 +62,10 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 脱敏 | `PII_PLACEHOLDER_PROMPT_TEXT` | 内建默认 | 自定义文案（4KB 上限，超限截断；含合法占位符形态回退默认） |
 | 脱敏 | `PII_HOLD_MAX` | `64` | **响应侧跨帧缝窗字符数**（须 ≥1 正整数；`PII_RESPONSE_SIDE` 关闭时窗口归零=直通不滞留）；缝合相邻两帧做跨缝 PII 检测，JSON 信封过滤后映射回原帧坐标、整帧延迟一级（见 §7.9）；审计 hold 字节上限由 `AUDIT_HOLD_MAX_BYTES` 独立承载，二者不同维度 |
 | 脱敏 | `NORMALIZE_JSON_WHITESPACE` | 关闭 | 仅 `"1"` 开启请求体空白归一 |
+| 脱敏 | `PII_SCOPE_MODE` | `request` | PII 作用域模式：`request`（默认，逐请求隔离，现行为）/ `conversation`（显式启用会话级关联）；非法值拒启动 |
+| 脱敏 | `PII_SCOPE_TTL_SECS` | `1800` | `conversation` 模式会话条目空闲 TTL（秒，须 ≥1 正整数，非法拒启动） |
+| 脱敏 | `PII_SCOPE_MAX_CONVERSATIONS` | `1024` | `conversation` 模式会话数上限（超限按 LRU 淘汰，须 ≥1 正整数，非法拒启动） |
+| 脱敏 | `PII_SCOPE_KEY_HEADER` | `x-veil-conversation-id` | `conversation` 模式会话键第 1 级来源请求头名；属 `x-veil-*` 内部命名空间，MUST NOT 转发上游或入日志 |
 | 审计 | `AUDIT_MODE` | `off` | `off` / `block` / `approve`；`approve` 必须配 `APPROVAL_WHITELIST` |
 | 审计 | `AUDIT_ENABLED` | 空 | 遗留回退：`AUDIT_MODE` 缺失/空白时真值 `1/true/yes/on`（trim + 大小写不敏感）→ `block`（fail-closed），显式 `AUDIT_MODE` 优先，缺省仍 `off` |
 | 审计 | `AUDIT_TIMEOUT` | `90`s | 禁止落在 `110`-`130`s 竞态区间，否则拒启动 |
@@ -250,7 +254,7 @@ done
 | 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 是 | 速率维度；按 TCP 远端地址计数，不采信代理头 |
 | SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 是 | 并发维度；与 `10/min` 正交；`60s` ping + `5min` 强制重连 |
 | 通用请求体上限 | `10MB` | `413` | 是（入口唯一 enforcement） | 通用 JSON 检查点 |
-| 非流对话响应上限 | `NONSTREAM_MAX_BYTES` 默认 `8MB` | `502` + `response_too_large` JSON 体 | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代；与 Python 观测差异见 design D12（`T14`：无独立指标/warning、无状态门） |
+| 非流对话响应上限 | `NONSTREAM_MAX_BYTES` 默认 `8MB` | `502` + `response_too_large` JSON 体（`error.type`，见 `src/handler/llm/nonstream.rs:582`） | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代；与 Python 观测差异见 design D12（`T14`：无独立指标/warning、无状态门） |
 | 审计类上限 | `8MB` | — | 否（纯 ceiling 锚点） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `AUDIT_HOLD_MAX_BYTES` 默认 1MB 均不得超过它）；与入口 `10MB` 属不同检查点、差异有意 |
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
 | 审批超时 | `AUDIT_TIMEOUT` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
@@ -668,6 +672,16 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 错误体（429 限流文案、500 HTML、404 说明，含空体）原样透传状态码与正文字节，
 不再合成 `502 E_EMPTY_BODY`（见 `src/handler/llm/nonstream.rs`）。
 
+非流空体/非 JSON 错误码正面档（`J`，`veil-audit-r4-remediation`）：`E_EMPTY_BODY` 触发于非流对话上游
+**非错误状态（`status<400`）**返回空体或非 JSON 体 → 下游 `502`（`src/error.rs:86-97` 的 `code()` 映射与
+`:110` 的 `EmptyBody → BAD_GATEWAY`）。错误体的字段形态为 `{"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}}`
+（网关级装配见 `src/handler/llm/mod.rs::empty_body_response`；入口级故障如上流未配置亦以同码 `502` 返回，
+见 `src/handler/llm/dispatch.rs:150`）。判定先后关系：非流响应体上限（`NONSTREAM_MAX_BYTES`，超限 → `502`
+`response_too_large`，见 §4 阈值表）判定**先于**空体/非 JSON 的 `E_EMPTY_BODY` 判定——有界读取先于空体
+分类（`src/handler/llm/nonstream.rs:130-161`）；`status>=400` 的错误体不受二者改写，按上段透传语义保留
+状态码与正文字节。注意两枚 502 错误体的字段名不同：`E_EMPTY_BODY` 用 `error.code`，超限 `response_too_large`
+用 `error.type`（`src/handler/llm/nonstream.rs:582`）。
+
 流式上游错误状态透传（S6/D7，`veil-stream-fidelity-fix`；`TRN-3`/`TRN-4`，`veil-gateway-transport-fidelity`）：
 `stream:true` 请求仅在
 上游 `status<400` 且响应 `content-type` 为 `text/event-stream` 时进入 SSE 泵；
@@ -705,12 +719,35 @@ fail-closed 收尾。档位硬编码，见 `src/service/llm_gateway/mod.rs::RETR
 
 ### 7.3 请求隔离声明
 
-PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁，跨请求不互见）；
-凭据 `vault` 与 PII `detector` 为进程单例只读复用（还原不断链）。与原仓差异：
-原仓 PII 全局复用（跨请求同明文同 token，prompt-cache 友好但可关联），本仓隐私更严，
-代价是跨请求 prompt-cache 命中率下降，属有意权衡：命中率差异本地不测量（wont-measure）——
-命中率是上游 provider 侧计费指标，网关侧不可见真值，且请求隔离是隐私硬要求
-（见 `src/service/metrics.rs` 模块文档）。
+PII 映射**默认**按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁，跨请求不互见）；
+凭据 `vault` 与 PII `detector` 为进程单例只读复用（还原不断链）。口径（与
+`src/service/metrics.rs` 模块文档**同字**）：**默认**请求级隔离为隐私硬要求；`PII_SCOPE_MODE=conversation`
+显式启用时在**有界、非持久**窗口内允许会话级关联。与原仓差异：原仓 PII 全局复用
+（跨请求同明文同 token，prompt-cache 友好但可关联），本仓默认隐私更严，代价是跨请求
+prompt-cache 命中率下降，属有意权衡：命中率差异本地不测量（wont-measure）——命中率是上游
+provider 侧计费指标，网关侧不可见真值，即使代价未知也不回退默认口径。
+
+会话作用域模式（`PII_SCOPE_MODE=conversation`，默认 `request`，**非 BREAKING**）：显式启用后，
+会话键成功推导时同一会话键内的同一明文跨轮铸造同一 token，使发往上游的前缀字节逐轮稳定
+（缓存友好）；**凭据仍为请求级授权（B3 不变，见下段），会话级仅承载 PII**。
+
+- 隐私增量（不得隐藏）：启用 `conversation` 后明文在 TTL 窗口（`PII_SCOPE_TTL_SECS`，默认 `1800`s）
+  内常驻内存（相对「请求结束即销毁」属回归）；会话内关联可接受（上游 provider 本就关联同一
+  上下文轮次）；跨会话隔离保持。
+- MUST NOT 承诺清单：不承诺 provider 缓存命中率可测量的提升（wont-measure 保持）、跨会话 token
+  稳定性、凭据占位符稳定性、零明文常驻、网关重启后 token 稳定、键推导含糊时的任何行为。
+- 前置条件（NB-3，会话级缓存友好**当且仅当**会话键成功推导时成立）：键按四级优先级首个命中者胜——
+  ① 客户端显式头 `PII_SCOPE_KEY_HEADER`（默认 `x-veil-conversation-id`，≤256 字节，且经租户命名空间
+  + HMAC，原始值绝不作键）；② 协议原生键（Chat/Responses 的 `prompt_cache_key`、Responses 的
+  `previous_response_id`）；③ 稳定前缀（**要求 `tools` + `system` + 首个 user turn 三者齐备**，
+  对脱敏前规范化前缀做 HMAC）。级别 1/2 依赖客户端配合（显式头 / `prompt_cache_key` /
+  `previous_response_id`），级别 3 依赖请求形态齐备。
+- 降级行为（NB-3）：**纯多轮 `messages` 请求（无工具、无会话键头、无协议原生键）即便
+  `PII_SCOPE_MODE=conversation` 亦落第 4 级逐请求**，不获跨轮 token 稳定；该降级**不报错、
+  不伪造键**（缓存失配属预期降级，非缺陷）。
+- 模式开关：`PII_SCOPE_MODE` 默认 `request` 即现行为，**非 BREAKING**；`PII_SCOPE_TTL_SECS`
+  （默认 `1800`）、`PII_SCOPE_MAX_CONVERSATIONS`（默认 `1024`）、`PII_SCOPE_KEY_HEADER`
+  （默认 `x-veil-conversation-id`）为 `conversation` 模式参数；非法值拒启动（fail-closed）。
 
 凭据还原授权收紧（`B3`，`veil-audit-r3-remediation`，**安全修复、非兼容回归**）：响应侧凭据
 还原改为**请求级授权**——仅当 token 属「本请求脱敏实际产出」（minted-set，随请求销毁）时才
@@ -845,6 +882,19 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   `[REDACTED:ipv4]`/`[REDACTED:id_card]`/`[REDACTED:bank_card]`（检出形态与 `sample_mask`
   对应分支同口径）；摘要输出不含三类明文。
 
+### 7.11 Anthropic 扩展思考签名连续性声明（`veil-pii-conversation-cache`）
+
+会话级 token 稳定（`PII_SCOPE_MODE=conversation` 且会话键成功推导，见 §7.3）是 Anthropic 扩展思考
+（extended thinking）`signature` 连续性的**必要条件**（非充分条件）。本仓**不**承诺签名连续性——
+MUST NOT 声称已实现或已验证。残余限制（四项）：① 网关**不校验**上游签名（`thinking_delta` 文本还原为
+明文，`signature` 为对**占位符文本**的 opaque 签名）；② 会话条目淘汰/进程重启后 token 重新铸造；
+③ 响应侧新 PII 仍产生新 token；④ 其他 provider 的签名 thinking 不在范围内。
+
+互引（按 requirement 名互指，两处 MUST NOT 漂移）：canonical `openspec/specs/llm-protocol-hardening/spec.md`
+的 requirement「Anthropic 扩展思考签名连续性限制声明」为真相源；本仓 `llm-gateway` 的 requirement
+「Anthropic thinking 签名连续性（条件性收益与残余限制）」与其显式互引，已随 `veil-audit-r4-remediation`
+（2026-09-16 归档）**生效**。
+
 ## 8. 遗留决策记录
 
 本节锁定遗留决策与口径，后续 change 不得静默漂移（见 `contract-docs` spec）。
@@ -887,9 +937,9 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 ### 8.5 测试口径注明（T-M7/T-M9，`veil-review-followup-test-gap`）
 
 - 原仓 `scripts/sentinel_record.py` 在本仓无直接对应脚本，录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 回放覆盖（替代关系，非缺失）。
-- 本仓真 SDK 一致性口径为脚本 `scripts/api_conformance.py` **23 项（脚本口径）**，口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）；原仓 `api_spec_conformance` 的 12 项为 **cargo 测试口径**（历史对照，不作为本仓脚本口径标签）。
+- 本仓真 SDK 一致性口径为脚本 `scripts/api_conformance.py` **24 项（脚本口径，live 实测）**，口径不同非回归缺失（脚本侧覆盖更广，含三协议 SDK 与阻断相）；原仓 `api_spec_conformance` 的 12 项为 **cargo 测试口径**（历史对照，不作为本仓脚本口径标签）。
   **已纳入 gate 步骤**（`veil-test-coverage-fill` T3）：`bash scripts/gate.sh` 第 6 步执行真 SDK 一致性
-  （23 项 = 14 常规 + 3 阻断 + 5 取用 + 1 无库 503），第 7 步在 `get/` 内执行 Go 客户端 `go vet ./...`
+  （24 项 = 14 常规 + 4 阻断 + 5 取用 + 1 无库 503，由 gate 第 6 步 live 实测登记），第 7 步在 `get/` 内执行 Go 客户端 `go vet ./...`
   与 `go test ./...`，与 fmt/clippy/test/文档路径/文件大小五步串联为七个步骤，任一失败整体非零退出。
   前置条件（第 6 步）：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
   可用 `VEIL_CONFORMANCE_PYTHON` 覆盖）与 SDK pin `openai==3.5.0`/`anthropic==1.1.0` + `pykeepass`；

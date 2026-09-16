@@ -122,9 +122,14 @@
 #### Scenario: 本 change 只收敛标签
 - **WHEN** 落计数时涉及对话范围或模式标签
 - **THEN** 按本 spec 的对话端点、`is_precise`、`truncated_mode` 分标签条执行
+
 ### Requirement: truncated_mode 三态落 metrics 分标签计数
 
 `stream_meta.truncated_mode` 四态（`silent_discard` / `open_ended` / `synthesized_failed` / `upstream_error`）SHALL 落 metrics 分标签计数（按 mode 分标签）；四态之外的值 SHALL NOT 落该指标。其中 `upstream_error` 用于「上游错误载荷帧即终端」的观测，与 `open_ended` 区分（阈值、状态码与指标键定义以 canonical `llm-gateway` 与 `credential-approval-dual-mode` 为准）。
+
+四态分标签 SHALL 端到端可观测，SHALL NOT 仅导出其中三态：`/_admin/metrics` 快照的 `truncated` 对象与 `/_admin/series` 行 SHALL 各自含 `silent_discard`/`open_ended`/`synthesized_failed`/`upstream_error` 四枚独立标签。
+
+持久化 SHALL 采用**加列式（additive）**方案（`N`，`veil-audit-r4-remediation` 决策）：在既有 `t_silent`/`t_open`/`t_synth` 列之外新增 `upstream_error` 独立列（`DEFAULT 0`）；旧库 SHALL 经启动期 `ALTER TABLE ... ADD COLUMN` 缺列补列（沿用 `src/service/metrics/store.rs:350-365` 既有补列循环模式），旧行读回 0；SHALL NOT 删除/重命名既有列，SHALL NOT 使旧读者（旧三标签字段与旧 `/_admin/series`/`/_admin/metrics` 消费方）断链——新列为只加不改，旧大盘忽略即可。`upstream_error` SHALL NOT 复用 `open_ended` 或 `silent_discard` 列承载。
 
 #### Scenario: 三态分标签计数
 
@@ -145,6 +150,22 @@
 
 - **WHEN** 截断状态为四态之外的值
 - **THEN** 系统不落该指标并记告警
+
+#### Scenario: 四态快照与导出口径
+
+- **WHEN** 检查 `/_admin/metrics` 的 `truncated` 对象与 `/_admin/series` 行
+- **THEN** 四态各含独立标签（含 `upstream_error`），不出现仅三态导出；`upstream_error` 不借 `open_ended` 列承载
+
+#### Scenario: 加列迁移不改旧列
+
+- **WHEN** 以缺 `upstream_error` 列的旧库启动，并写入一次 `upstream_error` 截断
+- **THEN** 启动期补列成功（`DEFAULT 0`），既有三列值与旧字段读取保持不变；超限/审计等其余行为不受影响
+
+#### Scenario: upstream_error 落盘不记非法值告警
+
+- **WHEN** `upstream_error` 经 `MetricsStore::record_chat_extended` 记录
+- **THEN** 走合法白名单分支落 `upstream_error` 独立列，不产生「truncated_mode 非法值不落指标」warn、不被丢弃
+
 ### Requirement: 管理面响应安全头
 
 管理面六路由（`/_admin/`、`/_admin/health`、`/_admin/metrics`、`/_admin/series`、`/_admin/events`、`/_admin/events/stream`）的响应 SHALL 统一携带 `Cache-Control: no-store`（与 Python 对齐的防缓存安全头，至少包含此项）；SHALL NOT 允许浏览器或中间代理缓存管理面响应。该约束 SHALL 对成功与失败（如 `401`、`OBSERVABILITY_DISABLE=1` 下的 `404`）响应一致生效；SSE 路由 SHALL 同样携带，不豁免。
@@ -249,3 +270,32 @@
 
 - **WHEN** 同一 `dedup_key` 在同一宽限窗口内再次出现
 - **THEN** 返回 false，不重复发送通知
+
+### Requirement: PII 作用域模式与复用/淘汰计数
+
+系统 SHALL 经 `GET /_admin/metrics` 暴露 PII 作用域只读观测：当前作用域模式（`request`/`conversation`）与会话作用域计数——会话复用次数、会话条目淘汰累计、回退请求级次数。计数 SHALL 以既有固定键原子计数风格承载（`GatewayMetrics` / `KeyedCounters`），SHALL NOT 改变既有指标键与语义；计数缺失或锁不可用时 SHALL 降级为 `0` 且不影响其余指标。该观测 SHALL NOT 暴露会话键、明文或 token 原值。不可泄露约束 SHALL 同样覆盖 **`tracing` 日志层**：会话键、会话键头值、明文与 token MUST NOT 出现在任一日志行（含 debug 级），强度与指标面一致。
+
+#### Scenario: 模式可观测
+
+- **WHEN** `/_admin/metrics` 读取快照
+- **THEN** 响应含当前作用域模式（`request`/`conversation`）
+
+#### Scenario: 复用/淘汰/回退计数
+
+- **WHEN** `conversation` 模式下发生会话复用、条目淘汰与回退
+- **THEN** 对应计数递增；默认 `request` 模式下复用与淘汰恒为 `0`
+
+#### Scenario: 既有指标键不变
+
+- **WHEN** 对比本 change 前后的指标快照
+- **THEN** 既有键 SHALL 不变，仅新增只读项
+
+#### Scenario: 不泄露键与明文
+
+- **WHEN** 检查观测输出
+- **THEN** 不含会话键、明文或 token 原值
+
+#### Scenario: 日志层同强度不泄露
+
+- **WHEN** `conversation` 模式下检查 `tracing` 日志（含 debug 级）
+- **THEN** 任一日志行不含会话键、会话键头值、明文或 token 原值

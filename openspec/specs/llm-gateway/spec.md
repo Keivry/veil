@@ -117,6 +117,15 @@ LLM 网关兼容多协议转发（OpenAI chat / Anthropic / Responses 系）：�
 
 流截断/终止状态 SHALL 仅为以下四态之一：`silent_discard` / `open_ended` / `synthesized_failed` / `upstream_error`。其中 `synthesized_failed` 仅 responses 可用（协议适用范围口径不变）；`upstream_error` 用于「上游错误载荷帧即终端」的观测（带顶层 `error` 且无 `choices` 的帧）。网关 SHALL 在 `stream_meta.truncated_mode` 记录该值并落 metrics（截断计数按 mode 分标签）。四态之外的值 SHALL NOT 落该指标。本 spec 不得使用 `complete` / `truncated` / `aborted` 旧三态命名。
 
+「唯一值」口径 SHALL 端到端一致：四态白名单 SHALL 在所有落点全量齐备，SHALL NOT 任一落点仅覆盖其中三态而把 `upstream_error` 归入 `other`/丢弃桶。至少以下四类落点 SHALL 四态齐备（`N`，`veil-audit-r4-remediation`）：
+
+1. **进程内固定键计数**：`TRUNCATED_MODE_KEYS`（`src/service/llm_gateway/metrics.rs:54-55`）SHALL 为长度 4 的键数组，派生 `KeyedCounters` 容量同步为 4；`upstream_error` 调用 SHALL 命中具名键递增，SHALL NOT 落 `other` 桶，SHALL NOT 触发未知键 warn（`src/service/llm_gateway/metrics.rs:26-41` 的未知键路径）。
+2. **落盘合法性白名单与聚合**：`TRUNCATED_MODES`（`src/service/metrics/aggregate.rs:30-31`）SHALL 为长度 4；`MetricsStore::record_chat_extended`（`src/service/metrics/store.rs:109-116`）SHALL NOT 对 `upstream_error` 走「非法值不落指标」分支或记该 warn；`WindowAgg` 截断列与聚合落标签分支（`src/service/metrics/aggregate.rs:175-177`、`src/service/metrics/store.rs:168-173`）SHALL 各含 `upstream_error` 独立槽。
+3. **持久化与快照/时序**：`MetricsSnapshot` 与 `SeriesPoint` 的截断字段（`src/service/metrics/aggregate.rs:271-273,296-298`）、`snapshot()` 环标签分支（`src/service/metrics/aggregate.rs:337-342`）、SQL 表列/UPSERT（`src/service/metrics/store.rs:310-312,327-329,344-346,431-465`）与读取/回填（`src/service/metrics/aggregate.rs:412-470,473-523`）与派生 SQL 的稳定列序。持久化 SHALL 采用加列式（见 canonical `observability-admin`「truncated_mode 三态落 metrics 分标签计数」）。每个状态 SHALL 只递增自身列/标签，SHALL NOT 借其他状态的列承载。
+4. **管理面导出**：`/_admin/metrics` 的 `truncated` 对象（`src/handler/admin.rs:129-133`）SHALL 含四态标签，SHALL NOT 仅导出三态而令 `upstream_error` 不可见。
+
+每个状态 SHALL 使「自身标签计数」递增（进程内计数与持久化列各自独立），SHALL NOT 计入其他状态的标签。
+
 #### Scenario: silent_discard 静默丢弃
 
 - **WHEN** 超限尾部命中静默丢弃策略
@@ -141,6 +150,21 @@ LLM 网关兼容多协议转发（OpenAI chat / Anthropic / Responses 系）：�
 
 - **WHEN** 检查 `stream_meta.truncated_mode` 的合法取值集
 - **THEN** 仅 `silent_discard` / `open_ended` / `synthesized_failed` / `upstream_error` 四态；四态之外的值 SHALL NOT 落该指标
+
+#### Scenario: upstream_error 命中具名键不落 other
+
+- **WHEN** 以 `upstream_error` 调用进程内截断计数（`record_truncated("upstream_error")`）
+- **THEN** `upstream_error` 具名键计数递增为 1，`other` 桶保持 0，未知键 warn 不触发（`upstream_error` 已在 `TRUNCATED_MODE_KEYS` 白名单内）
+
+#### Scenario: upstream_error 落盘与导出各标签独立
+
+- **WHEN** 一次 `upstream_error` 截断经 `record_chat_extended` 记录并刷盘、快照与 `/_admin/series` 查询
+- **THEN** 持久化 `upstream_error` 独立列、快照 `truncated.upstream_error`（`/_admin/metrics`）与 series 对应字段各自递增 1；`silent_discard`/`open_ended`/`synthesized_failed` 三者不受影响；不产生「truncated_mode 非法值不落指标」warn
+
+#### Scenario: 四态各自独立计数
+
+- **WHEN** 依次以四种 mode 各记录一次截断
+- **THEN** 四枚标签各自为 1、互不串计；四态之外的值四枚标签均不递增并记告警
 
 ### Requirement: 请求改写字节契约（引用 redaction）
 
@@ -221,3 +245,75 @@ LLM 网关兼容多协议转发（OpenAI chat / Anthropic / Responses 系）：�
 #### Scenario: 非对话豁免
 - **WHEN** 空响应来自非对话尾路径
 - **THEN** 网关原样透传，不转 502，不计对话用量
+
+### Requirement: 上游 prompt cache 前缀保真
+
+系统 SHALL 在脱敏改写中保留客户端提供的 `cache_control` 断点（MUST NOT 丢弃、位移或改写其内容），并 SHALL 原样转发 `prompt_cache_key` 与 `metadata` 请求体字段（MUST NOT 新增、删除或改写）。改写（含 json-aware 重序列化）后 `cache_control` 断点对象 SHALL 存活且语义等价；字节级表示可能因既有 JSON 重序列化规整而改变（既有已声明偏离），但断点数量、位置与取值 SHALL 不变。系统 SHALL NOT 自行注入客户端未提供的 `cache_control` 断点。
+
+#### Scenario: cache_control 断点存活
+
+- **WHEN** Chat/Anthropic 请求体在 `tools`/`system`/`messages` 内携带 `cache_control` 断点且请求发生脱敏替换
+- **THEN** 改写后输出的 `cache_control` 断点数量、位置与取值逐项存活（语义等价；字节表示受既有已声明偏离约束）
+
+#### Scenario: prompt_cache_key/metadata 透传
+
+- **WHEN** 请求体含 `prompt_cache_key` 或 `metadata`
+- **THEN** 改写后转发体保留原值，不新增、不删除、不改写
+
+#### Scenario: 无 cache_control 不新增
+
+- **WHEN** 请求体不含 `cache_control`
+- **THEN** 系统 SHALL NOT 自行注入 `cache_control` 断点
+
+#### Scenario: 非对话路径不受影响
+
+- **WHEN** 请求为非对话尾透传路径
+- **THEN** 该要求不改变既有字节透传语义（无改写、无字段增删）
+
+### Requirement: 占位符说明头部注入跨轮字节恒定
+
+占位符说明注入 SHALL 保持头部位置（Chat `messages[0]` / Anthropic `system` / Responses `input|instructions`），MUST NOT 改为尾部注入（尾部注入会改变提示语义并削弱指令遵循）。当 `PII_SCOPE_MODE=conversation` 且会话键稳定时，同一会话两轮的注入前缀 SHALL 字节一致（依赖 token 跨轮稳定 + 注入位置稳定）。既有幂等守卫（已含说明不重复前插，返回原字节）SHALL 不变。
+
+#### Scenario: 头部注入位置不变
+
+- **WHEN** 占位符说明被注入
+- **THEN** 位置为头部（`messages[0]`/`system`/`input|instructions`），非尾部
+
+#### Scenario: 会话内注入前缀字节一致
+
+- **WHEN** 同一会话键的两轮请求含需注入的 token
+- **THEN** 两轮注入前缀字节一致（逐字节相等）
+
+#### Scenario: 幂等不重复前插
+
+- **WHEN** 目标位置已含说明
+- **THEN** 不再重复前插，返回原字节（既有幂等语义不变）
+
+### Requirement: Anthropic thinking 签名连续性（条件性收益与残余限制）
+
+会话级作用域使同一明文铸造同一 token，SHALL 被文档声明为 Anthropic thinking `signature` 连续性的**必要条件**（非充分条件），MUST NOT 声称签名连续性已实现或已验证。残余限制 SHALL 显式列出：无签名校验、会话条目淘汰、响应侧新 PII 仍产生新 token、其他 provider 的签名 thinking 不在范围内。本要求 SHALL 与 canonical `llm-protocol-hardening` 的 requirement「Anthropic 扩展思考签名连续性限制声明」**显式互引**（按 requirement 名互指，两处 MUST NOT 漂移）；该 canonical 要求为真相源，本处声明 MUST NOT 与其漂移。**跨 change 排序（已满足，2026-09-16）**：该条款由 `veil-audit-r4-remediation` 引入并已随其归档晋升 canonical（`openspec/specs/llm-protocol-hardening/spec.md` 现存该 requirement），故本互引**已生效**（预设条件已由 r4 归档满足，无需再等待）。
+
+#### Scenario: 声明为必要条件
+
+- **WHEN** 查阅 thinking 连续性文档
+- **THEN** 会话级 token 稳定被声明为必要条件而非充分条件，且无实现/验证声明
+
+#### Scenario: 残余限制登记
+
+- **WHEN** 检查残余限制清单
+- **THEN** 含无签名校验、淘汰、响应侧新 PII、其他 provider 四项
+
+#### Scenario: 与 canonical llm-protocol-hardening 互引不漂移
+
+- **WHEN** 对照本要求与 canonical `llm-protocol-hardening` 的「Anthropic 扩展思考签名连续性限制声明」
+- **THEN** 两处均声明「必要条件非充分」「不校验签名」「不承诺无条件连续」，措辞互引且无冲突
+
+#### Scenario: 跨 change 排序：r4 已归档、互引已生效
+
+- **WHEN** 检查互引成立条件（`veil-audit-r4-remediation` 已于 2026-09-16 归档）
+- **THEN** canonical `llm-protocol-hardening` 含 requirement「Anthropic 扩展思考签名连续性限制声明」，本互引标注为已生效，以该 canonical requirement（按 requirement 名互指）为真相源
+
+#### Scenario: 不改变请求体语义
+
+- **WHEN** 启用 `conversation` 模式处理含 thinking 的请求
+- **THEN** 请求体除既有占位符替换与说明注入外，语义不变
