@@ -130,6 +130,21 @@ fn chat_bucket_no_collision() {
 }
 
 #[test]
+fn chat_bucket_bitfield_ci0_equivalence() {
+    // B2 回归锁定：位域公式 `(ci << 16) | (idx & 0xFFFF)` 在 `ci = 0` 时与历史
+    // `ci * 64 + idx` 等值（单 choice 桶键不变）；非零 choice 消除 64 步长饱和。
+    for idx in [0u32, 1, 63, 64, 255, 4095, 65535] {
+        assert_eq!(chat_bucket(0, idx), idx, "ci=0 须与历史公式等值: idx={idx}");
+    }
+    assert_eq!(chat_bucket(2, 5), (2 << 16) | 5);
+    assert_ne!(
+        chat_bucket(0, 4096),
+        chat_bucket(64, 0),
+        "旧 64 步长公式在该点碰撞，位域须分离"
+    );
+}
+
+#[test]
 fn empty_placeholder_covers_empty_array() {
     // STP-9/2.21：`content_block_start` 空数组占位 `input:[]` 不计入参数累积，
     // 不与后续 `partial_json` 拼成 `[]...` 前缀污染。

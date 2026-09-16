@@ -43,8 +43,6 @@ mod declaration_lock {
             format!("crate::{}::AppState", "state"),
             format!("State<{}>", "AppState"),
         ];
-        let axum_use = ["use", "axum"].join(" ");
-        let axum_allow = ["llm_gateway/hop.rs", "llm_gateway/mod.rs"];
         for path in files {
             let rel = path
                 .strip_prefix(&root)
@@ -58,11 +56,49 @@ mod declaration_lock {
                     "src/service/{rel} 命中禁用模式 {pat:?}（A1 层声明失真）"
                 );
             }
-            if src.contains(&axum_use) {
+        }
+    }
+
+    /// ARH-4/D-4（6.5）声明锁强化：对**首个 `#[cfg(test)]` 之前的生产前缀**
+    /// token-scan `axum::`——非白名单文件命中即失败；白名单文件内每个
+    /// `axum::` 之后须为 `http::`（纯数据 `HeaderMap`）。模式串运行期拼接，
+    /// 避免测试自身命中扫描。
+    #[test]
+    fn service_production_prefix_axum_whitelist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+        assert!(!files.is_empty(), "扫描根须存在");
+        let axum_token = ["axum", "::"].concat();
+        let axum_http = ["axum", "::http::"].concat();
+        let cfg_test = ["#[cfg", "(test)]"].concat();
+        let allow = ["llm_gateway/hop.rs", "llm_gateway/mod.rs"];
+        for path in files {
+            let rel = path
+                .strip_prefix(&root)
+                .expect("子路径")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // 测试兄弟文件（`tests.rs`/`*_tests.rs`/`tests/`）由父模块
+            // `#[cfg(test)] mod tests;` 引入，非生产面，跳过（同下方垫片守护口径）。
+            if rel.contains("test") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("读取成功");
+            let production = src.split(cfg_test.as_str()).next().unwrap_or("");
+            let mut rest = production;
+            while let Some(idx) = rest.find(axum_token.as_str()) {
+                let after = &rest[idx + axum_token.len()..];
+                let hit: String = rest[idx..].chars().take(48).collect();
                 assert!(
-                    axum_allow.contains(&rel.as_str()),
-                    "src/service/{rel} 出现 {axum_use}，非纯数据白名单（A1/X6）"
+                    allow.contains(&rel.as_str()),
+                    "src/service/{rel} 生产前缀出现 `{axum_token}`，非纯数据白名单（A1/X6 + ARH-4）: {hit}"
                 );
+                assert!(
+                    after.starts_with("http::"),
+                    "src/service/{rel} 白名单文件内 `{axum_token}` 之后须为 `{axum_http}`（纯数据），实得: {hit}"
+                );
+                rest = after;
             }
         }
     }

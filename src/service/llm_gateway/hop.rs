@@ -1,6 +1,9 @@
 //! 逐跳头过滤（RFC 9110 §7.6.1 全集，双向，大小写不敏感）。
 
-use {super::GatewayMetrics, axum::http::HeaderMap};
+use {
+    super::GatewayMetrics,
+    axum::http::{HeaderMap, HeaderName},
+};
 
 /// FIX-1：RFC 9110 §7.6.1 逐跳头全集，双向过滤，大小写不敏感。
 /// 固定集 8 项 + `Connection` 头内列名的动态项。
@@ -44,7 +47,9 @@ pub fn filter_hop_headers_counted(
         "hop 过滤方向须为 upstream/downstream"
     );
     // ARH-8（7.5）：固定 hop 集用常量数组匹配，动态项用小 `Vec` 线性比较——
-    // 不再每请求构造 `HashSet`（零堆分配于无 `Connection` 动态项的常见路径）。
+    // 不再每请求构造 `HashSet`；键快照与小 `Vec` 分配为既有成本，分配面收益
+    // 为假设（待 bench），不作对外承诺（详见 `hashset_reuse_equivalence` 注释）。
+    // 动态项为自由文本，保持 `String` + lower + trim。
     let dynamic: Vec<String> = headers
         .get_all("connection")
         .iter()
@@ -54,11 +59,12 @@ pub fn filter_hop_headers_counted(
         .filter(|t| !t.is_empty())
         .collect();
     let is_hop = |k: &str| HOP_HEADERS.contains(&k) || dynamic.iter().any(|d| d == k);
-    // 快照键后逐个移除（`HeaderMap` 键已规范小写，比较用小写）。
-    let keys: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+    // ARH-8：键快照直接复用 `HeaderName`（`HeaderMap` 键已规范小写），
+    // `remove(&k)` 直取，省去逐键 `to_string()` + `to_lowercase()` 重解析。
+    let keys: Vec<HeaderName> = headers.keys().cloned().collect();
     let mut removed: u64 = 0;
     for k in keys {
-        if is_hop(&k.to_lowercase()) && headers.remove(k.as_str()).is_some() {
+        if is_hop(k.as_str()) && headers.remove(&k).is_some() {
             removed += 1;
         }
     }
@@ -226,7 +232,9 @@ mod tests {
 
     #[test]
     fn hashset_reuse_equivalence() {
-        // ARH-8（7.5）：改用常量数组 + 动态项 `Vec` 后过滤集合等价（无 `HashSet` 分配）。
+        // ARH-8（7.5）：常量数组 + 动态项 `Vec` 的过滤集合**行为**等价（无
+        // `HashSet` 分配）；本用例只锁行为等价，**不锁分配属性**——每请求少
+        // N 次 String 分配为假设（待 bench），不作对外性能承诺。
         use axum::http::{HeaderMap, HeaderValue};
         let m = GatewayMetrics::default();
         let mut h = HeaderMap::new();

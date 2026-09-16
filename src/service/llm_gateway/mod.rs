@@ -3,20 +3,30 @@
 //! （工具调用/会话归档）；本模块留守网关度量、空体分类、重试/选路/上游抓取与重导出，
 //! 对外 `llm_gateway::*` 路径不变。
 
-use {
-    crate::config::Config,
-    axum::http::HeaderMap,
-    std::{
-        sync::atomic::{AtomicBool, AtomicU64, Ordering},
-        time::Duration,
-    },
-};
+use {crate::config::Config, axum::http::HeaderMap, std::time::Duration};
 
 pub mod hop;
+pub mod metrics;
 pub mod placeholder;
 pub mod protocol;
 pub mod tool;
 pub mod usage;
+
+pub use metrics::GatewayMetrics;
+
+/// T2/D2 + TRN-4（F-2）：剔除 `HeaderMap` 中全部 `x-veil-*` 内部头——`HeaderName`
+/// 大小写不敏感且规范化为小写，`starts_with` 即大小写不敏感匹配；请求方向防内部
+/// 头外传上游，响应方向防上游同名头覆盖网关自置头（网关自置头在剔除后写入）。
+pub fn strip_veil_internal_headers(headers: &mut HeaderMap) {
+    let veil_keys: Vec<_> = headers
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-veil-"))
+        .cloned()
+        .collect();
+    for k in veil_keys {
+        headers.remove(&k);
+    }
+}
 
 /// 上游重试退避三档（毫秒）：500/1000/2000，总等待 3.5s，远小于
 /// `HTTP_TIMEOUT_SECS`（默认 30s）转发超时；硬编码理由：重试预算须锁定在
@@ -26,185 +36,6 @@ pub const RETRY_DELAYS_MS: [u64; 3] = [500, 1000, 2000];
 /// 最多重试 3 次（`0..=3` 含初次共 4 次请求）；硬编码理由同上，与退避档位
 /// 一一对应，超限下标回退末档 2000ms（见 `retry_delay`）。
 pub const MAX_RETRY_ATTEMPTS: usize = 3;
-
-/// 固定键原子计数（H2/D2）：已知键编译期枚举，热路径无锁写入；未知键归 `other`
-/// 桶并每进程仅告警一次（不静默丢失，也不无限刷屏）。
-#[derive(Debug)]
-struct KeyedCounters<const N: usize> {
-    keys: [&'static str; N],
-    counts: [AtomicU64; N],
-    other: AtomicU64,
-    other_warned: AtomicBool,
-}
-
-impl<const N: usize> KeyedCounters<N> {
-    fn new(keys: [&'static str; N]) -> Self {
-        Self {
-            keys,
-            counts: std::array::from_fn(|_| AtomicU64::new(0)),
-            other: AtomicU64::new(0),
-            other_warned: AtomicBool::new(false),
-        }
-    }
-
-    fn record(&self, key: &str, n: u64) {
-        if n == 0 {
-            return;
-        }
-        match self.index_of(key) {
-            Some(i) => {
-                self.counts[i].fetch_add(n, Ordering::Relaxed);
-            }
-            None => {
-                self.other.fetch_add(n, Ordering::Relaxed);
-                if !self.other_warned.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(key = %key, "网关度量未知键归 other 桶（本进程仅提示一次）");
-                }
-            }
-        }
-    }
-
-    fn get(&self, key: &str) -> u64 {
-        match self.index_of(key) {
-            Some(i) => self.counts[i].load(Ordering::Relaxed),
-            None => self.other.load(Ordering::Relaxed),
-        }
-    }
-
-    fn index_of(&self, key: &str) -> Option<usize> { self.keys.iter().position(|k| *k == key) }
-}
-
-const LENIENT_TAIL_KEYS: [&str; 3] = ["chat/completions", "v1/messages", "v1/responses"];
-const TRUNCATED_MODE_KEYS: [&str; 3] = ["silent_discard", "open_ended", "synthesized_failed"];
-const HOP_DIR_KEYS: [&str; 2] = ["upstream", "downstream"];
-const CONV_MISSING_KEYS: [&str; 5] = [
-    "failed",
-    "block",
-    "truncated",
-    "nondialog-stream",
-    "nonstream-block",
-];
-
-#[derive(Debug)]
-pub struct GatewayMetrics {
-    lenient: KeyedCounters<3>,
-    truncated: KeyedCounters<3>,
-    hop_filtered: KeyedCounters<2>,
-    conv_missing: KeyedCounters<5>,
-    sse_events: AtomicU64,
-    /// P0-3.1/TSS-03：截断丢弃的残缺 tool 分片帧数。
-    truncated_tool_dropped: AtomicU64,
-    /// C11：超长 SSE 行截断丢弃的尾部字节数。
-    truncated_line_dropped_bytes: AtomicU64,
-    /// P0-4.2/F1：NonDialog 非对话臂透传次数（流量验证用）。
-    nondialog_passthrough: AtomicU64,
-    /// E5/D3：非流还原破裂重试仍失败、回退上游原文的次数。
-    restore_fallback: AtomicU64,
-    /// E8：Responses/Anthropic 终止判定 JSON 解析失败回退 contains 的次数。
-    terminal_fallback: AtomicU64,
-    /// RUN-2：管理面限流条目超上限被驱逐的累计次数。
-    admin_rate_evicted: AtomicU64,
-    /// RUN-4：上游响应体读取失败（`chunk()`/`bytes()` 报错）的累计次数。
-    upstream_read_errors: AtomicU64,
-}
-
-impl Default for GatewayMetrics {
-    fn default() -> Self {
-        Self {
-            lenient: KeyedCounters::new(LENIENT_TAIL_KEYS),
-            truncated: KeyedCounters::new(TRUNCATED_MODE_KEYS),
-            hop_filtered: KeyedCounters::new(HOP_DIR_KEYS),
-            conv_missing: KeyedCounters::new(CONV_MISSING_KEYS),
-            sse_events: AtomicU64::new(0),
-            truncated_tool_dropped: AtomicU64::new(0),
-            truncated_line_dropped_bytes: AtomicU64::new(0),
-            nondialog_passthrough: AtomicU64::new(0),
-            restore_fallback: AtomicU64::new(0),
-            terminal_fallback: AtomicU64::new(0),
-            admin_rate_evicted: AtomicU64::new(0),
-            upstream_read_errors: AtomicU64::new(0),
-        }
-    }
-}
-
-impl GatewayMetrics {
-    pub fn record_lenient(&self, tail: &str) { self.lenient.record(tail, 1); }
-
-    pub fn lenient_count(&self, tail: &str) -> u64 { self.lenient.get(tail) }
-
-    pub fn record_truncated(&self, mode: &str) { self.truncated.record(mode, 1); }
-
-    pub fn truncated_count(&self, mode: &str) -> u64 { self.truncated.get(mode) }
-
-    pub fn add_sse_event(&self) { self.sse_events.fetch_add(1, Ordering::Relaxed); }
-
-    pub fn sse_event_total(&self) -> u64 { self.sse_events.load(Ordering::Relaxed) }
-
-    pub fn record_hop_filtered(&self, dir: &str, count: u64) {
-        self.hop_filtered.record(dir, count);
-    }
-
-    pub fn hop_filtered_count(&self, dir: &str) -> u64 { self.hop_filtered.get(dir) }
-
-    pub fn record_conv_missing(&self, reason: &str) { self.conv_missing.record(reason, 1); }
-
-    #[cfg(test)]
-    pub(crate) fn conv_missing_count(&self, reason: &str) -> u64 { self.conv_missing.get(reason) }
-
-    pub fn record_truncated_tool_dropped(&self, n: u64) {
-        self.truncated_tool_dropped.fetch_add(n, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn truncated_tool_dropped_count(&self) -> u64 {
-        self.truncated_tool_dropped.load(Ordering::Relaxed)
-    }
-
-    pub fn record_truncated_line_dropped_bytes(&self, n: u64) {
-        self.truncated_line_dropped_bytes
-            .fetch_add(n, Ordering::Relaxed);
-    }
-
-    pub fn record_nondialog_passthrough(&self) {
-        self.nondialog_passthrough.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn nondialog_passthrough_count(&self) -> u64 {
-        self.nondialog_passthrough.load(Ordering::Relaxed)
-    }
-
-    pub fn record_terminal_fallback(&self) {
-        self.terminal_fallback.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn terminal_fallback_count(&self) -> u64 {
-        self.terminal_fallback.load(Ordering::Relaxed)
-    }
-
-    pub fn record_restore_fallback(&self) { self.restore_fallback.fetch_add(1, Ordering::Relaxed); }
-
-    #[cfg(test)]
-    pub(crate) fn restore_fallback_count(&self) -> u64 {
-        self.restore_fallback.load(Ordering::Relaxed)
-    }
-
-    pub fn record_admin_rate_evicted(&self, n: u64) {
-        self.admin_rate_evicted.fetch_add(n, Ordering::Relaxed);
-    }
-
-    pub fn admin_rate_evicted_count(&self) -> u64 {
-        self.admin_rate_evicted.load(Ordering::Relaxed)
-    }
-
-    pub fn record_upstream_read_error(&self) {
-        self.upstream_read_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn upstream_read_error_count(&self) -> u64 {
-        self.upstream_read_errors.load(Ordering::Relaxed)
-    }
-}
 
 /// ARH-10（7.7）：上游状态码受约束类型——仅接受 `100..=599` 的合法 HTTP 状态，
 /// 服务层不再以裸 `u16` 无约束传递；非法值在构造处即被拒（返回 `None`），
@@ -306,7 +137,8 @@ pub async fn fetch_upstream_with_retry(
 ) -> anyhow::Result<reqwest::Response> {
     // ARH-7（7.4）：请求体转共享 `Bytes`，重试时按引用计数克隆（零字节拷贝），
     // 不再对 `Vec<u8>` 逐次深拷贝；拿头前重试分类/退避语义不变。
-    let body = axum::body::Bytes::from(body);
+    // 6.5：直接用 `bytes::Bytes`（直依赖），service 生产不再引用 axum 通配路径。
+    let body = bytes::Bytes::from(body);
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 0..=MAX_RETRY_ATTEMPTS {
         let mut req = client.request(method.clone(), url);
@@ -378,7 +210,10 @@ mod retry_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        metrics::{CONV_MISSING_KEYS, HOP_DIR_KEYS, LENIENT_TAIL_KEYS, TRUNCATED_MODE_KEYS},
+        *,
+    };
 
     #[test]
     fn empty_body_502_three_branches() {
@@ -782,5 +617,26 @@ mod tests {
         assert!(UpstreamStatus::new(200).expect("合法").is_success());
         assert!(UpstreamStatus::new(500).expect("合法").is_error());
         assert!(!UpstreamStatus::new(500).expect("合法").is_success());
+    }
+
+    #[test]
+    fn strip_veil_internal_headers_case_insensitive_and_selective() {
+        // F-2（9.3）：单一定义——全部 `x-veil-*`（大小写归一）剔除，他头保留。
+        let mut headers = HeaderMap::new();
+        headers.insert("x-veil-protocol", "chat".parse().expect("合法头值"));
+        headers.insert("X-Veil-Normalized", "1".parse().expect("合法头值"));
+        headers.insert(
+            "content-type",
+            "text/event-stream".parse().expect("合法头值"),
+        );
+        assert_eq!(headers.len(), 3, "归一后 `x-veil-*` 两项 + 他头一项");
+        strip_veil_internal_headers(&mut headers);
+        assert!(headers.get("x-veil-protocol").is_none());
+        assert!(headers.get("x-veil-normalized").is_none());
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(headers.len(), 1, "仅非 x-veil-* 头保留");
     }
 }

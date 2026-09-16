@@ -23,8 +23,9 @@ fn match_pii_token(tail: &[u8]) -> bool {
 }
 
 fn match_cred_token(tail: &[u8]) -> bool {
-    // 严格子集说明：生产 token 恒为 `%06d` 6 位（见 credential_vault.rs），此处要求
-    // `\d{6,}` 是 vault 侧 `\d{4,}`（detector.rs 宽松识别，兼容历史 4-5 位幻觉形）的严格
+    // 严格子集说明：生产 token 恒为 `%06d` 6 位（见 credential_vault.rs 的 `make_cred_token`），
+    // 此处要求 `\d{6,}` 是 vault 还原侧 `\d{4,}`（credential_vault.rs 的 `token_re`，兼容
+    // 历史 4-5 位幻觉形；检测侧形态保护另见 pii/detector.rs）的严格
     // 子集；4-5 位形不触发注入门属有意保守（注入宜漏不宜误），还原侧仍按宽松口径处理。
     let mut j = 0;
     while j < tail.len() && tail[j].is_ascii_digit() {
