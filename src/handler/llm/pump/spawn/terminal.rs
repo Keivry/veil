@@ -10,7 +10,8 @@ use {
             event::{record_emitted_events, should_synthesize_empty_stream},
             synth_flush::{MidstreamInput, midstream_terminal},
         },
-        frame_feed::{drain_prefix_hold, feed_output_frame, residual_frame_payload},
+        frame_feed::{drain_prefix_hold, residual_frame_payload},
+        restore_emit::{FrameSink, RestoredFrame, emit_restored_json_frame},
     },
     crate::{
         approval::{PendingApprovals, PendingRecord},
@@ -216,14 +217,26 @@ where
             .redact_response_new_pii_with_skip(resp_vault, resp_detector, &restored, &spans)
             .await;
         if !scanned.is_empty() {
-            feed_output_frame(
-                prefix_hold,
-                boundary,
-                resp_detector,
-                resp_vault,
-                boundary_spans,
-                agg,
-                (String::new(), scanned),
+            // D/B-2：残余帧与正常帧共用 `emit_restored_json_frame`（守卫失败
+            // 回退占位符帧），消除残余路径缺守卫的回退缺口。
+            let _ = emit_restored_json_frame(
+                &mut FrameSink {
+                    prefix_hold: &mut *prefix_hold,
+                    boundary: &mut *boundary,
+                    detector: resp_detector,
+                    vault: resp_vault,
+                    boundary_spans,
+                    agg: &mut *agg,
+                },
+                RestoredFrame {
+                    prefix: "",
+                    restored: scanned,
+                    placeholder: &payload,
+                    placeholder_parsed: None,
+                    json_aware: true,
+                    feed: true,
+                },
+                metrics,
             )
             .await;
             drain_prefix_hold(prefix_hold, boundary, boundary_spans, agg);

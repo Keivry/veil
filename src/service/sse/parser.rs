@@ -19,9 +19,9 @@ use {
 /// 并计入 `truncated_line_dropped_bytes`（与行截断同口径）。
 const TEXT_CARRY_MAX_BYTES: usize = LINE_LIMIT_BYTES;
 
-/// D2/TRN-1：跨块 `event:` FIFO 暂存硬上限——仅发信封不发 `data` 的畸形流
-/// 超限时丢**最旧**并计入 `pending_events_dropped`（每流首次丢弃 warn），
-/// 防无界累积；`pending_retry` 为单值，无需上限。
+/// D2/TRN-1/Q4：跨块 `event:` FIFO 暂存硬上限——仅发信封不发 `data` 的畸形流
+/// 超限时**清空整队**并计入 `pending_events_dropped`（fail-safe：宁缺信封不错标，
+/// 每流首次丢弃 warn），防无界累积；`pending_retry` 为单值，无需上限。
 const PENDING_EVENTS_MAX: usize = 8;
 
 #[derive(Debug, Default)]
@@ -122,8 +122,8 @@ pub struct SseParser {
     /// TRN-1：跨块暂存——「有 `event` 无 `data`」块的 `event` 按 FIFO 待配对
     /// 下一含 `data` 块，出口同块重建，不产生孤立 `event:` 块。
     pending_events: VecDeque<String>,
-    /// D2：`pending_events` 超上限丢最旧的累计（经
-    /// [`SseParser::take_pending_events_dropped`] 排入观测）。
+    /// D2/Q4：`pending_events` 超上限清空整队丢弃的累计（已暂存项 + 触发事件，
+    /// 经 [`SseParser::take_pending_events_dropped`] 排入观测）。
     pending_events_dropped: u64,
     /// D2：每流仅首次丢弃 warn 一次（防日志洪泛）。
     pending_events_drop_warned: bool,
@@ -341,19 +341,24 @@ impl SseParser {
         if ev.data.is_empty() {
             if ev.event_type.is_some() || ev.retry.is_some() {
                 if let Some(t) = ev.event_type.take() {
-                    // D2：超上限丢最旧（消费语义不变——存活窗口内仍按 FIFO 配对）。
+                    // D2/Q4：超上限**清空整队**（fail-safe：宁缺信封不错标）——已
+                    // 暂存事件与本次触发事件一并丢弃，避免部分保留使后续 data 帧的
+                    // `event:` 名错配；消费语义不变（未溢出窗口内仍按 FIFO 配对）。
                     if self.pending_events.len() >= PENDING_EVENTS_MAX {
-                        self.pending_events.pop_front();
-                        self.pending_events_dropped += 1;
+                        let dropped = self.pending_events.len() as u64 + 1;
+                        self.pending_events.clear();
+                        self.pending_events_dropped += dropped;
                         if !self.pending_events_drop_warned {
                             self.pending_events_drop_warned = true;
                             tracing::warn!(
                                 cap = PENDING_EVENTS_MAX,
-                                "SSE 跨块 event 暂存超上限，丢弃最旧（计数经 take_pending_events_dropped 观测）"
+                                dropped,
+                                "SSE 跨块 event 暂存超上限，清空整队（计数经 take_pending_events_dropped 观测）"
                             );
                         }
+                    } else {
+                        self.pending_events.push_back(t);
                     }
-                    self.pending_events.push_back(t);
                 }
                 if ev.retry.is_some() {
                     self.pending_retry = ev.retry.take();

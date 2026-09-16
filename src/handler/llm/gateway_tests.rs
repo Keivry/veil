@@ -63,6 +63,7 @@ fn nonstream_ctx(
         req: RequestCtx {
             protocol,
             normalized_out: false,
+            redact_only: false,
             scope,
             vault,
             detector,

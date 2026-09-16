@@ -10,9 +10,16 @@
 //! 子模块划分（D2）：`scope` 请求/响应双侧编排，`seam` 跨帧边界 hold，
 //! `leaf` 叶回调与请求字节选择；旧路径经重导出兼容，对外 `redaction::*` 不变。
 
+pub mod conversation_key;
+pub mod conversation_store;
 pub mod leaf;
 pub mod restore_guard;
 pub mod scope;
 pub mod seam;
 
-pub use {scope::*, seam::*};
+pub use {conversation_key::*, conversation_store::*, scope::*, seam::*};
+
+/// 上游 prompt cache 保真与注入位置测试（4.1–4.4，sibling 纯测试文件）。
+#[cfg(test)]
+#[path = "redaction/cache_fidelity_tests.rs"]
+mod cache_fidelity_tests;

@@ -32,6 +32,9 @@ use {
     std::{collections::HashMap, path::PathBuf, time::Duration},
 };
 
+mod pii_scope;
+pub use pii_scope::PiiScopeMode;
+
 /// 审计审批默认超时（秒）。
 pub const AUDIT_TIMEOUT_DEFAULT: i64 = 90;
 /// `AUDIT_TIMEOUT` 禁区下限（含端点）：上游约 120s 断连窗口两侧各留约 10s 余量。
@@ -206,6 +209,16 @@ pub struct Config {
     /// 检测强化开关（`PII_DETECTION_HARDENING`，默认关闭；
     /// 开启时内置命中做严格边界复核，丢弃 ASCII 粘连与前导零 IPv4）。
     pub pii_detection_hardening: bool,
+    /// PII 作用域模式（`PII_SCOPE_MODE`，默认 `request`）：`conversation` 时
+    /// PII 映射按会话键跨轮共享（凭据仍请求级，B3 不变）；`request` 逐请求。
+    pub pii_scope_mode: PiiScopeMode,
+    /// 会话条目空闲 TTL（`PII_SCOPE_TTL_SECS`，默认 1800s；非正整数拒启动）。
+    pub pii_scope_ttl_secs: i64,
+    /// 会话条目上限（`PII_SCOPE_MAX_CONVERSATIONS`，默认 1024；非正整数拒启动）。
+    pub pii_scope_max_conversations: usize,
+    /// 显式会话键请求头名（`PII_SCOPE_KEY_HEADER`，默认
+    /// `x-veil-conversation-id`；该头 MUST NOT 转发上游）。
+    pub pii_scope_key_header: String,
     /// 自定义正则规则文件（`PII_CUSTOM_RULES_FILE` 或 `PII_CUSTOM_RULES`，JSON 数组）。
     pub pii_custom_rules_file: Option<PathBuf>,
     /// 自定义模式文件（`PII_CUSTOM_PATTERNS_FILE` 或 `PII_CUSTOM_PATTERNS`，数组或映射）。
@@ -340,6 +353,12 @@ impl Config {
             placeholder_prompt_enabled,
             placeholder_prompt_text,
         } = load_redaction(&get)?;
+        let pii_scope::PiiScopeParts {
+            mode: pii_scope_mode,
+            ttl_secs: pii_scope_ttl_secs,
+            max_conversations: pii_scope_max_conversations,
+            key_header: pii_scope_key_header,
+        } = pii_scope::load(&get)?;
         let LlmParts {
             llm_upstreams,
             llm_default_upstream,
@@ -376,6 +395,10 @@ impl Config {
             pii_response_side,
             pii_fuzzy_restore,
             pii_detection_hardening,
+            pii_scope_mode,
+            pii_scope_ttl_secs,
+            pii_scope_max_conversations,
+            pii_scope_key_header,
             pii_custom_rules_file,
             pii_custom_patterns_file,
             pii_custom_dict_file,

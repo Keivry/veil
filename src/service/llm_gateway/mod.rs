@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod placeholder;
 pub mod protocol;
 pub mod tool;
+pub mod tool_responses;
 pub mod usage;
 
 pub use metrics::GatewayMetrics;
@@ -187,6 +188,7 @@ pub use {
         is_chat_tail,
         is_passthrough,
         is_stream_body,
+        redact_only_protocol,
         resolve_protocol,
         should_inject_stream_options,
     },

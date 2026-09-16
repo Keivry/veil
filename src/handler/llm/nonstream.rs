@@ -23,7 +23,7 @@ use {
             },
             metrics::ChatRecord,
             redaction::{
-                leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE},
+                leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE, PROTOCOL_HEADER_NAME},
                 restore_guard::restore_guard_ok,
             },
         },
@@ -108,7 +108,10 @@ pub async fn serve_nonstream(
     // N1/D10：错误状态先于 SSE 内容类型判定——`status>=400` + `text/event-stream`
     // 一律走错误体透传（状态码与正文字节保留），SHALL NOT 经 `build_sse_response`
     // 合成硬编码 200 的假流；与流式分支既有 `status>=400` 守卫同口径。
-    if looks_sse && status_u16 < 400 {
+    // FIX 4：redact-only 变体（`count_tokens`）走本函数时 SHALL NOT 进 SSE 泵——
+    // 其契约为「跳过四类后处理、上游字节保真透传」，异常 SSE content-type 亦按
+    // 非 JSON 体经下方空体分类处置（与其它非 JSON 响应同口径），不伪造 200 流。
+    if looks_sse && status_u16 < 400 && !ctx.req.redact_only {
         // E12/D7：转泵时透传请求会话标识（泵内终端帧复用，不断审计链）；
         // 缺失则为 None，由调用方回退合成并记 `conv_missing`。
         return NonstreamOutcome::Stream(up, req_conv);
@@ -160,6 +163,22 @@ pub async fn serve_nonstream(
     if empty_action == EmptyAction::NonStreamTo502 {
         return NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol));
     }
+    // C/3.2：redact-only 变体（Anthropic `count_tokens`）——请求侧脱敏已在
+    // `request_rewrite` 完成；此处**显式跳过**四类后处理：① 用量记账（`record_chat`/
+    // `record_aux_counts`）；② 审计判定（逐 tool `evaluate_and_record` 与
+    // `evaluate_nonstream`）；③ 响应侧还原与新 PII 扫描（`restore_response_with_spans_json`
+    // + `redact_response_new_pii_with_skip`）；④ 阻断合成（`blocked` → `block_body`）。
+    // 保留 hop 过滤与有界读（体量受 `NONSTREAM_MAX_BYTES` 约束），按上游字节保真透传。
+    if ctx.req.redact_only {
+        return NonstreamOutcome::Responded(build_downstream_response(
+            StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
+            &resp_headers,
+            bytes,
+            ctx.req.protocol,
+            ctx.req.normalized_out,
+            is_json.then_some("application/json"),
+        ));
+    }
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         let usage = extract_usage_nonstream(ctx.req.protocol, &v);
         // C13/NLP-2：模型分桶优先上游回显值，缺失回退请求 model（对照 Python
@@ -202,6 +221,9 @@ pub async fn serve_nonstream(
                 }
             }
         }
+        if let Some(resp_id) = llm_gateway::extract_conv_id(&v) {
+            let _ = ctx.req.scope.record_response_id(ctx.req.protocol, &resp_id);
+        }
         let conv_id = llm_gateway::extract_conv_id(&v).unwrap_or_else(|| {
             llm_gateway::resolve_conv_id(
                 None,
@@ -236,7 +258,7 @@ pub async fn serve_nonstream(
                     );
                 }
                 resp.headers_mut().insert(
-                    "x-veil-protocol",
+                    PROTOCOL_HEADER_NAME,
                     header::HeaderValue::from_static(protocol_header_value(ctx.req.protocol)),
                 );
                 return NonstreamOutcome::Responded(resp);
@@ -506,7 +528,7 @@ fn error_streaming_response(
         builder = builder.header(k, v);
     }
     builder
-        .header("x-veil-protocol", protocol_header_value(protocol))
+        .header(PROTOCOL_HEADER_NAME, protocol_header_value(protocol))
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
 }
@@ -551,7 +573,7 @@ fn build_downstream_response(
         builder = builder.header(NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE);
     }
     builder
-        .header("x-veil-protocol", protocol_header_value(protocol))
+        .header(PROTOCOL_HEADER_NAME, protocol_header_value(protocol))
         .body(Body::from(body))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
 }

@@ -33,7 +33,7 @@ pub use crate::fs_perm::SQLITE_BUSY_TIMEOUT_MS;
 pub const SQLITE_USER_VERSION: i64 = 1;
 
 /// 可被多任务共享的应用状态，axum `State` 要求 `Clone` 故内层全 `Arc`。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub sqlite_ok: Arc<AtomicBool>,
@@ -65,9 +65,51 @@ pub struct AppState {
     pub http_stream_client: Arc<reqwest::Client>,
     pub vault: Arc<crate::service::credential_vault::CredentialVault>,
     pub detector: Arc<crate::service::pii::PiiDetector>,
+    /// D3：会话级 PII 作用域存储（`PII_SCOPE_MODE=conversation` 时构造并跨请求
+    /// 共享；`request` 模式为 `None` 且不使用）。
+    pub conversation_scope_store: Option<Arc<crate::service::redaction::ConversationScopeStore>>,
+    /// D1 第 2 级：`previous_response_id` → 会话键映射（租户分域、跨请求共享）。
+    pub previous_response_map: Arc<crate::service::redaction::PreviousResponseMap>,
+    /// D2：会话键/租户指纹 HMAC 密钥（进程内随机、跨请求稳定；不落盘、不进日志）。
+    pub conversation_secret: Arc<[u8]>,
     /// H10/D10：失败/审批通知统一有界 spool（单 Bot + 有界队列 + 常驻消费者）。
     /// 消费者由 `main` 启动期 `start()` 拉起；未启动时 `notify_text` 按满队列丢弃。
     pub notify: Arc<crate::service::matrix::NotificationSpool>,
+}
+
+/// 手工 `Debug`（FIX 2）：`conversation_secret`（会话 HMAC 密钥）派生 `Debug`
+/// 会打印密钥字节；一律以 `[redacted]` 呈现，其余字段保持既有呈现。
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("config", &self.config)
+            .field("sqlite_ok", &self.sqlite_ok)
+            .field("sqlite_error", &self.sqlite_error)
+            .field("db_path", &self.db_path)
+            .field("registry", &self.registry)
+            .field("registry_path", &self.registry_path)
+            .field("registry_save_lock", &self.registry_save_lock)
+            .field("keepass", &self.keepass)
+            .field("pending", &self.pending)
+            .field("approval", &self.approval)
+            .field("decisions", &self.decisions)
+            .field("credential_hits", &self.credential_hits)
+            .field("register_hits", &self.register_hits)
+            .field("gateway_metrics", &self.gateway_metrics)
+            .field("admin", &self.admin)
+            .field("audit_logger", &self.audit_logger)
+            .field("audit_sink", &self.audit_sink)
+            .field("audit_policy", &self.audit_policy)
+            .field("http_client", &self.http_client)
+            .field("http_stream_client", &self.http_stream_client)
+            .field("vault", &self.vault)
+            .field("detector", &self.detector)
+            .field("conversation_scope_store", &self.conversation_scope_store)
+            .field("previous_response_map", &self.previous_response_map)
+            .field("conversation_secret", &"[redacted]")
+            .field("notify", &self.notify)
+            .finish()
+    }
 }
 
 impl AppState {
@@ -133,6 +175,23 @@ impl AppState {
             let (rules, dict) = detector.load_custom_all(&custom_patterns, &custom_dict);
             tracing::info!("PII 自定义规则运行时注入: 正则 {rules} 条、字典 {dict} 条");
         }
+        let gateway_metrics = Arc::new(crate::service::llm_gateway::GatewayMetrics::default());
+        let conversation_scope_store = config.pii_scope_mode.is_conversation().then(|| {
+            let capacity = config.pii_scope_max_conversations;
+            let ttl = std::time::Duration::from_secs(config.pii_scope_ttl_secs.max(1) as u64);
+            Arc::new(
+                crate::service::redaction::ConversationScopeStore::new(capacity, ttl)
+                    .with_metrics(gateway_metrics.clone()),
+            )
+        });
+        let conversation_secret = if config.pii_scope_mode.is_conversation() {
+            generate_conversation_secret()
+        } else {
+            Arc::<[u8]>::from(&[][..])
+        };
+        let previous_response_map = Arc::new(crate::service::redaction::PreviousResponseMap::new(
+            config.pii_scope_max_conversations,
+        ));
         Ok(Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),
@@ -149,7 +208,7 @@ impl AppState {
             )),
             credential_hits: Arc::new(tokio::sync::Mutex::new(crate::service::RateTable::new())),
             register_hits: Arc::new(tokio::sync::Mutex::new(crate::service::RateTable::new())),
-            gateway_metrics: Arc::new(crate::service::llm_gateway::GatewayMetrics::default()),
+            gateway_metrics,
             admin,
             audit_logger,
             audit_sink,
@@ -158,6 +217,9 @@ impl AppState {
             http_stream_client,
             vault,
             detector,
+            conversation_scope_store,
+            previous_response_map,
+            conversation_secret,
             notify,
         })
     }
@@ -277,6 +339,52 @@ where
     F: FnOnce() -> Result<reqwest::Client, String>,
 {
     finish_http_client_with(build, |msg| tracing::warn!("{msg}"))
+}
+
+/// D2：进程内会话 HMAC 密钥（32 字节 CSPRNG；进程内稳定、不落盘、不进日志）。
+fn generate_conversation_secret() -> Arc<[u8]> {
+    let (buf, os_ok) = conversation_secret_bytes(|b| {
+        use rand::{rand_core::TryRngCore as _, rngs::OsRng};
+        OsRng.try_fill_bytes(b).is_ok()
+    });
+    if !os_ok {
+        tracing::warn!("会话 HMAC 密钥熵源不可用，回退时间/进程派生（仅进程内隔离，非 CSPRNG）");
+    }
+    Arc::from(buf.to_vec().into_boxed_slice())
+}
+
+/// 密钥字节生成核心（可测）：`os_fill` 返回 `true` 表示 CSPRNG 填充成功。
+/// `OsRng` 失败时回退 [`fallback_secret_bytes`]，**恒产出完整 32 字节**，
+/// 不遗留零填充半成键（上半 16 字节为零会显著削弱进程内隔离）。
+fn conversation_secret_bytes(os_fill: impl FnOnce(&mut [u8; 32]) -> bool) -> ([u8; 32], bool) {
+    let mut buf = [0u8; 32];
+    if os_fill(&mut buf) {
+        return (buf, true);
+    }
+    (fallback_secret_bytes(), false)
+}
+
+/// 熵源失败回退：SHA-256 吸收多源低熵材料（高精度时间、进程 id、ASLR 栈/堆
+/// 地址），输出完整 32 字节且无零填充。非 CSPRNG 替代，仅保「进程内稳定 +
+/// 跨进程相异」最低隔离；调用方已打 warn。
+fn fallback_secret_bytes() -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    hasher.update(now.as_nanos().to_le_bytes());
+    hasher.update(now.subsec_nanos().to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    let stack_probe = 0u8;
+    hasher.update((&stack_probe as *const u8 as usize).to_le_bytes());
+    let heap_probe = Box::new(0u8);
+    hasher.update((std::ptr::from_ref(heap_probe.as_ref()) as usize).to_le_bytes());
+    let local_probe = 0u8;
+    hasher.update((std::ptr::from_ref(&local_probe) as usize).to_le_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    out
 }
 
 pub fn build_http_client(config: &Config) -> reqwest::Client {

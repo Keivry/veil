@@ -27,8 +27,13 @@ pub(crate) const AGGS_MAX_ENTRIES: usize = 4096;
 pub const LATENCY_BOUNDS_MS: [u64; 11] = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
 /// 延迟桶数（硬性 12）。
 pub const LATENCY_BUCKETS: usize = 12;
-/// `truncated_mode` 唯一三态（他值不落指标）。
-pub const TRUNCATED_MODES: [&str; 3] = ["silent_discard", "open_ended", "synthesized_failed"];
+/// `truncated_mode` 唯一四态（他值不落指标；与 `sse::TruncatedMode` 四变体同集）。
+pub const TRUNCATED_MODES: [&str; 4] = [
+    "silent_discard",
+    "open_ended",
+    "synthesized_failed",
+    "upstream_error",
+];
 /// PII 采样落盘滚动天数。
 pub const PII_SAMPLE_RETENTION_DAYS: i64 = 7;
 /// 模型名归一上限（字符，对标 Python `unknown_model` 回退口径的防注入截断）。
@@ -175,6 +180,7 @@ pub(crate) struct WindowAgg {
     pub(crate) t_silent: u64,
     pub(crate) t_open: u64,
     pub(crate) t_synth: u64,
+    pub(crate) t_upstream_error: u64,
     /// 最近更新序号（LRU 驱逐依据；越小越旧）。
     pub(crate) updated: u64,
 }
@@ -271,6 +277,7 @@ pub struct MetricsSnapshot {
     pub truncated_silent_discard: u64,
     pub truncated_open_ended: u64,
     pub truncated_synthesized_failed: u64,
+    pub truncated_upstream_error: u64,
     pub is_precise: bool,
     pub ring_len: usize,
     pub dropped: u64,
@@ -296,6 +303,7 @@ pub struct SeriesPoint {
     pub truncated_silent_discard: u64,
     pub truncated_open_ended: u64,
     pub truncated_synthesized_failed: u64,
+    pub truncated_upstream_error: u64,
 }
 
 impl MetricsStore {
@@ -307,6 +315,7 @@ impl MetricsStore {
         let mut t_silent = 0u64;
         let mut t_open = 0u64;
         let mut t_synth = 0u64;
+        let mut t_upstream_error = 0u64;
         let mut per_protocol: HashMap<String, u64> = HashMap::new();
         let mut per_model: HashMap<String, u64> = HashMap::new();
         let mut precise_true = 0u64;
@@ -338,6 +347,7 @@ impl MetricsStore {
                     Some("silent_discard") => t_silent += 1,
                     Some("open_ended") => t_open += 1,
                     Some("synthesized_failed") => t_synth += 1,
+                    Some("upstream_error") => t_upstream_error += 1,
                     _ => {}
                 }
             }
@@ -357,6 +367,7 @@ impl MetricsStore {
             truncated_silent_discard: t_silent,
             truncated_open_ended: t_open,
             truncated_synthesized_failed: t_synth,
+            truncated_upstream_error: t_upstream_error,
             // 精确性双条件（窗口覆盖 ≥3600s 且样本 ≥100）叠加降级样本一票否决。
             is_precise: {
                 let coverage = if count == 0 {
@@ -425,7 +436,7 @@ fn query_series_blocking(
     let mut sql = format!(
         "SELECT window, protocol, requests, prompt_tokens, completion_tokens,\
          total_tokens, cached_read, cached_write, unknown, pii_hits, cred_hits, audit_blocks, \
-         t_silent, t_open, t_synth FROM {table} WHERE 1=1"
+         t_silent, t_open, t_synth, t_upstream_error FROM {table} WHERE 1=1"
     );
     if since.is_some() {
         sql.push_str(" AND CAST(substr(window, 2) AS INTEGER) >= ?");
@@ -460,6 +471,7 @@ fn query_series_blocking(
             truncated_silent_discard: row.get::<_, i64>(12)? as u64,
             truncated_open_ended: row.get::<_, i64>(13)? as u64,
             truncated_synthesized_failed: row.get::<_, i64>(14)? as u64,
+            truncated_upstream_error: row.get::<_, i64>(15)? as u64,
         })
     })?;
     let mut out = Vec::new();
@@ -482,10 +494,10 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
         let mut stmt = conn.prepare(&format!(
             "SELECT window, protocol, requests, prompt_tokens, completion_tokens, total_tokens, \
              cached_read, cached_write, unknown, pii_hits, cred_hits, audit_blocks, \
-             t_silent, t_open, t_synth, buckets FROM {table}"
+             t_silent, t_open, t_synth, t_upstream_error, buckets FROM {table}"
         ))?;
         let rows = stmt.query_map([], |row| {
-            let buckets_s: String = row.get(15)?;
+            let buckets_s: String = row.get(16)?;
             let mut buckets = [0u64; LATENCY_BUCKETS];
             for (i, part) in buckets_s.split(',').enumerate().take(LATENCY_BUCKETS) {
                 buckets[i] = part.trim().parse().unwrap_or(0);
@@ -510,6 +522,7 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
                     t_silent: row.get::<_, i64>(12)? as u64,
                     t_open: row.get::<_, i64>(13)? as u64,
                     t_synth: row.get::<_, i64>(14)? as u64,
+                    t_upstream_error: row.get::<_, i64>(15)? as u64,
                     buckets,
                     updated: 0,
                 },

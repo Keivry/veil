@@ -567,3 +567,51 @@ async fn custom_pii_e2e_hit_visible() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn app_state_debug_redacts_conversation_secret() {
+    // FIX 2：`AppState` 手工 `Debug` 不得泄漏 `conversation_secret` 的字节/hex。
+    let mut env = minimal_env();
+    env.insert("PII_SCOPE_MODE".to_string(), "conversation".to_string());
+    let state = AppState::try_new(
+        Config::load_from(&env).unwrap(),
+        outcome_for(Path::new("/tmp")),
+    )
+    .unwrap();
+    assert_eq!(
+        state.conversation_secret.len(),
+        32,
+        "conversation 模式须 32 字节密钥"
+    );
+    let secret = &*state.conversation_secret;
+    let debug = format!("{state:?}");
+    assert!(
+        !debug.contains(&hex::encode(secret)),
+        "Debug 不得泄漏密钥 hex: {debug}"
+    );
+    assert!(
+        !debug.contains(&format!("{secret:?}")),
+        "Debug 不得泄漏密钥字节: {debug}"
+    );
+    assert!(debug.contains("[redacted]"), "须显式标注已脱敏");
+}
+
+#[test]
+fn conversation_secret_fallback_is_full_nonzero_32_bytes() {
+    // FIX 3：OsRng 失败回退须产出完整 32 字节且无零填充（不留半成键）。
+    let (buf, os_ok) = conversation_secret_bytes(|_| false);
+    assert!(!os_ok, "注入失败须报告熵源不可用");
+    assert_eq!(buf.len(), 32);
+    assert!(buf.iter().any(|b| *b != 0), "回退密钥不得全零");
+    assert!(
+        buf[16..].iter().any(|b| *b != 0),
+        "回退不得遗留上半 16 字节为零"
+    );
+    // 成功分支：原样返回注入填充值。
+    let (ok, flag) = conversation_secret_bytes(|b| {
+        b.fill(0xAB);
+        true
+    });
+    assert!(flag);
+    assert!(ok.iter().all(|b| *b == 0xAB));
+}

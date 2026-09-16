@@ -5,6 +5,12 @@ use {
     serde_json::Value,
 };
 
+pub(crate) use super::tool_responses::{
+    derived_item_tool_call,
+    responses_derived_tool_kind,
+    responses_item_tool_name,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub index: u32,
@@ -195,39 +201,6 @@ fn custom_obj_to_call(
         args,
         id_synth,
     })
-}
-
-/// RED-4：Responses 四类工具 delta 事件 → 派生工具名（流/非流统一，对齐 Python
-/// `_llm.py:783-791` 将四者统一归 `function_call_arguments` 审计路径）。
-pub(crate) fn responses_derived_tool_kind(ev_type: &str) -> Option<&'static str> {
-    if ev_type.contains("code_interpreter_call_code") {
-        Some("code_interpreter")
-    } else if ev_type.contains("shell_call_command") {
-        Some("shell")
-    } else if ev_type.contains("mcp_call_arguments") {
-        Some("mcp")
-    } else if ev_type.contains("custom_tool_call_input") {
-        Some("custom_tool")
-    } else {
-        None
-    }
-}
-
-/// RSP-6/2.30：`response.output_item.done` 的非 function_call 工具 item 类型
-/// → 派生工具名，覆盖内置工具（与 [`responses_derived_tool_kind`] 的 delta
-/// 路径同名，保证 item-done 路径与 delta/非流路径同结论）。
-pub(crate) fn responses_item_tool_name(item_type: &str) -> Option<&'static str> {
-    if item_type.contains("code_interpreter") {
-        Some("code_interpreter")
-    } else if item_type.contains("shell") {
-        Some("shell")
-    } else if item_type.contains("mcp") {
-        Some("mcp")
-    } else if item_type.contains("custom_tool") {
-        Some("custom_tool")
-    } else {
-        None
-    }
 }
 
 /// ARC-3/D3：三协议 tool 调用提取单一核心，流式分片与非流两路径共用同一三臂
@@ -543,19 +516,24 @@ pub(crate) fn extract_tool_calls_with(
                 && let Some(item) = payload.get("item")
             {
                 let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let derived = responses_item_tool_name(type_str);
+                let idx = payload
+                    .get("output_index")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(0);
+                // A/M-1：内置工具（code_interpreter/shell/mcp/computer/custom_tool/
+                // 检索）经共享派生路径 `derived_item_tool_call`，与非流 `output[]`
+                // 同结论（parity 由 `responses_output_stream_nonstream_parity` 锁定）。
+                if let Some(c) = derived_item_tool_call(emit_warn, idx, item, type_str) {
+                    out.push(c);
+                    return out;
+                }
+                // function_call 等其余形态维持既有内联提取。
                 let is_tool = type_str.contains("function_call")
-                    || derived.is_some()
-                    || retrieval_tool_name(type_str).is_some()
                     || item.get("name").is_some()
                     || item.get("arguments").is_some()
                     || item.get("input").is_some();
                 if is_tool {
-                    let idx = payload
-                        .get("output_index")
-                        .and_then(|x| x.as_u64())
-                        .map(|n| n as u32)
-                        .unwrap_or(0);
                     let mut args = ["arguments", "code", "command", "input"]
                         .iter()
                         .find_map(|k| item.get(*k))
@@ -567,8 +545,6 @@ pub(crate) fn extract_tool_calls_with(
                             }
                         })
                         .unwrap_or_default();
-                    // C10：检索完成项参按 queries 回退（与流式分片同结论）；
-                    // RSP-6：shell 等内置工具参数位于 `action` 对象内。
                     if args.is_empty()
                         && let Some(obj) = item.as_object()
                     {
@@ -582,9 +558,7 @@ pub(crate) fn extract_tool_calls_with(
                     let name = item
                         .get("name")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| derived.map(str::to_string))
-                        .or_else(|| retrieval_tool_name(type_str).map(|s| s.to_string()));
+                        .map(|s| s.to_string());
                     let id_raw = item
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -650,6 +624,7 @@ pub(crate) fn extract_tool_calls_with(
                     let is_tool = item_type.contains("function_call")
                         || item_type.contains("custom_tool_call")
                         || item_type.contains("tool")
+                        || responses_item_tool_name(item_type).is_some()
                         || retrieval_tool_name(item_type).is_some()
                         || item.get("name").is_some()
                         || item.get("arguments").is_some()
@@ -658,29 +633,7 @@ pub(crate) fn extract_tool_calls_with(
                         continue;
                     }
                     let bucket = responses_output_bucket(item, i);
-                    // C10 检索调用直建条目（与非流同形：名派生+queries 回退）。
-                    if let Some(obj) = item.as_object()
-                        && let Some(rname) = retrieval_tool_name(item_type)
-                    {
-                        let id_raw = obj
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| obj.get("call_id").and_then(|v| v.as_str()));
-                        let name = obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .or_else(|| Some(rname.to_string()));
-                        let (id, id_synth) = synth_tool_id_with(emit_warn, bucket, id_raw);
-                        out.push(ToolCall {
-                            index: bucket,
-                            id,
-                            name,
-                            args: retrieval_args(obj),
-                            id_synth,
-                        });
-                        continue;
-                    }
+                    // 嵌套 custom 方言（非官方 Responses 形态）保持既有 custom_obj_to_call。
                     if let Some(obj) = item.as_object()
                         && let Some(Value::Object(inner)) = obj.get("custom_tool_call")
                         && let Some(c) = custom_obj_to_call(emit_warn, bucket, inner)
@@ -688,6 +641,13 @@ pub(crate) fn extract_tool_calls_with(
                         out.push(c);
                         continue;
                     }
+                    // A/M-1：内置（非 function_call）工具条目经共享派生路径建条目
+                    // （名派生 + 参数三级回退），与 item-done 路径同结论。
+                    if let Some(c) = derived_item_tool_call(emit_warn, bucket, item, item_type) {
+                        out.push(c);
+                        continue;
+                    }
+                    // function/custom 等其余形态保持既有 custom_obj_to_call 路径。
                     if let Some(obj) = item.as_object()
                         && let Some(c) = custom_obj_to_call(emit_warn, bucket, obj)
                     {

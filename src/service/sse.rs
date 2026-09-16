@@ -23,6 +23,11 @@ pub use {emit::*, meta::*, parser::*};
 #[cfg(test)]
 mod tests;
 
+/// CR/行终止与溢出清队测试外迁兄弟文件（`tests.rs` 超 800 行拆分，纯搬不改逻辑）。
+#[cfg(test)]
+#[path = "sse/cr_tests.rs"]
+mod cr_tests;
+
 /// T4 快慢径/delta 切分回补：`select_emit` 两档语义 + 解析器分包等价。
 #[cfg(test)]
 mod speed_split_parity_tests {

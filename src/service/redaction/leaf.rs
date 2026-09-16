@@ -23,6 +23,9 @@ use {
 pub(crate) const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
 /// 归一化声明头值（同上）。
 pub(crate) const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
+/// 下游协议声明头（`x-veil-protocol`）：值为 `Protocol::wire_name`。名/值为线协议
+/// 常量，硬编码理由：下游按精确头名识别，改名即 BREAKING（与 `NORMALIZED_HEADER_NAME` 同址）。
+pub(crate) const PROTOCOL_HEADER_NAME: &str = "x-veil-protocol";
 
 // D1.8：以下三辅助生产零引用（生产走 `Config` 同名成员），`#[cfg(test)]` 收编。
 /// 占位符说明注入开关（与 `Config::is_falsy` 同口径）：`0/false/no/off` 关闭，
@@ -62,17 +65,7 @@ pub(crate) async fn prescan_custom(
     text: &str,
     cred_map: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut snapshot = HashMap::new();
-    for (kind, value, ..) in detector.scan_custom(text, cred_map).await {
-        let _ = kind;
-        if snapshot.contains_key(&value) {
-            continue;
-        }
-        if let Ok(tok) = scope.register(&value, false) {
-            snapshot.insert(value, tok);
-        }
-    }
-    snapshot
+    prescan_custom_inner(detector, scope, text, cred_map, false).await
 }
 
 /// 自定义预扫（响应侧）：注册进响应表。
@@ -82,13 +75,25 @@ pub(crate) async fn prescan_custom_response(
     text: &str,
     cred_map: &HashMap<String, String>,
 ) -> HashMap<String, String> {
+    prescan_custom_inner(detector, scope, text, cred_map, true).await
+}
+
+/// 共享私有实现：`is_response` 决定注册进请求表（`false`）还是响应表（`true`）；
+/// 去重与值→token 快照逻辑单一化，消除近同形重复（`I`/7.2）。
+async fn prescan_custom_inner(
+    detector: &PiiDetector,
+    scope: &PiiScope,
+    text: &str,
+    cred_map: &HashMap<String, String>,
+    is_response: bool,
+) -> HashMap<String, String> {
     let mut snapshot = HashMap::new();
     for (kind, value, ..) in detector.scan_custom(text, cred_map).await {
         let _ = kind;
         if snapshot.contains_key(&value) {
             continue;
         }
-        if let Ok(tok) = scope.register(&value, true) {
+        if let Ok(tok) = scope.register(&value, is_response) {
             snapshot.insert(value, tok);
         }
     }
@@ -106,7 +111,15 @@ pub(crate) fn redact_leaf(
     custom_snapshot: &HashMap<String, String>,
     text: String,
 ) -> String {
-    redact_leaf_inner(scope, detector, cred_map, custom_snapshot, None, text)
+    redact_leaf_inner(
+        scope,
+        detector,
+        cred_map,
+        custom_snapshot,
+        None,
+        false,
+        text,
+    )
 }
 
 /// 叶回调（请求侧，B3 铸造追踪）：与 [`redact_leaf`] 同语义，并把凭据替换
@@ -125,6 +138,7 @@ pub(crate) fn redact_leaf_tracked(
         cred_map,
         custom_snapshot,
         Some(minted),
+        false,
         text,
     )
 }
@@ -135,6 +149,7 @@ fn redact_leaf_inner(
     cred_map: &P2tSnapshot,
     custom_snapshot: &HashMap<String, String>,
     minted: Option<&MintedSet>,
+    is_response: bool,
     text: String,
 ) -> String {
     // 1) 凭据替换（长度降序单次；快照内预编译正则）；B3 汇总实际替换产出。
@@ -148,7 +163,7 @@ fn redact_leaf_inner(
     //    此处做区间保护：与凭据/占位符/已命中重叠则跳过）。
     let protected = protected_spans(&after_cred);
     let cred_spans = credential_spans(&after_cred, cred_map.map());
-    let mut extra = Vec::new();
+    let mut custom_hits = Vec::new();
     let mut keys: Vec<&String> = custom_snapshot.keys().collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
     for value in keys {
@@ -158,20 +173,31 @@ fn redact_leaf_inner(
         let mut from = 0;
         while let Some(idx) = after_cred[from..].find(value.as_str()) {
             let (s, e) = (from + idx, from + idx + value.len());
-            extra.push(("custom".to_string(), value.clone(), s, e));
+            custom_hits.push(("custom".to_string(), value.clone(), s, e));
             from = e.max(from + 1);
             if from >= after_cred.len() {
                 break;
             }
         }
     }
-    hits.extend(extra.into_iter().filter(|(_, v, s, e)| {
-        !protected
+    let overlaps = |s: &usize, e: &usize| {
+        protected
             .iter()
             .chain(cred_spans.iter())
             .any(|(a, b)| *a <= *s && *s < *b || *a < *e && *e <= *b || *s <= *a && *b <= *e)
-            && !cred_map.contains_key(v)
-    }));
+    };
+    if is_response {
+        // 响应侧：自定义命中并入检测命中后整体按区间/凭据重叠过滤。
+        hits.extend(custom_hits);
+        hits.retain(|(_, v, s, e)| !overlaps(s, e) && !cred_map.contains_key(v));
+    } else {
+        // 请求侧：仅过滤自定义命中（检测命中已在扫描内消解），逐项行为不变。
+        hits.extend(
+            custom_hits
+                .into_iter()
+                .filter(|(_, v, s, e)| !overlaps(s, e) && !cred_map.contains_key(v)),
+        );
+    }
     // 4) 仲裁 + 注册 + 位置化替换。
     let mut spans = Vec::new();
     for (kind, value, s, e) in arbitrate(hits) {
@@ -179,7 +205,7 @@ fn redact_leaf_inner(
         let tok = if let Some(t) = custom_snapshot.get(&value) {
             t.clone()
         } else {
-            match scope.register(&value, false) {
+            match scope.register(&value, is_response) {
                 Ok(t) => t,
                 Err(_) => continue,
             }
@@ -189,7 +215,8 @@ fn redact_leaf_inner(
     apply_spans(&after_cred, &spans, false)
 }
 
-/// 叶回调（响应侧）：注册进响应表（不进请求还原表）。
+/// 叶回调（响应侧）：注册进响应表（不进请求还原表）；与请求侧共用
+/// [`redact_leaf_inner`]（`is_response = true`），行为逐项等价。
 pub(crate) fn redact_leaf_response(
     scope: &PiiScope,
     detector: &PiiDetector,
@@ -197,48 +224,7 @@ pub(crate) fn redact_leaf_response(
     custom_snapshot: &HashMap<String, String>,
     text: String,
 ) -> String {
-    let after_cred = cred_map.redact(&text);
-    let mut hits = detector.scan_spans_sync(&after_cred, cred_map.map());
-    let protected = protected_spans(&after_cred);
-    let cred_spans = credential_spans(&after_cred, cred_map.map());
-    let mut keys: Vec<&String> = custom_snapshot.keys().collect();
-    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
-    for value in keys {
-        if value.is_empty() {
-            continue;
-        }
-        let mut from = 0;
-        while let Some(idx) = after_cred[from..].find(value.as_str()) {
-            let (s, e) = (from + idx, from + idx + value.len());
-            hits.push(("custom".to_string(), value.clone(), s, e));
-            from = e.max(from + 1);
-            if from >= after_cred.len() {
-                break;
-            }
-        }
-    }
-    let hits: Vec<_> =
-        hits.into_iter()
-            .filter(|(_, v, s, e)| {
-                !protected.iter().chain(cred_spans.iter()).any(|(a, b)| {
-                    *a <= *s && *s < *b || *a < *e && *e <= *b || *s <= *a && *b <= *e
-                }) && !cred_map.contains_key(v)
-            })
-            .collect();
-    let mut spans = Vec::new();
-    for (kind, value, s, e) in arbitrate(hits) {
-        let _ = kind;
-        let tok = if let Some(t) = custom_snapshot.get(&value) {
-            t.clone()
-        } else {
-            match scope.register(&value, true) {
-                Ok(t) => t,
-                Err(_) => continue,
-            }
-        };
-        spans.push((s, e, tok));
-    }
-    apply_spans(&after_cred, &spans, false)
+    redact_leaf_inner(scope, detector, cred_map, custom_snapshot, None, true, text)
 }
 
 /// 扫描文本中的占位符形态（凭据/PII 完整形），返回 `(起始, 结束, token)` 字节区间。

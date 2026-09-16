@@ -169,6 +169,7 @@ impl MetricsStore {
                     Some("silent_discard") => entry.t_silent += 1,
                     Some("open_ended") => entry.t_open += 1,
                     Some("synthesized_failed") => entry.t_synth += 1,
+                    Some("upstream_error") => entry.t_upstream_error += 1,
                     _ => {}
                 }
             }
@@ -310,6 +311,7 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             t_silent INTEGER NOT NULL DEFAULT 0,
             t_open INTEGER NOT NULL DEFAULT 0,
             t_synth INTEGER NOT NULL DEFAULT 0,
+            t_upstream_error INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(window, protocol));
          CREATE TABLE IF NOT EXISTS metrics_hourly(
@@ -327,6 +329,7 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             t_silent INTEGER NOT NULL DEFAULT 0,
             t_open INTEGER NOT NULL DEFAULT 0,
             t_synth INTEGER NOT NULL DEFAULT 0,
+            t_upstream_error INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(window, protocol));
          CREATE TABLE IF NOT EXISTS metrics_five_min(
@@ -344,6 +347,7 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             t_silent INTEGER NOT NULL DEFAULT 0,
             t_open INTEGER NOT NULL DEFAULT 0,
             t_synth INTEGER NOT NULL DEFAULT 0,
+            t_upstream_error INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(window, protocol));",
     )?;
@@ -356,6 +360,7 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             "pii_hits",
             "cred_hits",
             "audit_blocks",
+            "t_upstream_error",
         ] {
             let _ = conn.execute(
                 &format!("ALTER TABLE {table} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
@@ -431,8 +436,8 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
         let sql = format!(
             "INSERT INTO {table}(window, protocol, requests, prompt_tokens, completion_tokens, \
              total_tokens, cached_read, cached_write, unknown, pii_hits, cred_hits, audit_blocks, \
-             t_silent, t_open, t_synth, buckets) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+             t_silent, t_open, t_synth, t_upstream_error, buckets) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
              ON CONFLICT(window, protocol) DO UPDATE SET \
              requests=excluded.requests, prompt_tokens=excluded.prompt_tokens, \
              completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens, \
@@ -440,7 +445,7 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
              unknown=excluded.unknown, pii_hits=excluded.pii_hits, cred_hits=excluded.cred_hits, \
              audit_blocks=excluded.audit_blocks, \
              t_silent=excluded.t_silent, t_open=excluded.t_open, t_synth=excluded.t_synth, \
-             buckets=excluded.buckets"
+             t_upstream_error=excluded.t_upstream_error, buckets=excluded.buckets"
         );
         conn.execute(
             &sql,
@@ -460,6 +465,7 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
                 agg.t_silent as i64,
                 agg.t_open as i64,
                 agg.t_synth as i64,
+                agg.t_upstream_error as i64,
                 buckets_encode(&agg.buckets),
             ],
         )?;
@@ -574,6 +580,9 @@ pub(crate) async fn sample_flush_driver(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod migration_tests;
 
 #[cfg(test)]
 mod reliability_tests;

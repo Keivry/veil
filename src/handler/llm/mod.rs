@@ -3,7 +3,10 @@
 //! 对外 `handler::*` 路径不变。
 
 use {
-    crate::service::llm_gateway::{self, GatewayMetrics, Protocol},
+    crate::service::{
+        llm_gateway::{self, GatewayMetrics, Protocol},
+        redaction::leaf::PROTOCOL_HEADER_NAME,
+    },
     axum::{
         Json,
         http::{HeaderMap, StatusCode, header},
@@ -58,7 +61,7 @@ pub(crate) fn protocol_header_value(protocol: Protocol) -> &'static str { protoc
 /// T10/D9：网关生成响应统一置 `x-veil-protocol`（与成功/阻断分支口径一致）。
 pub(crate) fn with_protocol_header(mut resp: Response, protocol: Protocol) -> Response {
     resp.headers_mut().insert(
-        "x-veil-protocol",
+        PROTOCOL_HEADER_NAME,
         header::HeaderValue::from_static(protocol_header_value(protocol)),
     );
     resp

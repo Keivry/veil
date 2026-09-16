@@ -59,8 +59,8 @@ fn chat_multi_choice_same_index_isolated_by_ci() {
 
 #[test]
 fn item_done_type_coverage() {
-    // RSP-6/2.30：`output_item.done` 覆盖非 function_call 工具 item 类型，
-    // 各类型均派生工具名并携带非空参数（与 delta/非流路径同结论）。
+    // RSP-6/2.30 + A/M-1：`output_item.done` 与非流 `output[]` 全量体均覆盖非
+    // function_call 工具 item 类型，两路径派生同名且携带非空参数（同结论）。
     let cases = [
         (
             serde_json::json!({"type":"function_call","id":"i1","name":"run","arguments":"{\"x\":1}"}),
@@ -93,8 +93,9 @@ fn item_done_type_coverage() {
     ];
     for (item, expect_name) in cases {
         let ty = item["type"].as_str().expect("item type").to_string();
-        let payload =
-            serde_json::json!({"type":"response.output_item.done","output_index":3,"item":item});
+        let payload = serde_json::json!(
+            {"type":"response.output_item.done","output_index":3,"item":item.clone()}
+        );
         let calls = extract_tool_calls(Protocol::Responses, &payload);
         assert_eq!(calls.len(), 1, "{ty} 须进 item-done 审计: {calls:?}");
         assert_eq!(calls[0].index, 3, "{ty} 桶号");
@@ -104,6 +105,207 @@ fn item_done_type_coverage() {
             "{ty} 派生名须一致"
         );
         assert!(!calls[0].args.is_empty(), "{ty} 参非空: {calls:?}");
+
+        // 1.3：非流 `output[]` 全量体同条目须同结论。
+        let mut body_item = item;
+        body_item["output_index"] = serde_json::json!(3);
+        let body = serde_json::json!({"output": [body_item]});
+        let body_calls = extract_tool_calls(Protocol::Responses, &body);
+        assert_eq!(
+            body_calls.len(),
+            1,
+            "{ty} 须进非流 output[] 审计: {body_calls:?}"
+        );
+        assert_eq!(body_calls[0].index, 3, "{ty} 非流桶号");
+        assert_eq!(
+            body_calls[0].name.as_deref(),
+            Some(expect_name),
+            "{ty} 非流 output[] 派生名须一致"
+        );
+        assert!(
+            !body_calls[0].args.is_empty(),
+            "{ty} 非流参非空: {body_calls:?}"
+        );
+    }
+}
+
+#[test]
+fn responses_output_builtin_tools_audited() {
+    // A/M-1：非流 Responses `output[]` 内置工具经派生名路径审计——各条目派生名
+    // 非空且 args 非空（真实条目：`code_interpreter_call` 携带 `code`、
+    // `shell_call`/`computer_call` 携带 `action`）。
+    let cases = [
+        (
+            serde_json::json!({"type":"function_call","id":"b1","name":"run","arguments":"{\"x\":1}"}),
+            "run",
+        ),
+        (
+            serde_json::json!({"type":"custom_tool_call","id":"b2","input":"{\"y\":2}"}),
+            "custom_tool",
+        ),
+        (
+            serde_json::json!({"type":"code_interpreter_call","id":"b3","code":"print(1)"}),
+            "code_interpreter",
+        ),
+        (
+            serde_json::json!({"type":"shell_call","id":"b4","action":{"command":"ls"}}),
+            "shell",
+        ),
+        (
+            serde_json::json!({"type":"mcp_call","id":"b5","arguments":"{\"p\":1}"}),
+            "mcp",
+        ),
+        (
+            serde_json::json!({"type":"file_search_call","id":"b6","queries":["q"]}),
+            "file_search",
+        ),
+        (
+            serde_json::json!({"type":"web_search_call","id":"b7","action":{"query":"q"}}),
+            "web_search",
+        ),
+        (
+            serde_json::json!({"type":"computer_call","id":"b8","action":{"type":"click","x":1}}),
+            "computer",
+        ),
+    ];
+    for (item, expect_name) in cases {
+        let ty = item["type"].as_str().expect("item type").to_string();
+        let body = serde_json::json!({"output": [item]});
+        let calls = extract_tool_calls(Protocol::Responses, &body);
+        assert_eq!(calls.len(), 1, "{ty} 须进非流 output[] 审计: {calls:?}");
+        assert_eq!(
+            calls[0].name.as_deref(),
+            Some(expect_name),
+            "{ty} 派生名须非空且一致"
+        );
+        assert!(
+            calls[0].name.as_deref().is_some_and(|n| !n.is_empty()),
+            "{ty} 派生名非空"
+        );
+        assert!(!calls[0].args.is_empty(), "{ty} args 非空: {calls:?}");
+    }
+}
+
+#[test]
+fn responses_output_stream_nonstream_parity() {
+    // A/G/6.2：同一工具条目经 `response.output_item.done`（流）与非流 `output[]`
+    // 两路径提取，`(name, args, bucket)` 须逐一致（冲突即失败）。
+    let items = [
+        serde_json::json!({"type":"function_call","id":"p1","name":"run","arguments":"{\"x\":1}"}),
+        serde_json::json!({"type":"custom_tool_call","id":"p2","input":"{\"y\":2}"}),
+        serde_json::json!({"type":"code_interpreter_call","id":"p3","code":"print(1)"}),
+        serde_json::json!({"type":"shell_call","id":"p4","action":{"command":"ls"}}),
+        serde_json::json!({"type":"mcp_call","id":"p5","arguments":"{\"p\":1}"}),
+        serde_json::json!({"type":"file_search_call","id":"p6","queries":["q"]}),
+        serde_json::json!({"type":"web_search_call","id":"p7","action":{"query":"q"}}),
+        serde_json::json!({"type":"computer_call","id":"p8","action":{"type":"click","x":1}}),
+    ];
+    for item in items {
+        let ty = item["type"].as_str().expect("item type").to_string();
+        let done_payload = serde_json::json!(
+            {"type":"response.output_item.done","output_index":3,"item":item.clone()}
+        );
+        let mut body_item = item;
+        body_item["output_index"] = serde_json::json!(3);
+        let stream = extract_tool_calls(Protocol::Responses, &done_payload);
+        let nonstream = extract_tool_calls(
+            Protocol::Responses,
+            &serde_json::json!({"output": [body_item]}),
+        );
+        assert_eq!(stream.len(), 1, "{ty} item-done 须建恰一条目");
+        assert_eq!(nonstream.len(), 1, "{ty} output[] 须建恰一条目");
+        assert_eq!(
+            (
+                stream[0].name.as_deref(),
+                stream[0].args.as_str(),
+                stream[0].index
+            ),
+            (
+                nonstream[0].name.as_deref(),
+                nonstream[0].args.as_str(),
+                nonstream[0].index
+            ),
+            "{ty} 流/非流 (name, args, bucket) 须逐一致"
+        );
+    }
+}
+
+#[test]
+fn responses_computer_call_audited() {
+    // B/2.1：`computer_call` 经 `contains("computer")` 分支派生名 `"computer"`，
+    // 流式 `response.output_item.done` 与非流 `output[]` 两路径同结论；参数取
+    // item 的 `action` 字段（serde 序列化）。`computer_use_preview`/
+    // `computer_call_output` 型 item 由同一 `contains("computer")` 分支覆盖。
+    let cases = [
+        (
+            serde_json::json!({"type":"computer_call","id":"c1","action":{"type":"click","x":1,"y":2}}),
+            "computer_call",
+        ),
+        (
+            serde_json::json!({"type":"computer_use_preview","id":"c2","action":{"type":"screenshot"}}),
+            "computer_use_preview",
+        ),
+        (
+            serde_json::json!({"type":"computer_call_output","id":"c3","action":{"type":"keypress","keys":["a"]}}),
+            "computer_call_output",
+        ),
+    ];
+    for (item, ty) in cases {
+        let action = item["action"].clone();
+        let expect_args = serde_json::to_string(&action).expect("action 序列化");
+
+        // 流式路径：`response.output_item.done`。
+        let done_payload = serde_json::json!(
+            {"type":"response.output_item.done","output_index":3,"item":item.clone()}
+        );
+        let stream = extract_tool_calls(Protocol::Responses, &done_payload);
+        assert_eq!(stream.len(), 1, "{ty} item-done 须建恰一条目: {stream:?}");
+        assert_eq!(
+            stream[0].name.as_deref(),
+            Some("computer"),
+            "{ty} item-done 派生名须恰为 computer"
+        );
+        assert!(!stream[0].args.is_empty(), "{ty} item-done args 非空");
+        assert_eq!(
+            stream[0].args, expect_args,
+            "{ty} item-done args 须来自 action 序列化"
+        );
+
+        // 非流路径：`output[]` 全量体。
+        let mut body_item = item;
+        body_item["output_index"] = serde_json::json!(3);
+        let body = serde_json::json!({"output": [body_item]});
+        let nonstream = extract_tool_calls(Protocol::Responses, &body);
+        assert_eq!(
+            nonstream.len(),
+            1,
+            "{ty} output[] 须建恰一条目: {nonstream:?}"
+        );
+        assert_eq!(
+            nonstream[0].name.as_deref(),
+            Some("computer"),
+            "{ty} output[] 派生名须恰为 computer"
+        );
+        assert!(!nonstream[0].args.is_empty(), "{ty} output[] args 非空");
+        assert_eq!(
+            nonstream[0].args, expect_args,
+            "{ty} output[] args 须来自 action 序列化"
+        );
+
+        // 两路径 (name, args, bucket) 逐一致。
+        assert_eq!(
+            (
+                stream[0].name.as_deref(),
+                stream[0].args.as_str(),
+                stream[0].index
+            ),
+            (
+                nonstream[0].name.as_deref(),
+                nonstream[0].args.as_str(),
+                nonstream[0].index
+            ),
+            "{ty} 流/非流 (name, args, bucket) 须逐一致"
+        );
     }
 }
 

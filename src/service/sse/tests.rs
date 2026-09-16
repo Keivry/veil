@@ -573,38 +573,6 @@ fn sse_cross_block_event_fifo() {
 }
 
 #[test]
-fn pending_events_hard_cap_drops_oldest() {
-    // D2：连续 >8 个 `event:`-only 块丢**最旧**（FIFO 窗口保留最新 8 个），
-    // 计数经 `take_*` 观测并清零；消费点语义不变（存活窗口仍按 FIFO 配对）。
-    let mut p = SseParser::new();
-    for i in 0..10usize {
-        assert!(
-            p.push_bytes(format!("event: e{i}\n\n").as_bytes())
-                .is_empty(),
-            "纯信封块不得单独分发"
-        );
-    }
-    assert_eq!(p.take_pending_events_dropped(), 2, "10-8=2 个最旧被丢");
-    assert_eq!(p.take_pending_events_dropped(), 0, "take 后清零");
-    for i in 2..10usize {
-        let evs = p.push_bytes(b"data: x\n\n");
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].event_type.as_deref(), Some(format!("e{i}").as_str()));
-        assert_eq!(evs[0].data, "x");
-    }
-    assert_eq!(p.sse_event_count, 8, "丢弃不改事件计数口径");
-    // 未超限（恰 8 个）不丢不计数。
-    let mut q = SseParser::new();
-    for i in 0..8usize {
-        assert!(
-            q.push_bytes(format!("event: f{i}\n\n").as_bytes())
-                .is_empty()
-        );
-    }
-    assert_eq!(q.take_pending_events_dropped(), 0, "恰 8 个不丢");
-}
-
-#[test]
 fn sse_last_event_id_persists() {
     // TRN-1：WHATWG last-event-id——最近 `id` 对后续无 `id` 事件持续生效，
     // 空值 `id:` 重置。
@@ -681,77 +649,4 @@ fn sse_id_and_retry_fields_captured() {
     assert_eq!(evs[0].retry, Some(3000));
     let bad = p.push_bytes(b"retry: 3x\ndata: v\n\n");
     assert_eq!(bad[0].retry, None, "非数字 retry 不得解析");
-}
-
-#[test]
-fn sse_data_frame_multiline_split() {
-    // A-5/F-07：出口含换行载荷拆为多条带前缀行、无裸行，且与解析侧
-    // WHATWG 单 `\n` 连接严格互逆（逐字节还原原载荷）。
-    let frame = data_frame("event: message\n", "第一行\n第二行");
-    assert_eq!(
-        frame, "event: message\ndata: 第一行\ndata: 第二行\n\n",
-        "信封前缀原样透出、data 按行拆分、尾部恰一空行"
-    );
-    assert!(
-        frame
-            .lines()
-            .all(|l| l.is_empty() || l.starts_with("data: ") || l.starts_with("event: ")),
-        "不得输出无前缀裸行: {frame:?}"
-    );
-
-    let mut p = SseParser::new();
-    let evs = p.push_bytes(frame.as_bytes());
-    assert_eq!(evs.len(), 1, "拆分行重组恰一事件: {evs:?}");
-    assert_eq!(evs[0].event_type.as_deref(), Some("message"));
-    assert_eq!(evs[0].data, "第一行\n第二行", "出口拆分与解析连接互逆");
-
-    // 单行/空载荷与既有 format 构造逐字节等价。
-    assert_eq!(data_frame("", "{\"a\":1}"), "data: {\"a\":1}\n\n");
-    assert_eq!(data_frame("", ""), "data: \n\n");
-    assert_eq!(data_frame("id: 7\n", "x"), "id: 7\ndata: x\n\n");
-}
-
-#[test]
-fn sse_multiline_data_roundtrip() {
-    // A-5/F-07 + 11.3（覆盖缺口）：出口 `data_frame` 按 `\n` 拆多条 `data:` 行与
-    // 解析侧 WHATWG 单 `\n` 连接严格互逆——多行载荷（含首尾/连续换行）逐字节还原；
-    // `event:`/`id:`/`retry:` 信封不参与拆分、字段原样回读。
-    // 注：拆分单元为 `\n`（A-5 定义），载荷内裸 `\r` 不属本互逆口径（WHATWG 视 CR 为行终止）。
-    let prefix = "event: message\nid: abc\nretry: 3000\n";
-    for payload in [
-        "第一行\n第二行",
-        "a\n\nb",
-        "trailing\n",
-        "\nleading",
-        "l1\nl2\nl3\nl4",
-        "{\"k\":\"v\"}\n{}",
-    ] {
-        let frame = data_frame(prefix, payload);
-        for line in frame.lines() {
-            assert!(
-                line.is_empty()
-                    || line.starts_with("data: ")
-                    || line.starts_with("event: ")
-                    || line.starts_with("id: ")
-                    || line.starts_with("retry: "),
-                "不得输出无前缀裸行: {frame:?}"
-            );
-        }
-        let mut p = SseParser::new();
-        let evs = p.push_bytes(frame.as_bytes());
-        assert_eq!(evs.len(), 1, "拆分行须重组恰一事件: {frame:?}");
-        assert_eq!(
-            evs[0].data, payload,
-            "出口拆分与解析连接须逐字节互逆: {frame:?}"
-        );
-        assert_eq!(evs[0].event_type.as_deref(), Some("message"));
-        assert_eq!(evs[0].id.as_deref(), Some("abc"));
-        assert_eq!(evs[0].retry, Some(3000));
-        assert_eq!(p.sse_event_count, 1, "恰一数据事件计数");
-    }
-    // 无信封前缀的多行载荷同样互逆。
-    let frame = data_frame("", "x\ny");
-    assert_eq!(frame, "data: x\ndata: y\n\n");
-    let mut p = SseParser::new();
-    assert_eq!(p.push_bytes(frame.as_bytes())[0].data, "x\ny");
 }

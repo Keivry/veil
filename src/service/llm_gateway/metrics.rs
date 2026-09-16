@@ -51,8 +51,14 @@ impl<const N: usize> KeyedCounters<N> {
 }
 
 pub(super) const LENIENT_TAIL_KEYS: [&str; 3] = ["chat/completions", "v1/messages", "v1/responses"];
-pub(super) const TRUNCATED_MODE_KEYS: [&str; 3] =
-    ["silent_discard", "open_ended", "synthesized_failed"];
+/// 截断态白名单（四态，与 `sse::TruncatedMode` 四变体及 `aggregate::TRUNCATED_MODES` 同集）。
+/// `pub(crate)`：四态落点行为测试需跨模块比对白名单（N/10.4）。
+pub(crate) const TRUNCATED_MODE_KEYS: [&str; 4] = [
+    "silent_discard",
+    "open_ended",
+    "synthesized_failed",
+    "upstream_error",
+];
 pub(super) const HOP_DIR_KEYS: [&str; 2] = ["upstream", "downstream"];
 pub(super) const CONV_MISSING_KEYS: [&str; 5] = [
     "failed",
@@ -65,7 +71,7 @@ pub(super) const CONV_MISSING_KEYS: [&str; 5] = [
 #[derive(Debug)]
 pub struct GatewayMetrics {
     lenient: KeyedCounters<3>,
-    truncated: KeyedCounters<3>,
+    truncated: KeyedCounters<4>,
     hop_filtered: KeyedCounters<2>,
     conv_missing: KeyedCounters<5>,
     sse_events: AtomicU64,
@@ -83,6 +89,12 @@ pub struct GatewayMetrics {
     admin_rate_evicted: AtomicU64,
     /// RUN-4：上游响应体读取失败（`chunk()`/`bytes()` 报错）的累计次数。
     upstream_read_errors: AtomicU64,
+    /// D12：会话作用域——`get_or_insert` 命中既有会话条目的复用次数。
+    conversation_reuse: AtomicU64,
+    /// D12：会话作用域——LRU 容量/空闲 TTL 淘汰的条目累计条数。
+    conversation_eviction: AtomicU64,
+    /// D12：会话作用域——会话键推导失败回退逐请求的次数（`request` 模式恒 0）。
+    request_fallback: AtomicU64,
 }
 
 impl Default for GatewayMetrics {
@@ -100,6 +112,9 @@ impl Default for GatewayMetrics {
             terminal_fallback: AtomicU64::new(0),
             admin_rate_evicted: AtomicU64::new(0),
             upstream_read_errors: AtomicU64::new(0),
+            conversation_reuse: AtomicU64::new(0),
+            conversation_eviction: AtomicU64::new(0),
+            request_fallback: AtomicU64::new(0),
         }
     }
 }
@@ -187,4 +202,29 @@ impl GatewayMetrics {
     pub fn upstream_read_error_count(&self) -> u64 {
         self.upstream_read_errors.load(Ordering::Relaxed)
     }
+
+    /// D12：会话作用域条目复用（`get_or_insert` 命中既有键）。
+    pub fn record_conversation_reuse(&self) {
+        self.conversation_reuse.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// D12：会话作用域条目淘汰条数（LRU 容量 + 空闲 TTL），零不写入。
+    pub fn record_conversation_eviction(&self, n: u64) {
+        if n > 0 {
+            self.conversation_eviction.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// D12：会话键推导失败回退逐请求；`request` 模式恒 0（不触本方法）。
+    pub fn record_request_fallback(&self) { self.request_fallback.fetch_add(1, Ordering::Relaxed); }
+
+    pub fn conversation_reuse_count(&self) -> u64 {
+        self.conversation_reuse.load(Ordering::Relaxed)
+    }
+
+    pub fn conversation_eviction_count(&self) -> u64 {
+        self.conversation_eviction.load(Ordering::Relaxed)
+    }
+
+    pub fn request_fallback_count(&self) -> u64 { self.request_fallback.load(Ordering::Relaxed) }
 }

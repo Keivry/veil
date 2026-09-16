@@ -91,6 +91,7 @@ async fn pending_tool_frames_same_index_zero_byte_flood_bounded() {
             req_start: std::time::Instant::now(),
             pending: Arc::new(crate::approval::PendingApprovals::default()),
             normalized_out: false,
+            redact_only: false,
         },
         hold_max: 512,
         pii_boundary_chars: 0,

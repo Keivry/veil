@@ -155,6 +155,7 @@ async fn model_bucket_fallback_stream_and_nonstream() {
             req_start: Instant::now(),
             pending: Arc::new(PendingApprovals::default()),
             normalized_out: false,
+            redact_only: false,
         },
         hold_max: 1_048_576,
         pii_boundary_chars: 64,

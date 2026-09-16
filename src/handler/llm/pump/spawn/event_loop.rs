@@ -25,7 +25,8 @@ use {
             synth_flush::flush_pre_terminal,
             toolbuf::take_pending_tool_inputs,
         },
-        frame_feed::{drain_prefix_hold, feed_output_frame, guard_restored_frame_parsed},
+        frame_feed::{drain_prefix_hold, feed_output_frame},
+        restore_emit::{FrameSink, RestoredFrame, emit_restored_json_frame},
         setup::{PumpEnv, PumpLoopState},
     },
     crate::{
@@ -207,6 +208,7 @@ where
             if state.stream_first_id.is_none() {
                 state.stream_first_id = Some(id.clone());
             }
+            let _ = env.resp_scope.record_response_id(env.protocol, &id);
             state.conv_id = Some(id);
         }
         if let Some(m) = stream_model_of(v).filter(|m| !m.is_empty()) {
@@ -613,7 +615,14 @@ where
             } else if AuditHold::is_complete_event(v) && !approve_held {
                 state.hold.mark_completed();
             }
-            let restored_data = if env.protocol.is_anthropic()
+            // D/Q5/B-2：正常帧两臂（opaque 与常规）与残余帧共用
+            // `emit_restored_json_frame`——先守卫（失败回退占位符帧），再按
+            // 是否缓冲决定立即喂出或暂存守卫产物。
+            let prefix = envelope_prefix(ev);
+            if event_terminal {
+                state.terminal_sent = true;
+            }
+            let (restored_data, emitted) = if env.protocol.is_anthropic()
                 && is_anthropic_opaque_event(v)
                 && !is_anthropic_thinking_event(v)
             {
@@ -623,7 +632,26 @@ where
                 let (restored, _spans) = env
                     .resp_scope
                     .restore_response_with_spans_json(&env.resp_vault, &ev.data);
-                guard_restored_frame_parsed(restored, &ev.data, parsed.as_ref(), &env.metrics)
+                emit_restored_json_frame(
+                    &mut FrameSink {
+                        prefix_hold: &mut state.prefix_hold,
+                        boundary: &mut state.boundary,
+                        detector: &env.resp_detector,
+                        vault: &env.resp_vault,
+                        boundary_spans,
+                        agg: &mut state.agg,
+                    },
+                    RestoredFrame {
+                        prefix: &prefix,
+                        restored,
+                        placeholder: &ev.data,
+                        placeholder_parsed: parsed.as_ref(),
+                        json_aware: false,
+                        feed: !buffer_tool_frame,
+                    },
+                    &env.metrics,
+                )
+                .await
             } else {
                 // MSP-4/2.28：thinking 明文 opaque 增量与其他文本同路——接入
                 // `TokenCarry` 做跨帧缝合，不绕过携带。
@@ -640,17 +668,28 @@ where
                         &spans,
                     )
                     .await;
-                guard_restored_frame_parsed(
-                    crate::service::sse::json_aware_line(&scanned, |s| s),
-                    &cleaned,
-                    (cleaned == ev.data).then_some(parsed.as_ref()).flatten(),
+                let parsed_opt = (cleaned == ev.data).then_some(parsed.as_ref()).flatten();
+                emit_restored_json_frame(
+                    &mut FrameSink {
+                        prefix_hold: &mut state.prefix_hold,
+                        boundary: &mut state.boundary,
+                        detector: &env.resp_detector,
+                        vault: &env.resp_vault,
+                        boundary_spans,
+                        agg: &mut state.agg,
+                    },
+                    RestoredFrame {
+                        prefix: &prefix,
+                        restored: scanned,
+                        placeholder: &cleaned,
+                        placeholder_parsed: parsed_opt,
+                        json_aware: true,
+                        feed: !buffer_tool_frame,
+                    },
                     &env.metrics,
                 )
+                .await
             };
-            let prefix = envelope_prefix(ev);
-            if event_terminal {
-                state.terminal_sent = true;
-            }
             // P0-3.1：未完成 tool 分片不进边界 hold、不进 `agg`
             // （hold-until-complete），直接缓冲还原后输入；完成帧走
             // 正常透传（此前缓冲已在本帧前重放进边界 hold）。
@@ -670,16 +709,6 @@ where
                     .push((tool_buckets, prefix, restored_data));
                 return EventFlow::Next;
             }
-            let emitted = feed_output_frame(
-                &mut state.prefix_hold,
-                &mut state.boundary,
-                &env.resp_detector,
-                &env.resp_vault,
-                &boundary_spans,
-                &mut state.agg,
-                (prefix, restored_data),
-            )
-            .await;
             if decide::should_suppress_held_output(
                 audit_hold_on,
                 state.hold.has_pending_fragments(),

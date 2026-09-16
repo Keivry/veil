@@ -1,20 +1,25 @@
 //! 请求级 `Scope` 脱敏外观（D2 自 `redaction.rs` 拆出）：请求/响应双侧编排。
 
-use super::{
+use {
     super::{
-        credential_vault::{CredentialVault, TOKEN_PREFIX, strip_cred_partials},
-        json_walk,
-        lock_recover::lock_or_recover,
-        pii::{PiiDetector, PiiScope},
+        super::{
+            credential_vault::{CredentialVault, TOKEN_PREFIX, strip_cred_partials},
+            json_walk,
+            llm_gateway::Protocol,
+            lock_recover::lock_or_recover,
+            pii::{PiiDetector, PiiScope},
+        },
+        conversation_key::{ConversationKey, ConversationWriteback, PreviousResponseMap},
+        leaf::{
+            find_sub_spans,
+            prescan_custom,
+            prescan_custom_response,
+            redact_leaf_response,
+            redact_leaf_tracked,
+            scan_token_forms,
+        },
     },
-    leaf::{
-        find_sub_spans,
-        prescan_custom,
-        prescan_custom_response,
-        redact_leaf_response,
-        redact_leaf_tracked,
-        scan_token_forms,
-    },
+    std::sync::Arc,
 };
 
 /// B3 请求级铸造集：仅记录本请求**脱敏实际产出**的凭据 token（`P2tSnapshot::redact`
@@ -41,22 +46,42 @@ impl MintedSet {
 
 /// 请求级作用域：PII 映射只活在本 Scope 内，请求结束即销毁，
 /// 跨请求 MUST NOT 互见；PII 还原只查本 Scope。
-#[derive(Debug)]
 pub struct Scope {
-    pii: PiiScope,
+    /// `request` 模式逐请求新建；`conversation` 模式为存储共享的 `Arc`。
+    pii: Arc<PiiScope>,
     response_side: bool,
     fuzzy_restore: bool,
-    /// B3：本请求脱敏实际产出的凭据 token（响应还原授权域）。
+    /// B3：本请求脱敏实际产出的凭据 token（响应还原授权域，恒逐请求）。
     minted: MintedSet,
+    /// 会话写回上下文：仅 `conversation` 模式且键推导成功时存在。
+    conversation: Option<ConversationWriteback>,
+}
+
+/// 手工 `Debug`（FIX 2）：会话写回上下文（会话键/租户指纹/HMAC 密钥）不得经
+/// `{:?}` 泄漏，仅暴露是否存在；其余字段保持既有呈现。
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scope")
+            .field("pii", &self.pii)
+            .field("response_side", &self.response_side)
+            .field("fuzzy_restore", &self.fuzzy_restore)
+            .field("minted", &self.minted)
+            .field(
+                "conversation",
+                &self.conversation.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for Scope {
     fn default() -> Self {
         Self {
-            pii: PiiScope::new(),
+            pii: Arc::new(PiiScope::new()),
             response_side: true,
             fuzzy_restore: false,
             minted: MintedSet::default(),
+            conversation: None,
         }
     }
 }
@@ -69,16 +94,53 @@ impl Scope {
     /// `fuzzy_restore` 开时残缺/宽松形态 token 按序号回查还原。
     pub fn with_opts(response_side: bool, fuzzy_restore: bool) -> Self {
         Self {
-            pii: PiiScope::new(),
+            pii: Arc::new(PiiScope::new()),
             response_side,
             fuzzy_restore,
             minted: MintedSet::default(),
+            conversation: None,
         }
+    }
+
+    /// 会话级作用域：PII 映射来自存储共享的 `Arc<PiiScope>`（跨轮复用），
+    /// 凭据 minted-set 仍逐请求独立（B3 不变）。
+    pub fn with_shared_pii(pii: Arc<PiiScope>, response_side: bool, fuzzy_restore: bool) -> Self {
+        Self {
+            pii,
+            response_side,
+            fuzzy_restore,
+            minted: MintedSet::default(),
+            conversation: None,
+        }
+    }
+
+    /// 挂载会话写回上下文：响应完成处据本会话键把上游响应 id 写入映射。
+    pub fn with_conversation(
+        mut self,
+        key: ConversationKey,
+        tenant_fingerprint: String,
+        secret: Arc<[u8]>,
+        previous_map: Arc<PreviousResponseMap>,
+    ) -> Self {
+        self.conversation = Some(ConversationWriteback::new(
+            key,
+            tenant_fingerprint,
+            secret,
+            previous_map,
+        ));
+        self
+    }
+
+    /// 响应完成写回（仅 `Protocol::Responses` 写入映射；无写回上下文时 no-op）。
+    pub fn record_response_id(&self, protocol: Protocol, response_id: &str) -> bool {
+        self.conversation
+            .as_ref()
+            .is_some_and(|wb| wb.record(protocol, response_id))
     }
 
     /// 底层的请求级 PII 容器（高级用法/断言）。
     #[cfg(test)]
-    pub(crate) fn pii_scope(&self) -> &PiiScope { &self.pii }
+    pub(crate) fn pii_scope(&self) -> &PiiScope { self.pii.as_ref() }
 
     /// 请求侧脱敏：凭据优先 → PII（内置+字典同步，自定义预扫异步）→ json-walk。
     /// 输出末尾统一 `_strip_partials` 残缺清理。

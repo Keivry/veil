@@ -81,16 +81,41 @@ fn strict_match(path: &str) -> Option<Protocol> {
 /// `T5`/D5：官方子资源排除。尾后缀的一层额外路径段若命中官方子资源，MUST NOT
 /// 判为对话协议（`lenient_match` 返回 `None` ⇒ `NonDialog` 字节透传），避免请求被
 /// 改写、响应被注入占位符或触发审计后处理：
-/// - Anthropic `v1/messages/{count_tokens|batches}`：独立端点，body 与响应形态均不同；
+/// - Anthropic `v1/messages/{batches}`：异步批处理元数据端点，body 与响应形态均不同；
 /// - Responses `v1/responses/{任意单段}`：均为响应对象检索（`.cancel`/`.input_items`
 ///   为两段后缀，`strict_match` 已不命中，天然 `NonDialog`，无需另列）。
+///
+/// `count_tokens` 已由 [`redact_only_protocol`] 收窄为 redact-only 对话变体，不再经
+/// 此排除（`C`/`veil-audit-r4-remediation`）：它在 `is_chat_tail` 中先于宽容匹配被
+/// **精确识别**为 `Protocol::Anthropic`，故不计 `chat_tail_lenient_total`。
 ///
 /// Chat 无同类官方子资源，保留一层宽容（`/v1/chat/completions/extra` 仍命中）。
 fn is_official_subresource(proto: Protocol, seg: &str) -> bool {
     if proto.is_anthropic() {
-        return seg.eq_ignore_ascii_case("count_tokens") || seg.eq_ignore_ascii_case("batches");
+        return seg.eq_ignore_ascii_case("batches");
     }
     proto.is_responses()
+}
+
+/// `C`/3.1：Anthropic `count_tokens` 官方子资源判定——**redact-only 对话变体**。
+///
+/// 仅 `/v1/messages/{count_tokens}`（大小写不敏感、剥离 query 与尾斜杠）命中，返回
+/// `Protocol::Anthropic`。**SHALL NOT 新增 `Protocol` 变体**——redact-only 切分由
+/// `RequestCtx::redact_only` 布尔标记承载（见 `handler/llm/dispatch.rs` 装配点）；
+/// `is_passthrough`（[`is_passthrough`]）/`is_dialog`（[`Protocol::is_dialog`]）语义不变。
+///
+/// 与 [`is_official_subresource`] 同源的一层子资源识别：本函数在 `is_chat_tail` 中先于
+/// `lenient_match` 拦截，故 `count_tokens` 归类为 `Anthropic` 而非 `NonDialog`，且不计
+/// 宽容计数；`batches` 仍由 `is_official_subresource` 排除为 `NonDialog` 字节透传。
+pub fn redact_only_protocol(path: &str) -> Option<Protocol> {
+    let p = strip_query(path);
+    let p = p.strip_suffix('/').unwrap_or(p);
+    let (parent, seg) = p.rsplit_once('/')?;
+    if seg.eq_ignore_ascii_case("count_tokens") && strict_match(parent) == Some(Protocol::Anthropic)
+    {
+        return Some(Protocol::Anthropic);
+    }
+    None
 }
 
 fn lenient_match(path: &str) -> Option<(Protocol, String)> {
@@ -124,6 +149,11 @@ fn lenient_match(path: &str) -> Option<(Protocol, String)> {
 
 pub fn is_chat_tail(path: &str, metrics: Option<&GatewayMetrics>) -> (bool, Protocol) {
     if let Some(proto) = strict_match(path) {
+        return (true, proto);
+    }
+    // C/3.1：`count_tokens` 为**精确识别**的 redact-only 对话变体（官方子资源，非宽容
+    // 命中），先于宽容匹配拦截，故不计 `chat_tail_lenient_total`。
+    if let Some(proto) = redact_only_protocol(path) {
         return (true, proto);
     }
     if let Some((proto, tail)) = lenient_match(path) {
@@ -247,10 +277,10 @@ mod tests {
 
     #[test]
     fn official_subresources_are_nondialog() {
-        // T5：官方子资源一层后缀须 NonDialog，且不得记宽容计数。
+        // T5 + C/3.1：`batches` 与 Responses 单段检索为 NonDialog，且不得记宽容计数；
+        // `count_tokens` 已收窄为 redact-only 对话变体（Anthropic，不计宽容）。
         let m = GatewayMetrics::default();
         for path in [
-            "/v1/messages/count_tokens",
             "/v1/messages/batches",
             "/v1/responses/abc123",
             "/v1/responses/abc123/cancel",
@@ -258,6 +288,18 @@ mod tests {
         ] {
             let (hit, proto) = is_chat_tail(path, Some(&m));
             assert!(!hit && proto == Protocol::NonDialog, "{path} 须 NonDialog");
+        }
+        for path in ["/v1/messages/count_tokens", "/V1/MESSAGES/COUNT_TOKENS"] {
+            let (hit, proto) = is_chat_tail(path, Some(&m));
+            assert!(
+                hit && proto == Protocol::Anthropic,
+                "{path} 须 redact-only Anthropic，实得 {proto:?}"
+            );
+            assert_eq!(
+                redact_only_protocol(path),
+                Some(Protocol::Anthropic),
+                "{path} redact-only sibling 判定须命中"
+            );
         }
         assert_eq!(m.lenient_count("v1/messages"), 0, "官方子资源不得记宽容");
         assert_eq!(m.lenient_count("v1/responses"), 0, "官方子资源不得记宽容");
@@ -310,14 +352,17 @@ mod tests {
                 pair.1
             );
         }
-        // 大小写宽容不放宽官方子资源排除。
-        for path in [
-            "/v1/MESSAGES/count_tokens",
-            "/v1/MESSAGES/batches",
-            "/V1/RESPONSES/abc123",
-        ] {
+        // 大小写宽容不放宽官方子资源排除；`count_tokens` 归 redact-only Anthropic（C）。
+        for path in ["/v1/MESSAGES/batches", "/V1/RESPONSES/abc123"] {
             let (hit, proto) = is_chat_tail(path, Some(&m));
             assert!(!hit && proto == Protocol::NonDialog, "{path} 须 NonDialog");
+        }
+        for path in ["/v1/MESSAGES/count_tokens", "/V1/Messages/Count_Tokens"] {
+            let (hit, proto) = is_chat_tail(path, Some(&m));
+            assert!(
+                hit && proto == Protocol::Anthropic,
+                "{path} 须 redact-only Anthropic，实得 {proto:?}"
+            );
         }
     }
 

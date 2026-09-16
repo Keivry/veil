@@ -50,6 +50,7 @@ fn test_ctx(protocol: Protocol) -> NonstreamCtx {
         req: RequestCtx {
             protocol,
             normalized_out: false,
+            redact_only: false,
             scope: Arc::new(Scope::new()),
             vault: Arc::new(CredentialVault::new()),
             detector: Arc::new(PiiDetector::new()),
@@ -724,4 +725,33 @@ async fn web_search_action_audit_hold_nonstream() {
         !text.contains("rm -rf"),
         "危险查询明文不得出现在下游: {text}"
     );
+}
+
+#[tokio::test]
+async fn redact_only_ignores_sse_content_type_no_pump() {
+    // FIX 4：redact-only（count_tokens）即使上游异常回 `text/event-stream`
+    // 也不得进 SSE 泵（契约：跳过四类后处理、字节保真）；按普通非流分支响应。
+    let client = reqwest::Client::new();
+    let upstream = br#"{"input_tokens":42}"#.to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", upstream.clone()).await;
+    let mut ctx = test_ctx(Protocol::Anthropic);
+    ctx.req.redact_only = true;
+    let outcome = serve_nonstream(
+        &client,
+        reqwest::Method::POST,
+        &url,
+        axum::http::HeaderMap::new(),
+        br#"{"model":"m","messages":[]}"#.to_vec(),
+        ctx,
+    )
+    .await;
+    server.abort();
+    let NonstreamOutcome::Responded(resp) = outcome else {
+        panic!("redact-only 异常 SSE content-type 不得转 SSE 泵");
+    };
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("响应体须可读");
+    assert_eq!(body.as_ref(), upstream.as_slice(), "须字节保真透传");
 }

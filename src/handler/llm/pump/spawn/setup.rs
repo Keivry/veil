@@ -102,6 +102,7 @@ pub(super) fn setup(
         req_start,
         pending: audit_pending,
         normalized_out: _,
+        redact_only: _,
     } = req;
     let (hold_max, pii_boundary_chars) = clamp_pump_limits(hold_max, pii_boundary_chars);
     let speed = if matches!(audit_mode, AuditMode::Off) {

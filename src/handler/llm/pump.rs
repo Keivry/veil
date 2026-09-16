@@ -66,6 +66,10 @@ pub struct RequestCtx {
     pub req_start: Instant,
     pub pending: Arc<PendingApprovals>,
     pub normalized_out: bool,
+    /// C/3.1：redact-only 对话变体标记（Anthropic `count_tokens`）——请求侧脱敏执行，
+    /// 响应侧还原/新 PII 扫描、审计判定、阻断合成、用量记账四类后处理显式跳过；
+    /// **不并入** `is_passthrough`/`is_dialog`（由 `dispatch.rs` 装配点写入）。
+    pub redact_only: bool,
 }
 
 /// 2.3 `stream_pump` 字节泵的上下文：共享请求上下文 + 流式专属字段。

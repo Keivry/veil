@@ -6,21 +6,55 @@
 
 pub fn keepalive_frame() -> String { ": keepalive\n\n".to_string() }
 
-/// A-5/F-07：SSE 出口 `data:` 帧唯一构造——含换行载荷按 `\n` 拆为多条带
-/// `data: ` 前缀的行后再补块终止空行，与解析侧 WHATWG 单 `\n` 连接
-/// （`parser.rs::feed_line` 多 `data:` 行合并）严格互逆；`prefix` 为
-/// `event:`/`id:`/`retry:` 信封前缀（原样透出，不受拆分影响），SHALL NOT
-/// 输出无前缀裸行（否则消费者静默截断到首行）。
+/// A-5/F-07：SSE 出口 `data:` 帧唯一构造——按行终止集合 `\n`/`\r\n`/`\r` 拆分
+/// 载荷，每行各补 `data: ` 前缀后补块终止空行；与解析侧行终止集合相关
+/// （`parser.rs::push_text` 同集合切行、多 `data:` 行以单 `\n` 连接，
+/// `parser.rs::dispatch_block`），SHALL NOT 把裸 CR 留在单条 `data:` 行内。
+/// 含裸 CR/CRLF 载荷按**已声明 LF 归一**（如 `a\rb` → `a\nb`），SHALL NOT
+/// 声称逐字节恒等。`prefix` 为 `event:`/`id:`/`retry:` 信封前缀（原样透出，
+/// 不受拆分影响），SHALL NOT 输出无前缀裸行（否则消费者静默截断到首行）。
 pub(crate) fn data_frame(prefix: &str, data: &str) -> String {
-    let mut out = String::with_capacity(prefix.len() + data.len() + data.matches('\n').count() + 8);
+    let terms = data.matches(['\n', '\r']).count();
+    let mut out = String::with_capacity(prefix.len() + data.len() + terms + 8);
     out.push_str(prefix);
-    for line in data.split('\n') {
+    for line in split_line_terminators(data) {
         out.push_str("data: ");
         out.push_str(line);
         out.push('\n');
     }
     out.push('\n');
     out
+}
+
+/// 按 SSE 行终止集合（`\n`/`\r\n`/`\r`）切分载荷为不含终止符的行序列；
+/// `\r\n` 视为单个终止符，与解析侧 `parser.rs` 行切分集合一致（切点恒落在
+/// ASCII 终止符字节边界，切片安全）。
+fn split_line_terminators(data: &str) -> Vec<&str> {
+    let bytes = data.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                lines.push(&data[start..i]);
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                start = i;
+            }
+            b'\n' => {
+                lines.push(&data[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    lines.push(&data[start..]);
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

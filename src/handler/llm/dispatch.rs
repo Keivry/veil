@@ -19,7 +19,10 @@ use {
             llm_gateway::{self, Protocol, resolve_protocol, resolve_upstream},
             redaction::{
                 Scope,
-                leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE},
+                derive_conversation_key,
+                explicit_header,
+                leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE, PROTOCOL_HEADER_NAME},
+                tenant_fingerprint,
             },
         },
         state::AppState,
@@ -120,6 +123,74 @@ fn parse_ingress_port(host: &str) -> Option<u16> {
     host.rsplit(':').next()?.trim().parse::<u16>().ok()
 }
 
+/// 租户指纹可区分凭据头（D2 可选次判别项）：Authorization / api-key。
+const CREDENTIAL_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-key"];
+
+/// 转发前剔除会话键头（含自定义头名，大小写不敏感）；返回是否确实剔除。
+pub(crate) fn strip_conversation_header(headers: &mut HeaderMap, header_name: &str) -> bool {
+    let name = header_name.to_ascii_lowercase();
+    headers.remove(name.as_str()).is_some()
+}
+
+/// 作用域选择（3.1）：`request` 逐请求 `PiiScope`；`conversation` 按 D1 四级推导
+/// 会话键并从共享存储取 `Arc<PiiScope>`，键不可推导时回退逐请求（缓存失配、不报错）。
+/// D12：`conversation` 模式下的逐请求回退计入 `request_fallback`（`request` 模式不计）。
+pub(crate) fn build_request_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    upstream_base: &str,
+    body: Option<&serde_json::Value>,
+) -> Arc<Scope> {
+    let response_side = state.config.pii_response_side;
+    let fuzzy_restore = state.config.pii_fuzzy_restore;
+    let per_request = || Arc::new(Scope::with_opts(response_side, fuzzy_restore));
+    if !state.config.pii_scope_mode.is_conversation() {
+        return per_request();
+    }
+    let Some(store) = state.conversation_scope_store.as_ref() else {
+        state.gateway_metrics.record_request_fallback();
+        return per_request();
+    };
+    let secret = state.conversation_secret.as_ref();
+    let explicit_raw = headers
+        .get(state.config.pii_scope_key_header.as_str())
+        .and_then(|v| v.to_str().ok());
+    let explicit = explicit_header(true, explicit_raw);
+    let prompt_cache_key = body
+        .and_then(|v| v.get("prompt_cache_key"))
+        .and_then(serde_json::Value::as_str);
+    let previous_response_id = body
+        .and_then(|v| v.get("previous_response_id"))
+        .and_then(serde_json::Value::as_str);
+    let credentials: Vec<&str> = CREDENTIAL_HEADER_NAMES
+        .iter()
+        .filter_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+        .collect();
+    let tenant_fp = tenant_fingerprint(secret, upstream_base, &credentials);
+    let Some(key) = derive_conversation_key(
+        secret,
+        &tenant_fp,
+        explicit.as_deref(),
+        prompt_cache_key,
+        previous_response_id,
+        body,
+        Some(&state.previous_response_map),
+    ) else {
+        // D12：键推导失败（纯多轮 messages 等）回退逐请求，不伪造键。
+        state.gateway_metrics.record_request_fallback();
+        return per_request();
+    };
+    let pii = store.get_or_insert(&key);
+    Arc::new(
+        Scope::with_shared_pii(pii, response_side, fuzzy_restore).with_conversation(
+            key,
+            tenant_fp,
+            state.conversation_secret.clone(),
+            state.previous_response_map.clone(),
+        ),
+    )
+}
+
 pub(crate) async fn gateway_serve(
     state: &AppState,
     parts: &mut axum::http::request::Parts,
@@ -134,6 +205,10 @@ pub(crate) async fn gateway_serve(
         .map(|s| s.to_string());
     // dispatcher 仅保留 protocol/url 分发。
     let protocol = resolve_protocol(path, ct.as_deref(), Some(&state.gateway_metrics));
+    // C/3.1：`count_tokens` 的 redact-only 语义由等价 sibling 判定产出（不新增
+    // `Protocol` 变体），在下方 RequestCtx 单一装配点写入；`is_passthrough` 仍只认
+    // `NonDialog`，故此处置位后 `count_tokens` 走对话臂（请求侧脱敏、跳过四类后处理）。
+    let redact_only = llm_gateway::redact_only_protocol(path).is_some();
     let is_chat = !llm_gateway::is_passthrough(protocol);
     // 入口宿主机端口（entry-transport）：`Host` 经 `parse_ingress_port` 解析
     //（方括号 IPv6/裸 IPv6/非法一律有定义），缺失/非法回退 None（缺省上游），不猜测。
@@ -157,10 +232,6 @@ pub(crate) async fn gateway_serve(
     // T3/D3：流式（SSE）分支用无总超时的独立 client，长流不被 `HTTP_TIMEOUT_SECS` 截断；
     // 非流与 NonDialog 透传保持既有总超时 client。
     let stream_client: &reqwest::Client = &state.http_stream_client;
-    let scope = Arc::new(Scope::with_opts(
-        state.config.pii_response_side,
-        state.config.pii_fuzzy_restore,
-    ));
     // 全局单例快照（credential-vault-singleton）：网关只读复用进程级
     // vault/detector，不得每请求新建空映射致还原断链。
     let vault = state.vault.clone();
@@ -176,16 +247,24 @@ pub(crate) async fn gateway_serve(
         0
     };
 
+    // 会话键头由网关消费且 MUST NOT 转发上游（含自定义头名）：转发前统一剔除，
+    // 覆盖 NonDialog 透传与对话臂两条路径（spec 要求自定义头名亦须在转发前剔除）。
+    // 键推导（`build_request_scope`）仍读原始 `parts.headers`，故此处只改转发克隆体。
+    let mut fwd_headers = parts.headers.clone();
+    if state.config.pii_scope_mode.is_conversation() {
+        let _ = strip_conversation_header(&mut fwd_headers, &state.config.pii_scope_key_header);
+    }
+
     if !is_chat {
         // H11/D11：NonDialog 走专用透传入口（返回 `Response`，无 `Stream` 死臂）；
-        // 上游意外回 SSE 亦按字节透传，类型即契约。
+        // 上游意外回 SSE 亦按字节透传，类型即契约。传已剔除会话键头的转发头。
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
         return serve_nondialog_passthrough(
             client,
             upstream_method,
             &url,
-            parts.headers.clone(),
+            fwd_headers,
             body_bytes,
             protocol,
             &state.gateway_metrics,
@@ -202,6 +281,9 @@ pub(crate) async fn gateway_serve(
         .filter(|m| !m.is_empty())
         .unwrap_or("")
         .to_string();
+    // 作用域选择（veil-pii-conversation-cache 1.5/3.1）：`request` 逐请求、
+    // `conversation` 取存储共享的 `Arc<PiiScope>`；脱敏前 `req_value` 供键推导。
+    let scope = build_request_scope(state, &parts.headers, &upstream_base, req_value.as_ref());
     let rw = super::request_rewrite(
         body_bytes,
         protocol,
@@ -229,6 +311,7 @@ pub(crate) async fn gateway_serve(
         req_start,
         pending: state.pending.clone(),
         normalized_out: rw.normalized_out,
+        redact_only,
     };
     let pump_ctx = || StreamPumpCtx {
         req: req.clone(),
@@ -237,8 +320,10 @@ pub(crate) async fn gateway_serve(
         init_conv: rw.init_conv.clone(),
         req_model: req_model.clone(),
     };
-    if rw.stream_flag {
-        let fwd_headers = forward_headers(&parts.headers, &state.gateway_metrics);
+    // C/3.2：redact-only 变体（count_tokens）恒走非流有界读路径（受
+    // `NONSTREAM_MAX_BYTES` 约束），不因请求体 stream 意图误入 SSE 泵。
+    if rw.stream_flag && !redact_only {
+        let fwd_headers = forward_headers(&fwd_headers, &state.gateway_metrics);
         match llm_gateway::fetch_upstream_with_retry(
             stream_client,
             dialog_method,
@@ -284,16 +369,7 @@ pub(crate) async fn gateway_serve(
             stream_flag: false,
             nonstream_max_bytes: state.config.nonstream_max_bytes,
         };
-        match serve_nonstream(
-            client,
-            dialog_method,
-            &url,
-            parts.headers.clone(),
-            rw.body,
-            nctx,
-        )
-        .await
-        {
+        match serve_nonstream(client, dialog_method, &url, fwd_headers, rw.body, nctx).await {
             NonstreamOutcome::Responded(resp) => resp,
             // 客户端未要求流但上游回 SSE 时，转字节泵保证终止闭合。
             // E12/D7：泵 conv 首选透传的请求会话（与 `rw.init_conv` 同源），
@@ -363,7 +439,7 @@ pub(super) async fn stream_upstream_passthrough(
     if normalized_out {
         builder = builder.header(NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE);
     }
-    let builder = builder.header("x-veil-protocol", super::protocol_header_value(protocol));
+    let builder = builder.header(PROTOCOL_HEADER_NAME, super::protocol_header_value(protocol));
     // TRN-3：`status >= 400` 错误体按透传语义保状态保字节，流式转发仅为内存安全，
     // 不改写为 502、不缓冲放大。
     if is_error {
@@ -416,6 +492,7 @@ mod entry_tests {
             req_start: Instant::now(),
             pending: Arc::new(crate::approval::PendingApprovals::default()),
             normalized_out: true,
+            redact_only: false,
         };
         let stream = StreamPumpCtx {
             req: req.clone(),
@@ -534,6 +611,25 @@ mod entry_tests {
         assert!(GATEWAY_BODY_LIMIT_BYTES > AUDIT_SUBLIMIT_CEILING_BYTES);
         assert!(!audit_scan_body_over_limit(AUDIT_SUBLIMIT_CEILING_BYTES));
         assert!(audit_scan_body_over_limit(AUDIT_SUBLIMIT_CEILING_BYTES + 1));
+    }
+
+    #[test]
+    fn strip_conversation_header_custom_name_case_insensitive() {
+        // FIX 1：自定义会话键头名（非 x-veil-*）亦须剔除，大小写不敏感；幂等。
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom-conv", axum::http::HeaderValue::from_static("v1"));
+        assert!(super::strip_conversation_header(
+            &mut headers,
+            "X-Custom-Conv"
+        ));
+        assert!(
+            !headers.contains_key("x-custom-conv"),
+            "自定义会话键头须被剔除"
+        );
+        assert!(
+            !super::strip_conversation_header(&mut headers, "x-custom-conv"),
+            "缺头时返回 false（未剔除）"
+        );
     }
 
     #[tokio::test]

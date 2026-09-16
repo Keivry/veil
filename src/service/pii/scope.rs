@@ -323,6 +323,14 @@ impl PiiScope {
             .contains_key(token)
     }
 
+    /// 单会话作用域聚合上界断言用（仅测试）：请求表与响应表当前条目数。
+    /// 不改变 token 语义，仅暴露只读计数。
+    #[cfg(test)]
+    pub(crate) fn table_sizes(&self) -> (usize, usize) {
+        let inner = lock_or_recover(self.inner.lock());
+        (inner.pii_p2t.len(), inner.resp_p2t.len())
+    }
+
     /// 记录宽松形态审计计数（同类聚合，调用方限流落盘）。
     pub fn count_malformed(&self, token: &str) -> String {
         let cat = if malformed_shape_re().is_match(token) {

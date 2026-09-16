@@ -5,6 +5,7 @@ use super::{PumpOutcome, StreamPumpCtx};
 mod event_loop;
 mod finish;
 mod frame_feed;
+mod restore_emit;
 mod setup;
 mod terminal;
 #[cfg(test)]

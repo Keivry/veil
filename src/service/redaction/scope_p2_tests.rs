@@ -260,3 +260,27 @@ async fn restore_unauthorized_token_stripped() {
     let ok = scope.restore_response(&vault, &format!("值 {token} 结束"));
     assert_eq!(ok, "值 leak-secret-001 结束");
 }
+
+#[test]
+fn scope_debug_redacts_conversation_context() {
+    // FIX 2：`Scope` 手工 `Debug` 不得泄漏会话键 hex/租户指纹/密钥字节。
+    let key = ConversationKey::for_test(
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    );
+    let tenant = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let secret: Arc<[u8]> = Arc::from(vec![0x5Au8; 32].into_boxed_slice());
+    let scope = Scope::new().with_conversation(
+        key.clone(),
+        tenant.to_string(),
+        secret.clone(),
+        Arc::new(PreviousResponseMap::new(4)),
+    );
+    let debug = format!("{scope:?}");
+    assert!(!debug.contains(key.as_str()), "不得泄漏会话键 hex: {debug}");
+    assert!(!debug.contains(tenant), "不得泄漏租户指纹: {debug}");
+    assert!(
+        !debug.contains(&format!("{secret:?}")),
+        "不得泄漏密钥字节: {debug}"
+    );
+    assert!(debug.contains("[redacted]"), "须显式标注已脱敏: {debug}");
+}
