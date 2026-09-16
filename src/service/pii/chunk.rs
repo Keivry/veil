@@ -234,6 +234,9 @@ fn builtin_chunk_sync(chunk: &str) -> Vec<(String, String, usize, usize)> {
 
 /// 内置联合正则一次扫描（异步版，走全局 moka 校验 LRU）。
 /// 超长输入按 1MB 分块（交叠 256，`char` 边界安全），边界重复命中去重。
+/// DCD-5（9.1）：本函数仅由 `detector.rs` 的 `#[cfg(test)] scan_spans` 调用，
+/// 但收敛可见性会使 `detector.rs` 的 `cached_*` 助手在生产构建死代码告警
+/// （该文件不在本批白名单），故暂保留 `pub`（阻塞项已上报）。
 pub async fn scan_builtin(text: &str, credential_p2t: &HashMap<String, String>) -> Vec<PiiHit> {
     if text.is_empty() || !coarse_hit(text) {
         return Vec::new();

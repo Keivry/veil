@@ -3,7 +3,7 @@ use {
         RE_DOS_BUDGET_MS,
         test_support::{detector, empty_cred},
     },
-    std::time::Duration,
+    std::{sync::Arc, time::Duration},
 };
 
 #[tokio::test]
@@ -68,19 +68,16 @@ async fn malicious_pattern_fast_reject_and_disable_after_three_timeouts() {
     let d2 = detector();
     d2.load_custom_patterns(&[("slow".to_string(), r"slow\d+".to_string())]);
     assert!(!d2.disabled_snapshot().contains(&"slow".to_string()));
-    d2.account_rule("slow", true);
-    d2.account_rule("slow", true);
+    d2.account_rules_batch(&[("slow", true), ("slow", true)]);
     assert!(!d2.disabled_snapshot().contains(&"slow".to_string()));
-    d2.account_rule("slow", true);
+    d2.account_rules_batch(&[("slow", true)]);
     assert!(d2.disabled_snapshot().contains(&"slow".to_string()));
     // 成功清零：超时 2 次后成功则计数重置。
     let d3 = detector();
     d3.load_custom_patterns(&[("flaky".to_string(), r"flaky\d+".to_string())]);
-    d3.account_rule("flaky", true);
-    d3.account_rule("flaky", true);
-    d3.account_rule("flaky", false);
-    d3.account_rule("flaky", true);
-    d3.account_rule("flaky", true);
+    d3.account_rules_batch(&[("flaky", true), ("flaky", true)]);
+    d3.account_rules_batch(&[("flaky", false)]);
+    d3.account_rules_batch(&[("flaky", true), ("flaky", true)]);
     assert!(!d3.disabled_snapshot().contains(&"flaky".to_string()));
 }
 
@@ -233,9 +230,7 @@ async fn custom_overlap_placeholder_skipped_and_disabled_skipped() {
         hits.is_empty(),
         "与 data URL 保护区间重叠必须跳过: {hits:?}"
     );
-    d.account_rule("tag", true);
-    d.account_rule("tag", true);
-    d.account_rule("tag", true);
+    d.account_rules_batch(&[("tag", true), ("tag", true), ("tag", true)]);
     assert!(d.disabled_snapshot().contains(&"tag".to_string()));
     let hits = d.scan_custom("TAG-77 独立出现", &empty_cred()).await;
     assert!(
@@ -327,7 +322,7 @@ async fn pii_lock_poison_scan_no_panic() {
     let d = detector();
     d.load_custom_patterns(&[("tag".to_string(), r"TAG-\d+".to_string())]);
     d.load_dict(&[("张三".to_string(), "name".to_string())]);
-    // 逐把锁持锁 panic 毒化（含 disabled/strikes 两把 Mutex）。
+    // 逐把锁持锁 panic 毒化（含 disabled/strikes 两把 Mutex；custom 容器 Arc 化后毒化同一写锁）。
     let poisoners: [fn(&super::PiiDetector); 6] = [
         |x| {
             let _g = x.custom.write().unwrap();
@@ -361,7 +356,7 @@ async fn pii_lock_poison_scan_no_panic() {
     assert!(hits.iter().any(|h| h.1 == "张三"), "{hits:?}");
     let hits = d.scan_custom("TAG-99", &empty_cred()).await;
     assert!(hits.iter().any(|h| h.1 == "TAG-99"), "{hits:?}");
-    d.account_rule("tag", true);
+    d.account_rules_batch(&[("tag", true)]);
     assert!(d.custom_names_snapshot().contains(&"tag".to_string()));
     assert!(!d.disabled_snapshot().contains(&"tag".to_string()));
 }
@@ -513,9 +508,7 @@ async fn scan_custom_batch_equivalence() {
         "{hits:?}"
     );
     assert_eq!(hits.len(), 3, "命中须与逐规则扫描一致: {hits:?}");
-    d.account_rule("tag", true);
-    d.account_rule("tag", true);
-    d.account_rule("tag", true);
+    d.account_rules_batch(&[("tag", true), ("tag", true), ("tag", true)]);
     let hits = d.scan_custom("TAG-33 工号999999", &empty_cred()).await;
     assert!(
         hits.iter().all(|h| h.0 != "tag"),
@@ -525,4 +518,117 @@ async fn scan_custom_batch_equivalence() {
         hits.iter().any(|h| h.0 == "emp"),
         "他规则不受影响: {hits:?}"
     );
+}
+
+#[test]
+fn custom_aggregate_timeout_no_strike() {
+    // D3：聚合墙钟超时（或阻塞任务 panic）不得对任何规则记账——即便规则已累计
+    // 2 次逐规则超时，单次聚合超时也不得将其三连停用；只记全局 warn 并零命中。
+    let d = detector();
+    d.load_custom_patterns(&[("tag".to_string(), r"TAG-\d+".to_string())]);
+    d.account_rules_batch(&[("tag", true), ("tag", true)]);
+    assert!(!d.disabled_snapshot().contains(&"tag".to_string()));
+    // 单阻塞线程运行时 + 占位任务钉死唯一阻塞线程：扫描的 `spawn_blocking` 任务
+    // 在聚合预算（100ms）内排不上队 → 确定性触发超时臂，不依赖机器速度。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("测试运行时构建");
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    rt.spawn_blocking(move || {
+        let _ = rx.recv();
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let hits = rt.block_on(d.scan_custom("TAG-99", &empty_cred()));
+    assert!(hits.is_empty(), "聚合超时须零命中: {hits:?}");
+    assert!(
+        !d.disabled_snapshot().contains(&"tag".to_string()),
+        "聚合超时不得逐规则记账（2 次既有超时 + 1 次聚合超时 ≠ 三连停用）"
+    );
+    drop(tx);
+    rt.shutdown_timeout(Duration::from_millis(200));
+}
+
+#[test]
+fn custom_ruleset_arc_no_deep_clone() {
+    // ARH-4：扫描路径仅 `Arc::clone` 规则集容器，不得 `Arc::new(read().clone())` 深克隆。
+    // 单阻塞线程运行时钉住扫描任务于聚合等待点，观测容器强计数：共享同一 Arc 时 > 1，
+    // 深克隆重建则存储侧恒为 1。
+    let d = Arc::new(detector());
+    d.load_custom_patterns(&[("tag".to_string(), r"TAG-\d+".to_string())]);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("测试运行时构建");
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    rt.spawn_blocking(move || {
+        let _ = rx.recv();
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let scan_detector = Arc::clone(&d);
+    let scan = rt.spawn(async move { scan_detector.scan_custom("TAG-99", &empty_cred()).await });
+    let mut observed = 1usize;
+    for _ in 0..200 {
+        observed = Arc::strong_count(&*crate::service::lock_recover::lock_or_recover(
+            d.custom.read(),
+        ));
+        if observed > 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        observed > 1,
+        "扫描期间容器须共享同一规则集 Arc（强计数 > 1），不得深克隆重建: {observed}"
+    );
+    let hits = rt.block_on(scan).expect("扫描任务须完成");
+    assert!(hits.is_empty(), "聚合超时须零命中: {hits:?}");
+    assert!(!d.disabled_snapshot().contains(&"tag".to_string()));
+    drop(tx);
+    rt.shutdown_timeout(Duration::from_millis(200));
+}
+
+#[test]
+fn custom_account_rules_batch_lock_order() {
+    // ARH-4：批量记账单次获取 `strikes` → `disabled`（锁序不变），状态机逐项等价：
+    // 成功清零 / 超时累计 / 三连停用 / 跳过已停用。
+    let d = detector();
+    d.account_rules_batch(&[("a", true), ("b", true)]);
+    d.account_rules_batch(&[("a", true), ("b", false)]);
+    d.account_rules_batch(&[("a", true), ("b", false)]);
+    assert!(
+        d.disabled_snapshot().contains(&"a".to_string()),
+        "三连超时须停用"
+    );
+    assert!(
+        !d.disabled_snapshot().contains(&"b".to_string()),
+        "中途成功须清零"
+    );
+    // 已停用者跳过；同批同名多元素继续累计未停用者。
+    d.account_rules_batch(&[("a", true), ("b", true), ("b", true)]);
+    assert!(d.disabled_snapshot().contains(&"a".to_string()));
+    assert!(
+        !d.disabled_snapshot().contains(&"b".to_string()),
+        "b 累计 2 次未达阈值"
+    );
+    d.account_rules_batch(&[("b", true)]);
+    assert!(
+        d.disabled_snapshot().contains(&"b".to_string()),
+        "b 第三连须停用"
+    );
+    d.account_rules_batch(&[("b", false)]);
+    assert!(
+        d.disabled_snapshot().contains(&"b".to_string()),
+        "停用后再成功不清状态（跳过已停用）"
+    );
+    // 锁序源码守护：`account_rules_batch` 函数体内 `strikes` 先于 `disabled`。
+    let src = include_str!("../custom.rs");
+    let body = &src[src.find("fn account_rules_batch").expect("批量函数存在")..];
+    let strikes = body.find("self.strikes.lock()").expect("strikes 锁");
+    let disabled = body.find("self.disabled.lock()").expect("disabled 锁");
+    assert!(strikes < disabled, "锁序违例：strikes 须先于 disabled");
 }

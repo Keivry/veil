@@ -1,8 +1,9 @@
 //! 自定义规则与字典：三槽加载 + ReDoS 守卫扫描 + 字典独立扫描。
 //!
-//! H7/D7 锁序不变量：`account_rule` 内 **`strikes` 先于 `disabled`**（两把 std
-//! `Mutex` 恒按此序获取，后续新增获取点须遵循）；审查清单真源见 design D7，
-//! 源码扫描守护见 `service::declaration_lock::lock_order_invariants`。
+//! H7/D7 锁序不变量：`account_rules_batch` 内 **`strikes` 先于 `disabled`**（两把 std
+//! `Mutex` 恒按此序获取，后续新增获取点须遵循）；审查清单真源见 design D7，源码扫描守护
+//! 见 `service::declaration_lock::lock_order_invariants`（按 `account_rule` 前缀定位函数体，
+//! 故批量实现须定义在测试用薄封装之前）。
 
 use {
     super::{
@@ -238,7 +239,9 @@ impl PiiDetector {
                 if names.contains(name) {
                     continue;
                 }
-                custom.push((name.clone(), compiled, pattern.clone()));
+                // ARH-4：唯一写点经 `Arc::make_mut`——无外部强引用时零拷贝原地 push，
+                // 扫描期存在共享引用时按 CoW 克隆，只读共享语义不被破坏。
+                Arc::make_mut(&mut custom).push((name.clone(), compiled, pattern.clone()));
                 names.insert(name.clone());
             }
             loaded += 1;
@@ -385,7 +388,8 @@ impl PiiDetector {
     }
 
     /// 自定义正则扫描（ReDoS 守卫）：整帧以**单次** `spawn_blocking` 批量扫描
-    /// 全部规则与分块（规则集经只读共享引用传递），逐规则判定超时/停用记账；
+    /// 全部规则与分块（规则集 `Arc` 只读共享，扫描路径仅 `Arc::clone`）；逐规则
+    /// `find_iter` Err 经批量记账停用，聚合墙钟超时仅一条全局 warn（零命中不记账）；
     /// 与逐规则逐分块扫描结果等价。
     pub async fn scan_custom(
         &self,
@@ -393,7 +397,7 @@ impl PiiDetector {
         credential_p2t: &HashMap<String, String>,
     ) -> Vec<PiiHit> {
         let rules: Arc<Vec<(String, fancy_regex::Regex, String)>> =
-            Arc::new(recover(self.custom.read()).clone());
+            Arc::clone(&*recover(self.custom.read()));
         if rules.is_empty() || text.is_empty() {
             return Vec::new();
         }
@@ -436,21 +440,22 @@ impl PiiDetector {
             }
             (found, timed_out)
         });
-        // 每规则一档 `RE_DOS_BUDGET_MS` 的聚合上界（真挂起才触发全批 fail-closed）。
+        // 每规则一档 `RE_DOS_BUDGET_MS` 的聚合上界（真挂起才触发全局跳过：零命中且不记账）。
         let budget =
             Duration::from_millis(RE_DOS_BUDGET_MS).saturating_mul(rules.len().max(1) as u32);
         let (found, timed_out) = match tokio::time::timeout(budget, batch).await {
             Ok(Ok(out)) => out,
-            // 超时或任务 panic：整批 fail-closed——非停用规则全部按超时记账，零命中。
-            _ => (
-                Vec::new(),
-                rules
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (n, ..))| !disabled.contains(n))
-                    .map(|(ri, _)| ri)
-                    .collect(),
-            ),
+            // D3：聚合墙钟超时（或阻塞任务 panic）**SHALL NOT** 对任何规则记账——逐规则
+            // 停用仅由 batch 内 `find_iter` Err 路径触发；此处仅一条全局 warn（含规则数
+            // 与预算）并返回零命中。
+            _ => {
+                tracing::warn!(
+                    "自定义正则聚合扫描超时或阻塞任务异常：规则数 {}、预算 {}ms，本帧返回零命中（不记账）",
+                    rules.len(),
+                    budget.as_millis()
+                );
+                return Vec::new();
+            }
         };
         let timed_out_names: HashSet<&str> = timed_out
             .iter()
@@ -475,32 +480,46 @@ impl PiiDetector {
             };
             hits.push((name.clone(), value, s, e));
         }
-        // 锁外结算：成功清零，超时累计，连续 3 次停用并告警。
-        for (name, ..) in rules.iter() {
-            if disabled.contains(name) {
-                continue;
-            }
-            self.account_rule(name, timed_out_names.contains(name.as_str()));
-        }
+        // ARH-4：锁外批量结算——单次获取 `strikes` → `disabled`；成功清零、超时累计、
+        // 连续 3 次停用并告警，已停用者跳过。
+        let outcomes: Vec<(&str, bool)> = rules
+            .iter()
+            .map(|(name, ..)| (name.as_str(), timed_out_names.contains(name.as_str())))
+            .collect();
+        self.account_rules_batch(&outcomes);
         hits
     }
 
-    /// 超时记账状态机：成功清零；超时累计，连续 [`RE_DOS_STRIKES`] 次停用并告警。
-    pub(crate) fn account_rule(&self, name: &str, timed_out: bool) {
+    /// 批量超时记账（ARH-4）：单次获取 `strikes` → `disabled`（锁序见模块头不变量），
+    /// 逐规则成功清零 / 超时累计 / 连续 [`RE_DOS_STRIKES`] 次停用并告警，已停用者跳过。
+    /// D3：聚合超时**不**走本函数；调用方仅传 batch 内逐规则 `find_iter` Err 结果。
+    pub(crate) fn account_rules_batch(&self, outcomes: &[(&str, bool)]) {
         let mut strikes = recover(self.strikes.lock());
         let mut disabled = recover(self.disabled.lock());
-        if !timed_out {
-            strikes.remove(name);
-            return;
+        for (name, timed_out) in outcomes {
+            if disabled.contains(*name) {
+                continue;
+            }
+            if !*timed_out {
+                strikes.remove(*name);
+                continue;
+            }
+            let c = strikes.entry((*name).to_string()).or_insert(0);
+            *c += 1;
+            if *c >= RE_DOS_STRIKES {
+                disabled.insert((*name).to_string());
+                tracing::warn!("自定义正则 {name} 连续 {} 次超时，临时停用", RE_DOS_STRIKES);
+            } else {
+                tracing::warn!("自定义正则 {name} 扫描超时（第 {c} 次），跳过该规则");
+            }
         }
-        let c = strikes.entry(name.to_string()).or_insert(0);
-        *c += 1;
-        if *c >= RE_DOS_STRIKES {
-            disabled.insert(name.to_string());
-            tracing::warn!("自定义正则 {name} 连续 {} 次超时，临时停用", RE_DOS_STRIKES);
-        } else {
-            tracing::warn!("自定义正则 {name} 扫描超时（第 {c} 次），跳过该规则");
-        }
+    }
+
+    /// 单规则记账薄封装（`&[(name, timed_out)]` 单元素调用）；仅供既有测试面复用，
+    /// 生产扫描一律经 [`Self::account_rules_batch`] 批量结算。
+    #[cfg(test)]
+    pub(crate) fn account_rule(&self, name: &str, timed_out: bool) {
+        self.account_rules_batch(&[(name, timed_out)]);
     }
 }
 

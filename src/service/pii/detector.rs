@@ -21,6 +21,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
+        Arc,
         Mutex,
         OnceLock,
         RwLock,
@@ -33,7 +34,8 @@ use std::{
 pub const PII_TOKEN_PREFIX: &str = "__PII_";
 /// 请求/响应单表上限（真 LRU，与凭据 5000 区分）。
 pub const PII_MAX_ENTRIES: usize = 1000;
-/// 自定义正则单次扫描预算（毫秒）。
+/// 自定义正则单规则扫描预算（毫秒）：聚合墙钟上界按规则数放大；
+/// 聚合超时（D3）零命中且**不**逐规则记账，仅一条全局 warn。
 pub const RE_DOS_BUDGET_MS: u64 = 100;
 /// 自定义正则连续超时停用阈值。
 pub const RE_DOS_STRIKES: u32 = 3;
@@ -489,10 +491,11 @@ pub(crate) async fn cached_reserved(value: &str, kind: &str) -> bool {
 }
 
 /// PII 检测器：内置联合正则 + 自定义正则 + 字典 recognizer。
-/// 扫描可并发调用；自定义正则走 `spawn_blocking` 独立执行 + 100ms 超时守卫。
+/// 扫描可并发调用；自定义正则走 `spawn_blocking` 批量执行 + 聚合墙钟超时守卫
+/// （超时零命中且不逐规则记账，D3；规则集容器 `Arc` 只读共享，扫描仅 `Arc::clone`，ARH-4）。
 #[derive(Debug, Default)]
 pub struct PiiDetector {
-    pub(crate) custom: RwLock<Vec<(String, fancy_regex::Regex, String)>>,
+    pub(crate) custom: RwLock<Arc<Vec<(String, fancy_regex::Regex, String)>>>,
     pub(crate) custom_names: RwLock<HashSet<String>>,
     pub(crate) strikes: Mutex<HashMap<String, u32>>,
     pub(crate) disabled: Mutex<HashSet<String>>,
