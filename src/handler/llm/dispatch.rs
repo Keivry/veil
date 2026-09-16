@@ -9,6 +9,7 @@ use {
         StreamPumpCtx,
         build_sse_response,
         forward_headers,
+        is_event_stream,
         serve_nondialog_passthrough,
         serve_nonstream,
         spawn_stream_pump,
@@ -16,7 +17,10 @@ use {
     crate::{
         service::{
             llm_gateway::{self, Protocol, resolve_protocol, resolve_upstream},
-            redaction::Scope,
+            redaction::{
+                Scope,
+                leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE},
+            },
         },
         state::AppState,
     },
@@ -254,8 +258,9 @@ pub(crate) async fn gateway_serve(
                     .to_string();
                 // S6/D7：仅 `status<400` 且上游正文为 `text/event-stream` 才转 SSE 泵；
                 // 上游错误状态（4xx/5xx）或 2xx 非 SSE 正文按非流口径保状态保正文透传，
-                // 不得改写为 200 SSE 假流（客户端会误判为流式成功）。
-                if status_u16 >= 400 || !resp_ct.contains("text/event-stream") {
+                // 不得改写为 200 SSE 假流（客户端会误判为流式成功）。F-09：谓词与
+                // `should_pump_stream` 共用同一实现（`;` 前段 + trim + 大小写不敏感）。
+                if status_u16 >= 400 || !is_event_stream(&resp_ct) {
                     return stream_upstream_passthrough(
                         up,
                         rw.normalized_out,
@@ -332,14 +337,7 @@ pub(super) async fn stream_upstream_passthrough(
     }
     // TRN-4：剔除上游 `x-veil-*` 内部头（大小写不敏感），网关自置头在剔除后写入，
     // 上游同名声不得覆盖或泄漏。
-    let veil_keys: Vec<axum::http::HeaderName> = resp_headers
-        .keys()
-        .filter(|k| k.as_str().starts_with("x-veil-"))
-        .cloned()
-        .collect();
-    for k in veil_keys {
-        resp_headers.remove(&k);
-    }
+    llm_gateway::strip_veil_internal_headers(&mut resp_headers);
     let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
     // TRN-3：先判 `content-length`（仅非错误状态），超限即 502 且不读 body。
     if !is_error
@@ -363,7 +361,7 @@ pub(super) async fn stream_upstream_passthrough(
         builder = builder.header(k, v);
     }
     if normalized_out {
-        builder = builder.header("x-veil-normalized", "json-whitespace");
+        builder = builder.header(NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE);
     }
     let builder = builder.header("x-veil-protocol", super::protocol_header_value(protocol));
     // TRN-3：`status >= 400` 错误体按透传语义保状态保字节，流式转发仅为内存安全，
@@ -392,6 +390,7 @@ mod entry_tests {
             AUDIT_SUBLIMIT_CEILING_BYTES,
             GATEWAY_BODY_LIMIT_BYTES,
             audit_scan_body_over_limit,
+            is_event_stream,
             should_pump_stream,
         },
         *,
@@ -505,6 +504,26 @@ mod entry_tests {
         assert!(should_pump_stream("application/json", true));
         assert!(!should_pump_stream("application/json", false));
         assert!(!should_pump_stream("", false));
+    }
+
+    #[test]
+    fn content_type_event_stream_case_insensitive() {
+        // F-09：`;` 前段 + trim + 大小写不敏感；前缀相近值不误判，
+        // `should_pump_stream` 与派发点（`:258`）共用同一谓词。
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("TEXT/EVENT-STREAM"));
+        assert!(is_event_stream(" text/event-stream "));
+        assert!(is_event_stream("text/event-stream; charset=utf-8"));
+        assert!(is_event_stream("Text/Event-Stream;charset=utf-8"));
+        assert!(!is_event_stream("application/json"));
+        assert!(!is_event_stream("application/json; text/event-stream"));
+        assert!(!is_event_stream("text/event-streaming"));
+        assert!(!is_event_stream(""));
+        assert!(should_pump_stream(
+            "TEXT/EVENT-STREAM; charset=utf-8",
+            false
+        ));
+        assert!(!should_pump_stream("application/json", false));
     }
 
     #[test]

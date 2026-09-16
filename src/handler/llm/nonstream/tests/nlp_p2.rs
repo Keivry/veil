@@ -7,13 +7,7 @@ use {
         approval::PendingApprovals,
         config::AuditMode,
         handler::llm::{
-            nonstream::{
-                ErrorBody,
-                NonstreamOutcome,
-                read_error_body_bounded,
-                restore_guard_ok,
-                serve_nonstream,
-            },
+            nonstream::{ErrorBody, NonstreamOutcome, read_error_body_bounded, serve_nonstream},
             pump::{RequestCtx, StreamPumpCtx},
             stream_tests::{collect_pump, fresh_arcs, loopback_server as stream_loopback},
         },
@@ -21,6 +15,7 @@ use {
             audit::AuditSink,
             llm_gateway::{GatewayMetrics, Protocol},
             metrics::MetricsStore,
+            redaction::restore_guard::restore_guard_ok,
         },
     },
     std::{path::PathBuf, sync::Arc, time::Instant},
@@ -263,10 +258,16 @@ fn nonstream_inner_json_guard() {
         serde_json::from_str::<serde_json::Value>(broken).is_ok(),
         "破损帧外层须仍可解析（构造前提）"
     );
-    assert!(restore_guard_ok(placeholder, intact), "内层完好须通过");
-    assert!(!restore_guard_ok(placeholder, broken), "内层破损须拒绝");
     assert!(
-        restore_guard_ok(placeholder, placeholder),
+        restore_guard_ok(intact, placeholder, None),
+        "内层完好须通过"
+    );
+    assert!(
+        !restore_guard_ok(broken, placeholder, None),
+        "内层破损须拒绝"
+    );
+    assert!(
+        restore_guard_ok(placeholder, placeholder, None),
         "占位符帧自身须通过"
     );
 }
@@ -280,13 +281,16 @@ fn nonstream_broken_inner_json() {
         serde_json::from_str::<serde_json::Value>(broken).is_ok(),
         "外层合法"
     );
-    assert!(!restore_guard_ok(placeholder, broken), "内层破损不得误还原");
     assert!(
-        !restore_guard_ok(placeholder, "{not json"),
+        !restore_guard_ok(broken, placeholder, None),
+        "内层破损不得误还原"
+    );
+    assert!(
+        !restore_guard_ok("{not json", placeholder, None),
         "外层破损须拒绝"
     );
     assert!(
-        restore_guard_ok(placeholder, r#"{"a":"{\"k\":\"plain\"}"}"#),
+        restore_guard_ok(r#"{"a":"{\"k\":\"plain\"}"}"#, placeholder, None),
         "内层同构合法须通过"
     );
 }

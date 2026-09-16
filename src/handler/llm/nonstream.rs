@@ -22,6 +22,10 @@ use {
                 extract_usage_nonstream,
             },
             metrics::ChatRecord,
+            redaction::{
+                leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE},
+                restore_guard::restore_guard_ok,
+            },
         },
     },
     axum::{
@@ -227,8 +231,8 @@ pub async fn serve_nonstream(
                 let mut resp = (StatusCode::OK, Json(block_body)).into_response();
                 if ctx.req.normalized_out {
                     resp.headers_mut().insert(
-                        "x-veil-normalized",
-                        header::HeaderValue::from_static("json-whitespace"),
+                        NORMALIZED_HEADER_NAME,
+                        header::HeaderValue::from_static(NORMALIZED_HEADER_VALUE),
                     );
                 }
                 resp.headers_mut().insert(
@@ -265,8 +269,9 @@ pub async fn serve_nonstream(
         // P0-1.2：还原后双 `_jloads` 校验（对标 Python `_nonstream_build`）：
         // 还原/脱敏可能把未转义明文写回 JSON 串内致破裂；E5/D3 先 `strip_partials`
         // 重试一次（半截形态可挽回时用剥离体），仍失败才回退上游原文并记 metrics + warn。
-        if !restore_guard_ok(&text, &restored) {
-            if let Some(stripped) = retry_stripped(&restored).filter(|s| restore_guard_ok(&text, s))
+        if !restore_guard_ok(&restored, &text, None) {
+            if let Some(stripped) =
+                retry_stripped(&restored).filter(|s| restore_guard_ok(s, &text, None))
             {
                 tracing::warn!("非流还原后 JSON 校验失败，残缺剥离后挽回");
                 restored = stripped;
@@ -515,60 +520,11 @@ fn retry_stripped(restored: &str) -> Option<String> {
         .then_some(stripped)
 }
 
-/// NLP-3/D12：非流还原守卫——外层 `from_str` 合法时进一步校验字符串值内的
-/// stringified JSON 结构有效性（对齐流式 `frame_feed.rs::inner_json_intact`），
-/// 内层破损不得被外层合法掩盖而静默透传。占位符帧不可解析时无内层参照，维持
-/// 既有外层口径。
-fn restore_guard_ok(placeholder_frame: &str, restored: &str) -> bool {
-    let Ok(rv) = serde_json::from_str::<Value>(restored) else {
-        return false;
-    };
-    match serde_json::from_str::<Value>(placeholder_frame) {
-        Ok(pv) => inner_json_intact(&pv, &rv),
-        Err(_) => true,
-    }
-}
-
-/// 递归比对占位符帧与还原帧的字符串值：占位符字符串值若为 stringified JSON，
-/// 则还原后仍须可解析为同构容器（内层破损 fail-closed）。
-fn inner_json_intact(placeholder: &Value, restored: &Value) -> bool {
-    use crate::service::json_walk::strip_bom;
-    match (placeholder, restored) {
-        (Value::String(p), Value::String(r)) => {
-            let pt = strip_bom(p).trim();
-            if (pt.starts_with('{') || pt.starts_with('['))
-                && let Ok(pv) = serde_json::from_str::<Value>(pt)
-                && matches!(pv, Value::Object(_) | Value::Array(_))
-            {
-                return serde_json::from_str::<Value>(strip_bom(r).trim())
-                    .ok()
-                    .filter(|rv| matches!(rv, Value::Object(_) | Value::Array(_)))
-                    .is_some_and(|rv| inner_json_intact(&pv, &rv));
-            }
-            true
-        }
-        (Value::Array(pa), Value::Array(ra)) => {
-            pa.len() == ra.len() && pa.iter().zip(ra).all(|(p, r)| inner_json_intact(p, r))
-        }
-        (Value::Object(pm), Value::Object(rm)) => pm
-            .iter()
-            .all(|(k, pv)| rm.get(k).is_some_and(|rv| inner_json_intact(pv, rv))),
-        _ => true,
-    }
-}
-
 /// T2/D2：消费上游 body 前快照响应头，经逐跳过滤后剥除上游 `x-veil-*`
 /// （网关自有同名头在转发后覆盖写入，上游声明不得生效）。
 fn snapshot_downstream_headers(up: &reqwest::Response, metrics: &GatewayMetrics) -> HeaderMap {
     let mut resp_headers = clone_upstream_headers(up, metrics);
-    let veil_keys: Vec<axum::http::HeaderName> = resp_headers
-        .keys()
-        .filter(|k| k.as_str().starts_with("x-veil-"))
-        .cloned()
-        .collect();
-    for k in veil_keys {
-        resp_headers.remove(&k);
-    }
+    llm_gateway::strip_veil_internal_headers(&mut resp_headers);
     resp_headers
 }
 
@@ -592,7 +548,7 @@ fn build_downstream_response(
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
     if normalized_out {
-        builder = builder.header("x-veil-normalized", "json-whitespace");
+        builder = builder.header(NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE);
     }
     builder
         .header("x-veil-protocol", protocol_header_value(protocol))

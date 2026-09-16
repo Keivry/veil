@@ -48,10 +48,14 @@ async fn run_restore(
     let token = vault.register(plain).expect("测试凭据须注册成功");
     let up_body = up_body.replace("<TOKEN>", &token);
     let (url, server) = loopback_server(200, "application/json", up_body.into_bytes()).await;
+    let detector = Arc::new(PiiDetector::new());
+    let scope = Arc::new(Scope::new());
+    // B3：请求侧脱敏铸造 token（响应还原仅授权本请求实际产出）。
+    let _ = scope.redact_request(&vault, &detector, plain).await;
     let mut ctx = test_ctx(Protocol::Chat);
-    ctx.req.scope = Arc::new(Scope::new());
+    ctx.req.scope = scope;
     ctx.req.vault = vault;
-    ctx.req.detector = Arc::new(PiiDetector::new());
+    ctx.req.detector = detector;
     ctx.req.gateway_metrics = metrics.clone();
     let resp = drive(&url, ctx).await;
     server.abort();

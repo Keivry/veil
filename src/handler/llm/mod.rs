@@ -42,16 +42,8 @@ pub fn forward_headers(incoming: &HeaderMap, metrics: &GatewayMetrics) -> Header
     fwd.remove(header::CONTENT_LENGTH);
     fwd.remove(header::CONTENT_ENCODING);
     fwd.remove(header::ACCEPT_ENCODING);
-    // NLP-8：请求方向同样剔除下游 `x-veil-*` 内部头——`HeaderName` 大小写不敏感
-    // 且规范化为小写，`starts_with("x-veil-")` 即大小写不敏感匹配，防内部头外传上游。
-    let veil_keys: Vec<header::HeaderName> = fwd
-        .keys()
-        .filter(|k| k.as_str().starts_with("x-veil-"))
-        .cloned()
-        .collect();
-    for k in veil_keys {
-        fwd.remove(&k);
-    }
+    // NLP-8：请求方向同样剔除下游 `x-veil-*` 内部头（大小写不敏感），防内部头外传上游。
+    llm_gateway::strip_veil_internal_headers(&mut fwd);
     llm_gateway::filter_hop_headers_counted(
         &mut fwd,
         "upstream",
@@ -83,11 +75,20 @@ pub(crate) fn empty_body_response(protocol: Protocol) -> Response {
     )
 }
 
+/// F-09：`Content-Type` 是否为 `text/event-stream`——仅取 `;` 前段、trim 后
+/// 大小写不敏感比较，供 pump 路由与非流分类共用，消除第二决策站点。
+pub(crate) fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 /// 流泵路由判定（D5 定稿：客户端 `stream` 意图优先）：上游 `Content-Type`
 /// 为 `event-stream` 或请求 `stream==true` 即转流泵；`stream:true` 配
 /// `application/json` 组合亦走流泵，由泵内残余分类保证不丢帧。
 pub fn should_pump_stream(resp_content_type: &str, stream_flag: bool) -> bool {
-    resp_content_type.contains("text/event-stream") || stream_flag
+    is_event_stream(resp_content_type) || stream_flag
 }
 
 pub use {
