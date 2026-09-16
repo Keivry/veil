@@ -1,9 +1,4 @@
-# credential-vault-singleton Specification
-
-## Purpose
-恢复凭据与 PII 映射的跨请求稳定性，使同一秘密在多次查询与网关转发中映射到同一占位符，保证还原不断链。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 全局 Vault 单例与快照透传
 
@@ -37,6 +32,8 @@ PII 映射 SHALL 为请求级容器（`Scope::pii`，随请求销毁），跨请
 
 - **WHEN** 响应命中新 PII 明文
 - **THEN** 系统注册响应侧占位符但不将其还原为明文
+
+## ADDED Requirements
 
 ### Requirement: 响应侧凭据还原请求级授权
 

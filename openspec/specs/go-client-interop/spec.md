@@ -60,7 +60,7 @@
 
 ### Requirement: revoke 异步 202 轮询契约
 
-默认模式（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）下 `POST /revoke`（含紧急吊销转常规审批路径）SHALL 以 `202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示已建单待审批，口径与 `POST /credential` 一致；调用方 SHALL NOT 将 `202` 视为吊销已完成，SHALL 对同一请求轮询重试（建议指数退避）直至批准（吊销生效）或拒绝/超时。`CREDENTIAL_BLOCK_WAIT=1` 时 SHALL 同请求阻塞返回终态，无需轮询。Go 客户端（本仓 `get/`）SHALL NOT 将 `202` 视为吊销完成且 SHALL 对同一请求轮询重试至终态；该轮询由内置客户端实现（`get/internal/approval.go` 与 `get/internal/proxy.go` 的 `RevokeCaller`/`RegisterCaller`/`FetchCredential`），CLI 以退出码 `2` 表示「已受理未完成」（veil 侧见 `src/service/credential/vault_ops.rs` 的 `revoke_caller_with_approval`）。
+默认模式（`CREDENTIAL_BLOCK_WAIT` 未设或非真值）下 `POST /revoke`（含紧急吊销转常规审批路径）SHALL 以 `202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示已建单待审批，口径与 `POST /credential` 一致；调用方 SHALL NOT 将 `202` 视为吊销已完成，SHALL 对同一请求轮询重试（建议指数退避）直至批准（吊销生效）或拒绝/超时。`CREDENTIAL_BLOCK_WAIT=1` 时 SHALL 同请求阻塞返回终态，无需轮询。Go 客户端（本仓 `get/`）SHALL NOT 将 `202` 视为吊销完成且 SHALL 对同一请求轮询重试至终态；该轮询由内置客户端实现（`get/internal/approval.go` 与 `get/internal/proxy.go` 的 `RevokeCaller`/`RegisterCaller`/`FetchCredential`）。CLI 退出码语义 SHALL 为：`flag.ErrHelp`（`-h`）退出 `0`；用法/解析错误退出 `1`；退出码 `2` **专用于**「已受理未完成」（`202 + E_PENDING` 或 `--no-wait`），SHALL NOT 用于其它情形（含用法错误）。
 
 #### Scenario: revoke 返回 202 待审
 
@@ -72,9 +72,42 @@
 - **WHEN** 调用方对同一 revoke 请求轮询重试
 - **THEN** 批准后吊销生效（条目 `revoked=true`）、拒绝/超时返回 `403`，且不重复建单
 
+#### Scenario: 退出码语义
+
+- **WHEN** 子命令以 `-h`、用法错误、或 `202 + E_PENDING` 三种情形之一结束
+- **THEN** 分别退出 `0`、退出 `1`、退出 `2`，退出码 `2` 不用于其它情形
+
+### Requirement: Go 客户端超时默认与非法 env 回退
+
+Go 客户端的 `parseDurationEnv` SHALL 对 `PROXY_APPROVAL_TIMEOUT` 与 `PROXY_HTTP_TIMEOUT` 使用与文档一致的默认 `300s`；当环境变量取值非法（如 `5min`，Go `ParseDuration` 不接受）时 SHALL 回退到文档默认 `300s` 并向 stderr 告警，SHALL NOT 静默取 `30s`，SHALL NOT fail-fast 使脚本硬失败。
+
+#### Scenario: 非法值回退 300s 并告警
+
+- **WHEN** `PROXY_APPROVAL_TIMEOUT` 或 `PROXY_HTTP_TIMEOUT` 取值无法解析
+- **THEN** 回退到 `300s`，向 stderr 输出告警，进程不因该值失败
+
+#### Scenario: 合法值生效
+
+- **WHEN** 环境变量取值为合法时长
+- **THEN** 按该值生效，不告警、不回退
+
+### Requirement: Go 客户端审批测试真实形状与判别力
+
+Go 客户端审批测试 SHALL 使用与真实服务端一致的响应形状：主用例 SHALL 覆盖 Rust 服务器 `202` 形状（`{"error":{"code":"E_PENDING",…}}`，断言 `regID == ""`）；SHALL 另留一条 Python 基线（顶层 `reg_id`）用例覆盖 `proxy.go` 的 `reg_id` 回退，回退逻辑 SHALL 保留并注明「对 Rust 服务器恒不命中」。轮询间隔钳制测试 SHALL 具备判别力：以长超时 + 记录型 `sleepFn` + 两元素脚本响应驱动，断言恰一次休眠且首次休眠参数为钳制下界 `2s`；SHALL NOT 引入可注入时钟或真实休眠，SHALL NOT 修改生产代码。
+
+#### Scenario: 主用例覆盖真实 Rust 形状
+
+- **WHEN** 运行审批测试主用例
+- **THEN** 以 `{"error":{"code":"E_PENDING",…}}` 驱动并断言 `regID == ""`，另有 Python `reg_id` 基线用例覆盖回退
+
+#### Scenario: 钳制测试有判别力
+
+- **WHEN** 删除轮询间隔钳制下界
+- **THEN** 钳制测试失败（`slept[0] != 2s`）；保留钳制时恰一次休眠且 `slept[0] == 2s`
+
 ### Requirement: registrations 响应形状契约
 
-`GET /registrations` 响应中每条注册条目 SHALL 含 Go 契约字段 `type`（字段存在且非空，取值与条目类型一致且稳定）；`allow_mode` 输出词汇 SHALL 为 `auto`/`manual`（不再输出布尔或 `none`）。输入兼容 SHALL 保留三态：`auto` → 自动放行、`manual` → 人工审批、未知值回退 `auto` 并记 `warn`。既有字段（如 `ok`/`registration`/`name`/`script_path`/`script_hash`/`entries`/`allow_mode`）SHALL NOT 删除（`src/handler/credential.rs:147-183`）。
+`GET /registrations` 响应中每条注册条目 SHALL 含 Go 契约字段 `type`（字段存在且非空，取值与条目类型一致且稳定）；`allow_mode` 输出词汇 SHALL 为 `auto`/`manual`（不再输出布尔或 `none`）。输入兼容 SHALL 保留三态：`auto` → 自动放行、`manual` → 人工审批、未知值回退 `auto` 并记 `warn`。既有字段（如 `ok`/`registration`/`name`/`script_path`/`script_hash`/`entries`/`allow_mode`）SHALL NOT 删除（`src/handler/credential.rs:61-101` / `:190-199`）。
 
 #### Scenario: 响应含 type 与 auto/manual
 

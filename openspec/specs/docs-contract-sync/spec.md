@@ -44,7 +44,7 @@ README §4 阈值表 SHALL 与 `admin-ratelimit-contract` spec 同字；每行 S
 
 #### Scenario: 隐藏开关被补录
 
-- **WHEN** 核查 `OBSERVABILITY_DISABLE`（`src/config/env_parse.rs:342-347`、`src/router.rs:19-28`）
+- **WHEN** 核查 `OBSERVABILITY_DISABLE`（`src/config/env_parse.rs:295-296`、`src/router.rs:19-28`）
 - **THEN** README 变量表含该行，语义为精确 `=1`（去空白）时 `/_admin*` 全 404 且与 token 有效性无关（`tests/http_e2e_admin_matrix.rs:252-254`）
 
 #### Scenario: 完整性断言可复核

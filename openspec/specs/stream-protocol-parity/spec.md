@@ -5,19 +5,7 @@ Close remaining streaming-protocol edge semantics and restore observability colu
 
 ## Requirements
 
-### Requirement: Empty streams stay open-ended for chat/anthropic
-
-Chat/Anthropic streams with zero residual bytes SHALL stay open-ended (no fabricated success termination) and the open-ended outcome SHALL be observable (`truncated_mode=open_ended`); Responses SHALL still synthesize a failed terminal. Downstream stub protection (e.g. Hermes) SHALL NOT be asserted as an in-repo guarantee; its evidence is tracked as an open item in README §8.6.
-
-#### Scenario: Vacuum stream does not fabricate stop
-
-- **WHEN** a chat stream ends with zero bytes written and no residue
-- **THEN** downstream sees no synthetic `delta+stop+[DONE]`, `open_ended` is recorded, and any downstream stub protection remains an external dependency (README §8.6)
-
-#### Scenario: Anthropic vacuum stream stays open-ended
-
-- **WHEN** an anthropic stream ends with zero bytes written and no residue
-- **THEN** downstream sees no synthetic `message_stop` and `open_ended` is recorded
+> **迁移声明（F-06）**：原「空流保持开放结尾（chat/anthropic）」条款已删除。三协议真空流（零字节零残余）SHALL 均走最小可解析终止——Chat 补恰一 `data: [DONE]`；Anthropic 补最小 `message_start` + `message_stop`；Responses 补恰一 `response.failed`。`truncated_mode` 的 `open_ended`/`synthesized_failed` SHALL 保留为**观测口径**；系统 SHALL NOT 依据历史文本实现开放结尾。行为真相源见 canonical `openspec/specs/llm-protocol-hardening/spec.md`，差异与原仓对照见 README §8.6。
 
 ### Requirement: Responses start events create audit slots
 
@@ -123,17 +111,27 @@ SSE lines over 16KB SHALL be truncated with a `truncated_line_dropped_bytes` cou
 
 ### Requirement: hold 放行保持 sequence_number 相对序
 
-系统 SHALL 在 hold 放行（含并行 item 交错）时保持各 item 帧的相对 `sequence_number` 次序，SHALL NOT 因延迟放行使并行 item 的相对顺序颠倒或乱序；若实现无法保序，SHALL 显式声明该范围并锁定测试。
+系统 SHALL 在 hold 放行时按「每槽按到达序取出、由该槽完成事件驱动」执行：同一槽内帧的相对次序 SHALL 保持（按到达序）。**跨槽并行 item 的相对 `sequence_number` 次序 SHALL NOT 被保证**；该不保证范围 SHALL 显式声明并由交错并行 item 用例锁定实际放行序。系统 SHALL NOT 为追求跨槽严格排序而等待可能永不到达的槽完成事件（与 hold-until-complete 的 fail-closed 语义一致）。
+
+#### Scenario: 槽内到达序保持
+
+- **WHEN** 同一槽的多个帧被 hold 后放行
+- **THEN** 该槽内帧按到达序放行，相对次序不颠倒
 
 #### Scenario: 交错并行 item 保序
 
-- **WHEN** 多个并行 item 的帧被 hold 后放行
-- **THEN** 放行顺序保持原相对 `sequence_number` 次序
+- **WHEN** 多个并行 item 的帧交错到达并被 hold 后放行
+- **THEN** 同一槽内按到达序放行；跨槽相对 `sequence_number` 次序**不被保证**（为显式声明的例外），实际放行序由锁定用例断言
 
 #### Scenario: 无法保序时显式声明
 
-- **WHEN** 实现无法保证相对次序
-- **THEN** 该范围被显式声明并由测试锁定
+- **WHEN** 检查跨槽并行 item 的放行序契约
+- **THEN** 「每槽到达序 + 该槽完成事件驱动、跨槽不保证相对序」被显式声明，并由交错并行 item 用例锁定实际行为
+
+#### Scenario: 不为保序等待未完成槽
+
+- **WHEN** 某槽尚未收到完成事件
+- **THEN** 系统不因等待跨槽排序而阻塞其它已就绪槽的放行，无悬挂
 
 ### Requirement: 无 event: 行的 data 帧不注入 event
 

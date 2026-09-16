@@ -1,13 +1,13 @@
 # credential-flow-parity Specification
 
 ## Purpose
-锁定凭据流水线六段（注册 → 审批 → 取用 → 哈希变更 → 吊销 → 锁定）的目标契约：注册/吊销/哈希变更审批链与三态落定、生产旧格式迁移、按名吊销与重名冲突、lock/forget 清理接线、审批票 TTL 与双 pending 原子清理、TPM 并发隔离、审批消息可读上下文、限流维度、旧哈希宽限、紧急吊销网段、注册表存储语义，以及 `/credential` 信封、时序安全比较、未 enrolled 兼容放行三项登记契约。行为真相源为 `src/service/credential/`、`src/service/matrix/`、`src/registry/`、`src/handler/credential.rs`、`src/service/tpm.rs`、`src/approval.rs`、`src/auth.rs`。
+锁定凭据流水线六段（注册 → 审批 → 取用 → 哈希变更 → 吊销 → 锁定）的目标契约：注册/吊销/哈希变更审批链与三态落定、生产旧格式迁移、按名吊销与重名冲突、lock/forget 清理接线、审批票 TTL 与双 pending 原子清理、TPM 并发隔离、审批消息可读上下文、限流维度、旧哈希宽限、紧急吊销网段、注册表存储语义，以及 `/credential` 信封、时序安全比较、未 enrolled 默认转审批（`AUTO_APPROVE=false` 才 `403`）三项登记契约。行为真相源为 `src/service/credential/`、`src/service/matrix/`、`src/registry/`、`src/handler/credential.rs`、`src/service/tpm.rs`、`src/approval.rs`、`src/auth.rs`。
 
 ## Requirements
 
 ### Requirement: 注册审批链三态落定
 
-系统 SHALL 在注册成功后创建 Matrix 审批单（`MatrixBranch::Register`，携带 `reg_id`），并按既有双模口径等待落定：默认模式 SHALL 返回 `202` 抛单，`CREDENTIAL_BLOCK_WAIT=1` 时 SHALL 阻塞等待至 `300s` 审批超时。落定 SHALL 支持三态：`🔓` 保持 `disabled`（不激活）、`✅` 置 `enabled=true`、`❎` 置 `revoked=true`；等待超时 SHALL 按吊销落定（fail-closed）。系统 SHALL NOT 在未获 `✅` 时激活注册条目，SHALL NOT 因落定失败回滚注册表内存态。对同一未决注册请求的重试 SHALL 幂等：SHALL 返回同一 pending（`202 + E_PENDING`），SHALL NOT 重复建单、SHALL NOT 对该待审 `caller_path` 返回 `409`；落定为终态后重试 SHALL 返回终态结果（`✅` 放行、`❎`/超时按 `403` 拒绝），与 README 声明的轮询语义一致（`src/service/credential/vault_ops.rs:297`）。
+系统 SHALL 在注册成功后创建 Matrix 审批单（`MatrixBranch::Register`，携带 `reg_id`），并按既有双模口径等待落定：默认模式 SHALL 返回 `202` 抛单，`CREDENTIAL_BLOCK_WAIT=1` 时 SHALL 阻塞等待至 `300s` 审批超时。落定 SHALL 支持三态：`🔓` 保持 `disabled`（不激活）、`✅` 置 `enabled=true`、`❎` 置 `revoked=true`；等待超时 SHALL 按吊销落定（fail-closed）。系统 SHALL NOT 在未获 `✅` 时激活注册条目，SHALL NOT 因落定失败回滚注册表内存态。对同一未决注册请求的重试 SHALL 幂等：SHALL 返回同一 pending（`202 + E_PENDING`），SHALL NOT 重复建单、SHALL NOT 对该待审 `caller_path` 返回 `409`；落定为终态后重试 SHALL 返回终态结果（`✅` 放行、`❎`/超时按 `403` 拒绝），与 README 声明的轮询语义一致（`src/service/credential/vault_ops.rs:314`）。
 
 #### Scenario: 注册等待 ✅ 后启用
 
@@ -31,7 +31,7 @@
 
 ### Requirement: 吊销审批确认
 
-系统 SHALL 使常规吊销请求经 Matrix 审批确认后执行：`✅` 后条目置 `revoked=true` 且 `enabled=false`；`❎` 与等待超时 SHALL NOT 改变条目状态。系统 SHALL 保留紧急吊销豁免通道（管理 token / 文件在位 / 内网来源任一），且紧急通道 SHALL NOT 要求审批。对同一未决吊销请求的重试 SHALL 幂等：SHALL 返回同一 pending（`202 + E_PENDING`）且 SHALL NOT 重复建单；终态后重试 SHALL 返回终态（批准后条目保持 `revoked=true`/`enabled=false`，拒绝/超时保持原状），与 README 声明的轮询语义一致（`src/service/credential/vault_ops.rs:389`）。
+系统 SHALL 使常规吊销请求经 Matrix 审批确认后执行：`✅` 后条目置 `revoked=true` 且 `enabled=false`；`❎` 与等待超时 SHALL NOT 改变条目状态。系统 SHALL 保留紧急吊销豁免通道（管理 token / 文件在位 / 内网来源任一），且紧急通道 SHALL NOT 要求审批。对同一未决吊销请求的重试 SHALL 幂等：SHALL 返回同一 pending（`202 + E_PENDING`）且 SHALL NOT 重复建单；终态后重试 SHALL 返回终态（批准后条目保持 `revoked=true`/`enabled=false`，拒绝/超时保持原状），与 README 声明的轮询语义一致（`src/service/credential/vault_ops.rs:420`）。
 
 #### Scenario: 批准后吊销生效
 
@@ -55,7 +55,7 @@
 
 ### Requirement: 哈希变更三态与落定契约
 
-哈希变更落定后系统 SHALL 按三态处理：`🔓` 保持现有 `allow_mode`（自动放行延续）；`✅` 降级为人工审批模式（后续取用进入审批）；`❎` 与超时置 `enabled=false`。三态 SHALL 均写入旧哈希宽限（`old_hash` + `old_hash_expires_at = now + 3600s`）并更新 `script_sha256`。落定入口 SHALL 接受 `reg_id` 与 `reaction` 入参（`reg_id` 缺省回退 `caller_path`，`reaction` 缺省按保持自动语义），且 SHALL NOT 因入参缺省返回 `400`。落定 SHALL NOT 写入 `revoked=false` 或 `enabled=true`——`🔓` 与 `✅` 分支均 SHALL NOT 复活或解吊销既有条目，仅更新 `script_sha256` 与旧哈希宽限字段，与 Python 语义对齐（`src/registry/store.rs:381-393`；Python `_registry.py:294-306`）。
+哈希变更落定后系统 SHALL 按三态处理：`🔓` 保持现有 `allow_mode`（自动放行延续）；`✅` 降级为人工审批模式（后续取用进入审批）；`❎` 与超时置 `enabled=false`。三态 SHALL 均写入旧哈希宽限（`old_hash` + `old_hash_expires_at = now + 3600s`）并更新 `script_sha256`。落定入口 SHALL 接受 `reg_id` 与 `reaction` 入参（`reg_id` 缺省回退 `caller_path`，`reaction` 缺省按保持自动语义），且 SHALL NOT 因入参缺省返回 `400`。落定 SHALL NOT 写入 `revoked=false` 或 `enabled=true`——`🔓` 与 `✅` 分支均 SHALL NOT 复活或解吊销既有条目，仅更新 `script_sha256` 与旧哈希宽限字段，与 Python 语义对齐（`src/registry/store.rs:371-393`；Python `_registry.py:294-306`）。
 
 #### Scenario: ✅ 降级人工
 
@@ -117,12 +117,17 @@
 
 ### Requirement: lock/forget 清理接线
 
-系统 SHALL 在 Matrix `lock` 指令执行时清理：口令缓存、KeePass 会话、未决审批（内存 pending + 矩阵 pending 按拒绝落定）与 PII scope 缓存；清理后凭据取用 SHALL 失败直至重新解锁。系统 SHALL 在 `forget` 指令执行时清理已决审批单与 token 映射，并在回执中报告真实清理条数。
+系统 SHALL 在 Matrix `lock` 指令执行时清理：口令缓存、KeePass 会话、TPM 派生主密码缓存、未决审批（内存 pending + 矩阵 pending 按拒绝落定）与请求级 PII 作用域（`Scope::pii`）。系统 SHALL NOT 宣称或依赖「全局 PII 缓存」——PII 映射为请求级容器（随请求销毁，跨请求不互见），`lock` 清理不触及任何全局 PII 映射。清理后凭据取用 SHALL 失败直至重新解锁。系统 SHALL 在 `forget` 指令执行时清理已决审批单与 token 映射，并在回执中报告真实清理条数。
 
 #### Scenario: lock 后取不到凭据
 
 - **WHEN** 已解锁状态下执行 `lock`
 - **THEN** 未决审批清零，凭据取用失败（会话/缓存已清）
+
+#### Scenario: lock 不依赖全局 PII 缓存
+
+- **WHEN** 核查 `lock` 清理范围
+- **THEN** 清理对象为请求级 PII 作用域（`Scope::pii`）而非全局缓存；不存在全局 PII 映射被清空或跨请求共享
 
 #### Scenario: forget 清理映射并计数
 
@@ -220,7 +225,7 @@
 
 ### Requirement: 紧急吊销豁免网段
 
-紧急吊销 SHALL 在管理 token、文件在位标记、内网来源三者任一命中时直接执行。内网判定 SHALL 覆盖：`localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`169.254.0.0/16`、`100.64.0.0/10`、`fd00::/8`、`fe80::/10`；SHALL 仅采信 TCP 远端地址（`ConnectInfo`），SHALL NOT 采信代理头。公网来源 SHALL 转常规审批。网段清单 SHALL 在 README 声明。内网判定 SHALL 同时覆盖 IPv4-mapped IPv6 环回形（如 `::ffff:127.0.0.1`，等价 `127.0.0.0/8`；`src/service/credential/` 网络判定）。
+紧急吊销 SHALL 在管理 token、文件在位标记、内网来源三者任一命中时直接执行。内网判定 SHALL 覆盖：`localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`169.254.0.0/16`、`100.64.0.0/10`、`fd00::/8`、`fe80::/10`；SHALL 仅采信 TCP 远端地址（`ConnectInfo`），SHALL NOT 采信代理头。公网来源 SHALL 转常规审批。网段清单 SHALL 在 README 声明。内网判定 SHALL 同时覆盖 IPv4-mapped IPv6 环回形（如 `::ffff:127.0.0.1`，等价 `127.0.0.0/8`；`src/service/credential/vault_ops.rs:538` 的 `is_private_peer` 判定）。
 
 #### Scenario: 回环紧急吊销放行
 
@@ -244,7 +249,7 @@
 
 ### Requirement: 注册表存储语义
 
-系统 SHALL 对注册表加载采用 fail-closed：解析失败或完整性失配 SHALL 拒绝加载，SHALL NOT 回落空表放行。落盘 SHALL 原子（tmp + rename）并在确认前同步落盘（fsync）；条目序列化 SHALL 采用稳定排序（`BTreeMap` 键序）。数据库选择 SHALL 排序取末位 `.kdbx`，仅当存在同名 `.key` 时配对，SHALL NOT 取任意首个 `.key`。上述语义 SHALL 登记（含与原仓差异）。启动加载路径 SHALL 传播加载错误并拒绝启动（fail-fast），同时记 `error` 日志；SHALL NOT 以 `.unwrap_or_default()` 等静默回落为空表（C14；`src/state.rs:76`，`store.rs:193-208`）。注册表临时文件 SHALL 在创建时即以 `0600` 权限打开（`OpenOptionsExt::mode`），SHALL NOT 存在先创建后 `chmod` 的宽权限窗口；重写产物权限口径一致（`src/registry/store.rs`）。
+系统 SHALL 对注册表加载采用 fail-closed：解析失败或完整性失配 SHALL 拒绝加载，SHALL NOT 回落空表放行。落盘 SHALL 原子（tmp + rename）并在确认前同步落盘（fsync）；条目序列化 SHALL 采用稳定排序（`BTreeMap` 键序）。数据库选择 SHALL 排序取末位 `.kdbx`，仅当存在同名 `.key` 时配对，SHALL NOT 取任意首个 `.key`。上述语义 SHALL 登记（含与原仓差异）。启动加载路径 SHALL 传播加载错误并拒绝启动（fail-fast），同时记 `error` 日志；SHALL NOT 以 `.unwrap_or_default()` 等静默回落为空表（C14；`src/state.rs:76`，`src/registry/store.rs:206-221`）。注册表临时文件 SHALL 在创建时即以 `0600` 权限打开（`OpenOptionsExt::mode`），SHALL NOT 存在先创建后 `chmod` 的宽权限窗口；重写产物权限口径一致（`src/registry/store.rs`）。
 
 #### Scenario: 损坏注册表拒绝加载
 
@@ -308,14 +313,19 @@
 - **WHEN** 以不同长度的候选 token 请求管理面
 - **THEN** 比较按恒时口径执行，不因长度不等而可分辨地提前返回，鉴权结果正确
 
-### Requirement: 未 enrolled 兼容放行
+### Requirement: 未 enrolled 默认转审批
 
-当服务端未配置调用方期望哈希（未 enrolled）时，系统 SHALL 跳过哈希比对并兼容放行，但 Secret 校验 SHALL 继续执行；Secret 失败 SHALL 返回 `403`。
+当服务端未配置调用方期望哈希（未 enrolled）时，系统 SHALL 默认转入 Matrix 审批（`202 + E_PENDING`）；仅当 `AUTO_APPROVE=false` 时 SHALL 返回 `403`。系统 SHALL NOT 因未注册而直接自动放行。Secret 校验 SHALL 在转审批/拒绝判定前继续执行；Secret 失败 SHALL 返回 `403`。行为真相源 SHALL 为 canonical `openspec/specs/credential-auth-hardening/spec.md`「未注册调用方默认转审批」。代码锚点：`src/service/credential/auth.rs:262-280`（未 enrolled 且 `Deny` → 403，否则 `approval_dual_mode`）。
 
 #### Scenario: 未 enrolled 放行且 Secret 仍校验
 
 - **WHEN** 调用方无期望哈希配置且 Secret 正确
-- **THEN** 请求放行并按自动放行三态处理
+- **THEN** 默认转入 Matrix 审批（`202 + E_PENDING`），不返回凭据明文、不直接放行（`AUTO_APPROVE=false` 时为 `403`）
+
+#### Scenario: AUTO_APPROVE=false 时 403
+
+- **WHEN** 调用方无期望哈希配置、Secret 正确，且 `AUTO_APPROVE=false`
+- **THEN** 返回 `403`，不转审批、不返回凭据
 
 #### Scenario: Secret 错误仍拒绝
 

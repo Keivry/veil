@@ -115,7 +115,7 @@
 
 ### Requirement: Chat 审计按声明 index 分桶
 
-系统 SHALL 以 Chat `choices[].index` 声明值参与审计分桶（缺省回退枚举位置）；SHALL NOT 仅用位置序号导致乱序或跳号 `index` 时槽归属错位。分桶键 SHALL 保持既有 `chat_bucket` 语义（`ci*64+declared_index`）。
+系统 SHALL 以 Chat `choices[].index` 声明值参与审计分桶（缺省回退枚举位置）；SHALL NOT 仅用位置序号导致乱序或跳号 `index` 时槽归属错位。分桶键 SHALL 采用位域公式 `(ci << 16) | (idx & 0xFFFF)`（`ci, idx < 2^16` 时单射无碰撞），SHALL NOT 使用历史 `ci*64+declared_index`（该式在 `idx >= 64` 时与下一 choice 的桶 0 碰撞）。`ci=0` 时位域公式与历史公式等值。
 
 #### Scenario: 乱序/跳号 index 分桶正确
 

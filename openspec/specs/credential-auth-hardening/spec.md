@@ -26,7 +26,7 @@
 
 ### Requirement: 紧急吊销通道仅认管理 token 与内网来源
 
-系统 SHALL 使紧急吊销 `POST /revoke/emergency` 仅接受两类放行依据：有效管理 token（`admin_token` 或 `X-Admin-Token`）与内网来源（仅按 TCP 远端地址判定，不采信代理头）。系统 SHALL NOT 接受客户端在请求体中声明的「文件在位」之类的自证依据，SHALL NOT 将任何纯客户端布尔字段作为放行条件。未命中放行依据时 SHALL 转常规审批而非直接吊销。管理 token 源 SHALL 为 `OBSERVABILITY_ADMIN_TOKEN`（与 `/_admin` 同一 token）；相对原仓/早期实现使用 `CREDENTIAL_ADMIN_TOKEN` 属**有意变更，BREAKING**——`CREDENTIAL_ADMIN_TOKEN` SHALL NOT 再作为紧急吊销的放行依据。迁移：将 `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs:458-464`）。
+系统 SHALL 使紧急吊销 `POST /revoke/emergency` 仅接受两类放行依据：有效管理 token（`admin_token` 或 `X-Admin-Token`）与内网来源（仅按 TCP 远端地址判定，不采信代理头）。系统 SHALL NOT 接受客户端在请求体中声明的「文件在位」之类的自证依据，SHALL NOT 将任何纯客户端布尔字段作为放行条件。未命中放行依据时 SHALL 转常规审批而非直接吊销。管理 token 源 SHALL 为 `OBSERVABILITY_ADMIN_TOKEN`（与 `/_admin` 同一 token）；相对原仓/早期实现使用 `CREDENTIAL_ADMIN_TOKEN` 属**有意变更，BREAKING**——`CREDENTIAL_ADMIN_TOKEN` SHALL NOT 再作为紧急吊销的放行依据。迁移：将 `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs:555-561`）。
 
 #### Scenario: 伪造文件在位不放行
 
