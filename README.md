@@ -214,6 +214,10 @@ curl -fsS http://127.0.0.1:8877/credential \
   不受影响（跨方故障隔离）。该维度相对原仓 Python 全局单桶 `2s` 属**有意差异**——
   全局单桶下任一调用方高频会阻塞所有调用方（跨方 DoS 面）。回退条款：若运维要求严格
   全局单桶，须另立 change 交付，本 change 不静默改行为。
+- `/_admin/series` 的 `since` 仅接受 `[dhm]<整数>` 形态（与 `day_key`/`hour_key`/`five_min_key`
+  产出同形）；非法值返回 `400 + E_BAD_REQUEST`（消息列明合法形态），**不以全量无过滤回退**
+  （`i64::MIN` 回退已移除）。epoch 或日期形态支持须另立 change 交付（见 canonical
+  `openspec/specs/observability-admin/spec.md`「series since 取值形态校验」）。
 
 ```bash
 # 超限示例（同一 IP 一分钟内第 11 次调用通用 admin 接口）
@@ -351,6 +355,14 @@ get revoke --name "check-mail"
   （不再把 `202` 当成功）；`CREDENTIAL_BLOCK_WAIT=1` 时服务端阻塞返回终态，客户端单次调用即完成。
   错误体兼容（`ErrMessage`：网关对象取 `message`、兼容 Python 字符串错误体）与 `/credential`
   成功信封 `{"ok":true,"credential":{...}}` 不变；`202` 体不再报「解析响应失败」。
+- Go 客户端环境变量（`get/`，本仓内置）：`PROXY_URL`（网关基址，默认 `http://127.0.0.1:8877`）、
+  `PROXY_HTTP_TIMEOUT`（单次 HTTP 超时秒数，默认 `300`；非法值回退默认并向 stderr 告警，
+  fail-closed 不回退 `30s`）、`PROXY_APPROVAL_WAIT`（默认 `1`；`0` 立即返回待审批）、
+  `PROXY_APPROVAL_TIMEOUT`（审批终态总时限，默认 `300s`）、`PROXY_APPROVAL_POLL`（轮询起始间隔，
+  默认 `2s`，逐次翻倍至 `10s`）。审批真实网关 E2E（`get/internal/approval_e2e_test.go`）由
+  `VEIL_APPROVAL_E2E_URL`（网关基址）与 `VEIL_APPROVAL_E2E_CALLER`（一次性调用方名）共同启用，
+  二者未同时设置即 `t.Skip`；该用例会向网关提交对 `VEIL_APPROVAL_E2E_CALLER` 的**真实吊销审批单**
+  （破坏性，仅限可弃用调用方）。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
 
 ## 6. 行为变更（BREAKING）与迁移
@@ -405,7 +417,7 @@ get revoke --name "check-mail"
   不挂起等待真人 `✅/❎`；拒绝/过期语义由凭据审批链承载。原仓在流中挂起等待 Matrix 审批
  （`keepalive` + 超时默认拒绝并注入阻断帧）。
 - 路径集合（`R3`，`veil-reverify-fix`）：`audit-hold` 仅插入内存 pending 记录
-  （`audit_pending` 建单点迁移至 `src/handler/llm/pump/spawn/event_loop.rs:414`），**不建 Matrix 审批票**（无 tracked 发送、
+  （`audit_pending` 建单点迁移至 `src/handler/llm/pump/spawn/event_loop.rs::handle_event`，取符号锚不随行号漂移），**不建 Matrix 审批票**（无 tracked 发送、
   无真实 `event_id` 键建单）；审批建单路径白名单见 §6.7，规范文本见本 change spec
   「审批建单路径白名单」。
 - 影响：长连接不挂起，对 Hermes 更友好；但“危险调用被拦”在流式面表现为 pending 建单
@@ -563,6 +575,11 @@ A5/D9 互引：编码剥离即对外统一 `identity`，见同文件 `filter_hop
 多源 usage 取最大值（`max` 口径，不双计）：流式增量与完成帧 usage 按
 `prompt_tokens`/`completion_tokens`/`total_tokens` 三列各自取 max。
 旧大盘按 `sum` 估算会虚高，迁移到新口径请以本声明为准。
+`total_tokens` 显式优先与求和回退（互斥，勿混用）：若任一事件显式携带 `total_tokens`/`total`，
+取显式值 `max`（保留上游声明）；若全部事件均未显式携带，最终按合并后的
+`prompt_tokens_max + completion_tokens_max` **求和回退**（Anthropic `message_start` 输入 +
+`message_delta` 输出必须求和而非取 max，见 `src/service/llm_gateway/usage.rs::merge_usage`）。
+回退仅在无显式 total 时生效，不覆盖上游声明值。
 Responses 取数顶层优先：非流按顶层 `usage` → `response.usage` → `response.response.usage`
 三级回退，流式同口径（含 `response.completed` 事件）；定制双层体仍经回退命中不断链。
 缓存列 `cached_read`/`cached_write` 同样按列取 max：Anthropic 取顶层
@@ -695,6 +712,14 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 命中率是上游 provider 侧计费指标，网关侧不可见真值，且请求隔离是隐私硬要求
 （见 `src/service/metrics.rs` 模块文档）。
 
+凭据还原授权收紧（`B3`，`veil-audit-r3-remediation`，**安全修复、非兼容回归**）：响应侧凭据
+还原改为**请求级授权**——仅当 token 属「本请求脱敏实际产出」（minted-set，随请求销毁）时才
+调用 vault 还原；调用方自带的 `__VG_CRED_<n>__` 字面量现按未授权幻觉 token 剥离（fail-closed），
+不再借进程单例的历史映射还原。字面 token 无法还原属**有意收紧**：原行为允许任意调用方以
+猜测序号触达历史请求的凭据明文，属安全缺陷修复，不视为兼容回归；依赖该行为的调用方须改由
+请求侧真实脱敏产出 token（契约见 canonical `openspec/specs/credential-vault-singleton/spec.md`
+「响应侧凭据还原请求级授权」）。
+
 ### 7.4 遗留变量兼容表
 
 | 遗留变量 | 状态 | 改用 |
@@ -723,7 +748,7 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   管理 token 源为 `OBSERVABILITY_ADMIN_TOKEN`（与 `/_admin` 同一 token，`CRD-7`）；
   `CREDENTIAL_ADMIN_TOKEN` **不再作为紧急吊销放行依据**（**BREAKING**）——仅携带旧
   `CREDENTIAL_ADMIN_TOKEN` 值且来源非内网时转常规审批，不直接吊销。迁移：将
-  `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs:458-464`）。
+  `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs:555-561`）。
 - 紧急吊销豁免网段（`C13`，`veil-credential-flow-parity`）：内网来源覆盖
   `localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、
   `169.254.0.0/16`（链路本地）、`100.64.0.0/10`（CGNAT）、`fd00::/8`（ULA）、`fe80::/10`
@@ -869,7 +894,10 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
   前置条件（第 6 步）：Python venv（默认 `/home/keivry/项目/Python/credential-proxy/.venv/bin/python`，
   可用 `VEIL_CONFORMANCE_PYTHON` 覆盖）与 SDK pin `openai==3.5.0`/`anthropic==1.1.0` + `pykeepass`；
   无 TPM 硬件时脚本内建 `VEIL_ALLOW_MOCK_TPM=1` 回退（仅开发/CI，生产接 TPM 2.0 硬件）。
-  前置条件（第 7 步）：本机 Go 工具链（`get/go.mod` 要求 go 1.22），在 `get/` 目录内执行。
+  前置条件（第 7 步）：本机 Go 工具链，在 `get/` 目录内执行；**Go 版本由 `get/go.mod`（`go 1.22`）
+  在 `vet`/`test` 阶段强制**——Go ≥1.21 的 `GOTOOLCHAIN=auto` 会依 `go.mod` 自动选型/下载，
+  Go <1.21 时版本指令在 `vet`/`test` 阶段明确报错并非零退出（fail-closed）。gate **SHALL NOT**
+  增加版本字符串比较（会把本可成功的环境误判失败）。
   跳过语义：缺前置条件默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与
   `GATE_SKIP_GO=1`（第 7 步）为显式跳过并打印跳过理由与文档位置，不出现无输出的静默跳过。
 
@@ -887,9 +915,10 @@ PII 映射按请求隔离（`Scope::pii` 请求级容器，请求结束即销毁
 - 与原仓差异：原仓 Python `_ensure_nonempty_stream`（`_llm.py:2633`）对三协议均注入最小可解析
   事件以避免下游 `JSONDecodeError` 空体；本仓现按协议最小面补终止，语义面只补线级终止，
   不伪造内容/usage/成功（Anthropic `error` 本身即终端，其后不注入 `message_stop`）。
-- 口径变更声明：本条替换旧「Chat/Anthropic 真空流保持 open-ended」口径；既有
-  `stream-protocol-parity` spec 的空流条款待随本 change 归档时同步修订，
-  行为真相源以 `openspec/specs/llm-protocol-hardening/spec.md`（canonical，该 change 已归档）为准。
+- 口径变更声明：本条替换旧「Chat/Anthropic 真空流保持开放结尾」口径；canonical
+  `openspec/specs/stream-protocol-parity/spec.md` 与 `openspec/specs/llm-proto-closeout/spec.md`
+  的空流条款已在 `veil-audit-r3-remediation` apply 期同步修订（旧条款已删除、迁移声明在位），
+  行为真相源以 `openspec/specs/llm-protocol-hardening/spec.md`（canonical）为准。
 - 风险：Anthropic 严格 SDK 若要求 `message_delta` 才认流闭合，最小信封可能被拒收；
   以 spec「真空流最小终止」Scenario 为准，实测需要时另立 change 补帧。
 - 中途断流与真空流区分（D6，`veil-stream-fidelity-fix`）：真空流（零字节零残余）走本节的
