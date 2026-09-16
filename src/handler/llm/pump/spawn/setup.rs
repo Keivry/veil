@@ -68,6 +68,9 @@ pub(super) struct PumpLoopState {
     pub audit_blocked: bool,
     pub terminal_sent: bool,
     pub responses_failed_sent: bool,
+    /// A-2/F-02：Responses「已见上游序号上界」游标（仅 Responses 帧更新；
+    /// 缺 `sequence_number` 不推进、回退忽略），供阻断/截断合成取 `base = max + 1`。
+    pub responses_seq_cursor: Option<u64>,
     /// CHC-5/2.24：Chat 已见非空 `finish_reason`（干净收尾信号）。
     pub chat_finish_seen: bool,
 }
@@ -129,6 +132,7 @@ pub(super) fn setup(
         audit_blocked: false,
         terminal_sent: false,
         responses_failed_sent: false,
+        responses_seq_cursor: None,
         chat_finish_seen: false,
     };
     let env = PumpEnv {

@@ -22,7 +22,7 @@ use {
             llm_gateway::{self, GatewayMetrics, Protocol},
             pii::PiiDetector,
             redaction::{BoundaryHold, PrefixHold, Scope},
-            sse::{SseParser, StreamMeta, TruncatedMode, set_truncated},
+            sse::{SseParser, StreamMeta, TruncatedMode, data_frame, set_truncated},
         },
     },
 };
@@ -38,6 +38,8 @@ where
     pub terminal_sent: bool,
     /// CHC-5/2.24：Chat 干净收尾（已见非空 `finish_reason`），断流终端不记 open_ended。
     pub chat_finish_seen: bool,
+    /// A-2/F-02：Responses 上游序号上界游标（阻断 7 帧序列与截断单帧的 base 来源）。
+    pub responses_seq_cursor: Option<u64>,
     pub any_frame_sent: bool,
     pub forwarded: &'a mut usize,
     pub block_injected: &'a mut bool,
@@ -73,6 +75,7 @@ where
         transport_error,
         terminal_sent: terminal_sent_in,
         chat_finish_seen,
+        responses_seq_cursor,
         any_frame_sent: any_frame_sent_in,
         forwarded,
         block_injected,
@@ -160,6 +163,7 @@ where
                     conv_id.as_deref(),
                     blocked_index.unwrap_or(0),
                     None,
+                    responses_seq_cursor,
                 )) {
                     let _ = pump_tx.send(f).await;
                 }
@@ -192,8 +196,7 @@ where
     let stream_truncated = transport_error || truncated_tool_dropped;
     drain_prefix_hold(prefix_hold, boundary, boundary_spans, agg);
     if let Some((fp, fd)) = boundary.flush() {
-        agg.push_str(&fp);
-        agg.push_str(&format!("data: {fd}\n\n"));
+        agg.push_str(&data_frame(&fp, &fd));
     }
     if !agg.is_empty() {
         record_emitted_events(metrics, agg);
@@ -205,7 +208,10 @@ where
     // CHC-2/D7：残余分类（§2.6）+ 半帧丢弃——BOM/`[DONE]`/空白/半帧/非 JSON 一律
     // 丢弃；仅完整 JSON 载荷（已剥 `data:` 前缀）才放行，杜绝二次加前缀转发。
     if let Some(payload) = residual_frame_payload(&residual) {
-        let (restored, spans) = resp_scope.restore_response_with_spans(resp_vault, &payload);
+        // B1/A-9：残余帧由 `residual_frame_payload` 保证为完整 JSON，还原须走
+        // `_json` 变体（按深度转义）——明文含 `"`/`\`/控制字符时仍为合法 JSON，
+        // 与正常帧（`event_loop.rs` 两处）同口径；逐字插入变体会破帧。
+        let (restored, spans) = resp_scope.restore_response_with_spans_json(resp_vault, &payload);
         let scanned = resp_scope
             .redact_response_new_pii_with_skip(resp_vault, resp_detector, &restored, &spans)
             .await;
@@ -222,8 +228,7 @@ where
             .await;
             drain_prefix_hold(prefix_hold, boundary, boundary_spans, agg);
             if let Some((fp, fd)) = boundary.flush() {
-                agg.push_str(&fp);
-                agg.push_str(&format!("data: {fd}\n\n"));
+                agg.push_str(&data_frame(&fp, &fd));
             }
             if !agg.is_empty() {
                 let _ = pump_tx.send(std::mem::take(agg)).await;
@@ -246,6 +251,7 @@ where
             MidstreamInput {
                 conv_id: conv_id.as_deref(),
                 clean_close: protocol.is_chat() && chat_finish_seen,
+                seq_cursor: responses_seq_cursor,
             },
             boundary,
             agg,
@@ -292,4 +298,46 @@ where
         }
     }
     carry.finish();
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use {
+        super::*,
+        crate::handler::llm::stream_tests::{collect_pump, fresh_arcs, loopback_server, pump_ctx},
+    };
+
+    #[tokio::test]
+    async fn residual_frame_json_escape_restore() {
+        // B1/A-9：残余帧还原走 `_json` 变体——明文含 `"`/`\` 时仍为合法 JSON
+        // （逐字插入变体会破帧），还原值精确、下游无解析错误。
+        // B3 授权前提：token 须由本请求脱敏实际产出（minted-set）方可还原——
+        // 先注册再经请求侧脱敏产出（其返回值经残缺清理剥离 token，不消费）；
+        // 未产出 token 会被按未授权剥离，本用例即无从还原。
+        let (scope, vault, detector) = fresh_arcs();
+        let secret = "a\"b\\c";
+        let token = vault.register(secret).expect("注册恒成功");
+        let _ = scope.redact_request_plain(&vault, &detector, secret).await;
+        let body =
+            format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{token}\"}}")
+                .into_bytes();
+        let (url, server) = loopback_server(200, "text/event-stream", body).await;
+        let upstream = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("回环上游须可达");
+        let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+        ctx.pii_boundary_chars = 0;
+        let (_outcome, frames) = collect_pump(upstream, ctx).await;
+        server.abort();
+        let payload = frames
+            .iter()
+            .flat_map(|f| f.lines())
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|p| p.contains("output_text.delta"))
+            .expect("残余帧须送达下游");
+        let v: serde_json::Value = serde_json::from_str(payload).expect("残余还原后须为合法 JSON");
+        assert_eq!(v["delta"], secret, "明文须按 JSON 转义精确还原: {payload}");
+    }
 }

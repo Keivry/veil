@@ -105,4 +105,68 @@ mod toolbuf_tests {
         assert_eq!(rest.len(), 1, "全局完成取空剩余");
         assert!(pending.is_empty());
     }
+
+    #[tokio::test]
+    async fn toolbuf_interleaved_parallel_release_order() {
+        // A-8/7.3：两并行 tool 槽交错到达/完成——放行序定义为「每槽按到达序取出、
+        // 由该槽完成事件驱动」；跨槽相对次序不被保证（锁实测：先完成者先放行，
+        // 不按槽号/全局到达序排序）。
+        use crate::{
+            config::AuditMode,
+            handler::llm::stream_tests::{collect_pump, fresh_arcs, loopback_server, pump_ctx},
+            service::llm_gateway::Protocol,
+        };
+        let sse = br#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":1,"item":{"type":"function_call","id":"call-A","name":"get_weather","arguments":""}}
+
+data: {"type":"response.output_item.added","output_index":1,"sequence_number":2,"item":{"type":"function_call","id":"call-B","name":"get_weather","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-A","output_index":0,"sequence_number":3,"delta":"{\"city\":\"AAA"}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-B","output_index":1,"sequence_number":4,"delta":"{\"city\":\"BBB"}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-A","output_index":0,"sequence_number":5,"delta":" ZZZ\"}"}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-B","output_index":1,"sequence_number":6,"delta":" WWW\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-B","output_index":1,"sequence_number":7,"arguments":"{\"city\":\"BBB WWW\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-A","output_index":0,"sequence_number":8,"arguments":"{\"city\":\"AAA ZZZ\"}"}
+
+data: {"type":"response.completed","sequence_number":9,"response":{"id":"r1","status":"completed"}}
+
+"#
+        .to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+        let upstream = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+        ctx.req.audit_mode = AuditMode::Block;
+        ctx.pii_boundary_chars = 0;
+        let (outcome, frames) = collect_pump(upstream, ctx).await;
+        server.abort();
+        assert!(!outcome.block_injected, "良性并行调用不得阻断");
+        let joined = frames.join("");
+        let a = joined.find("AAA").expect("槽 0 分片须放行");
+        let b = joined.find("BBB").expect("槽 1 分片须放行");
+        assert!(
+            b < a,
+            "放行由完成事件驱动（槽 1 先完成须先放行，不按到达序/槽号重排）: {joined}"
+        );
+        assert!(
+            joined.find("AAA").unwrap() < joined.find("ZZZ").unwrap(),
+            "槽 0 内须保到达序: {joined}"
+        );
+        assert!(
+            joined.find("BBB").unwrap() < joined.find("WWW").unwrap(),
+            "槽 1 内须保到达序: {joined}"
+        );
+        assert!(
+            !joined.contains("rm -rf"),
+            "测试向量不含危险参数（判别力集中于放行序）: {joined}"
+        );
+    }
 }

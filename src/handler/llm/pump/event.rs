@@ -2,8 +2,10 @@
 
 use {
     crate::service::{
-        json_walk::strip_bom,
+        json_walk::{jloads, strip_bom},
         llm_gateway::{self, GatewayMetrics, Protocol},
+        redaction::leaf::{NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE},
+        sse::is_done_payload,
     },
     axum::{
         body::Body,
@@ -43,7 +45,7 @@ pub fn build_sse_response(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache");
     if normalized_out {
-        stream_builder = stream_builder.header("x-veil-normalized", "json-whitespace");
+        stream_builder = stream_builder.header(NORMALIZED_HEADER_NAME, NORMALIZED_HEADER_VALUE);
     }
     stream_builder
         .header("X-Accel-Buffering", "no")
@@ -120,41 +122,63 @@ pub(super) fn sticky_terminal_fallback(protocol: Protocol, data: &str) -> bool {
     }
 }
 
-/// E8 对拒止粘滞分支的终止判定：JSON 可解析走精确判定，否则走
-/// contains 兜底并记 `terminal_fallback` 计数。
+/// 6.1/ARH-2：每帧 `ev.data` 的唯一全量解析点——剥 BOM 后单次 `jloads`，
+/// 产物供本函数各判定复用；空帧/`[DONE]`/非法 JSON 返回 `None`（调用方按需走
+/// contains 兜底）。生产段 SHALL NOT 再出现第二处帧解析（源码守护见
+/// `model_bucket_tests.rs` 的 `single_parse_per_frame` 与
+/// `event_rs_production_prefix_no_from_str`）。
+pub(super) fn parse_event_data(data: &str) -> Option<Value> {
+    if data.is_empty() || is_done_payload(data) {
+        return None;
+    }
+    count_parse();
+    jloads(strip_bom(data)).ok()
+}
+
+/// E8 对拒止粘滞分支的终止判定：已解析帧走精确判定，未解析帧走 contains
+/// 兜底并记 `terminal_fallback` 计数（调用点已排除空帧/`[DONE]`，`None`
+/// 即解析失败）。
+/// 6.1/ARH-2：解析产物经 [`parse_event_data`] 单点产出，此处零重解析。
 pub(super) fn sticky_terminal_event(
     protocol: Protocol,
+    parsed: Option<&Value>,
     data: &str,
     metrics: &GatewayMetrics,
 ) -> bool {
-    if let Ok(v) = serde_json::from_str::<Value>(strip_bom(data)) {
-        sticky_terminal_precise(protocol, &v)
-    } else {
-        metrics.record_terminal_fallback();
-        sticky_terminal_fallback(protocol, data)
+    match parsed {
+        Some(v) => sticky_terminal_precise(protocol, v),
+        None => {
+            metrics.record_terminal_fallback();
+            sticky_terminal_fallback(protocol, data)
+        }
     }
 }
 
-/// E8 Responses 合成前的失败/未完成分类：解析成功按 `type` 精确分类，
-/// 失败回退 contains 并计数。返回 `(is_failed, is_incomplete, is_error)`。
+/// E8 Responses 合成前的失败/未完成分类：已解析帧按 `type` 精确分类，
+/// 未解析帧回退 contains 并计数。返回 `(is_failed, is_incomplete, is_error)`。
+/// 6.1/ARH-2：解析产物经 [`parse_event_data`] 单点产出，此处零重解析。
 pub(super) fn responses_failed_incomplete(
+    parsed: Option<&Value>,
     data: &str,
     metrics: &GatewayMetrics,
 ) -> (bool, bool, bool) {
-    if let Ok(v) = serde_json::from_str::<Value>(strip_bom(data)) {
-        let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        (
-            t == "response.failed",
-            t == "response.incomplete",
-            t == "error",
-        )
-    } else {
-        metrics.record_terminal_fallback();
-        (
-            data.contains("response.failed"),
-            data.contains("response.incomplete"),
-            data.contains("\"type\":\"error\"") || data.contains("\"type\": \"error\""),
-        )
+    match parsed {
+        Some(v) => {
+            let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            (
+                t == "response.failed",
+                t == "response.incomplete",
+                t == "error",
+            )
+        }
+        None => {
+            metrics.record_terminal_fallback();
+            (
+                data.contains("response.failed"),
+                data.contains("response.incomplete"),
+                data.contains("\"type\":\"error\"") || data.contains("\"type\": \"error\""),
+            )
+        }
     }
 }
 
@@ -163,8 +187,9 @@ pub(super) fn responses_failed_incomplete(
 /// 顶层 `code`/`param`/`message` 仅补缺；同时携带顶层 `sequence_number`（可得时）。
 /// 无 `message`（合并后为空）或两形态均无有效字段时返回 `None`
 /// （合成帧回退既有 `{"id","status"}` 形态，不带 error 字段、无空字段噪声）。
-pub(super) fn responses_error_object(data: &str) -> Option<(Value, Option<u64>)> {
-    let v = serde_json::from_str::<Value>(strip_bom(data)).ok()?;
+/// 6.1/ARH-2：解析产物经 [`parse_event_data`] 单点产出，此处零重解析。
+pub(super) fn responses_error_object(parsed: Option<&Value>) -> Option<(Value, Option<u64>)> {
+    let v = parsed?;
     let mut obj = serde_json::Map::new();
     if let Some(err) = v.get("error").filter(|e| e.is_object()) {
         for key in ["type", "code", "param", "message"] {
@@ -184,7 +209,7 @@ pub(super) fn responses_error_object(data: &str) -> Option<(Value, Option<u64>)>
         .get("message")
         .and_then(|m| m.as_str())
         .is_some_and(|s| !s.is_empty());
-    has_message.then(|| (Value::Object(obj), extract_responses_seq(&v)))
+    has_message.then(|| (Value::Object(obj), extract_responses_seq(v)))
 }
 
 /// TRN-7：流式模型提取——顶层 `model` 优先，回退 Anthropic `message_start.message.model`
@@ -227,6 +252,22 @@ pub(super) fn is_terminal_event(protocol: Protocol, v: &Value) -> bool {
             t == "response.completed" || t == "response.failed" || t == "response.incomplete"
         }),
         _ => false,
+    }
+}
+
+/// A-6/F-08：Chat 错误载荷帧即终端——判据严格限定为「顶层 `error` 存在」与
+/// 「`choices` 缺席」同时成立；`choices[].error` 或顶层 `error` 与 `choices`
+/// 共存的正常形态不满足判据（不误伤，既有透传与收尾语义不变）。
+pub(super) fn is_chat_error_terminal(protocol: Protocol, v: &Value) -> bool {
+    protocol.is_chat() && v.get("error").is_some() && v.get("choices").is_none()
+}
+
+/// A-2/F-02：Responses 序号游标推进——取既有上界与上游 `sequence_number` 的
+/// 较大值（`cursor = max(cursor.unwrap_or(0), seq)`）；缺 `sequence_number` 的
+/// 帧不更新、回退值被忽略（只取 max），断序不升级为错误。
+pub(super) fn advance_responses_seq_cursor(cursor: &mut Option<u64>, v: &Value) {
+    if let Some(seq) = extract_responses_seq(v) {
+        *cursor = Some(cursor.unwrap_or(0).max(seq));
     }
 }
 
@@ -338,9 +379,43 @@ pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {
     }
 }
 
+/// 6.2/ARH-2：帧解析计数钩子——生产编译为空实现（零开销），测试经线程本地
+/// `PARSE_COUNT` 计数，供泵 e2e 断言每帧恰一次解析。
+#[cfg(not(test))]
+fn count_parse() {}
+
+#[cfg(test)]
+fn count_parse() { PARSE_COUNT.with(|c| c.set(c.get() + 1)); }
+
+#[cfg(test)]
+thread_local! {
+    /// 6.2/ARH-2：线程本地解析计数（并行用例互不串扰，勿改全局原子）。
+    static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 6.2/ARH-2：取出并清零本线程帧解析计数（仅测试可见）。
+#[cfg(test)]
+pub(super) fn take_parse_count() -> usize { PARSE_COUNT.with(std::cell::Cell::take) }
+
 #[cfg(test)]
 mod event_tests {
     use {super::*, crate::service::block_inject};
+
+    /// 6.1/ARH-2：测试面字符串签名包装（既有用例零改）——内部经单点
+    /// [`parse_event_data`] 产出解析产物后委托生产签名。
+    fn sticky_terminal_event(protocol: Protocol, data: &str, metrics: &GatewayMetrics) -> bool {
+        super::sticky_terminal_event(protocol, parse_event_data(data).as_ref(), data, metrics)
+    }
+
+    /// 6.1/ARH-2：测试面字符串签名包装（单点解析后委托生产签名）。
+    fn responses_failed_incomplete(data: &str, metrics: &GatewayMetrics) -> (bool, bool, bool) {
+        super::responses_failed_incomplete(parse_event_data(data).as_ref(), data, metrics)
+    }
+
+    /// 6.1/ARH-2：测试面字符串签名包装（单点解析后委托生产签名）。
+    fn responses_error_object(data: &str) -> Option<(Value, Option<u64>)> {
+        super::responses_error_object(parse_event_data(data).as_ref())
+    }
 
     #[test]
     fn terminal_error_spaced_variant_triggers_truncation() {
@@ -665,5 +740,48 @@ mod event_tests {
                 "{t} 须维持次要"
             );
         }
+    }
+
+    #[test]
+    fn responses_seq_cursor_missing_and_regression_ignored() {
+        // A-2/F-02：游标取上界——缺 `sequence_number` 不更新、回退值不降游标。
+        let mut cursor = None;
+        advance_responses_seq_cursor(&mut cursor, &serde_json::json!({"sequence_number": 4}));
+        assert_eq!(cursor, Some(4), "首见序号须置位");
+        advance_responses_seq_cursor(&mut cursor, &serde_json::json!({"type": "response.x"}));
+        assert_eq!(cursor, Some(4), "缺序号帧不得复位游标");
+        advance_responses_seq_cursor(&mut cursor, &serde_json::json!({"sequence_number": 2}));
+        assert_eq!(cursor, Some(4), "回退值不降游标（只取 max）");
+        advance_responses_seq_cursor(&mut cursor, &serde_json::json!({"sequence_number": -1}));
+        assert_eq!(cursor, Some(4), "非 u64 回退值忽略");
+        advance_responses_seq_cursor(&mut cursor, &serde_json::json!({"sequence_number": 9}));
+        assert_eq!(cursor, Some(9), "更大序号须推进");
+    }
+
+    #[test]
+    fn chat_error_terminal_predicate_boundaries() {
+        // A-6/F-08：判据边界——顶层 `error` 且无 `choices` 才判终端；`choices`
+        // 内 `error` 或二者共存不误伤；`is_terminal_event` 对 Chat 恒 false 保持。
+        use crate::service::llm_gateway::Protocol as P;
+        assert!(is_chat_error_terminal(
+            P::Chat,
+            &serde_json::json!({"error": {"message": "boom"}})
+        ));
+        assert!(!is_chat_error_terminal(
+            P::Chat,
+            &serde_json::json!({"choices": [{"delta": {"error": "x"}}]})
+        ));
+        assert!(!is_chat_error_terminal(
+            P::Chat,
+            &serde_json::json!({"error": {"message": "x"}, "choices": []})
+        ));
+        assert!(!is_chat_error_terminal(
+            P::Responses,
+            &serde_json::json!({"error": {"message": "boom"}})
+        ));
+        assert!(
+            !is_terminal_event(P::Chat, &serde_json::json!({"error": {"message": "boom"}})),
+            "is_terminal_event 对 Chat 恒 false（错误帧由独立判据承载）"
+        );
     }
 }

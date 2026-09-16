@@ -6,8 +6,8 @@ use {
         json_walk::strip_bom,
         llm_gateway::GatewayMetrics,
         pii::PiiDetector,
-        redaction::{BoundaryHold, PrefixHold},
-        sse::classify_residue,
+        redaction::{BoundaryHold, PrefixHold, restore_guard::restore_guard_ok},
+        sse::{classify_residue, data_frame},
     },
     serde_json::Value,
 };
@@ -53,53 +53,12 @@ pub(crate) fn guard_restored_frame_parsed(
     placeholder_parsed: Option<&Value>,
     metrics: &GatewayMetrics,
 ) -> String {
-    if guard_ok(&restored, placeholder_frame, placeholder_parsed) {
+    if restore_guard_ok(&restored, placeholder_frame, placeholder_parsed) {
         return restored;
     }
     tracing::warn!("流式还原后 JSON 校验失败，已回退还原前占位符帧（fail-closed）");
     metrics.record_restore_fallback();
     placeholder_frame.to_string()
-}
-
-fn guard_ok(restored: &str, placeholder_frame: &str, placeholder_parsed: Option<&Value>) -> bool {
-    let Ok(rv) = serde_json::from_str::<Value>(strip_bom(restored)) else {
-        return false;
-    };
-    match placeholder_parsed {
-        Some(pv) => inner_json_intact(pv, &rv),
-        // 占位符帧不可解析：无内层参照，维持既有外层口径。
-        None => match serde_json::from_str::<Value>(strip_bom(placeholder_frame)) {
-            Ok(pv) => inner_json_intact(&pv, &rv),
-            Err(_) => true,
-        },
-    }
-}
-
-/// RED-1：递归比对占位符帧与还原帧的字符串值。占位符字符串值若为
-/// stringified JSON，则还原后仍须可解析为同构容器（内层破损 fail-closed）。
-fn inner_json_intact(placeholder: &Value, restored: &Value) -> bool {
-    match (placeholder, restored) {
-        (Value::String(p), Value::String(r)) => {
-            let pt = strip_bom(p).trim();
-            if (pt.starts_with('{') || pt.starts_with('['))
-                && let Ok(pv) = serde_json::from_str::<Value>(pt)
-                && matches!(pv, Value::Object(_) | Value::Array(_))
-            {
-                return serde_json::from_str::<Value>(strip_bom(r).trim())
-                    .ok()
-                    .filter(|rv| matches!(rv, Value::Object(_) | Value::Array(_)))
-                    .is_some_and(|rv| inner_json_intact(&pv, &rv));
-            }
-            true
-        }
-        (Value::Array(pa), Value::Array(ra)) => {
-            pa.len() == ra.len() && pa.iter().zip(ra).all(|(p, r)| inner_json_intact(p, r))
-        }
-        (Value::Object(pm), Value::Object(rm)) => pm
-            .iter()
-            .all(|(k, pv)| rm.get(k).is_some_and(|rv| inner_json_intact(pv, rv))),
-        _ => true,
-    }
 }
 
 /// 把一帧送入边界 hold，仅在可放行时并入 `agg`；返回本轮是否有非空数据放行
@@ -114,8 +73,7 @@ fn push_frame(
     let (out_prefix, out_data) = boundary.push(prefix, data, boundary_spans);
     let nonempty = !out_data.is_empty();
     if nonempty || !boundary.has_held() {
-        agg.push_str(&out_prefix);
-        agg.push_str(&format!("data: {out_data}\n\n"));
+        agg.push_str(&data_frame(&out_prefix, &out_data));
     }
     nonempty
 }

@@ -13,7 +13,7 @@ use {
         block_inject,
         llm_gateway::{self, GatewayMetrics, Protocol},
         redaction::BoundaryHold,
-        sse::{StreamMeta, TruncatedMode, set_truncated},
+        sse::{StreamMeta, TruncatedMode, data_frame, set_truncated},
     },
 };
 
@@ -27,8 +27,7 @@ pub(super) async fn flush_pre_terminal(
     metrics: &GatewayMetrics,
 ) -> bool {
     if let Some((fp, fd)) = boundary.flush() {
-        agg.push_str(&fp);
-        agg.push_str(&format!("data: {fd}\n\n"));
+        agg.push_str(&data_frame(&fp, &fd));
     }
     if agg.is_empty() {
         return false;
@@ -56,6 +55,8 @@ pub(super) struct MidstreamInput<'a> {
     pub conv_id: Option<&'a str>,
     /// 已见非空 `finish_reason` 的干净 EOF（Chat 不记 `open_ended`）。
     pub clean_close: bool,
+    /// A-2/F-02：Responses 上游序号上界游标（截断单帧 base 来源）。
+    pub seq_cursor: Option<u64>,
 }
 
 /// D6/S11：中途断流终端策略（仅在已发帧、未终端、未阻断时由调用方进入）。
@@ -79,12 +80,16 @@ pub(super) async fn midstream_terminal(
     let MidstreamInput {
         conv_id,
         clean_close,
+        seq_cursor,
     } = input;
     // D3/S3：合成终端前先 flush 边界滞留帧，保证末段增量先于终端帧下行。
     let flush_ok = flush_pre_terminal(boundary, agg, pump_tx, metrics).await;
     let mut forwarded = u64::from(flush_ok);
     let terminal_sent = match protocol {
         Protocol::Chat => {
+            // A-6/F-08：错误载荷帧已在流内置终端（`upstream_error` 观测），
+            // `should_apply_midstream_terminal` 随即短路——本臂不再为其补 `[DONE]`、
+            // 不记 `open_ended`；此处仅承载无终端信号的异常断流与干净收尾。
             agg.push_str(&block_inject::chat_done_frame());
             let events = data_event_count(agg);
             let ok = pump_tx.send(std::mem::take(agg)).await.is_ok();
@@ -123,7 +128,7 @@ pub(super) async fn midstream_terminal(
             });
             let mut ok = false;
             for f in block_inject::ensure_event_lines(block_inject::synthesize_truncation(
-                protocol, &tid,
+                protocol, &tid, seq_cursor,
             )) {
                 if pump_tx.send(f).await.is_err() {
                     ok = false;

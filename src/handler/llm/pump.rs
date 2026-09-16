@@ -2,8 +2,9 @@
 //!
 //! 子模块划分（D2 四桶映射）：`spawn` 主泵循环（透传臂/空流守门/hold 分支装配），
 //! `event` 终止/次要事件判定 + SSE 响应装配，`toolbuf` tool 分桶缓冲与入口钳位，
-//! `fragments` tool 分片提取，`synth_flush` 合成终端前边界滞留帧 flush（`S3` 保序）；
-//! 旧路径经重导出兼容，对外 `handler::*` 不变。
+//! `fragments` tool 分片提取，`synth_flush` 合成终端前边界滞留帧 flush（`S3` 保序），
+//! `carry` 跨帧占位符残缺前缀缝合（`D4`/`S4`），`decide` 主循环纯决策函数
+//! （无 async/无 IO，供真值表断言）；旧路径经重导出兼容，对外 `handler::*` 不变。
 
 use {
     crate::{

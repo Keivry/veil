@@ -54,10 +54,14 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
 
 #[tokio::test]
 async fn opaque_branch_token_carry() {
-    // MSP-4/2.28：thinking 明文 opaque 增量接入 TokenCarry，跨帧切开的凭证 token
-    // 缝合后经还原路径还原为明文。
+    // MSP-4/2.28 + B3：thinking 明文 opaque 增量接入 TokenCarry，跨帧切开的凭证
+    // token 缝合后经还原路径还原为明文；token 须由请求侧脱敏实际产出方可还原
+    // （minted-set 授权，返回值经残缺清理剥离、不消费）。
     let (scope, vault, detector) = fresh_arcs();
     let token = vault.register("my-secret-001").expect("注册恒成功");
+    let _ = scope
+        .redact_request_plain(&vault, &detector, "my-secret-001")
+        .await;
     let (head, tail) = token.split_at(8);
     let sse = format!(
         r#"event: content_block_delta
@@ -178,4 +182,142 @@ async fn abnormal_eof_still_open_ended() {
         "无 finish_reason 的异常 EOF 须记 open_ended"
     );
     server.abort();
+}
+
+async fn run_chat_error_stream(
+    sse: &'static [u8],
+) -> (
+    crate::handler::llm::pump::PumpOutcome,
+    Vec<String>,
+    Arc<GatewayMetrics>,
+) {
+    let (url, server) = loopback_server(200, "text/event-stream", sse.to_vec()).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Chat, scope, vault, detector);
+    ctx.req.gateway_metrics = metrics.clone();
+    let (outcome, frames) = collect_pump(upstream, ctx).await;
+    server.abort();
+    (outcome, frames, metrics)
+}
+
+#[tokio::test]
+async fn chat_error_frame_is_terminal() {
+    // A-6/F-08：错误载荷帧即终端——本帧作为终端帧透出，其后数据帧被终端守卫
+    // 丢弃、流末不补 [DONE]；`choices` 内 `error` 的正常形态不误伤。
+    let sse = br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: {"error":{"message":"rate limited","type":"server_error"}}
+
+data: {"error":{"message":"late error"}}
+
+data: {"choices":[{"index":0,"delta":{"content":"late"}}]}
+
+"#;
+    let (outcome, frames, _metrics) = run_chat_error_stream(sse).await;
+    let joined = frames.join("");
+    assert!(
+        joined.contains("rate limited"),
+        "首个错误帧须作终端帧透出: {joined}"
+    );
+    assert!(
+        !joined.contains("late error"),
+        "终端后重复错误帧不得透出: {joined}"
+    );
+    assert!(!joined.contains("late"), "终端后数据帧不得透出: {joined}");
+    assert_eq!(
+        crate::service::block_inject::terminal_count(&frames, "chat"),
+        0,
+        "错误帧即终端，不得再补 [DONE]: {joined}"
+    );
+    assert!(!outcome.block_injected);
+}
+
+#[tokio::test]
+async fn chat_error_frame_no_done_no_open_ended() {
+    // A-6/F-08 + 2.5：错误帧终端不进入断流收尾——不补 [DONE]、不记
+    // `open_ended`（观测为 `upstream_error`）。
+    let sse = br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: {"error":{"message":"boom"}}
+
+"#;
+    let (_, frames, metrics) = run_chat_error_stream(sse).await;
+    let joined = frames.join("");
+    assert!(!joined.contains("data: [DONE]"), "不得补 [DONE]: {joined}");
+    assert_eq!(
+        metrics.truncated_count("open_ended"),
+        0,
+        "错误终端不得记 open_ended"
+    );
+    assert_eq!(metrics.truncated_count("upstream_error"), 1);
+}
+
+#[tokio::test]
+async fn chat_error_frame_upstream_error() {
+    // 2.6/GAP-2：新态 `upstream_error` 落 metrics 分标签计数，四态白名单口径
+    // 与 canonical `llm-gateway` 一致（四态之外不落该指标）。
+    use crate::service::sse::TruncatedMode;
+    assert_eq!(TruncatedMode::SilentDiscard.as_str(), "silent_discard");
+    assert_eq!(TruncatedMode::OpenEnded.as_str(), "open_ended");
+    assert_eq!(
+        TruncatedMode::SynthesizedFailed.as_str(),
+        "synthesized_failed"
+    );
+    assert_eq!(TruncatedMode::UpstreamError.as_str(), "upstream_error");
+    let sse = br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: {"error":{"message":"upstream broken"}}
+
+"#;
+    let (_, frames, metrics) = run_chat_error_stream(sse).await;
+    assert_eq!(
+        metrics.truncated_count("upstream_error"),
+        1,
+        "新态须落 metrics 分标签计数"
+    );
+    assert_eq!(
+        metrics.truncated_count("open_ended") + metrics.truncated_count("synthesized_failed"),
+        0,
+        "四态互斥：同一流不得再落其他截断态"
+    );
+    let joined = frames.join("");
+    assert!(joined.contains("upstream broken") && !joined.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn anthropic_midstream_eof_no_message_stop() {
+    // F-05/A-4：Anthropic 中途断流（已发内容帧后异常 EOF）仅记 `open_ended`，
+    // 不合成 `message_stop` 或任何终端数据帧（真空流最小终止不适用于此）。
+    let sse = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n".to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let metrics = Arc::new(GatewayMetrics::default());
+    let mut ctx = pump_ctx(Protocol::Anthropic, scope, vault, detector);
+    ctx.req.gateway_metrics = metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
+    server.abort();
+    let joined = frames.join("");
+    assert!(joined.contains("hi"), "内容帧须保留: {joined}");
+    assert!(
+        !joined.contains("message_stop"),
+        "中途断流不得合成 message_stop: {joined}"
+    );
+    assert_eq!(
+        crate::service::block_inject::terminal_count(&frames, "anthropic"),
+        0,
+        "不得合成任何终端数据帧"
+    );
+    assert_eq!(metrics.truncated_count("open_ended"), 1);
+    assert_eq!(metrics.truncated_count("upstream_error"), 0);
 }

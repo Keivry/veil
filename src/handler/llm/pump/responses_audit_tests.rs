@@ -271,3 +271,103 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}
         "阻断终端恰一: {joined}"
     );
 }
+
+#[tokio::test]
+async fn responses_seq_cursor_tracks_max() {
+    // A-2/F-02：阻断合成序列接续「已见上游序号上界」——上游 3/5/4 断序后阻断
+    // 起始为 6（取 max，回退值不降游标）；缺序号 `.done` 帧不推进游标。
+    use serde_json::Value;
+    let sse = br#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":3,"item":{"type":"function_call","id":"call-1","name":"exec","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"sequence_number":5,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"sequence_number":4,"delta":"-rf /\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-1","output_index":0,"arguments":"{\"command\":\"rm -rf /\"}"}
+
+"#;
+    let (outcome, frames) = run(sse).await;
+    assert!(outcome.block_injected, "危险参数须阻断: {frames:?}");
+    let mut seqs = Vec::new();
+    for f in &frames {
+        for line in f.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            if let Ok(v) = serde_json::from_str::<Value>(line)
+                && let Some(n) = v["sequence_number"].as_u64()
+            {
+                seqs.push(n);
+            }
+        }
+    }
+    assert_eq!(
+        seqs,
+        (6..13u64).collect::<Vec<u64>>(),
+        "阻断 7 帧须自 max+1=6 起严格递增: {seqs:?}"
+    );
+}
+
+/// 11.2：按帧出现序提取下游全部顶层 `sequence_number`（合法 JSON `data:` 行）。
+fn collect_seqs(frames: &[String]) -> Vec<u64> {
+    use serde_json::Value;
+    let mut seqs = Vec::new();
+    for f in frames {
+        for line in f.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            if let Ok(v) = serde_json::from_str::<Value>(line)
+                && let Some(n) = v["sequence_number"].as_u64()
+            {
+                seqs.push(n);
+            }
+        }
+    }
+    seqs
+}
+
+#[tokio::test]
+async fn responses_seq_cursor_e2e_multi_frame() {
+    // 11.2（A-2/F-02 覆盖缺口）序号游标端到端多帧矩阵：
+    // ① 真空流零帧：cursor=None → 合成 failed 全序列维持 0..6 不变；
+    // ② 多帧后阻断——次要帧 9、被 hold 缓冲帧 10/11 均推进游标，缺序号
+    //    `.done` 不推进；合成 base = max+1 = 12，下游序号严格递增不倒退；
+    // ③ 上游 `error` 自带序号 6（低于已见上界 9）原样沿用，不被 cursor+1 重编号。
+    let (_outcome, frames) = run(b"").await;
+    assert_eq!(
+        collect_seqs(&frames),
+        (0..=6u64).collect::<Vec<u64>>(),
+        "真空流维持 0..6 全序列: {}",
+        frames.join("")
+    );
+
+    let sse = br#"data: {"type":"response.reasoning_text.delta","sequence_number":9,"delta":"hmm"}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"sequence_number":10,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"sequence_number":11,"delta":"-rf /\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-1","output_index":0,"arguments":"{\"command\":\"rm -rf /\"}"}
+
+"#;
+    let (outcome, frames) = run(sse).await;
+    assert!(outcome.block_injected, "危险参数须阻断: {frames:?}");
+    let seqs = collect_seqs(&frames);
+    assert_eq!(
+        seqs,
+        [9, 12, 13, 14, 15, 16, 17, 18],
+        "次要帧 9 先行 + 阻断 7 帧自 max+1=12 起: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "下游序号须严格递增不倒退: {seqs:?}"
+    );
+
+    let sse = br#"data: {"type":"response.reasoning_text.delta","sequence_number":9,"delta":"hmm"}
+
+data: {"type":"error","code":"server_error","message":"boom","sequence_number":6}
+
+"#;
+    let (_outcome, frames) = run(sse).await;
+    assert_eq!(
+        collect_seqs(&frames),
+        vec![9, 6],
+        "error 自带序号须原样沿用（不按 cursor+1 重编号）: {}",
+        frames.join("")
+    );
+}
