@@ -67,6 +67,11 @@ pub struct AuditHold {
     max_bytes: usize,
     rejected: bool,
     completed: bool,
+    /// C-3/D1（5.4）：`pending_tool_frames` 缓冲帧记账——条目与字节双维度与聚合
+    /// 槽位（`args_by_index`/`responses_slots`）**独立**：同一 index 零字节分片
+    /// 不创建聚合条目也不加聚合字节，聚合维度看不见该洪泛，故须独立计数。
+    pending_frames: usize,
+    pending_bytes: usize,
 }
 
 impl AuditHold {
@@ -115,6 +120,38 @@ impl AuditHold {
         self.args_by_index.len() + self.responses_slots.len() > AUDIT_HOLD_MAX_ENTRIES
     }
 
+    /// C-3/D1（5.4）：tool 缓冲帧入账——调用方在 `pending_tool_frames.push`
+    /// **之前**调用；条目维度复用 [`AUDIT_HOLD_MAX_ENTRIES`]，字节维度以独立
+    /// 计数器受 `max_bytes`（`AUDIT_HOLD_MAX_BYTES`）约束。超限与聚合超限同语义
+    /// fail-closed 清仓（调用方据此走 `audit-hold-overflow` 阻断臂，不静默丢弃）。
+    pub fn account_pending_frame(&mut self, bytes: usize) -> HoldVerdict {
+        if self.rejected || self.completed {
+            return if self.rejected {
+                HoldVerdict::Rejected
+            } else {
+                HoldVerdict::Approved
+            };
+        }
+        self.pending_frames += 1;
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        if self.pending_frames > AUDIT_HOLD_MAX_ENTRIES || self.pending_bytes > self.max_bytes {
+            return self.reject_and_clear();
+        }
+        HoldVerdict::Approved
+    }
+
+    /// C-3/D1（5.4）：tool 缓冲帧出账——缓冲帧重放（按槽取出）后归还对应条目
+    /// 与字节，长流多轮 drain 不误判溢出。
+    pub fn release_pending_frames(&mut self, count: usize, bytes: usize) {
+        self.pending_frames = self.pending_frames.saturating_sub(count);
+        self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_accounting(&self) -> (usize, usize) {
+        (self.pending_frames, self.pending_bytes)
+    }
+
     /// 字节或条目超限共用的 fail-closed 清仓（拒绝态 + 归零 + 清空全部槽）。
     fn reject_and_clear(&mut self) -> HoldVerdict {
         self.rejected = true;
@@ -123,6 +160,8 @@ impl AuditHold {
         self.name_by_index.clear();
         self.id_by_index.clear();
         self.responses_slots.clear();
+        self.pending_frames = 0;
+        self.pending_bytes = 0;
         HoldVerdict::Rejected
     }
 
@@ -344,6 +383,8 @@ impl AuditHold {
         self.name_by_index.clear();
         self.id_by_index.clear();
         self.responses_slots.clear();
+        self.pending_frames = 0;
+        self.pending_bytes = 0;
     }
 
     /// 完成点审计用三元组：`(index, tool 名, 累积参数全文)`。
@@ -494,3 +535,11 @@ impl Drop for RequestKeepalive {
 /// D3 hold 单测（自 `audit_hold.rs` 随实现体并入，语义不变；用例见 `hold/tests.rs`）。
 #[cfg(test)]
 mod tests;
+
+/// keepalive 门控与竞态常量测试（触 800 红线后按测试外迁模板独立成子模块）。
+#[cfg(test)]
+mod keepalive_tests;
+
+/// 同 index 零字节分片洪泛记账测试（触 800 红线后按同一测试外迁模板独立成子模块）。
+#[cfg(test)]
+mod zero_byte_tests;

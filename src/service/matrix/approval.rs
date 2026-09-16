@@ -361,6 +361,9 @@ impl MatrixApproval {
     pub async fn pending_len(&self) -> usize { self.pending.lock().await.len() }
 
     /// 待审批 event 列表（只读快照，凭据阻塞双模的测试/运维可观测用）。
+    /// DCD-5（9.1）：集成测试以非 `cfg(test)` 构建链接本库并直接调用
+    /// （`tests/http_e2e_credential*.rs`/`http_e2e_vault_stability.rs`），
+    /// 降级 `#[cfg(test)] pub(crate)` 会破坏其编译，故暂保留 `pub`。
     pub async fn pending_event_ids(&self) -> Vec<String> {
         self.pending.lock().await.keys().cloned().collect()
     }
