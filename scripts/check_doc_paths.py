@@ -76,6 +76,11 @@ _ARCHIVED_HARDENING_REF = "veil-hardening 归档后其 change-local admin-rateli
 _ARCHIVED_SELF_REF = "2026-09-13 归档后其 change-local spec 引用（历史/情景文本），canonical 已在位"
 _ARCHIVED_SELF_REF_0914 = "2026-09-14 归档后其 change-local spec 引用（历史/情景文本），canonical 已在位"
 _ARCHIVED_SELF_REF_0916 = "2026-09-16 归档后其 change-local spec delta 引用（历史/验证串文本），canonical 已在位"
+_ARCHIVED_XREF_0917 = (
+    "2026-09-17 起：归档 r4 change 对后续 change veil-pii-conversation-cache 的 "
+    "change-local spec delta 交叉引用（历史/验证串文本）；该后续 change 已于 2026-09-17 归档，"
+    "对应 requirement 已晋升 canonical openspec/specs/llm-gateway/spec.md"
+)
 _PLANNING_TARGET = (
     "本 change 规划期目标路径（apply 后实际落点/命名为实现真相），规划快照，"
     "apply 期不改其正文，其他任务所有者负责"
@@ -161,6 +166,18 @@ PENDING_REFS: dict[tuple[str, str], str] = {
         "openspec/changes/archive/2026-09-16-veil-audit-r3-remediation/tasks.md",
         "openspec/changes/veil-audit-r3-remediation/specs/observability-admin/spec.md",
     ): _ARCHIVED_SELF_REF_0916,
+    (
+        "openspec/changes/archive/2026-09-16-veil-audit-r4-remediation/design.md",
+        "openspec/changes/veil-pii-conversation-cache/specs/llm-gateway/spec.md",
+    ): _ARCHIVED_XREF_0917,
+    (
+        "openspec/changes/archive/2026-09-16-veil-audit-r4-remediation/tasks.md",
+        "openspec/changes/veil-pii-conversation-cache/specs/llm-gateway/spec.md",
+    ): _ARCHIVED_XREF_0917,
+    (
+        "openspec/changes/archive/2026-09-16-veil-audit-r4-remediation/specs/llm-protocol-hardening/spec.md",
+        "openspec/changes/veil-pii-conversation-cache/specs/llm-gateway/spec.md",
+    ): _ARCHIVED_XREF_0917,
 }
 
 # 本 change（veil-audit-r2-remediation）为在途规划 artifact：其 design/spec/tasks 引用的
