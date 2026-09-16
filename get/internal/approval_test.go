@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -174,10 +175,10 @@ func TestFetchCredentialWaitsForApproval(t *testing.T) {
 	}
 }
 
-func TestRegisterCallerKeepsRegIDAfterApproval(t *testing.T) {
+func TestRegisterCallerRust202ShapeTerminal(t *testing.T) {
 	approvalTestEnv(t)
-	srv, _, _ := newScriptedServer(t, []scriptedResponse{
-		{http.StatusAccepted, `{"reg_id":"reg-001","status":"pending","error":{"code":"E_PENDING","message":"注册已转 Matrix 人工审批"}}`},
+	srv, _, count := newScriptedServer(t, []scriptedResponse{
+		{http.StatusAccepted, pendingBody},
 		{http.StatusOK, `{"type":"script","name":"check-mail","allow_mode":"auto","enabled":true}`},
 	})
 	ProxyURL = srv.URL
@@ -191,16 +192,19 @@ func TestRegisterCallerKeepsRegIDAfterApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("批准后应成功，实际: %v", err)
 	}
-	if regID != "reg-001" {
-		t.Fatalf("终态响应无 reg_id 时应回退受理单 ID，实际 %q", regID)
+	if n := count(); n != 2 {
+		t.Fatalf("应轮询 2 次，实际 %d", n)
+	}
+	if regID != "" {
+		t.Fatalf("真实 Rust 202 形状与终态视图均无 reg_id，应为空串，实际 %q", regID)
 	}
 }
 
-func TestRegisterCallerPendingReturnsRegIDAndSentinel(t *testing.T) {
+func TestRegisterCallerRust202ShapePendingNoWait(t *testing.T) {
 	approvalTestEnv(t)
 	ApprovalWait = false
-	srv, _, _ := newScriptedServer(t, []scriptedResponse{
-		{http.StatusAccepted, `{"reg_id":"reg-002","status":"pending","error":{"code":"E_PENDING","message":"注册已转 Matrix 人工审批"}}`},
+	srv, _, count := newScriptedServer(t, []scriptedResponse{
+		{http.StatusAccepted, pendingBody},
 	})
 	ProxyURL = srv.URL
 
@@ -212,8 +216,35 @@ func TestRegisterCallerPendingReturnsRegIDAndSentinel(t *testing.T) {
 	if !errors.Is(err, ErrPendingApproval) {
 		t.Fatalf("应返回 ErrPendingApproval，实际: %v", err)
 	}
-	if regID != "reg-002" {
-		t.Fatalf("待审批应保留受理单 ID，实际 %q", regID)
+	if n := count(); n != 1 {
+		t.Fatalf("关闭等待不得轮询，实际请求 %d 次", n)
+	}
+	if regID != "" {
+		t.Fatalf("真实 Rust 202 形状无 reg_id，应为空串，实际 %q", regID)
+	}
+}
+
+// TestRegisterCallerPythonBaselineRegIDFallback 覆盖 Python 基线（顶层 reg_id）回退路径（proxy.go 回退分支）；
+// 该分支对 Rust 服务器恒不命中，仅保留兼容。
+func TestRegisterCallerPythonBaselineRegIDFallback(t *testing.T) {
+	approvalTestEnv(t)
+	srv, _, _ := newScriptedServer(t, []scriptedResponse{
+		{http.StatusAccepted, `{"reg_id":"reg-python-001","status":"pending","error":{"code":"E_PENDING","message":"注册已转 Matrix 人工审批"}}`},
+		{http.StatusOK, `{"type":"script","name":"check-mail","allow_mode":"auto","enabled":true}`},
+	})
+	ProxyURL = srv.URL
+
+	regID, err := RegisterCaller(&RegisterCallerRequest{
+		Name:       "check-mail",
+		ScriptPath: "/tmp/x.py",
+		ScriptHash: "sha256:abc",
+		Entries:    map[string][]string{"网易": {}},
+	})
+	if err != nil {
+		t.Fatalf("批准后应成功，实际: %v", err)
+	}
+	if regID != "reg-python-001" {
+		t.Fatalf("Python 基线应回退受理响应顶层 reg_id，实际 %q", regID)
 	}
 }
 
@@ -241,20 +272,59 @@ func TestDurationAndBoolEnvParsing(t *testing.T) {
 	}
 }
 
+// TestParseDurationEnvFallbackWarns300s 锁定 H-1：非法时长按文档默认回退 300s，并向 stderr 告警（非 fail-fast）。
+func TestParseDurationEnvFallbackWarns300s(t *testing.T) {
+	t.Setenv("TEST_DUR_INVALID", "5min")
+
+	origStderr := os.Stderr
+	t.Cleanup(func() { os.Stderr = origStderr })
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("创建 stderr 管道失败: %v", err)
+	}
+	os.Stderr = w
+	got := parseDurationEnv("TEST_DUR_INVALID", "300", 300*time.Second)
+	os.Stderr = origStderr
+	if err := w.Close(); err != nil {
+		t.Fatalf("关闭 stderr 管道失败: %v", err)
+	}
+	out, _ := io.ReadAll(r)
+
+	if got != 300*time.Second {
+		t.Fatalf("非法时长应回退文档默认 300s，实际 %v", got)
+	}
+	if !strings.Contains(string(out), "TEST_DUR_INVALID") {
+		t.Fatalf("非法时长回退应输出 stderr 告警（含变量名），实际: %q", string(out))
+	}
+}
+
+// TestApprovalPollIntervalClamped 锁定 approval.go 的非正轮询间隔钳制：
+// 长超时下非正间隔必须被钳制为 2s 下界——恰好一次休眠且休眠参数为 2s。
+// 若钳制被删，休眠参数退化为 0（slept[0] == 0）而失败，具备判别力。
 func TestApprovalPollIntervalClamped(t *testing.T) {
 	approvalTestEnv(t)
 	approvalPollInterval = 0
-	approvalTimeout = 50 * time.Millisecond
-	sleepFn = time.Sleep
+	approvalTimeout = 30 * time.Second
+
+	var slept []time.Duration
+	sleepFn = func(d time.Duration) { slept = append(slept, d) }
+
 	srv, _, count := newScriptedServer(t, []scriptedResponse{
 		{http.StatusAccepted, pendingBody},
+		{http.StatusOK, `{"status":"revoked","name":"check-mail"}`},
 	})
 	ProxyURL = srv.URL
 
-	if err := RevokeCaller("check-mail"); !errors.Is(err, ErrPendingApproval) {
-		t.Fatalf("超时未决应返回 ErrPendingApproval，实际: %v", err)
+	if err := RevokeCaller("check-mail"); err != nil {
+		t.Fatalf("批准后应返回 nil，实际: %v", err)
 	}
-	if n := count(); n != 1 {
-		t.Fatalf("非正间隔必须被钳制为安全下界（不得紧循环重发），实际请求数 %d", n)
+	if n := count(); n != 2 {
+		t.Fatalf("应轮询 2 次，实际请求数 %d", n)
+	}
+	if len(slept) != 1 {
+		t.Fatalf("应恰好休眠一次，实际 %d 次: %v", len(slept), slept)
+	}
+	if slept[0] != 2*time.Second {
+		t.Fatalf("非正间隔必须钳制为 2s 下界（approval.go 钳制），实际休眠 %v", slept[0])
 	}
 }

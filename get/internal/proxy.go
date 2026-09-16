@@ -14,8 +14,8 @@ import (
 var ProxyURL = getEnv("PROXY_URL", "http://127.0.0.1:8877")
 
 // httpClientTimeoutSeconds 单次 HTTP 超时，可通过 PROXY_HTTP_TIMEOUT 环境变量覆盖。
-// 支持 "30"（秒）或 "1m30s"（Go Duration 格式）两种输入。
-var httpClientTimeoutSeconds = parseDurationEnv("PROXY_HTTP_TIMEOUT", "300", 30*time.Second)
+// 支持 "300"（秒）或 "5m"（Go Duration 格式）两种输入；非法值回退文档默认 300s 并告警。
+var httpClientTimeoutSeconds = parseDurationEnv("PROXY_HTTP_TIMEOUT", "300", 300*time.Second)
 
 // httpClient 带超时的共享 HTTP 客户端
 var httpClient = &http.Client{
@@ -245,10 +245,11 @@ func (r *RegisterCallerResponse) UnmarshalJSON(data []byte) error {
 //
 // 默认模式下注册转人工审批：首次返回 `202 + E_PENDING`（已建单待审批），
 // 此时按退避轮询同一请求直至终态（批准 → 注册生效，拒绝/超时 → `403`）；
-// 关闭等待（`PROXY_APPROVAL_WAIT=0` / `--no-wait`）或超时未决返回 ErrPendingApproval，
-// 并在返回值中保留受理单 ID 供调用方后续重试。
+// 关闭等待（`PROXY_APPROVAL_WAIT=0` / `--no-wait`）或超时未决返回 ErrPendingApproval。
 //
-// 终态响应为注册视图（不含 `reg_id`）时回退受理响应中的 ID；
+// 受理单 ID 仅 Python 基线受理响应顶层携带 `reg_id`；Rust 网关 202 体为
+// `{"error":{"code":"E_PENDING",…}}`，无 ID，此时返回空串。终态响应为注册视图
+// （不含 `reg_id`）时回退 Python 基线受理响应中的 ID（该回退对 Rust 服务器恒不命中）；
 // 服务端阻塞模式（`CREDENTIAL_BLOCK_WAIT=1`）下终态直接返回、无受理单，此时 ID 为空串。
 func RegisterCaller(req *RegisterCallerRequest) (string, error) {
 	req.Auth = BuildAuth()
@@ -267,6 +268,9 @@ func RegisterCaller(req *RegisterCallerRequest) (string, error) {
 	}
 	regID := result.RegID
 	if regID == "" && len(res.Pending) > 0 {
+		// Python 基线兼容回退：受理单 ID 仅出现在受理响应顶层 `reg_id`。
+		// Rust 服务器 202 体为 `{"error":{"code":"E_PENDING",…}}`，无 `reg_id`，
+		// 故本回退对 Rust 服务器恒不命中，仅为 Python 基线保留。
 		var accepted RegisterCallerResponse
 		if json.Unmarshal(res.Pending, &accepted) == nil {
 			regID = accepted.RegID

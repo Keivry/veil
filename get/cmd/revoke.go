@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 
@@ -13,14 +12,13 @@ import (
 // Revoke 吊销注册
 // Usage: get revoke --name <名称> [--no-wait]
 func Revoke(args []string) {
-	fs := flag.NewFlagSet("revoke", flag.ExitOnError)
+	fs := newFlagSet("revoke", "用法: get revoke --name <名称> [--no-wait]")
 	name := fs.String("name", "", "注册名称（必填）")
 	noWait := fs.Bool("no-wait", false, "仅提交审批单，不等待终态（待审批时退出码 2）")
-	fs.Parse(args)
+	parseFlags(fs, args)
 
 	if *name == "" {
-		fmt.Fprintln(os.Stderr, "用法: get revoke --name <名称> [--no-wait]")
-		fs.PrintDefaults()
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *noWait {

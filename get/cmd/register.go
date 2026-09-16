@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +14,7 @@ import (
 // Register 注册当前脚本到 Proxy
 // Usage: get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]
 func Register(args []string) {
-	fs := flag.NewFlagSet("register", flag.ExitOnError)
+	fs := newFlagSet("register", "用法: get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]")
 	name := fs.String("name", "", "注册名称（必填）")
 	entry := fs.String("entry", "", "允许访问的条目（必填，逗号分隔）")
 	desc := fs.String("desc", "", "程序用途描述")
@@ -23,11 +22,10 @@ func Register(args []string) {
 	fields := fs.String("fields", "", "允许的字段名（逗号分隔，默认全部属性）")
 	scriptPath := fs.String("script-path", "", "脚本文件路径（直接指定，自动计算哈希）")
 	noWait := fs.Bool("no-wait", false, "仅提交审批单，不等待终态（待审批时退出码 2）")
-	fs.Parse(args)
+	parseFlags(fs, args)
 
 	if *name == "" || *entry == "" {
-		fmt.Fprintln(os.Stderr, "用法: get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]")
-		fs.PrintDefaults()
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *noWait {

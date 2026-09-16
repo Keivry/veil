@@ -39,7 +39,7 @@ var ErrPendingApproval = errors.New("已受理待审批（202 + E_PENDING），�
 var ApprovalWait = parseBoolEnv("PROXY_APPROVAL_WAIT", true)
 
 // approvalTimeout 等待终态的总时限（`PROXY_APPROVAL_TIMEOUT`，默认 300s）。
-var approvalTimeout = parseDurationEnv("PROXY_APPROVAL_TIMEOUT", "300", 30*time.Second)
+var approvalTimeout = parseDurationEnv("PROXY_APPROVAL_TIMEOUT", "300", 300*time.Second)
 
 // approvalPollInterval 轮询起始间隔（`PROXY_APPROVAL_POLL`，默认 2s，逐次翻倍）。
 var approvalPollInterval = parseDurationEnv("PROXY_APPROVAL_POLL", "2", 2*time.Second)
@@ -62,7 +62,7 @@ type approvalResult struct {
 }
 
 // parseDurationEnv 解析时长类环境变量，支持 Go Duration（`1m30s`）与纯秒数（`300`）两种输入；
-// 均无法解析时返回 def。
+// 均无法解析时回退 def 并向 stderr 告警（非 fail-fast，避免脚本硬失败；SHALL NOT 静默回退）。
 func parseDurationEnv(key, fallback string, def time.Duration) time.Duration {
 	s := getEnv(key, fallback)
 	if d, err := time.ParseDuration(s); err == nil {
@@ -71,6 +71,7 @@ func parseDurationEnv(key, fallback string, def time.Duration) time.Duration {
 	if d, err := time.ParseDuration(s + "s"); err == nil {
 		return d
 	}
+	fmt.Fprintf(os.Stderr, "警告: 环境变量 %s=%q 无法解析为时长，回退默认 %s\n", key, s, def)
 	return def
 }
 
