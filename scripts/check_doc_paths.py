@@ -75,6 +75,7 @@ _ARCHIVED_HISTORY = "目标 change 已归档（canonical 在位），历史记�
 _ARCHIVED_HARDENING_REF = "veil-hardening 归档后其 change-local admin-ratelimit-contract spec 引用（历史/情景文本），canonical 已在位"
 _ARCHIVED_SELF_REF = "2026-09-13 归档后其 change-local spec 引用（历史/情景文本），canonical 已在位"
 _ARCHIVED_SELF_REF_0914 = "2026-09-14 归档后其 change-local spec 引用（历史/情景文本），canonical 已在位"
+_ARCHIVED_SELF_REF_0916 = "2026-09-16 归档后其 change-local spec delta 引用（历史/验证串文本），canonical 已在位"
 _PLANNING_TARGET = (
     "本 change 规划期目标路径（apply 后实际落点/命名为实现真相），规划快照，"
     "apply 期不改其正文，其他任务所有者负责"
@@ -148,6 +149,18 @@ PENDING_REFS: dict[tuple[str, str], str] = {
         "openspec/changes/archive/2026-09-14-veil-redaction-audit-coverage/proposal.md",
         "openspec/changes/veil-redaction-audit-coverage/specs/redaction-audit-coverage/spec.md",
     ): _ARCHIVED_SELF_REF_0914,
+    (
+        "openspec/changes/archive/2026-09-16-veil-audit-r3-remediation/tasks.md",
+        "openspec/changes/veil-audit-r3-remediation/specs/llm-gateway/spec.md",
+    ): _ARCHIVED_SELF_REF_0916,
+    (
+        "openspec/changes/archive/2026-09-16-veil-audit-r3-remediation/tasks.md",
+        "openspec/changes/veil-audit-r3-remediation/specs/llm-proto-closeout/spec.md",
+    ): _ARCHIVED_SELF_REF_0916,
+    (
+        "openspec/changes/archive/2026-09-16-veil-audit-r3-remediation/tasks.md",
+        "openspec/changes/veil-audit-r3-remediation/specs/observability-admin/spec.md",
+    ): _ARCHIVED_SELF_REF_0916,
 }
 
 # 本 change（veil-audit-r2-remediation）为在途规划 artifact：其 design/spec/tasks 引用的
