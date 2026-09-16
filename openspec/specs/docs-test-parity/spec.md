@@ -43,7 +43,7 @@ README 与 canonical spec 中指向 Python 原仓 `_llm.py`/`_credential.py` 的
 
 ### Requirement: 源码注释指针准确
 
-Rust 源码注释中引用的本地文件与行号 SHALL 指向所述内容；引用「approve 空白名单启动门禁」时 SHALL 指向配置解析处的 `src/config/env_parse.rs:493`（`validate_approve_whitelist`）与显式门禁 `src/main.rs:46`（`preflight_whitelist`），SHALL NOT 指向已失效的旧指针（`env_parse.rs` 旧 469–478 区间 / `main.rs:45`），SHALL NOT 指向 `env_parse.rs:307-310`（该处为 `load_storage` 返回值列表）；引用 keepalive `spawn_gated` 接线时 SHALL 指向实际存在的符号或路径（如 `service::audit::RequestKeepalive::spawn_gated` 或 `handler/llm/pump/spawn/setup.rs` 的接线点），SHALL NOT 指向不存在的 `pump.rs::spawn_gated`。
+Rust 源码注释中引用的本地文件与行号 SHALL 指向所述内容；引用「approve 空白名单启动门禁」时 SHALL 指向配置解析处的 `src/config/env_parse.rs:493`（`validate_approve_whitelist`）与显式门禁 `src/main.rs:46`（`preflight_whitelist`），SHALL NOT 指向已失效的 `env_parse.rs:469-478` / `main.rs:45`，SHALL NOT 指向 `env_parse.rs:307-310`（该处为 `load_storage` 返回值列表）；引用 keepalive `spawn_gated` 接线时 SHALL 指向实际存在的符号或路径（如 `service::audit::RequestKeepalive::spawn_gated` 或 `handler/llm/pump/spawn/setup.rs` 的接线点），SHALL NOT 指向不存在的 `pump.rs::spawn_gated`。
 
 #### Scenario: 门禁注释指向真实位置
 

@@ -122,6 +122,16 @@
 - **WHEN** Chat 响应 `choices[].index` 乱序或跳号（如 2、0、5）
 - **THEN** 各 choice 的 tool 分片按声明 index 归入各自槽，审计对象与实际 choice 匹配
 
+#### Scenario: 分桶无碰撞
+
+- **WHEN** 两个不同 `(ci, idx)` 组合、其中 `idx >= 64`
+- **THEN** 位域公式产出互异桶键，不映射到同一槽
+
+#### Scenario: ci=0 等价锚点
+
+- **WHEN** `ci=0` 且 `idx` 任意（`< 2^16`）
+- **THEN** 位域公式结果与历史 `ci*64+idx` 等值，单 choice 快照不回归
+
 #### Scenario: 单 choice 快照不变
 
 - **WHEN** 单 choice（`index=0`）常规流

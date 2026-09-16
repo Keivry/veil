@@ -27,7 +27,7 @@
 
 ### Requirement: 空流三协议语义与差异声明
 
-Chat / Anthropic / Responses 三协议真空流（零字节零残余）SHALL 均走最小可解析终止：Chat 补恰一 `data: [DONE]`；Anthropic 补最小 `message_start` + `message_stop`（空 `content`、null `stop_reason`、usage 全 0，不含 `content_block_*`）；Responses 保持恰一 `response.failed` 全序列。系统 SHALL NOT 保持开放结尾、SHALL NOT 零合成帧。`truncated_mode` 观测口径 SHALL 保留（Chat/Anthropic `open_ended`、Responses `synthesized_failed`），`open_ended` 仅余观测语义、不再代表「不发终止帧」。README §8.6 SHALL 声明与原仓 `_ensure_nonempty_stream` 的差异、风险与下游依赖。
+Chat / Anthropic / Responses 三协议真空流（零字节零残余）SHALL 均走最小可解析终止：Chat 补恰一 `data: [DONE]`；Anthropic 补最小 `message_start` + `message_stop`（空 `content`、null `stop_reason`、usage 全 0，不含 `content_block_*`）；Responses 保持恰一 `response.failed` 全序列。系统 SHALL NOT 保持 open-ended、SHALL NOT 零合成帧。`truncated_mode` 观测口径 SHALL 保留（Chat/Anthropic `open_ended`、Responses `synthesized_failed`），`open_ended` 仅余观测语义、不再代表「不发终止帧」。README §8.6 SHALL 声明与原仓 `_ensure_nonempty_stream` 的差异、风险与下游依赖。
 
 #### Scenario: Anthropic 真空流 open-ended
 
