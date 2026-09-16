@@ -8,22 +8,22 @@ use {
             carry::TokenCarry,
             decide,
             event::{record_emitted_events, should_synthesize_empty_stream},
-            synth_flush::{MidstreamInput, midstream_terminal},
+            synth_flush::midstream_terminal,
         },
         frame_feed::{drain_prefix_hold, residual_frame_payload},
         restore_emit::{FrameSink, RestoredFrame, emit_restored_json_frame},
+        terminator::{StreamTerminator, TerminalPlan},
     },
     crate::{
         approval::{PendingApprovals, PendingRecord},
         config::AuditMode,
         service::{
             audit::{self, AuditHold, AuditPolicy, AuditSink},
-            block_inject,
             credential_vault::CredentialVault,
             llm_gateway::{self, GatewayMetrics, Protocol},
             pii::PiiDetector,
             redaction::{BoundaryHold, PrefixHold, Scope},
-            sse::{SseParser, StreamMeta, TruncatedMode, data_frame, set_truncated},
+            sse::{SseParser, StreamMeta, data_frame, set_truncated},
         },
     },
 };
@@ -36,14 +36,13 @@ where
     pub protocol: Protocol,
     pub conv_id: &'a Option<String>,
     pub transport_error: bool,
-    pub terminal_sent: bool,
     /// CHC-5/2.24：Chat 干净收尾（已见非空 `finish_reason`），断流终端不记 open_ended。
     pub chat_finish_seen: bool,
     /// A-2/F-02：Responses 上游序号上界游标（阻断 7 帧序列与截断单帧的 base 来源）。
     pub responses_seq_cursor: Option<u64>,
-    pub any_frame_sent: bool,
+    /// 1.2/2.2：终端状态机（取代 `terminal_sent`/`block_injected`/`any_frame_sent` 借用字段）。
+    pub terminator: &'a mut StreamTerminator,
     pub forwarded: &'a mut usize,
-    pub block_injected: &'a mut bool,
     pub pending_tool_frames: &'a mut Vec<(Vec<u32>, String, String)>,
     pub metrics: &'a GatewayMetrics,
     pub prefix_hold: &'a mut PrefixHold,
@@ -74,12 +73,10 @@ where
         protocol,
         conv_id,
         transport_error,
-        terminal_sent: terminal_sent_in,
         chat_finish_seen,
         responses_seq_cursor,
-        any_frame_sent: any_frame_sent_in,
+        terminator,
         forwarded,
-        block_injected,
         pending_tool_frames,
         metrics,
         prefix_hold,
@@ -100,8 +97,6 @@ where
         approval_whitelist,
         audit_pending,
     } = ctx;
-    let mut terminal_sent = terminal_sent_in;
-    let mut any_frame_sent = any_frame_sent_in;
 
     // RED-8：截断未完成 tool 分片信息（清除前捕获，供审计/告警；不含参数明文）。
     let truncated_tool_dropped = !pending_tool_frames.is_empty();
@@ -150,25 +145,24 @@ where
             }
         }
         if blocked {
-            terminal_sent = true;
             agg.clear();
             boundary.clear();
             prefix_hold.clear();
             pending_tool_frames.clear();
-            if !*block_injected {
-                *block_injected = true;
-                let reason = "audit-policy-block".to_string();
-                for f in block_inject::ensure_event_lines(block_inject::protocol_block_frames(
-                    protocol,
-                    &reason,
-                    conv_id.as_deref(),
-                    blocked_index.unwrap_or(0),
-                    None,
-                    responses_seq_cursor,
-                )) {
+            // 2.2 收敛：`metrics` 保持现状 `None`；I-2 计数无 `add_sse_event`（BLOCKER-1）；
+            // Block commit 无条件置终端/阻断位并回填 `mark_terminal`（现状 :153/:171）。
+            if let TerminalPlan::Frames { kind, frames, .. } = terminator.plan_block(
+                protocol,
+                "audit-policy-block",
+                conv_id.as_deref(),
+                blocked_index.unwrap_or(0),
+                responses_seq_cursor,
+                None,
+            ) {
+                for f in frames {
                     let _ = pump_tx.send(f).await;
                 }
-                block_inject::mark_terminal(meta);
+                terminator.commit(meta, kind, true, true);
             }
         } else {
             hold.release_audited();
@@ -203,7 +197,7 @@ where
         record_emitted_events(metrics, agg);
         let _ = pump_tx.send(std::mem::take(agg)).await;
         *forwarded += 1;
-        any_frame_sent = true;
+        terminator.note_frame_sent();
     }
     let residual = parser.residual_json_aware();
     // CHC-2/D7：残余分类（§2.6）+ 半帧丢弃——BOM/`[DONE]`/空白/半帧/非 JSON 一律
@@ -245,7 +239,7 @@ where
             }
             if !agg.is_empty() {
                 let _ = pump_tx.send(std::mem::take(agg)).await;
-                any_frame_sent = true;
+                terminator.note_frame_sent();
             }
         }
     }
@@ -254,60 +248,78 @@ where
     // 真空流（零帧零残余）交下方空流守门补最小终止。
     if decide::should_apply_midstream_terminal(
         protocol,
-        terminal_sent,
-        *block_injected,
-        any_frame_sent,
+        terminator.terminal_sent(),
+        terminator.block_injected(),
+        terminator.any_frame_sent(),
         stream_truncated,
     ) {
-        let mid = midstream_terminal(
+        // 3.1 收敛：终端帧选择迁入 `plan_midstream`（MAJOR-5 的 `metrics` 供 Responses
+        // 归档回退计数）；`None` 即未开放/已终端（幂等，调用点零动作）。
+        if let TerminalPlan::Frames {
+            kind,
+            frames,
+            truncated,
+        } = terminator.plan_midstream(
             protocol,
-            MidstreamInput {
-                conv_id: conv_id.as_deref(),
-                clean_close: protocol.is_chat() && chat_finish_seen,
-                seq_cursor: responses_seq_cursor,
-            },
-            boundary,
-            agg,
-            pump_tx,
-            metrics,
-            meta,
-        )
-        .await;
-        *forwarded += mid.forwarded as usize;
-        any_frame_sent |= mid.forwarded > 0;
-        // D9/S9：仅合成终端实际下行才置位；全失败时保持未终端，守门如实。
-        terminal_sent = mid.terminal_sent;
+            conv_id.as_deref(),
+            protocol.is_chat() && chat_finish_seen,
+            responses_seq_cursor,
+            Some(metrics),
+        ) {
+            let mid = midstream_terminal(
+                protocol, &frames, truncated, boundary, agg, pump_tx, metrics,
+            )
+            .await;
+            *forwarded += mid.forwarded as usize;
+            if mid.forwarded > 0 {
+                terminator.note_frame_sent();
+            }
+            // 调用点按 plan 携带的观测落 `set_truncated`（口径不变）。
+            if let Some(mode) = truncated {
+                let _ = set_truncated(meta, protocol, mode, Some(metrics));
+            }
+            // D9/S9：仅合成终端实际下行/收尾成立才置位（Chat/Responses 送成即标，
+            // Anthropic 零合成帧按收尾成立计；下游早断 `frames_sent=false` 不置位）。
+            // `delivered` 须以终端帧集非空为准，不用 `mid.forwarded`（其含
+            // `flush_pre_terminal` 滞留帧，非终端帧）。
+            let delivered = !frames.is_empty() && mid.terminal_sent;
+            terminator.commit(meta, kind, mid.terminal_sent, delivered);
+        }
     }
     // D4：空流合成守门以终端/任意帧状态位为准（残余 `send` 即记位），
     // 不依赖 `forwarded` 计数器；真空流（三位全假）仍合成三协议恰一终端帧。
-    if should_synthesize_empty_stream(terminal_sent, any_frame_sent, *block_injected) {
+    if should_synthesize_empty_stream(
+        terminator.terminal_sent(),
+        terminator.any_frame_sent(),
+        terminator.block_injected(),
+    ) {
         let proto_name = protocol_header_value(protocol);
         let tid = conv_id.clone().unwrap_or_else(|| {
             llm_gateway::resolve_conv_id(None, &serde_json::Value::Null, Some(metrics), "truncated")
                 .0
         });
-        // C8 open-ended：真空流 chat/anthropic 为空帧集（不伪造成功终止，
-        // 仅记 open-ended 可观测，不置 block_injected）；Responses 合成 failed。
-        let frames =
-            block_inject::ensure_event_lines(block_inject::empty_stream_frames(proto_name, &tid));
-        if frames.is_empty() {
-            let _ = set_truncated(meta, protocol, TruncatedMode::OpenEnded, Some(metrics));
-        } else {
-            *block_injected = true;
-            for f in frames {
-                let _ = pump_tx.send(f).await;
+        // 3.2 收敛：真空流帧集与截断观测交 `plan_empty_stream`；I-4 无 `add_sse_event`
+        // （BLOCKER-1，不得新增）。空帧集（未知/非对话协议）仅落 `set_truncated`；
+        // 非空帧集先 `commit` 再落对应 truncation。
+        if let TerminalPlan::Frames {
+            kind,
+            frames,
+            truncated,
+        } = terminator.plan_empty_stream(proto_name, &tid)
+        {
+            if frames.is_empty() {
+                if let Some(mode) = truncated {
+                    let _ = set_truncated(meta, protocol, mode, Some(metrics));
+                }
+            } else {
+                for f in frames {
+                    let _ = pump_tx.send(f).await;
+                }
+                terminator.commit(meta, kind, true, true);
+                if let Some(mode) = truncated {
+                    let _ = set_truncated(meta, protocol, mode, Some(metrics));
+                }
             }
-            let _ = set_truncated(
-                meta,
-                protocol,
-                if protocol.is_responses() {
-                    TruncatedMode::SynthesizedFailed
-                } else {
-                    TruncatedMode::OpenEnded
-                },
-                Some(metrics),
-            );
-            block_inject::mark_terminal(meta);
         }
     }
     carry.finish();

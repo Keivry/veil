@@ -1,7 +1,10 @@
 //! ARC-1：流泵 setup——`StreamPumpCtx` 解构、循环可变状态聚合与只读依赖装配。
 
 use {
-    super::super::{RequestCtx, StreamPumpCtx, carry::TokenCarry, toolbuf::clamp_pump_limits},
+    super::{
+        super::{RequestCtx, StreamPumpCtx, carry::TokenCarry, toolbuf::clamp_pump_limits},
+        terminator::StreamTerminator,
+    },
     crate::{
         approval::PendingApprovals,
         config::AuditMode,
@@ -61,13 +64,10 @@ pub(super) struct PumpLoopState {
     pub meta: StreamMeta,
     pub agg: String,
     pub forwarded: usize,
-    pub any_frame_sent: bool,
-    pub terminated: bool,
-    pub rejected_sticky: bool,
-    pub block_injected: bool,
-    pub audit_blocked: bool,
-    pub terminal_sent: bool,
-    pub responses_failed_sent: bool,
+    /// 1.2：终端状态机（取代 7 枚终端相关 bool：`any_frame_sent`/`terminated`/
+    /// `rejected_sticky`/`block_injected`/`audit_blocked`/`terminal_sent`/
+    /// `responses_failed_sent`），单所有者、经访问器/变更器读写。
+    pub terminator: StreamTerminator,
     /// A-2/F-02：Responses「已见上游序号上界」游标（仅 Responses 帧更新；
     /// 缺 `sequence_number` 不推进、回退忽略），供阻断/截断合成取 `base = max + 1`。
     pub responses_seq_cursor: Option<u64>,
@@ -126,13 +126,7 @@ pub(super) fn setup(
         meta: StreamMeta::default(),
         agg: String::new(),
         forwarded: 0,
-        any_frame_sent: false,
-        terminated: false,
-        rejected_sticky: false,
-        block_injected: false,
-        audit_blocked: false,
-        terminal_sent: false,
-        responses_failed_sent: false,
+        terminator: StreamTerminator::new(),
         responses_seq_cursor: None,
         chat_finish_seen: false,
     };

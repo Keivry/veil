@@ -44,6 +44,8 @@ mod p3_tests;
 mod responses_audit_tests;
 #[cfg(test)]
 mod spawn_tests;
+#[cfg(test)]
+mod terminator_tests;
 
 /// ARH-3（7.2）：流式与非流共享的请求级上下文。由 `dispatch.rs` 单一装配点
 /// 构造一次，供 `StreamPumpCtx`/`NonstreamCtx` 复用；SHALL NOT 在两条路径上

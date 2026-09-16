@@ -25,12 +25,10 @@ where
         protocol: env.protocol,
         conv_id: &state.conv_id,
         transport_error,
-        terminal_sent: state.terminal_sent,
         chat_finish_seen: state.chat_finish_seen,
         responses_seq_cursor: state.responses_seq_cursor,
-        any_frame_sent: state.any_frame_sent,
+        terminator: &mut state.terminator,
         forwarded: &mut state.forwarded,
-        block_injected: &mut state.block_injected,
         pending_tool_frames: &mut state.pending_tool_frames,
         metrics: &env.metrics,
         prefix_hold: &mut state.prefix_hold,
@@ -67,11 +65,11 @@ where
         now_secs(),
         0,
         0,
-        u64::from(state.audit_blocked),
+        u64::from(state.terminator.audit_blocked()),
     );
     PumpOutcome {
         forwarded: state.forwarded,
-        block_injected: state.block_injected,
+        block_injected: state.terminator.block_injected(),
         terminal_injected: state.meta.terminal_injected,
     }
 }

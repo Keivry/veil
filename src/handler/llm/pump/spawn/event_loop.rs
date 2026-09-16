@@ -28,6 +28,7 @@ use {
         frame_feed::{drain_prefix_hold, feed_output_frame},
         restore_emit::{FrameSink, RestoredFrame, emit_restored_json_frame},
         setup::{PumpEnv, PumpLoopState},
+        terminator::TerminalPlan,
     },
     crate::{
         approval::PendingRecord,
@@ -116,7 +117,7 @@ where
                 break;
             }
         }
-        if downstream_abort || state.terminated {
+        if downstream_abort || state.terminator.terminated() {
             break;
         }
     }
@@ -141,9 +142,7 @@ async fn apply_reject_block(
     reason: &str,
     is_tool_or_complete: bool,
 ) -> bool {
-    state.rejected_sticky = true;
-    state.audit_blocked = true;
-    state.terminal_sent = true;
+    state.terminator.note_sticky_rejected();
     state.agg.clear();
     state.boundary.clear();
     state.prefix_hold.clear();
@@ -157,20 +156,21 @@ async fn apply_reject_block(
         .hold
         .release_pending_frames(state.pending_tool_frames.len(), released);
     state.pending_tool_frames.clear();
-    if !state.block_injected {
-        state.block_injected = true;
-        let blocked_index = outer_event_index(env.protocol, v).unwrap_or(0);
-        for f in block_inject::ensure_event_lines(block_inject::protocol_block_frames(
-            env.protocol,
-            reason,
-            state.conv_id.as_deref(),
-            blocked_index,
-            Some(&env.metrics),
-            state.responses_seq_cursor,
-        )) {
+    // 2.1 收敛：I-1 无 `add_sse_event`（BLOCKER-1 不得新增）；`plan_block` 的
+    // `None` 门等价既有 `if !block_injected` 幂等守卫。
+    let blocked_index = outer_event_index(env.protocol, v).unwrap_or(0);
+    if let TerminalPlan::Frames { kind, frames, .. } = state.terminator.plan_block(
+        env.protocol,
+        reason,
+        state.conv_id.as_deref(),
+        blocked_index,
+        state.responses_seq_cursor,
+        Some(&env.metrics),
+    ) {
+        for f in frames {
             let _ = env.pump_tx.send(f).await;
         }
-        block_inject::mark_terminal(&mut state.meta);
+        state.terminator.commit(&mut state.meta, kind, true, true);
     }
     is_tool_or_complete
 }
@@ -227,7 +227,7 @@ where
         // A-6/F-08：错误载荷帧即终端（顶层 `error` 且无 `choices`）——观测记
         // `upstream_error`（区别于 `open_ended`）；本帧仍作终端帧透出，其后数据帧
         // 由终端守卫丢弃，流末不再补 `[DONE]`。
-        if is_chat_error_terminal(env.protocol, v) && !state.terminal_sent {
+        if is_chat_error_terminal(env.protocol, v) && !state.terminator.terminal_sent() {
             let _ = set_truncated(
                 &mut state.meta,
                 env.protocol,
@@ -248,7 +248,7 @@ where
         !matches!(env.audit_mode, AuditMode::Off) && state.hold.has_pending_fragments(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    if state.rejected_sticky {
+    if state.terminator.rejected_sticky() {
         // 纯函数决策；短路求值与 metrics 副作用留调用点：
         // 仅非空非 DONE 才解析/记 terminal_fallback（原语义不变）。
         let data_empty = ev.data.is_empty();
@@ -261,7 +261,7 @@ where
                 || AuditHold::is_audit_due_event(env.protocol, v)
         });
         if decide::sticky_suppress_action(
-            state.rejected_sticky,
+            state.terminator.rejected_sticky(),
             data_empty,
             is_done,
             is_terminal,
@@ -274,15 +274,15 @@ where
     if env.protocol.is_responses() && !ev.data.is_empty() {
         // N1 守卫（T1/D1）：决策交纯函数 `responses_control_action`；
         // 已发终端时保持原语义不解析（terminal_fallback 计数不漂移）。
-        let (is_failed, is_error) = if state.terminal_sent {
+        let (is_failed, is_error) = if state.terminator.terminal_sent() {
             (false, false)
         } else {
             let (f, _, e) = responses_failed_incomplete(parsed.as_ref(), &ev.data, &env.metrics);
             (f, e)
         };
         match decide::responses_control_action(
-            state.terminal_sent,
-            state.responses_failed_sent,
+            state.terminator.terminal_sent(),
+            state.terminator.responses_failed_seen(),
             is_error,
             is_failed,
         ) {
@@ -292,7 +292,7 @@ where
                 //（`response.error.message` 携带上游 error 文案），不注入
                 // `output_index` 序列；`incomplete` 不在此列——原样透传并作为
                 // 唯一终端（保留 `incomplete_details`，由 `is_terminal_event` 置位）。
-                state.responses_failed_sent = true;
+                state.terminator.note_responses_failed();
                 let fid = responses_synth_conv_id(
                     state.stream_first_id.as_deref(),
                     state.conv_id.as_deref(),
@@ -315,39 +315,46 @@ where
                 .await
                 {
                     state.forwarded += 1;
-                    state.any_frame_sent = true;
+                    state.terminator.note_frame_sent();
                 }
+                // 3.2 收敛：`responses_failed_frame` 构造迁入 `plan_responses_error`；
+                // I-5 逐帧成功下行记 `add_sse_event`（BLOCKER-1，不得增删）。
                 // D9/S9：合成 failed 帧 send 成功才置位终端，下游早断不撒谎。
                 let mut terminal_ok = false;
-                for f in
-                    block_inject::ensure_event_lines(vec![block_inject::responses_failed_frame(
+                if let TerminalPlan::Frames { kind, frames, .. } =
+                    state.terminator.plan_responses_error(
                         &fid,
                         err_obj.as_ref().map(|(v, _)| v),
                         err_obj.as_ref().and_then(|(_, s)| *s),
-                    )])
+                    )
                 {
-                    if env.pump_tx.send(f).await.is_err() {
-                        break;
+                    for f in frames {
+                        if env.pump_tx.send(f).await.is_err() {
+                            break;
+                        }
+                        env.metrics.add_sse_event();
+                        state.forwarded += 1;
+                        state.terminator.note_frame_sent();
+                        terminal_ok = true;
                     }
-                    env.metrics.add_sse_event();
-                    state.forwarded += 1;
-                    state.any_frame_sent = true;
-                    terminal_ok = true;
+                    // BLOCKER-3：传实际 `terminal_ok`，不得硬编码 `true`
+                    //（`send` 失败即不置终端帧位、不落 `terminal_injected`）。
+                    state
+                        .terminator
+                        .commit(&mut state.meta, kind, terminal_ok, terminal_ok);
                 }
-                if terminal_ok {
-                    state.terminal_sent = true;
-                    block_inject::mark_terminal(&mut state.meta);
-                }
-                state.terminated = true;
+                // BLOCKER-3：无帧也可终止循环（对齐旧 `event_loop.rs:341` 无条件置
+                // `terminated`）；`ResponsesAction::DuplicateFailed` 仅调本方法。
+                state.terminator.mark_loop_terminated();
                 return EventFlow::Next;
             }
             ResponsesAction::DuplicateFailed => {
-                state.terminated = true;
+                state.terminator.mark_loop_terminated();
                 return EventFlow::Next;
             }
             ResponsesAction::Passthrough => {
                 if is_failed {
-                    state.responses_failed_sent = true;
+                    state.terminator.note_responses_failed();
                 }
             }
         }
@@ -355,7 +362,7 @@ where
     if !ev.data.is_empty() && !is_done_payload(&ev.data) {
         if let Some(v) = parsed.as_ref() {
             // 终端后不再透出任何数据帧：恰一终止帧且其后无内容。
-            if state.terminal_sent {
+            if state.terminator.terminal_sent() {
                 return EventFlow::Next;
             }
             let event_terminal =
@@ -363,7 +370,7 @@ where
             let frags = extract_tool_fragments(env.protocol, v);
             let is_tool_event = !frags.is_empty();
             let minor = !is_tool_event && is_minor_event(env.protocol, v);
-            if state.rejected_sticky && is_tool_event {
+            if state.terminator.rejected_sticky() && is_tool_event {
                 return EventFlow::Next;
             }
             // F3/D3：Responses 槽完成（`response.output_item.done`/
@@ -620,7 +627,7 @@ where
             // 是否缓冲决定立即喂出或暂存守卫产物。
             let prefix = envelope_prefix(ev);
             if event_terminal {
-                state.terminal_sent = true;
+                state.terminator.mark_upstream_terminal();
             }
             let (restored_data, emitted) = if env.protocol.is_anthropic()
                 && is_anthropic_opaque_event(v)
@@ -719,7 +726,7 @@ where
             }
         } else {
             // 非 JSON 文本同样走 span 跳过还原，终端后不再透出。
-            if state.terminal_sent {
+            if state.terminator.terminal_sent() {
                 return EventFlow::Next;
             }
             let (restored, spans) = env
@@ -753,10 +760,10 @@ where
     } else {
         // `[DONE]`（含 BOM 前缀）：恰一终止帧，多余去重。
         // 滞留帧先于终止帧放行（保序：滞留内容属于终止前的数据）。
-        if state.terminal_sent {
+        if state.terminator.terminal_sent() {
             return EventFlow::Next;
         }
-        state.terminal_sent = true;
+        state.terminator.mark_upstream_terminal();
         drain_prefix_hold(
             &mut state.prefix_hold,
             &mut state.boundary,
@@ -773,7 +780,7 @@ where
     if let Some(out) = crate::service::sse::select_emit(&mut state.agg, env.speed) {
         record_emitted_events(&env.metrics, &out);
         state.forwarded += 1;
-        state.any_frame_sent = true;
+        state.terminator.note_frame_sent();
         if env.pump_tx.send(out).await.is_err() {
             return EventFlow::BreakFor;
         }

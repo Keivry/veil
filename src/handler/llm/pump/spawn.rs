@@ -8,6 +8,8 @@ mod frame_feed;
 mod restore_emit;
 mod setup;
 mod terminal;
+// 1.1：类型 `pub(in crate::handler::llm::pump)`，模块须同宽以供 4.2 兄弟测试命名（MAJOR-4 (a)）。
+pub(in crate::handler::llm::pump) mod terminator;
 #[cfg(test)]
 pub(crate) use frame_feed::guard_restored_frame;
 
