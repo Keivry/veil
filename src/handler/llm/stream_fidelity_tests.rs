@@ -30,12 +30,16 @@ async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetric
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let metrics = Arc::new(GatewayMetrics::default());
+    let detector = Arc::new(PiiDetector::new());
+    let scope = Arc::new(Scope::new());
+    // B3：请求侧脱敏铸造 token（响应还原仅授权本请求实际产出）。
+    let _ = scope.redact_request(&vault, &detector, secret).await;
     let ctx = StreamPumpCtx {
         req: RequestCtx {
             protocol: Protocol::Chat,
-            scope: Arc::new(Scope::new()),
+            scope,
             vault,
-            detector: Arc::new(PiiDetector::new()),
+            detector,
             audit_mode: AuditMode::Off,
             audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
             approval_whitelist: Vec::new(),
@@ -221,15 +225,31 @@ async fn pump_sse_with_vault(
     vault: Arc<CredentialVault>,
     sse: Vec<u8>,
 ) -> Vec<String> {
+    pump_sse_with_vault_minted(protocol, vault, None, sse).await
+}
+
+/// B3 变体：`mint_secret` 非空时先经请求侧脱敏铸造该凭据 token，
+/// 建立「token 为本请求实际产出」的响应还原授权前置。
+async fn pump_sse_with_vault_minted(
+    protocol: Protocol,
+    vault: Arc<CredentialVault>,
+    mint_secret: Option<&str>,
+    sse: Vec<u8>,
+) -> Vec<String> {
     let (url, server) = loopback_server(200, "text/event-stream", sse).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let detector = Arc::new(PiiDetector::new());
+    let scope = Arc::new(Scope::new());
+    if let Some(secret) = mint_secret {
+        let _ = scope.redact_request(&vault, &detector, secret).await;
+    }
     let ctx = StreamPumpCtx {
         req: RequestCtx {
             protocol,
-            scope: Arc::new(Scope::new()),
+            scope,
             vault,
-            detector: Arc::new(PiiDetector::new()),
+            detector,
             audit_mode: AuditMode::Off,
             audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),
             approval_whitelist: Vec::new(),
@@ -276,7 +296,8 @@ async fn thinking_delta_token_restore_no_reorder() {
         r#"{{"type":"content_block_delta","index":1,"delta":{{"type":"thinking_delta","thinking":"思考 {token} 完毕"}}}}"#
     );
     let sse = format!("event: content_block_delta\ndata: {payload}\n\n").into_bytes();
-    let frames = pump_sse_with_vault(Protocol::Anthropic, vault, sse).await;
+    let frames =
+        pump_sse_with_vault_minted(Protocol::Anthropic, vault, Some("my-secret-001"), sse).await;
     let expected = payload.replace(&token, "my-secret-001");
     let joined = frames.join("");
     assert!(
@@ -380,7 +401,9 @@ async fn cross_frame_token_stitch_cred() {
         "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{head}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{tail}\"}}}}]}}\n\ndata: [DONE]\n\n"
     )
     .into_bytes();
-    let frames = pump_sse_with_vault(Protocol::Chat, vault, sse).await;
+    let frames =
+        pump_sse_with_vault_minted(Protocol::Chat, vault, Some("cross-frame-secret-xyz"), sse)
+            .await;
     let decoded = delta_contents(&frames);
     assert_eq!(
         decoded, "cross-frame-secret-xyz",

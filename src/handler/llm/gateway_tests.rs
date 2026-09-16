@@ -358,6 +358,8 @@ async fn nonstream_quote_plain_restored_escaped() {
     let (scope, vault, detector) = fresh_arcs();
     let plain = "ab\"cd-ef";
     let token = vault.register(plain).expect("测试凭据须注册成功");
+    // B3：请求侧脱敏铸造 token（响应还原仅授权本请求实际产出）。
+    let _ = scope.redact_request(&vault, &detector, plain).await;
     let up_body = format!(
         "{{\"id\":\"x\",\"choices\":[{{\"message\":{{\"content\":\"{token}\"}}}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}"
     );

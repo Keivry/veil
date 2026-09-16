@@ -11,6 +11,7 @@
 //! `leaf` 叶回调与请求字节选择；旧路径经重导出兼容，对外 `redaction::*` 不变。
 
 pub mod leaf;
+pub mod restore_guard;
 pub mod scope;
 pub mod seam;
 

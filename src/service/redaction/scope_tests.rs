@@ -1,14 +1,18 @@
 //! `Scope` 请求/响应编排单测（自 `scope.rs` 拆出；测试名与断言不变）。
 
-use {
-    super::*,
-    crate::service::{credential_vault::redact_with_map, pii::apply_spans},
-};
+use {super::*, crate::service::pii::apply_spans};
 
 fn vault_with_secret(secret: &str) -> CredentialVault {
     let v = CredentialVault::new();
     v.register(secret).unwrap();
     v
+}
+
+/// B3：经真实请求侧脱敏铸造凭据 token（响应侧仅授权本请求实际产出）。
+async fn mint_cred(scope: &Scope, vault: &CredentialVault, secret: &str) {
+    let _ = scope
+        .redact_request(vault, &PiiDetector::new(), secret)
+        .await;
 }
 
 #[tokio::test]
@@ -116,6 +120,7 @@ async fn skip_segments_recursive_stringified_pii() {
     let detector = PiiDetector::new();
     detector.load_dict(&[("a\"b".to_string(), "hostname".to_string())]);
     let scope = Scope::new();
+    mint_cred(&scope, &vault, "veil-secret-001").await;
     let frame = r#"{"a":"__VG_CRED_000001__","b":"{\"host\":\"a\\\"b\"}"}"#;
     let (restored, spans) = scope.restore_response_with_spans_json(&vault, frame);
     assert!(restored.contains("veil-secret-001"), "{restored}");
@@ -529,12 +534,14 @@ async fn restore_spans_skip_prevents_remask() {
     assert!(masked.contains("__PII_"), "{masked}");
 }
 
-#[test]
-fn credential_restore_spans_cover_plaintext() {
+#[tokio::test]
+async fn credential_restore_spans_cover_plaintext() {
     let vault = CredentialVault::new();
     vault.register("my-secret-001").expect("注册恒成功");
     let scope = Scope::new();
-    let masked = redact_with_map("密码 my-secret-001 结束", &vault.snapshot_p2t());
+    let masked = scope
+        .redact_request(&vault, &PiiDetector::new(), "密码 my-secret-001 结束")
+        .await;
     assert!(!masked.contains("my-secret-001"), "{masked}");
     let (restored, spans) = scope.restore_response_with_spans(&vault, &masked);
     assert_eq!(restored, "密码 my-secret-001 结束");
@@ -546,12 +553,13 @@ fn credential_restore_spans_cover_plaintext() {
     assert!(empty.is_empty());
 }
 
-#[test]
-fn per_token_lookup_does_not_snapshot_full_vault() {
+#[tokio::test]
+async fn per_token_lookup_does_not_snapshot_full_vault() {
     let vault = CredentialVault::new();
     let secret = "complexity-secret-001";
     let token = vault.register(secret).unwrap();
     let scope = Scope::new();
+    mint_cred(&scope, &vault, secret).await;
     let text = format!("{token} {token} {token}");
     let before = vault.snapshot_calls();
     let (restored, spans) = scope.restore_response_with_spans(&vault, &text);
@@ -565,12 +573,13 @@ fn per_token_lookup_does_not_snapshot_full_vault() {
     );
 }
 
-#[test]
-fn restore_per_token_parity() {
+#[tokio::test]
+async fn restore_per_token_parity() {
     let vault = CredentialVault::new();
     let scope = Scope::new();
     let a = vault.register("parity-secret-alpha").unwrap();
     let b = vault.register("parity-secret-beta").unwrap();
+    mint_cred(&scope, &vault, "parity-secret-alpha parity-secret-beta").await;
     let pii_tok = scope.pii_scope().register("13812345678", false).unwrap();
     let sample = format!(
         "{{\"x\":\"{a}{b}\",\"y\":\"__VG_CRED_999999__\",\"z\":\"{pii_tok}\",\"e\":\"换行\\n引号\\\"\"}}"
@@ -579,7 +588,7 @@ fn restore_per_token_parity() {
     let full = {
         let step1 = vault.restore(&sample);
         let step2 = scope.pii_scope().restore(&step1);
-        let step3 = vault.strip_hallucinated(&step2);
+        let step3 = vault.strip_hallucinated(&step2, None);
         strip_partials(&step3)
     };
     assert_eq!(per_token, full, "逐 token 还原须与全量路径逐字节一致");
@@ -731,14 +740,15 @@ fn t12_restore_only_own_scope_tokens() {
     );
 }
 
-#[test]
-fn nested_stringified_json_restore_inner_valid() {
+#[tokio::test]
+async fn nested_stringified_json_restore_inner_valid() {
     // RED-1：两层嵌套 stringified JSON 参数内含带引号凭据明文，还原写回须按
     // 实际 JSON 深度转义，内层结构保持有效、无非法裸 `"`。
     let vault = CredentialVault::new();
     let secret = "p@ss\"q";
     let token = vault.register(secret).unwrap();
     let scope = Scope::new();
+    mint_cred(&scope, &vault, secret).await;
     let frame = serde_json::to_string(&serde_json::json!({
         "arguments": serde_json::to_string(&serde_json::json!({ "k": token })).unwrap()
     }))
@@ -758,14 +768,15 @@ fn nested_stringified_json_restore_inner_valid() {
     );
 }
 
-#[test]
-fn restore_json_aware_regression() {
+#[tokio::test]
+async fn restore_json_aware_regression() {
     // RED-1 回归：单层帧仅命中 span 单层转义、其余字节等价；零替换帧不触发
     // `loads→dumps` 重排（逐字节透传）。
     let vault = CredentialVault::new();
     let secret = "p@ss\"q";
     let token = vault.register(secret).unwrap();
     let scope = Scope::new();
+    mint_cred(&scope, &vault, secret).await;
     let single = format!("{{\"msg\":\"hi {token}\"}}");
     let (restored, spans) = scope.restore_response_with_spans_json(&vault, &single);
     assert_eq!(restored, "{\"msg\":\"hi p@ss\\\"q\"}");

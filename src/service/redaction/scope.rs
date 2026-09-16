@@ -2,19 +2,42 @@
 
 use super::{
     super::{
-        credential_vault::{CredentialVault, strip_cred_partials},
+        credential_vault::{CredentialVault, TOKEN_PREFIX, strip_cred_partials},
         json_walk,
+        lock_recover::lock_or_recover,
         pii::{PiiDetector, PiiScope},
     },
     leaf::{
         find_sub_spans,
         prescan_custom,
         prescan_custom_response,
-        redact_leaf,
         redact_leaf_response,
+        redact_leaf_tracked,
         scan_token_forms,
     },
 };
+
+/// B3 请求级铸造集：仅记录本请求**脱敏实际产出**的凭据 token（`P2tSnapshot::redact`
+/// 的替换值经 `redact_leaf` 汇总），随 `Scope` 请求结束销毁；响应还原仅授权集合内 token。
+#[derive(Debug, Default)]
+pub(crate) struct MintedSet(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl MintedSet {
+    /// 记录一枚实际产出的 token（重复插入幂等）。
+    pub(crate) fn record(&self, token: &str) {
+        lock_or_recover(self.0.lock()).insert(token.to_string());
+    }
+
+    /// token 是否为本请求脱敏实际产出（还原授权判据）。
+    pub(crate) fn contains(&self, token: &str) -> bool {
+        lock_or_recover(self.0.lock()).contains(token)
+    }
+
+    /// 授权集合快照（`CredentialVault::strip_hallucinated` 过滤用）。
+    fn snapshot(&self) -> std::collections::HashSet<String> {
+        lock_or_recover(self.0.lock()).clone()
+    }
+}
 
 /// 请求级作用域：PII 映射只活在本 Scope 内，请求结束即销毁，
 /// 跨请求 MUST NOT 互见；PII 还原只查本 Scope。
@@ -23,6 +46,8 @@ pub struct Scope {
     pii: PiiScope,
     response_side: bool,
     fuzzy_restore: bool,
+    /// B3：本请求脱敏实际产出的凭据 token（响应还原授权域）。
+    minted: MintedSet,
 }
 
 impl Default for Scope {
@@ -31,6 +56,7 @@ impl Default for Scope {
             pii: PiiScope::new(),
             response_side: true,
             fuzzy_restore: false,
+            minted: MintedSet::default(),
         }
     }
 }
@@ -46,6 +72,7 @@ impl Scope {
             pii: PiiScope::new(),
             response_side,
             fuzzy_restore,
+            minted: MintedSet::default(),
         }
     }
 
@@ -82,7 +109,14 @@ impl Scope {
         let custom_snapshot = prescan_custom(detector, &self.pii, text, cred_map.map()).await;
         let replaced = std::cell::Cell::new(false);
         let mut leaf = |s: String| {
-            let r = redact_leaf(&self.pii, detector, &cred_map, &custom_snapshot, s.clone());
+            let r = redact_leaf_tracked(
+                &self.pii,
+                detector,
+                &cred_map,
+                &custom_snapshot,
+                &self.minted,
+                s.clone(),
+            );
             if r != s {
                 replaced.set(true);
             }
@@ -106,26 +140,29 @@ impl Scope {
     ) -> String {
         let cred_map = vault.p2t_snapshot();
         let custom_snapshot = prescan_custom(detector, &self.pii, text, cred_map.map()).await;
-        let redacted = redact_leaf(
+        let redacted = redact_leaf_tracked(
             &self.pii,
             detector,
             &cred_map,
             &custom_snapshot,
+            &self.minted,
             text.to_string(),
         );
         strip_partials(&redacted)
     }
 
-    /// 响应侧还原：凭据 token → PII 请求 token → 幻觉剥离 → 残缺清理。
+    /// 响应侧还原：凭据 token（**仅本请求脱敏实际产出者**，B3）→ PII 请求 token →
+    /// 幻觉/未授权剥离 → 残缺清理。
     /// PII 完整形态一律保留（响应期新 token 原样保留语义）。
     /// `fuzzy_restore` 开启时追加宽松形态按序号回查。
     /// R7：本函数为内部步骤，唯一公开还原入口为
     /// [`Scope::restore_response_with_spans`]（生产调用方均经该入口）；
     /// 可见性收敛为模块内，单测同文件可达。
     fn restore_response(&self, vault: &CredentialVault, text: &str) -> String {
-        let step1 = restore_cred_tokens(vault, text);
+        let minted = self.minted.snapshot();
+        let step1 = restore_cred_tokens(vault, text, &minted);
         let step2 = self.pii.restore_with_fuzzy(&step1, self.fuzzy_restore);
-        let step3 = vault.strip_hallucinated(&step2);
+        let step3 = vault.strip_hallucinated(&step2, Some(&minted));
         strip_partials(&step3)
     }
 
@@ -133,12 +170,18 @@ impl Scope {
     /// 直查（不克隆全表、不重建 alternation 正则）；非凭据 token 原样进入
     /// PII 回查。其余步骤与 [`Scope::restore_response`] 同序（PII 还原 →
     /// 幻觉剥离 → 残缺清理），保证 span 明文与全量还原结果一致。
+    /// B3：凭据 token 非本请求脱敏产出（未授权）者 **SHALL NOT** 还原，原样返回，
+    /// 由 [`Scope::restore_response`] 的授权剥离阶段统一清理；PII token 授权
+    /// 由请求级 `PiiScope`（本 Scope 内）自理，不适用铸造集。
     fn restore_response_one(&self, vault: &CredentialVault, token: &str) -> String {
+        if token.starts_with(TOKEN_PREFIX) && !self.minted.contains(token) {
+            return token.to_string();
+        }
         let step1 = vault
             .restore_one(token)
             .unwrap_or_else(|| token.to_string());
         let step2 = self.pii.restore_with_fuzzy(&step1, self.fuzzy_restore);
-        let step3 = vault.strip_hallucinated(&step2);
+        let step3 = vault.strip_hallucinated(&step2, None);
         strip_partials(&step3)
     }
 
@@ -373,7 +416,12 @@ fn skip_sentinel(idx: usize, text: &str) -> String {
 /// 凭据 token 逐 token 直查重建（B2/D2）：仅对 `scan_token_forms` 命中的完整形态
 /// 调 `CredentialVault::restore_one`，未注册形态原样保留；与全量 alternation
 /// 替换逐字节等价（还原只做 token→明文，不重序列化）。
-fn restore_cred_tokens(vault: &CredentialVault, text: &str) -> String {
+/// B3：仅授权集合内（本请求脱敏实际产出）的 token 还原，其余原样保留。
+fn restore_cred_tokens(
+    vault: &CredentialVault,
+    text: &str,
+    minted: &std::collections::HashSet<String>,
+) -> String {
     let forms = scan_token_forms(text);
     if forms.is_empty() {
         return text.to_string();
@@ -382,7 +430,12 @@ fn restore_cred_tokens(vault: &CredentialVault, text: &str) -> String {
     let mut cursor = 0usize;
     for (start, end, token) in forms {
         out.push_str(&text[cursor..start]);
-        match vault.restore_one(&token) {
+        let plain = if minted.contains(&token) {
+            vault.restore_one(&token)
+        } else {
+            None
+        };
+        match plain {
             Some(plain) => out.push_str(&plain),
             None => out.push_str(&token),
         }
@@ -428,7 +481,7 @@ fn escape_json_depth(plain: &str, depth: u32) -> String {
     out
 }
 
-/// RED-1/NLP-4：统计各还原明文在 JSON 帧中的字符串嵌套深度，**按出现点文档序**
+/// RED-1/NLP-4/B4：统计各还原明文在 JSON 帧中的字符串嵌套深度，**按出现点文档序**
 /// 逐点入队（明文 → 深度队列），供 [`Scope::restore_response_with_spans_json`]
 /// 按 span 实际深度逐点转义。`plain_of` 返回 token 还原明文；非 token 明文不计入。
 fn token_restore_depths(
@@ -443,7 +496,7 @@ fn token_restore_depths(
             serde_json::Value::Object(_) | serde_json::Value::Array(_)
         )
     {
-        collect_token_depths(&v, 1, &plain_of, &mut depths);
+        collect_token_depths(&v, 1, frame_fragment_carrier(&v), &plain_of, &mut depths);
     }
     if depths.is_empty() {
         for (_, _, tok) in scan_token_forms(text) {
@@ -456,24 +509,45 @@ fn token_restore_depths(
     depths
 }
 
+/// B4 帧级片段载体判定：Responses `response.function_call_arguments.delta` 帧，
+/// 或 Anthropic `content_block_delta` 且 `delta.type == "input_json_delta"` 帧。
+/// 其余帧由子树键名（`partial_json`/`arguments`）逐层标记载体上下文。
+fn frame_fragment_carrier(v: &serde_json::Value) -> bool {
+    match v.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.function_call_arguments.delta") => true,
+        Some("content_block_delta") => {
+            v.get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("input_json_delta")
+        }
+        _ => false,
+    }
+}
+
 fn collect_token_depths(
     value: &serde_json::Value,
     depth: u32,
+    fragment_ctx: bool,
     plain_of: &impl Fn(&str) -> String,
     depths: &mut std::collections::HashMap<String, std::collections::VecDeque<u32>>,
 ) {
     match value {
-        serde_json::Value::String(s) => collect_string_depths(s, depth, plain_of, depths),
+        serde_json::Value::String(s) => {
+            collect_string_depths(s, depth, fragment_ctx, plain_of, depths)
+        }
         serde_json::Value::Array(items) => {
             for v in items {
-                collect_token_depths(v, depth, plain_of, depths);
+                collect_token_depths(v, depth, fragment_ctx, plain_of, depths);
             }
         }
         serde_json::Value::Object(map) => {
             // NLP-3/D12：对象 key 与字符串值同深度口径——键位凭据深度不得漏算。
             for (k, v) in map {
-                collect_string_depths(k, depth, plain_of, depths);
-                collect_token_depths(v, depth, plain_of, depths);
+                // B4：子树键名 `partial_json`/`arguments` 即片段载体上下文。
+                let child_ctx = fragment_ctx || matches!(k.as_str(), "partial_json" | "arguments");
+                collect_string_depths(k, depth, fragment_ctx, plain_of, depths);
+                collect_token_depths(v, depth, child_ctx, plain_of, depths);
             }
         }
         _ => {}
@@ -481,10 +555,14 @@ fn collect_token_depths(
 }
 
 /// 单个字符串节点的深度统计：stringified JSON 容器只按内层 +1 递归（容器内
-/// token 的深度属内层，不得按外层重复计入），非容器字符串统计自身当前深度。
+/// token 的深度属内层，不得按外层重复计入），非容器字符串统计自身当前深度；
+/// B4：载体上下文中以 `{`/`[` 开头但整体不可解析的片段按 `depth + 1` 计入
+/// （token 将随片段拼接进入内层 JSON），载体外普通字符串（如 `delta.text`）
+/// **SHALL NOT** 加一。
 fn collect_string_depths(
     s: &str,
     depth: u32,
+    fragment_ctx: bool,
     plain_of: &impl Fn(&str) -> String,
     depths: &mut std::collections::HashMap<String, std::collections::VecDeque<u32>>,
 ) {
@@ -496,13 +574,18 @@ fn collect_string_depths(
             serde_json::Value::Object(_) | serde_json::Value::Array(_)
         )
     {
-        collect_token_depths(&v, depth + 1, plain_of, depths);
+        collect_token_depths(&v, depth + 1, fragment_ctx, plain_of, depths);
         return;
     }
+    let scan_depth = if fragment_ctx && (inner.starts_with('{') || inner.starts_with('[')) {
+        depth + 1
+    } else {
+        depth
+    };
     for (_, _, tok) in scan_token_forms(s) {
         let plain = plain_of(&tok);
         if !plain.is_empty() && plain != tok {
-            depths.entry(plain).or_default().push_back(depth);
+            depths.entry(plain).or_default().push_back(scan_depth);
         }
     }
 }
@@ -518,7 +601,7 @@ pub fn strip_partials(text: &str) -> String {
 /// 真实 token 应先经 `restore_response` 还原，未还原的完整形态必是幻觉。
 #[cfg(test)]
 pub(crate) fn strip_token_forms(vault: &CredentialVault, text: &str) -> String {
-    strip_partials(&vault.strip_hallucinated(text))
+    strip_partials(&vault.strip_hallucinated(text, None))
 }
 
 #[cfg(test)]

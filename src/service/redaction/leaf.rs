@@ -1,19 +1,27 @@
 //! 叶回调与请求字节选择（D2 自 `redaction.rs` 拆出）：凭据优先的位置化仲裁。
 
 use {
-    super::super::{
-        credential_vault::P2tSnapshot,
-        pii::{PiiDetector, PiiScope, apply_spans, arbitrate, credential_spans, protected_spans},
+    super::{
+        super::{
+            credential_vault::P2tSnapshot,
+            pii::{
+                PiiDetector,
+                PiiScope,
+                apply_spans,
+                arbitrate,
+                credential_spans,
+                protected_spans,
+            },
+        },
+        scope::MintedSet,
     },
     std::collections::HashMap,
 };
 
 /// 归一化声明头（protocol-parity Cvem）：注入改写请求体空白归一时声明，
 /// 名/值均为线协议常量，硬编码理由：下游按精确头名识别，改名即 BREAKING。
-#[cfg(test)]
 pub(crate) const NORMALIZED_HEADER_NAME: &str = "x-veil-normalized";
 /// 归一化声明头值（同上）。
-#[cfg(test)]
 pub(crate) const NORMALIZED_HEADER_VALUE: &str = "json-whitespace";
 
 // D1.8：以下三辅助生产零引用（生产走 `Config` 同名成员），`#[cfg(test)]` 收编。
@@ -89,6 +97,8 @@ pub(crate) async fn prescan_custom_response(
 
 /// 叶回调（请求侧）：凭据替换 → 内置+字典扫描注册 → 自定义快照值替换。
 /// 全程位置化仲裁，凭据区间与占位符区间重叠排除。
+/// 生产走 [`redact_leaf_tracked`]（须汇总铸造 token）；本包装仅测试对账用。
+#[cfg(test)]
 pub(crate) fn redact_leaf(
     scope: &PiiScope,
     detector: &PiiDetector,
@@ -96,8 +106,42 @@ pub(crate) fn redact_leaf(
     custom_snapshot: &HashMap<String, String>,
     text: String,
 ) -> String {
-    // 1) 凭据替换（长度降序单次；快照内预编译正则）。
-    let after_cred = cred_map.redact(&text);
+    redact_leaf_inner(scope, detector, cred_map, custom_snapshot, None, text)
+}
+
+/// 叶回调（请求侧，B3 铸造追踪）：与 [`redact_leaf`] 同语义，并把凭据替换
+/// **实际产出**的 token 记入请求级铸造集（未命中键与字面 token 均不产出）。
+pub(crate) fn redact_leaf_tracked(
+    scope: &PiiScope,
+    detector: &PiiDetector,
+    cred_map: &P2tSnapshot,
+    custom_snapshot: &HashMap<String, String>,
+    minted: &MintedSet,
+    text: String,
+) -> String {
+    redact_leaf_inner(
+        scope,
+        detector,
+        cred_map,
+        custom_snapshot,
+        Some(minted),
+        text,
+    )
+}
+
+fn redact_leaf_inner(
+    scope: &PiiScope,
+    detector: &PiiDetector,
+    cred_map: &P2tSnapshot,
+    custom_snapshot: &HashMap<String, String>,
+    minted: Option<&MintedSet>,
+    text: String,
+) -> String {
+    // 1) 凭据替换（长度降序单次；快照内预编译正则）；B3 汇总实际替换产出。
+    let after_cred = match minted {
+        Some(m) => cred_map.redact_tracked(&text, &mut |tok| m.record(tok)),
+        None => cred_map.redact(&text),
+    };
     // 2) 内置 + 字典同步扫描（凭据优先已在扫描内跳过）。
     let mut hits = detector.scan_spans_sync(&after_cred, cred_map.map());
     // 3) 自定义快照值在叶内定位（逐值全出现点，边界由加载期 lookaround 保证，

@@ -12,7 +12,7 @@
 use {
     crate::service::lock_recover::lock_or_recover,
     std::{
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
     },
 };
@@ -96,17 +96,35 @@ impl P2tSnapshot {
     pub fn is_empty(&self) -> bool { self.map.is_empty() }
 
     /// 按快照替换（预编译正则；编译失败走逐键回退，输出一致）。
-    pub fn redact(&self, text: &str) -> String {
+    pub fn redact(&self, text: &str) -> String { self.redact_tracked(text, &mut |_| {}) }
+
+    /// 按快照替换并回传**实际产出**的 token（B3 minted-set 依据）：`on_minted`
+    /// 仅在映射键真正发生替换时以替换值调用；未命中键与字面 token 均不产出。
+    pub fn redact_tracked(&self, text: &str, on_minted: &mut dyn FnMut(&str)) -> String {
         match &self.alternation {
             Some(re) => re
                 .replace_all(text, |caps: &regex::Captures| {
-                    self.map
-                        .get(&caps[0])
-                        .cloned()
-                        .unwrap_or_else(|| caps[0].to_string())
+                    match self.map.get(&caps[0]) {
+                        Some(tok) => {
+                            on_minted(tok);
+                            tok.clone()
+                        }
+                        None => caps[0].to_string(),
+                    }
                 })
                 .into_owned(),
-            None => replace_per_key(text, &self.map),
+            None => {
+                let mut out = text.to_string();
+                for k in sorted_keys_desc(&self.map) {
+                    if let Some(v) = self.map.get(k) {
+                        if out.contains(k.as_str()) {
+                            on_minted(v);
+                        }
+                        out = out.replace(k.as_str(), v);
+                    }
+                }
+                out
+            }
         }
     }
 }
@@ -315,16 +333,19 @@ impl CredentialVault {
     pub fn restore(&self, text: &str) -> String { replace_all_by_map(text, &self.snapshot_t2p()) }
 
     /// 剥离未知完整凭据 token（模型幻觉/未知句柄）。
-    /// 已还原的真实 token 不会落此函数；命中映射的一律保留。
-    pub fn strip_hallucinated(&self, text: &str) -> String {
+    /// `allowed` 为 `Some` 时仅保留「授权集合内 **且** 全局映射仍命中」的 token
+    /// （B3 请求级授权：命中映射但非本请求产出者同幻觉剥离，未还原形态不透出下游）；
+    /// `None` 保持旧口径（命中映射的一律保留，仅未注册形态剥离）。
+    pub fn strip_hallucinated(&self, text: &str, allowed: Option<&HashSet<String>>) -> String {
         let guard = read_inner(&self.inner);
         token_re()
             .replace_all(text, |caps: &regex::Captures| {
-                if guard.token_to_pwd.contains_key(&caps[0]) {
-                    caps[0].to_string()
-                } else {
-                    String::new()
-                }
+                let tok = &caps[0];
+                let keep = match allowed {
+                    Some(set) => set.contains(tok) && guard.token_to_pwd.contains_key(tok),
+                    None => guard.token_to_pwd.contains_key(tok),
+                };
+                if keep { tok.to_string() } else { String::new() }
             })
             .into_owned()
     }
@@ -421,7 +442,7 @@ mod tests {
         let text = format!("real={tok} fake=__VG_CRED_999999__");
         let restored = vault.restore(&text);
         assert!(restored.contains("s3cr3t-value"));
-        let cleaned = vault.strip_hallucinated(&restored);
+        let cleaned = vault.strip_hallucinated(&restored, None);
         assert!(!cleaned.contains("__VG_CRED_999999__"));
         assert!(cleaned.contains("s3cr3t-value"));
     }
@@ -597,13 +618,17 @@ mod tests {
     /// B2/D2：帧间注册新凭据后缓存失效，后续帧可还原新 token。
     #[tokio::test]
     async fn restore_after_register() {
-        use crate::service::redaction::Scope;
+        use crate::service::{pii::PiiDetector, redaction::Scope};
         let vault = CredentialVault::new();
         let scope = Scope::new();
         let first = vault.register("first-secret-001").unwrap();
         assert!(vault.p2t_snapshot().contains_key("first-secret-001"));
         let builds_before = vault.p2t_build_calls();
         let fresh = vault.register("fresh-secret-002").unwrap();
+        // B3：两 token 均须经本请求脱敏实际产出方可还原。
+        let _ = scope
+            .redact_request(&vault, &PiiDetector::new(), "fresh-secret-002")
+            .await;
         let (restored, _) = scope.restore_response_with_spans(&vault, &format!("值 {fresh} 结束"));
         assert_eq!(restored, "值 fresh-secret-002 结束");
         assert!(
@@ -611,6 +636,9 @@ mod tests {
             "缓存失效重建后须含新凭据"
         );
         assert!(vault.p2t_build_calls() > builds_before, "注册后缓存须重建");
+        let _ = scope
+            .redact_request(&vault, &PiiDetector::new(), "first-secret-001")
+            .await;
         let (restored_old, _) =
             scope.restore_response_with_spans(&vault, &format!("值 {first} 结束"));
         assert_eq!(restored_old, "值 first-secret-001 结束");
@@ -619,7 +647,10 @@ mod tests {
     /// B2/D2：并发注册 + 还原无死锁/无 panic，结果与串行语义一致。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn restore_concurrent_register() {
-        use {crate::service::redaction::Scope, std::sync::Arc};
+        use {
+            crate::service::{pii::PiiDetector, redaction::Scope},
+            std::sync::Arc,
+        };
         let vault = Arc::new(CredentialVault::new());
         let mut set = tokio::task::JoinSet::new();
         for i in 0..8 {
@@ -628,6 +659,8 @@ mod tests {
                 let secret = format!("concurrent-secret-{i:03}");
                 let token = v.register(&secret).unwrap();
                 let scope = Scope::new();
+                // B3：请求侧脱敏铸造 token。
+                let _ = scope.redact_request(&v, &PiiDetector::new(), &secret).await;
                 let (restored, _) = scope.restore_response_with_spans(&v, &format!("v {token}"));
                 assert_eq!(restored, format!("v {secret}"));
             });
@@ -663,7 +696,10 @@ mod tests {
             Some("poison-secret-001")
         );
         assert_eq!(vault.restore(&format!("v {tok}")), "v poison-secret-001");
-        assert_eq!(vault.strip_hallucinated("x __VG_CRED_999999__ y"), "x  y");
+        assert_eq!(
+            vault.strip_hallucinated("x __VG_CRED_999999__ y", None),
+            "x  y"
+        );
         let tok2 = vault.register("poison-secret-002").unwrap();
         assert_eq!(
             vault.restore_one(&tok2).as_deref(),
@@ -723,9 +759,9 @@ mod tests {
     }
 
     /// B2/D2：每帧快照计数与表规模解耦（大表与空表均为 0 增量）。
-    #[test]
-    fn stream_restore_complexity() {
-        use crate::service::redaction::Scope;
+    #[tokio::test]
+    async fn stream_restore_complexity() {
+        use crate::service::{pii::PiiDetector, redaction::Scope};
         let vault = CredentialVault::new();
         for i in 0..MAX_TOKEN_ENTRIES - 1 {
             vault
@@ -735,6 +771,10 @@ mod tests {
         let token = vault.register("big-table-target-secret").unwrap();
         assert_eq!(vault.len(), MAX_TOKEN_ENTRIES, "须构造上限规模表");
         let scope = Scope::new();
+        // B3：请求侧脱敏铸造 token（基线快照计数之前）。
+        let _ = scope
+            .redact_request(&vault, &PiiDetector::new(), "big-table-target-secret")
+            .await;
         let frame = format!("{{\"k\":\"{token}\"}}");
         let before = vault.snapshot_calls();
         for _ in 0..20 {
