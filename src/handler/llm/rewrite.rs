@@ -5,6 +5,7 @@ use {
         config::{Config, effective_placeholder_prompt},
         service::{
             credential_vault::CredentialVault,
+            json_walk,
             llm_gateway::{self, Protocol, is_stream_body},
             pii::PiiDetector,
             redaction::Scope,
@@ -26,6 +27,14 @@ pub struct RewriteOutput {
     pub init_conv: Option<String>,
 }
 
+/// R5-23（5.1/D1）：生产请求体 JSON 解析统一经中央 `json_walk`——先按 UTF-8
+/// 解码再剥前导 BOM，使 BOM 前缀体与非 BOM 体解析结果一致（不再落解析失败回退）。
+fn parse_body_json(bytes: &[u8]) -> Option<Value> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| json_walk::jloads(json_walk::strip_bom(s)).ok())
+}
+
 /// 2.1 `request_rewrite` 纯改写：仅做 token 子串替换、stream 选项注入、
 /// 占位符说明注入与声明头计算，MUST NOT 发起任何网络 I/O。
 /// 仅在对话路径调用（`is_chat` 恒为真，保持原 `should_inject_placeholders(true, ..)` 语义）。
@@ -39,7 +48,7 @@ pub async fn request_rewrite(
 ) -> RewriteOutput {
     let original_valid = std::str::from_utf8(&body_bytes).is_ok();
     let original_text = String::from_utf8_lossy(&body_bytes).into_owned();
-    let body_value: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+    let body_value: Option<Value> = parse_body_json(&body_bytes);
     let mut normalized_out = false;
     let mut body_bytes = body_bytes;
     let mut redacted_text = original_text.clone();
@@ -75,8 +84,7 @@ pub async fn request_rewrite(
         body_bytes = serde_json::to_vec(v).unwrap_or_default();
         normalized_out = true;
     }
-    let stream_flag: bool = serde_json::from_slice::<Value>(&body_bytes)
-        .ok()
+    let stream_flag: bool = parse_body_json(&body_bytes)
         .as_ref()
         .is_some_and(is_stream_body)
         || body_value.as_ref().is_some_and(is_stream_body);
@@ -113,7 +121,7 @@ fn apply_stream_options_injection(
     original_valid: bool,
     body_value: Option<&Value>,
 ) -> (Vec<u8>, bool) {
-    if let Ok(mut v) = serde_json::from_str::<Value>(redacted_text) {
+    if let Ok(mut v) = json_walk::jloads(json_walk::strip_bom(redacted_text)) {
         llm_gateway::inject_stream_options(&mut v);
         return (serde_json::to_vec(&v).unwrap_or_default(), true);
     }
@@ -617,6 +625,48 @@ mod rewrite_unit_tests {
         .await;
         let v: serde_json::Value = serde_json::from_slice(&out.body).expect("合法 JSON");
         assert_eq!(v["messages"][0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn bom_prefixed_request_body_parses_like_non_bom() {
+        // R5-23/D1：带前导 BOM 的请求体经中央 `strip_bom`/`jloads` 正常解析——
+        // stream 意图识别与 stream_options 注入与同字节无 BOM 体一致。
+        let config = test_config(&[("REDACTION_ENABLED", "0"), ("PII_PLACEHOLDER_PROMPT", "0")]);
+        let (scope, vault, detector) = fresh_arcs();
+        let plain = br#"{"model":"m","stream":true,"messages":[]}"#.to_vec();
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(&plain);
+        let out_plain =
+            request_rewrite(plain, Protocol::Chat, &config, scope, vault, detector).await;
+        let (scope, vault, detector) = fresh_arcs();
+        let out_bom = request_rewrite(bom, Protocol::Chat, &config, scope, vault, detector).await;
+        assert!(out_bom.stream_flag, "BOM 前缀体 stream 意图须识别");
+        assert_eq!(
+            out_bom.stream_flag, out_plain.stream_flag,
+            "BOM 体与非 BOM 体 stream_flag 须一致"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&out_bom.body).expect("注入后须合法 JSON");
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert_eq!(
+            out_bom.body, out_plain.body,
+            "BOM 体解析结果须与无 BOM 体一致"
+        );
+    }
+
+    #[tokio::test]
+    async fn bom_prefixed_request_body_redacts_and_parses() {
+        // R5-23/D1：BOM 前缀请求体不再落 `body_value=None` 回退，脱敏与解析均正常。
+        let config = test_config(&[("PII_PLACEHOLDER_PROMPT", "0")]);
+        let (scope, vault, detector) = fresh_arcs();
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice(
+            br#"{"model":"m","messages":[{"role":"user","content":"call 13812345678"}]}"#,
+        );
+        let out = request_rewrite(raw, Protocol::Chat, &config, scope, vault, detector).await;
+        assert!(out.normalized_out, "BOM 体 JSON 脱敏重序列化须置位");
+        let text = String::from_utf8_lossy(&out.body).into_owned();
+        assert!(text.contains("__PII_"), "BOM 体须已脱敏: {text}");
     }
 
     #[test]

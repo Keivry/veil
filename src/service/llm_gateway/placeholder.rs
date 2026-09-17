@@ -253,7 +253,10 @@ pub fn inject_placeholder_prompt(
     if !(stripped.starts_with('{') || stripped.starts_with('[')) {
         return None;
     }
-    let mut obj: Value = serde_json::from_str(body_text.trim_start_matches('\u{feff}')).ok()?;
+    // R5-23/D1：生产请求体 JSON 解析统一经中央 `json_walk::{strip_bom, jloads}`
+    // （BOM 处理单一来源），非 BOM 输入与非中央路径逐字节等价。
+    let mut obj: Value =
+        crate::service::json_walk::jloads(crate::service::json_walk::strip_bom(body_text)).ok()?;
     if !obj.is_object() {
         return None;
     }

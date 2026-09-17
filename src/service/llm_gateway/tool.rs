@@ -11,6 +11,13 @@ pub(crate) use super::tool_responses::{
     responses_item_tool_name,
 };
 
+/// R5-16/D12：桶号派生（合法直用 / 越界有界哈希溢出桶）抽为 sibling 模块，
+/// 保持 `tool.rs` 在 800 行红线内（先例 `tool_responses.rs`）。
+mod bucket;
+
+pub use bucket::{anthropic_bucket_index, chat_bucket};
+pub(crate) use bucket::{bucket_index_of, chat_bucket_raw, responses_output_bucket};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub index: u32,
@@ -146,39 +153,6 @@ pub fn retrieval_args(obj: &serde_json::Map<String, Value>) -> String {
     String::new()
 }
 
-/// Chat 桶键（F-P1b + CHC-6/2.25）：`choice` 序号与 tool `index` 位域拼接，
-/// 声明域内 `ci < 2^16 && idx < 2^16` 单射无碰撞。旧实现 `ci*64+idx` 在
-/// `idx >= 64` 时与下一 choice 的桶 0 碰撞（64 步长饱和）；`ci = 0` 时本键
-/// 与旧实现等值，单 choice 快照不变。
-pub fn chat_bucket(ci: usize, idx: u32) -> u32 {
-    let ci = ci as u32;
-    debug_assert!(ci < (1 << 16), "choice index 超出位域: {ci}");
-    debug_assert!(idx < (1 << 16), "tool index 超出位域: {idx}");
-    (ci << 16) | (idx & 0xFFFF)
-}
-
-/// P9/X2：Responses `output[]` 桶号唯一实现（流/非流同键）：`item.output_index`
-/// 优先，缺失回退枚举下标；两路径共用防漂移。
-pub(crate) fn responses_output_bucket(item: &Value, fallback: usize) -> u32 {
-    item.get("output_index")
-        .and_then(|x| x.as_u64())
-        .map(|n| n as u32)
-        .unwrap_or(fallback as u32)
-}
-
-/// Anthropic 分桶唯一实现（P0-2.2）：外层事件 `index` > 内层块 `index` >
-/// 枚举下标；流式（`handler::llm::pump`）与非流共用，单优先级单实现。
-pub fn anthropic_bucket_index(outer: Option<u32>, block: &Value, fallback: u32) -> u32 {
-    outer
-        .or_else(|| {
-            block
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32)
-        })
-        .unwrap_or(fallback)
-}
-
 fn custom_obj_to_call(
     emit_warn: bool,
     index: u32,
@@ -220,7 +194,7 @@ pub(crate) fn extract_tool_calls_with(
                     let choice_idx = ch
                         .get("index")
                         .and_then(|x| x.as_u64())
-                        .unwrap_or(ci as u64) as usize;
+                        .unwrap_or(ci as u64);
                     for key in ["delta", "message"] {
                         let Some(container) = ch.get(key) else {
                             continue;
@@ -231,9 +205,8 @@ pub(crate) fn extract_tool_calls_with(
                                 let idx = call
                                     .get("index")
                                     .and_then(|x| x.as_u64())
-                                    .unwrap_or(i as u64)
-                                    as u32;
-                                let bucket = chat_bucket(choice_idx, idx);
+                                    .unwrap_or(i as u64);
+                                let bucket = chat_bucket_raw(choice_idx, idx);
                                 let (id, id_synth) = synth_tool_id_with(
                                     emit_warn,
                                     bucket,
@@ -274,7 +247,7 @@ pub(crate) fn extract_tool_calls_with(
                                     continue;
                                 };
                                 if legacy_key == "function_call" {
-                                    let bucket = chat_bucket(choice_idx, 0);
+                                    let bucket = chat_bucket_raw(choice_idx, i as u64);
                                     let (id, id_synth) =
                                         synth_tool_id_with(emit_warn, bucket, None);
                                     let name = obj
@@ -292,7 +265,7 @@ pub(crate) fn extract_tool_calls_with(
                                     });
                                 } else if let Some(c) = custom_obj_to_call(
                                     emit_warn,
-                                    chat_bucket(choice_idx, i as u32),
+                                    chat_bucket_raw(choice_idx, i as u64),
                                     obj,
                                 ) {
                                     out.push(c);
@@ -324,10 +297,7 @@ pub(crate) fn extract_tool_calls_with(
                     blocks.push(msg);
                 }
             }
-            let outer_index: Option<u32> = payload
-                .get("index")
-                .and_then(|x| x.as_u64())
-                .map(|n| n as u32);
+            let outer_index: Option<u64> = payload.get("index").and_then(|x| x.as_u64());
             for (i, b) in blocks.iter().enumerate() {
                 let bucket = anthropic_bucket_index(outer_index, b, i as u32);
                 if let Some(fc) = b.get("function_call").and_then(|v| v.as_object()) {
@@ -419,11 +389,7 @@ pub(crate) fn extract_tool_calls_with(
             let ev_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let derived = responses_derived_tool_kind(ev_type);
             if ev_type.contains("function_call_arguments") || derived.is_some() {
-                let idx = payload
-                    .get("output_index")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(0);
+                let idx = bucket_index_of(payload, &["output_index"], 0);
                 let id_raw = payload
                     .get("item_id")
                     .and_then(|v| v.as_str())
@@ -479,11 +445,7 @@ pub(crate) fn extract_tool_calls_with(
             // C10 检索事件计 tool（与非流一致）：名按类型派生，参按
             // queries 回退；中间态同样建槽审计，误报优于漏审。
             if let Some(rname) = retrieval_tool_name(ev_type) {
-                let idx = payload
-                    .get("output_index")
-                    .or_else(|| payload.get("index"))
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as u32;
+                let idx = bucket_index_of(payload, &["output_index", "index"], 0);
                 let id_raw = payload
                     .get("item_id")
                     .and_then(|v| v.as_str())
@@ -516,11 +478,7 @@ pub(crate) fn extract_tool_calls_with(
                 && let Some(item) = payload.get("item")
             {
                 let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let idx = payload
-                    .get("output_index")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(0);
+                let idx = bucket_index_of(payload, &["output_index"], 0);
                 // A/M-1：内置工具（code_interpreter/shell/mcp/computer/custom_tool/
                 // 检索）经共享派生路径 `derived_item_tool_call`，与非流 `output[]`
                 // 同结论（parity 由 `responses_output_stream_nonstream_parity` 锁定）。
@@ -591,11 +549,7 @@ pub(crate) fn extract_tool_calls_with(
                 if !is_tool {
                     return out;
                 }
-                let idx = payload
-                    .get("output_index")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(0);
+                let idx = bucket_index_of(payload, &["output_index"], 0);
                 let name = item
                     .get("name")
                     .and_then(|v| v.as_str())

@@ -17,6 +17,30 @@ async fn mint_cred(scope: &Scope, vault: &CredentialVault, secret: &str) {
 }
 
 #[tokio::test]
+async fn pii_unavailable_flag_set_on_entropy_failure() {
+    // R5-14/D5：注入 rand8 熵源故障 → 脱敏链失败信号置位，调用方据此 fail-closed。
+    let vault = CredentialVault::new();
+    let detector = PiiDetector::new();
+    let scope = Scope::new();
+    scope.pii_scope().force_entropy_failure(true);
+    let redacted = scope
+        .redact_request(&vault, &detector, r#"{"phone":"13812345678"}"#)
+        .await;
+    assert!(scope.pii_unavailable(), "熵源故障须置 fail-closed 信号");
+    assert!(redacted.contains("13812345678"), "本层不做替换: {redacted}");
+    // token 形态值：静默跳过，不置失败信号、不报错。
+    let scope2 = Scope::new();
+    let out = scope2
+        .redact_request(&vault, &detector, r#"{"p":"__PII_1_ab12cd34__"}"#)
+        .await;
+    assert!(!scope2.pii_unavailable(), "token 形态不得置失败信号");
+    assert!(
+        out.contains("__PII_1_ab12cd34__"),
+        "token 形态原样保留: {out}"
+    );
+}
+
+#[tokio::test]
 async fn same_plaintext_cross_depth_escape() {
     // NLP-4/D13：同明文跨深度逐点转义——浅层不得按深层 max 过度转义（内容损坏）。
     let secret = "p@ss\"q";

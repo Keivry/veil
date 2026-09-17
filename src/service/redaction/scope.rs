@@ -19,7 +19,10 @@ use {
             scan_token_forms,
         },
     },
-    std::sync::Arc,
+    std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// B3 请求级铸造集：仅记录本请求**脱敏实际产出**的凭据 token（`P2tSnapshot::redact`
@@ -55,6 +58,9 @@ pub struct Scope {
     minted: MintedSet,
     /// 会话写回上下文：仅 `conversation` 模式且键推导成功时存在。
     conversation: Option<ConversationWriteback>,
+    /// R5-14/D5 side-channel 失败标志：脱敏链中 rand8 熵源/内部故障置位；
+    /// 调用方据此 fail-closed（`502 + E_PII_UNAVAILABLE`），MUST NOT 转发未脱敏正文。
+    pii_unavailable: AtomicBool,
 }
 
 /// 手工 `Debug`（FIX 2）：会话写回上下文（会话键/租户指纹/HMAC 密钥）不得经
@@ -70,6 +76,7 @@ impl std::fmt::Debug for Scope {
                 "conversation",
                 &self.conversation.as_ref().map(|_| "[redacted]"),
             )
+            .field("pii_unavailable", &self.pii_unavailable())
             .finish()
     }
 }
@@ -82,6 +89,7 @@ impl Default for Scope {
             fuzzy_restore: false,
             minted: MintedSet::default(),
             conversation: None,
+            pii_unavailable: AtomicBool::new(false),
         }
     }
 }
@@ -99,6 +107,7 @@ impl Scope {
             fuzzy_restore,
             minted: MintedSet::default(),
             conversation: None,
+            pii_unavailable: AtomicBool::new(false),
         }
     }
 
@@ -111,6 +120,7 @@ impl Scope {
             fuzzy_restore,
             minted: MintedSet::default(),
             conversation: None,
+            pii_unavailable: AtomicBool::new(false),
         }
     }
 
@@ -137,6 +147,13 @@ impl Scope {
             .as_ref()
             .is_some_and(|wb| wb.record(protocol, response_id))
     }
+
+    /// R5-14/D5：脱敏链是否发生 rand8 熵源/内部故障（调用方据此 fail-closed）。
+    pub fn pii_unavailable(&self) -> bool { self.pii_unavailable.load(Ordering::Relaxed) }
+
+    /// R5-09/D10：是否挂载了会话写回上下文（仅 `conversation` 模式且键推导成功）。
+    /// 只暴露「有无」，MUST NOT 泄露会话键或租户指纹。
+    pub fn has_conversation(&self) -> bool { self.conversation.is_some() }
 
     /// 底层的请求级 PII 容器（高级用法/断言）。
     #[cfg(test)]
@@ -168,7 +185,14 @@ impl Scope {
     ) -> (String, bool) {
         let cred_map = vault.p2t_snapshot();
         // 自定义正则先在原文上预扫并注册（值→token 快照供叶回调复用）。
-        let custom_snapshot = prescan_custom(detector, &self.pii, text, cred_map.map()).await;
+        let custom_snapshot = prescan_custom(
+            detector,
+            &self.pii,
+            text,
+            cred_map.map(),
+            &self.pii_unavailable,
+        )
+        .await;
         let replaced = std::cell::Cell::new(false);
         let mut leaf = |s: String| {
             let r = redact_leaf_tracked(
@@ -178,6 +202,7 @@ impl Scope {
                 &custom_snapshot,
                 &self.minted,
                 s.clone(),
+                &self.pii_unavailable,
             );
             if r != s {
                 replaced.set(true);
@@ -201,7 +226,14 @@ impl Scope {
         text: &str,
     ) -> String {
         let cred_map = vault.p2t_snapshot();
-        let custom_snapshot = prescan_custom(detector, &self.pii, text, cred_map.map()).await;
+        let custom_snapshot = prescan_custom(
+            detector,
+            &self.pii,
+            text,
+            cred_map.map(),
+            &self.pii_unavailable,
+        )
+        .await;
         let redacted = redact_leaf_tracked(
             &self.pii,
             detector,
@@ -209,6 +241,7 @@ impl Scope {
             &custom_snapshot,
             &self.minted,
             text.to_string(),
+            &self.pii_unavailable,
         );
         strip_partials(&redacted)
     }
@@ -385,12 +418,24 @@ impl Scope {
             return (text.to_string(), false);
         }
         let cred_map = vault.p2t_snapshot();
-        let custom_snapshot =
-            prescan_custom_response(detector, &self.pii, text, cred_map.map()).await;
+        let custom_snapshot = prescan_custom_response(
+            detector,
+            &self.pii,
+            text,
+            cred_map.map(),
+            &self.pii_unavailable,
+        )
+        .await;
         let replaced = std::cell::Cell::new(false);
         let mut leaf = |s: String| {
-            let r =
-                redact_leaf_response(&self.pii, detector, &cred_map, &custom_snapshot, s.clone());
+            let r = redact_leaf_response(
+                &self.pii,
+                detector,
+                &cred_map,
+                &custom_snapshot,
+                s.clone(),
+                &self.pii_unavailable,
+            );
             if r != s {
                 replaced.set(true);
             }

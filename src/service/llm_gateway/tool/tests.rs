@@ -347,6 +347,47 @@ fn chat_bucket_bitfield_ci0_equivalence() {
 }
 
 #[test]
+fn r5_16_out_of_range_index_no_legal_collision() {
+    // R5-16/D12：越界索引经 `u32::try_from` 检测后有界哈希溢出，不得静默截断
+    // 与合法索引碰撞。
+    assert_ne!(chat_bucket_raw(0, 65536), chat_bucket_raw(0, 0));
+    assert_ne!(chat_bucket_raw(0, u32::MAX as u64), chat_bucket_raw(0, 0));
+    let legal = serde_json::json!({"type":"response.output_item.done","output_index":0,
+        "item":{"type":"function_call","id":"a","name":"run","arguments":"{}"}});
+    let over = serde_json::json!({"type":"response.output_item.done","output_index":u64::MAX,
+        "item":{"type":"function_call","id":"b","name":"run","arguments":"{}"}});
+    let lc = extract_tool_calls(Protocol::Responses, &legal);
+    let oc = extract_tool_calls(Protocol::Responses, &over);
+    assert_eq!((lc.len(), oc.len()), (1, 1));
+    assert_ne!(
+        oc[0].index, lc[0].index,
+        "u64::MAX 越界索引不得与合法 0 碰撞"
+    );
+}
+
+#[test]
+fn r5_16_legacy_function_call_multi_entries_distinct_buckets() {
+    // 旧式 `function_call` 多条目须按枚举下标分桶，不得恒用固定桶 0 互相覆盖。
+    let v = serde_json::json!({"choices":[{"delta":{"function_call":[
+        {"name":"a","arguments":"{\"x\":1}"},
+        {"name":"b","arguments":"{\"y\":2}"}
+    ]}}]});
+    let calls = extract_tool_calls(Protocol::Chat, &v);
+    assert_eq!(calls.len(), 2);
+    assert_ne!(
+        calls[0].index, calls[1].index,
+        "同 choice 多 function_call 须分桶不互相覆盖"
+    );
+    assert_eq!(calls[0].name.as_deref(), Some("a"));
+    assert_eq!(calls[1].name.as_deref(), Some("b"));
+    assert!(calls[0].args.contains("\"x\":1") && calls[1].args.contains("\"y\":2"));
+    // 单条目仍与历史桶 0 等值（单 choice 快照不变）。
+    let one = serde_json::json!({"choices":[{"delta":{"function_call":{"name":"old","arguments":"{}"}}}]});
+    let c1 = extract_tool_calls(Protocol::Chat, &one);
+    assert_eq!(c1[0].index, chat_bucket(0, 0));
+}
+
+#[test]
 fn empty_placeholder_covers_empty_array() {
     // STP-9/2.21：`content_block_start` 空数组占位 `input:[]` 不计入参数累积，
     // 不与后续 `partial_json` 拼成 `[]...` 前缀污染。

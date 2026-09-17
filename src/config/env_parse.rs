@@ -217,8 +217,11 @@ pub struct Config {
     /// 会话条目上限（`PII_SCOPE_MAX_CONVERSATIONS`，默认 1024；非正整数拒启动）。
     pub pii_scope_max_conversations: usize,
     /// 显式会话键请求头名（`PII_SCOPE_KEY_HEADER`，默认
-    /// `x-veil-conversation-id`；该头 MUST NOT 转发上游）。
+    /// `x-veil-conversation-id`；该头 MUST NOT 转发上游；保留鉴权/传输头名拒启动）。
     pub pii_scope_key_header: String,
+    /// `previous_response_id` 映射容量（`PII_PREV_ID_MAX_ENTRIES`；未设置时取
+    /// `PII_SCOPE_MAX_CONVERSATIONS` 的生效值，非正整数拒启动）。
+    pub pii_prev_id_max_entries: usize,
     /// 自定义正则规则文件（`PII_CUSTOM_RULES_FILE` 或 `PII_CUSTOM_RULES`，JSON 数组）。
     pub pii_custom_rules_file: Option<PathBuf>,
     /// 自定义模式文件（`PII_CUSTOM_PATTERNS_FILE` 或 `PII_CUSTOM_PATTERNS`，数组或映射）。
@@ -358,6 +361,7 @@ impl Config {
             ttl_secs: pii_scope_ttl_secs,
             max_conversations: pii_scope_max_conversations,
             key_header: pii_scope_key_header,
+            prev_id_max_entries: pii_prev_id_max_entries,
         } = pii_scope::load(&get)?;
         let LlmParts {
             llm_upstreams,
@@ -399,6 +403,7 @@ impl Config {
             pii_scope_ttl_secs,
             pii_scope_max_conversations,
             pii_scope_key_header,
+            pii_prev_id_max_entries,
             pii_custom_rules_file,
             pii_custom_patterns_file,
             pii_custom_dict_file,

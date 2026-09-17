@@ -35,6 +35,8 @@ where
 {
     pub protocol: Protocol,
     pub conv_id: &'a Option<String>,
+    /// R5-39：流式回显模型（阻断/截断/真空合成帧回显，缺失归 `unknown_model`）。
+    pub stream_model: Option<&'a str>,
     pub transport_error: bool,
     /// CHC-5/2.24：Chat 干净收尾（已见非空 `finish_reason`），断流终端不记 open_ended。
     pub chat_finish_seen: bool,
@@ -72,6 +74,7 @@ where
     let TerminalCtx {
         protocol,
         conv_id,
+        stream_model,
         transport_error,
         chat_finish_seen,
         responses_seq_cursor,
@@ -155,6 +158,7 @@ where
                 protocol,
                 "audit-policy-block",
                 conv_id.as_deref(),
+                stream_model.unwrap_or(""),
                 blocked_index.unwrap_or(0),
                 responses_seq_cursor,
                 None,
@@ -163,6 +167,14 @@ where
                     let _ = pump_tx.send(f).await;
                 }
                 terminator.commit(meta, kind, true, true);
+            } else {
+                // R5-35/D3：已终端后收尾审计命中 Block——不注入第二终端，但保留
+                // 阻断语义与观测（warn 不含明文/token；audit_blocks 经 audit_blocked）。
+                terminator.note_terminal_reject_block();
+                tracing::warn!(
+                    protocol = protocol_header_value(protocol),
+                    "已终端流收尾审计命中 Block，不注入第二终端（保留阻断语义与计数）"
+                );
             }
         } else {
             hold.release_audited();
@@ -210,7 +222,33 @@ where
         let scanned = resp_scope
             .redact_response_new_pii_with_skip(resp_vault, resp_detector, &restored, &spans)
             .await;
-        if !scanned.is_empty() {
+        // R5-14/D5：脱敏链 fail-closed——本帧若触发熵源/内部故障，`scanned` 仍可能
+        // 含未能 token 化的明文，MUST NOT 下发（与 `event_loop.rs` 主循环帧同口径）。
+        // 此处上下文无 `apply_reject_block`，改为经唯一所有者 `StreamTerminator`
+        // 注入协议阻断终端并提交；后续 D6 收尾因已终端而不再合成第二终端。
+        if resp_scope.pii_unavailable() {
+            tracing::warn!(
+                protocol = protocol_header_value(protocol),
+                "残余帧脱敏失败（PII 不可用），改注入协议阻断终端（不含明文）"
+            );
+            if let TerminalPlan::Frames { kind, frames, .. } = terminator.plan_block(
+                protocol,
+                "pii-unavailable",
+                conv_id.as_deref(),
+                stream_model.unwrap_or(""),
+                blocked_index.unwrap_or(0),
+                responses_seq_cursor,
+                None,
+            ) {
+                for f in frames {
+                    let _ = pump_tx.send(f).await;
+                }
+                terminator.commit(meta, kind, true, true);
+            } else {
+                // 已终端/已阻断：不注入第二终端，仅保留阻断语义与观测。
+                terminator.note_terminal_reject_block();
+            }
+        } else if !scanned.is_empty() {
             // D/B-2：残余帧与正常帧共用 `emit_restored_json_frame`（守卫失败
             // 回退占位符帧），消除残余路径缺守卫的回退缺口。
             let _ = emit_restored_json_frame(
@@ -262,6 +300,7 @@ where
         } = terminator.plan_midstream(
             protocol,
             conv_id.as_deref(),
+            stream_model.unwrap_or(""),
             protocol.is_chat() && chat_finish_seen,
             responses_seq_cursor,
             Some(metrics),
@@ -305,7 +344,7 @@ where
             kind,
             frames,
             truncated,
-        } = terminator.plan_empty_stream(proto_name, &tid)
+        } = terminator.plan_empty_stream(proto_name, &tid, stream_model.unwrap_or(""))
         {
             if frames.is_empty() {
                 if let Some(mode) = truncated {
@@ -364,5 +403,32 @@ mod residual_tests {
             .expect("残余帧须送达下游");
         let v: serde_json::Value = serde_json::from_str(payload).expect("残余还原后须为合法 JSON");
         assert_eq!(v["delta"], secret, "明文须按 JSON 转义精确还原: {payload}");
+    }
+
+    #[tokio::test]
+    async fn residual_frame_pii_unavailable_fails_closed_without_plaintext() {
+        // R5-14/D5：残余帧触发脱敏链故障（熵源不可用）时 MUST NOT 下发明文，
+        // 改经 StreamTerminator 注入协议阻断终端并保留阻断语义。
+        let (scope, vault, detector) = fresh_arcs();
+        scope.pii_scope().force_entropy_failure(true);
+        let phone = "13812345678";
+        let body =
+            format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{phone}\"}}")
+                .into_bytes();
+        let (url, server) = loopback_server(200, "text/event-stream", body).await;
+        let upstream = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("回环上游须可达");
+        let probe = scope.clone();
+        let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+        ctx.pii_boundary_chars = 0;
+        let (outcome, frames) = collect_pump(upstream, ctx).await;
+        server.abort();
+        let joined = frames.join("");
+        assert!(probe.pii_unavailable(), "熵源故障须置位 pii_unavailable");
+        assert!(!joined.contains(phone), "MUST NOT 下发未脱敏明文: {joined}");
+        assert!(outcome.block_injected, "残余帧故障须保留阻断语义: {joined}");
     }
 }

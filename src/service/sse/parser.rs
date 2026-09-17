@@ -438,8 +438,7 @@ pub fn classify_residue(tail: &str) -> Option<String> {
 pub fn json_aware_line(line: &str, restore: impl Fn(String) -> String) -> String {
     // §2.6：BOM 剥离后判 JSON（BOM+JSON 不得当残余转发）。
     let trimmed = json_walk::strip_bom(line).trim();
-    if (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+    if (trimmed.starts_with('{') || trimmed.starts_with('[')) && json_walk::jloads(trimmed).is_ok()
     {
         // H1/D2：JSON 合法即返回输入（仅保留校验），不再二次 `loads→walk→dumps`。
         // Leaf 还原/脱敏已由调用方（scope 层）先行完成；二次序列化会重排

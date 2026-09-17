@@ -65,7 +65,8 @@ Rust 实现的安全网关：凭据 API（三因子认证 + Matrix 审批）与 
 | 脱敏 | `PII_SCOPE_MODE` | `request` | PII 作用域模式：`request`（默认，逐请求隔离，现行为）/ `conversation`（显式启用会话级关联）；非法值拒启动 |
 | 脱敏 | `PII_SCOPE_TTL_SECS` | `1800` | `conversation` 模式会话条目空闲 TTL（秒，须 ≥1 正整数，非法拒启动） |
 | 脱敏 | `PII_SCOPE_MAX_CONVERSATIONS` | `1024` | `conversation` 模式会话数上限（超限按 LRU 淘汰，须 ≥1 正整数，非法拒启动） |
-| 脱敏 | `PII_SCOPE_KEY_HEADER` | `x-veil-conversation-id` | `conversation` 模式会话键第 1 级来源请求头名；属 `x-veil-*` 内部命名空间，MUST NOT 转发上游或入日志 |
+| 脱敏 | `PII_PREV_ID_MAX_ENTRIES` | 未设置→取 `PII_SCOPE_MAX_CONVERSATIONS` 生效值 | `PreviousResponseMap`（`previous_response_id`→会话键映射）条目上限，与 PII 会话容量解耦（须 ≥1 正整数，非法拒启动；未设置时回退 PII 会话容量生效值以零行为变化，见 §7.3） |
+| 脱敏 | `PII_SCOPE_KEY_HEADER` | `x-veil-conversation-id` | 会话键第 1 级来源请求头名；其名与值 MUST NOT 转发上游或入日志（**无条件**剔除，`request` 模式同样剔除）；启动期保留名校验：命中 `authorization`/`x-api-key`/`api-key`/HOP 集/`host`/`content-length`/`content-encoding`/`accept-encoding` 之一（大小写不敏感）拒启动；除保留名外任意自定义名接受，安全性由无条件剔除保证（见 §7.3） |
 | 审计 | `AUDIT_MODE` | `off` | `off` / `block` / `approve`；`approve` 必须配 `APPROVAL_WHITELIST` |
 | 审计 | `AUDIT_ENABLED` | 空 | 遗留回退：`AUDIT_MODE` 缺失/空白时真值 `1/true/yes/on`（trim + 大小写不敏感）→ `block`（fail-closed），显式 `AUDIT_MODE` 优先，缺省仍 `off` |
 | 审计 | `AUDIT_TIMEOUT` | `90`s | 禁止落在 `110`-`130`s 竞态区间，否则拒启动 |
@@ -410,10 +411,14 @@ get revoke --name "check-mail"
 - 基线 commit（锁定）：`46f6ff665c869b02c154c10df431c638c2177fd9`（2026-09-07，bump version v0.9.47）。
 - 迁移：无配置项需改；容量分表（本仓 `MAX_TOKEN_ENTRIES=5000` / `PII_MAX_ENTRIES=1000`）与原仓一致，
   仅作容量复核锚点，不主张默认值/行为变化。
-- 序号分配口径（`P5`，`veil-pii-parity-closeout`）：本仓 `PiiScope` 用游标 + 在用序号集合
-  O(1) 均摊分配（到顶回卷、淘汰释放的序号可复用、满表返回 `PII_MAX_ENTRIES + 1` 并由紧随
-  LRU 淘汰恢复）；与 Python 最小空洞扫描的**可见序号值差异仅影响跨实现关联性，不承诺值一致**。
-  序号值非对外契约，不可预测性由 `rand8`（CSPRNG）承担。
+- 序号分配口径（`P5`，`veil-pii-parity-closeout`；`R5-15`/D6，`veil-audit-r5-remediation`）：
+  本仓 `PiiScope` 用游标 + 在用序号集合 O(1) 均摊分配（淘汰释放的序号可复用）；**请求表与响应表
+  分设独立序号空间**，可观测不变量为**各表内**「**一个在用条目 ↔ 一个序号**」——数值相同的序号可
+  同时存在于两表（两套独立空间，非重复）；某表在用序号集覆盖 `1..=PII_MAX_ENTRIES` 时该表下一次
+  分配返回饱和哨兵 `PII_MAX_ENTRIES + 1`（单表内至多一个在用条目持有），紧随的 LRU 淘汰释放空洞；
+  按序号回查的 `fuzzy` 还原**仅查请求表**，故响应表数值相同的序号 SHALL NOT 被解析到响应表明文
+  （跨表误解析结构性不可能）；聚合上界仍为 `2 × PII_MAX_ENTRIES`/会话。与 Python 最小空洞扫描的
+  **可见序号值差异仅影响跨实现关联性，不承诺值一致**。序号值非对外契约，不可预测性由 `rand8`（CSPRNG）承担。
 
 ### 6.4 流式审批挂起声明（原仓同步阻塞）
 
@@ -559,7 +564,9 @@ get revoke --name "check-mail"
 外加 `Connection` 头内列名的动态项。解码开启时（默认）额外剥离
 `content-encoding`/`content-length`（已解码，对外统一 `identity`：如上游回
 `content-encoding: gzip`，下游响应无该头与 `content-length`），
-每次剥离记 `hop_filtered_total{dir}` 并打 `tracing::debug`（`header`/`dir` 字段）。与原仓差异：原仓显式剥 7 项 HOP
+每次剥离经 `src/service/llm_gateway/metrics.rs::GatewayMetrics::record_hop_filtered` 计数（读取侧
+`src/service/llm_gateway/metrics.rs::GatewayMetrics::hop_filtered_count`；`hop_filtered_total{dir}` 为其
+Prometheus **度量名**约定、非可解析的 Rust 符号）并打 `tracing::debug`（`header`/`dir` 字段）。与原仓差异：原仓显式剥 7 项 HOP
 （`host`/`transfer-encoding`/`content-length`/`content-encoding`/`connection`/`keep-alive`/`te`，`_sse.py:19-28`）；
 本仓为 RFC 9110 §7.6.1 全集 8 项 + `Connection` 头内列名的动态项
 （`src/service/llm_gateway/hop.rs::HOP_HEADERS`，经 `llm_gateway/mod.rs` 重导出亦可用），
@@ -585,7 +592,8 @@ A5/D9 互引：编码剥离即对外统一 `identity`，见同文件 `filter_hop
 `message_delta` 输出必须求和而非取 max，见 `src/service/llm_gateway/usage.rs::merge_usage`）。
 回退仅在无显式 total 时生效，不覆盖上游声明值。
 Responses 取数顶层优先：非流按顶层 `usage` → `response.usage` → `response.response.usage`
-三级回退，流式同口径（含 `response.completed` 事件）；定制双层体仍经回退命中不断链。
+三级回退，流式同口径（含 `response.completed` 事件；`src/service/llm_gateway/usage.rs::extract_usage_nonstream`
+与同文件 `extract_usage_stream` 共用 `usage_from_paths` 同口径）；定制双层体仍经回退命中不断链。
 缓存列 `cached_read`/`cached_write` 同样按列取 max：Anthropic 取顶层
 `cache_read/cache_creation_input_tokens`，Responses 取
 `input_tokens_details.cached_tokens`，Chat 取
@@ -606,13 +614,44 @@ Chat 显式 false 即放弃流式用量，按 key 合并保留不覆写：Chat �
 `stream_options={"include_usage":false}` 时转发体保留 `false`，不覆写为 `true`
 （按 key 合并语义，见 `src/service/llm_gateway/protocol.rs` 与
 `src/handler/llm/rewrite.rs`）；此时流式无 usage 帧，metrics 空 usage 桶为预期而非异常。
-`stream_options` 三态保留（`TRN-5`，`veil-gateway-transport-fidelity`）：键**缺失**时注入
+`stream_options` 注入范围**仅 Chat**（`R5-19.1`，`veil-audit-r5-remediation`）：注入判定的唯一来源为
+`src/service/llm_gateway/protocol.rs::should_inject_stream_options`，其对非 Chat 协议 SHALL 直接返假。
+Chat 三态保留（`TRN-5`，`veil-gateway-transport-fidelity`）：键**缺失**时注入
 `{"include_usage":true}`；值为 `null`（用户显式第三态）时**原样保留 `null`**，不注入、不替换；
 值为对象时仅在缺 `include_usage` 时按 key 合并，已含 `include_usage`（含 `false`）时原样保留；
 字符串/数组等畸形形态维持 warn + 整体替换，不静默丢键。
-Responses **不注入** `stream_options`（官方规范仅接受 `include_obfuscation`，无
+Responses 系**不注入** `stream_options`（官方规范仅接受 `include_obfuscation`，无
 `include_usage`；决策依据与回退条款见 change `veil-llm-proto-closeout` 的 design.md D1/R1），其流式用量一律经
-`response.completed.response.usage` 三级回退记录，用户自带键逐字节保留。
+`response.completed.response.usage` 三级回退记录，用户自带键逐字节保留；Anthropic `messages` 系同样
+**不注入**（官方无该参数）。
+
+下游发送语义 `Speed` 由 `audit_mode` 派生（`R5-19.5`，`veil-audit-r5-remediation`）：
+`src/handler/llm/pump/spawn/setup.rs` 按 `AuditMode::Off → Speed::Fast`、其余 → `Speed::Slow` 派生
+（`src/service/sse/emit.rs::select_emit` 与同文件 `Speed` 定义），MUST NOT 作为独立配置项暴露；
+两档仅描述下游发送节奏（`Slow` 见文即吐、`Fast` 攒至标点边界或 `FAST_EMIT_THRESHOLD_BYTES` 字节阈值），
+与 keepalive 10s 节奏无关，亦不构成「脱敏完整性」的判据。
+
+流式 model 三级回退与三协议阻断帧回显（`R5-02`/`R5-03`/`R5-39`，`veil-audit-r5-remediation`）：
+流式模型提取按顶层 `model` → Anthropic 嵌套 `message.model` → Responses 嵌套 `response.model` 三级回退
+（`src/handler/llm/pump/event.rs::stream_model_of`，与 `src/service/llm_gateway/tool.rs::extract_conv_id`
+的 `response.id` 回退对称），使 Responses `response.completed` 携带的 `response.model` 参与分桶，
+不再流式恒回退请求模型而与上游回显口径分裂；三协议流式阻断帧（`src/service/block_inject/frames.rs`
+的生产入口 `protocol_block_frames_modeled` 及其分派 `anthropic_block_frames_modeled`/
+`responses_block_frames_at_modeled`/`responses_failed_frame_modeled`，`chat_block_frames_full` 仍由生产内调用）
+回显已知会话标识与请求/归一模型名（缺失才回退 `blocked-0`/`unknown_model`），与非流
+`src/service/block_inject/frames.rs::nonstream_block_body` 的三协议回显口径一致。
+非阻断合成终止帧同样回显模型（`R5-39`）：`synthesize_truncation_modeled` 与 `empty_stream_frames_modeled`
+将流模型名写入 `response.failed.response.model`（此前恒 `unknown_model`），故 Responses 截断/真空合成的
+`response.failed.response.model` 由 `unknown_model` 变为真实模型名（用户可见变更，见 §7.12）。
+legacy 非 `_modeled` 包装（`chat_block_frames`/`protocol_block_frames`/`anthropic_block_frames`/
+`anthropic_block_frames_full`/`responses_block_frames`/`responses_block_frames_at`/
+`responses_truncated_frames`/`responses_failed_frame`/`synthesize_truncation`/`empty_stream_frames`）
+现已 `#[cfg(test)]` 收编，SHALL NOT 被生产路径调用，以防模型回显被静默回退。
+
+Anthropic `error` 终端观测（`R5-04`，`veil-audit-r5-remediation`）：Anthropic 流中 `type:"error"`
+作为终端透出且此前未发终端时，除既有终端语义外 `truncated_mode` 记 `upstream_error`（非 `None`、
+非 `open_ended`），使「上游错误即终端」的第四态在 Anthropic 面可见（Chat 带顶层 `error` 且无 `choices`
+的帧同记 `upstream_error`；Responses 走 `synthesized_failed` 自有路径）。
 
 中途断流终端策略（D6，`S5`/`S11`）：上游 `chunk()` 报错或异常 EOF（流未发终端即结束）时，
 网关按协议收尾并记 `truncated_mode` 观测；`chunk()` 报错另记 warn（含错误与已读字节），
@@ -621,7 +660,9 @@ Responses **不注入** `stream_options`（官方规范仅接受 `include_obfusc
 不丢；上游已发 `[DONE]` 时不重复补发）；Anthropic 不合成 `message_stop`（不伪造成功
 终止），仅记 `open_ended`；Responses 已发帧时合成恰一 `response.failed` 并记
 `synthesized_failed`，零帧维持真空流最小终止（见 §8.6）。三协议合成终端恒恰一
-（见 `src/handler/llm/pump/spawn.rs`、`src/handler/llm/pump/synth_flush.rs`）。
+（终端决策的单一所有者为 `src/handler/llm/pump/spawn/terminator.rs::StreamTerminator` 的
+`plan_midstream`/`commit`；帧发送与计数仍留在 `src/handler/llm/pump/synth_flush.rs` 的
+`flush_pre_terminal`/`midstream_terminal`，二者非终端决策所有者）。
 
 SSE 出口信封保真（`TRN-1`，`veil-gateway-transport-fidelity`）：出口在 `event:` 重放基础上
 保真透出 `id:`（WHATWG last-event-id——最近一次出现的 `id` 对后续无 `id` 事件持续有效，
@@ -646,7 +687,9 @@ Responses 断序容忍：流中 `sequence_number` 不连续（跳号/回退）�
 不丢帧，终端恰一，不因断序升级为错误日志（见 `src/handler/llm/pump/event.rs::extract_responses_seq`）。
 
 Responses `error` 事件统一为失败终端：流中 `type:"error"` 合成恰一 `response.failed`，
-不出现 `response.completed`、无重复终端（见 `src/handler/llm/pump/spawn.rs`）。
+不出现 `response.completed`、无重复终端（终端决策见
+`src/handler/llm/pump/spawn/terminator.rs::StreamTerminator::plan_responses_error`，调用点为
+`src/handler/llm/pump/spawn/event_loop.rs::handle_event` 的 Responses error 臂）。
 
 Responses 失败帧诊断字段（M2/D5 + `TRN-2`，lossy 边界）：合成 `response.failed.response.error`
 兼容上游 error 事件的**两种形态**——官方 `ResponseErrorEvent`（`code`/`message`/`param`/
@@ -655,7 +698,7 @@ Responses 失败帧诊断字段（M2/D5 + `TRN-2`，lossy 边界）：合成 `re
 载荷顶层。缺失 `message`（合并后为空）或 error 非对象时回退既有 `{"id","status"}` 形态；
 error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留，属已声明 lossy 范围，
 下游诊断依赖须以本清单为准（见 `src/handler/llm/pump/event.rs::responses_error_object`、
-`src/service/block_inject/frames.rs::responses_failed_frame`）。
+`src/service/block_inject/frames.rs::responses_failed_frame_modeled`）。
 
 空 usage 桶排查指引：观测到某模型空 usage 桶时，先查请求是否显式 `false`
 （转发体保留原值即用户放弃流式用量），再判上游异常或采样缺失，不得直接按故障报修。
@@ -664,8 +707,11 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 窄于 vault 还原侧 `\d{4,}`（兼容历史 4-5 位幻觉形）；4-5 位形态不触发说明注入属**有意保守**
 （注入宜漏不宜误，还原侧仍按宽松口径处理，见 `src/service/llm_gateway/placeholder.rs`）。
 
-非流阻断与错误状态声明（E4/E6/D4，`veil-nonstream-audit-align`；N2/D6，`veil-llm-protocol-hardening`）：
-非流上游为 **2xx** 且审计命中 `Block` 时，下游恒收 `200 + nonstream_block_body`（与流式恒 200 闭合对称）；
+非流阻断与错误状态声明（E4/E6/D4，`veil-nonstream-audit-align`；N2/D6，`veil-llm-protocol-hardening`；
+`R5-43`/D15，`veil-audit-r5-remediation`）：
+非流上游为 **2xx** 且审计命中 `Block` 时，下游恒收 `200 + nonstream_block_body`；与流式路径对称的是
+**阻断帧正文**（非流 `nonstream_block_body`、流式按协议注入阻断帧），**状态码不构成对称判据**——
+流式上游 2xx 逐字透传原状态码（见下段），旧「与流式恒定 200 闭合对称」口径已被 `R5-43` 取代；
 错误状态的 JSON 体（如 400 `truncation:disabled`）仍进完整后处理链
 （用量记录＋审计判定＋还原），审计照记（`audit_blocks` 列 + warn 日志），但下游
 **不合成阻断体**、状态码与正文保留、非字节等价为有意行为；`status>=400` 的非 JSON
@@ -676,18 +722,27 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 **非错误状态（`status<400`）**返回空体或非 JSON 体 → 下游 `502`（`src/error.rs:86-97` 的 `code()` 映射与
 `:110` 的 `EmptyBody → BAD_GATEWAY`）。错误体的字段形态为 `{"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}}`
 （网关级装配见 `src/handler/llm/mod.rs::empty_body_response`；入口级故障如上流未配置亦以同码 `502` 返回，
-见 `src/handler/llm/dispatch.rs:150`）。判定先后关系：非流响应体上限（`NONSTREAM_MAX_BYTES`，超限 → `502`
+见 `src/handler/llm/dispatch.rs::gateway_serve` 的 `resolve_upstream` 未配置分支）。判定先后关系：非流响应体上限（`NONSTREAM_MAX_BYTES`，超限 → `502`
 `response_too_large`，见 §4 阈值表）判定**先于**空体/非 JSON 的 `E_EMPTY_BODY` 判定——有界读取先于空体
 分类（`src/handler/llm/nonstream.rs:130-161`）；`status>=400` 的错误体不受二者改写，按上段透传语义保留
 状态码与正文字节。注意两枚 502 错误体的字段名不同：`E_EMPTY_BODY` 用 `error.code`，超限 `response_too_large`
 用 `error.type`（`src/handler/llm/nonstream.rs:582`）。
+
+空体 502 四分支一致性（`R5-19.6`，`veil-audit-r5-remediation`）：① 流式空流（零有效分片）SHALL 补
+最小可解析终止帧后按正常流闭合，**SHALL NOT 转 502**（见 §8.6）；② 非流空体/非 JSON（`status<400`）
+→ 502 `E_EMPTY_BODY`；③ 上游 `502`/`401` 原样透传、不改写；④ 非对话尾豁免（原文透传、不转 502、不计
+对话用量，见 §7.6）。502 SHALL 仅适用于非流式空体/非 JSON（唯一入口
+`src/service/llm_gateway/mod.rs::classify_empty` 的 `NonStreamTo502`）。
 
 流式上游错误状态透传（S6/D7，`veil-stream-fidelity-fix`；`TRN-3`/`TRN-4`，`veil-gateway-transport-fidelity`）：
 `stream:true` 请求仅在
 上游 `status<400` 且响应 `content-type` 为 `text/event-stream` 时进入 SSE 泵；
 上游 `status>=400`（4xx/5xx 的 JSON/HTML/空体）或 2xx 非 `text/event-stream`
 正文一律按非流口径保状态与正文字节透传（hop 头过滤 + `x-veil-protocol`，受
-`NONSTREAM_MAX_BYTES` 约束），不改写为 200 SSE 假流；仅非错误状态（`status<400`）
+`NONSTREAM_MAX_BYTES` 约束），不改写为 200 SSE 假流；进入 SSE 泵的上游 2xx（`status<400` 且
+`content-type: text/event-stream`）下游 SHALL 逐字携带上游原状态码（如 `201`/`202`/`206`），
+SHALL NOT 硬编码改写为 `200`（`R5-05`/D4，`veil-audit-r5-remediation`；实现见
+`src/handler/llm/pump/event.rs::build_sse_response`），`<400` 入泵门不放宽；仅非错误状态（`status<400`）
 严格超限走 502 `response_too_large`（见 `src/handler/llm/dispatch.rs::stream_upstream_passthrough`）。
 有界读（`TRN-3`）：透传读取先判上游 `content-length`，再按 `NONSTREAM_MAX_BYTES`
 有界读，不先全量缓冲；超限 502 **严格作用于非错误状态**，4xx/5xx 错误体不因体大
@@ -735,16 +790,55 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   内常驻内存（相对「请求结束即销毁」属回归）；会话内关联可接受（上游 provider 本就关联同一
   上下文轮次）；跨会话隔离保持。
 - MUST NOT 承诺清单：不承诺 provider 缓存命中率可测量的提升（wont-measure 保持）、跨会话 token
-  稳定性、凭据占位符稳定性、零明文常驻、网关重启后 token 稳定、键推导含糊时的任何行为。
+  稳定性、**Responses 标量 `input` 形态的会话级 token 稳定**（`R5-06`）、**序号空间饱和后的 `fuzzy`
+  还原确定性**（`R5-15`）、凭据占位符稳定性、零明文常驻、网关重启后 token 稳定、键推导含糊时的任何行为。
 - 前置条件（NB-3，会话级缓存友好**当且仅当**会话键成功推导时成立）：键按四级优先级首个命中者胜——
   ① 客户端显式头 `PII_SCOPE_KEY_HEADER`（默认 `x-veil-conversation-id`，≤256 字节，且经租户命名空间
-  + HMAC，原始值绝不作键）；② 协议原生键（Chat/Responses 的 `prompt_cache_key`、Responses 的
-  `previous_response_id`）；③ 稳定前缀（**要求 `tools` + `system` + 首个 user turn 三者齐备**，
-  对脱敏前规范化前缀做 HMAC）。级别 1/2 依赖客户端配合（显式头 / `prompt_cache_key` /
-  `previous_response_id`），级别 3 依赖请求形态齐备。
-- 降级行为（NB-3）：**纯多轮 `messages` 请求（无工具、无会话键头、无协议原生键）即便
-  `PII_SCOPE_MODE=conversation` 亦落第 4 级逐请求**，不获跨轮 token 稳定；该降级**不报错、
-  不伪造键**（缓存失配属预期降级，非缺陷）。
+  + HMAC，原始值绝不作键）；② 协议原生键（**按协议白名单，不跨协议接受**：仅 Chat/Responses 的
+  `prompt_cache_key`、仅 Responses 的 `previous_response_id`；Anthropic MUST NOT 接受二者、Chat MUST NOT
+  接受 `previous_response_id`，不匹配的原生字段按优先级继续下一级）；③ 稳定前缀（**要求 `tools` +
+  `system` + 首个 user turn 三者齐备**，对脱敏前规范化前缀做 HMAC；字段提取同按协议白名单——
+  Chat/Anthropic 取 `messages`、Responses 取**数组形** `input` 与 `instructions`，协议外字段不越界参与）。
+  级别 1/2 依赖客户端配合（显式头 / `prompt_cache_key` / `previous_response_id`），级别 3 依赖请求形态齐备。
+- 降级行为（NB-3 + `R5-06`/D1）：**纯多轮 `messages` 请求（无工具、无会话键头、无协议原生键）即便
+  `PII_SCOPE_MODE=conversation` 亦落第 4 级逐请求**，不获跨轮 token 稳定；**Responses 标量（字符串）
+  `input` 简写形态的第 3 级不可命中**（标量 `input` 是「当前轮全文」、随轮次增长，不作稳定 turn 锚点），
+  同样落第 4 级逐请求并由既有 `record_request_fallback()` 计入观测；以上降级**不报错、不伪造键**
+  （缓存失配属预期降级，非缺陷；原静默换键现为明确降级）。
+- 缓存稳定性边界（`R5-12`，已成立但 MUST NOT 作为稳定承诺）：(a) 第 3 级要求 `tools` + `system` +
+  首个 user turn 的**内容跨轮冻结**，改写其内容即换键（键序/工具序扰动已由规范化归一，不在此列）；
+  (b) 租户指纹纳入**完整上游基址（含 path/query）**与归一化客户端凭据头，切换上游基址或轮换凭据
+  即换命名空间、此前铸造的键不可解析（缓存失配/重新铸造，不报错）；(c) 会话期间修改
+  `PII_PLACEHOLDER_PROMPT_TEXT`（或切换注入开关）改变发往上游的前缀字节，应冻结该配置；(d)
+  `src/service/json_walk.rs::SCAN_INPUT_LIMIT`（1 MiB）、`::CONTAINER_NEST_LIMIT`（128 层）、
+  `::DEPTH_LIMIT`（5 层 stringified JSON）为回退阈值，超限正文回退原样处理，可能改变该请求的
+  序列化形状。以上边界均不改变 token 还原正确性。
+- 占位符说明注入的跨轮边界（`R5-11`）：注入仅在脱敏后请求体**仍含占位符 token** 时发生
+  （`src/handler/llm/rewrite.rs` 经 `src/service/llm_gateway/placeholder.rs::has_placeholder_tokens` 判定），
+  故「同会话两轮前缀字节一致」仅对**两轮均含 token**成立；token 首次出现的那一轮 SHALL 允许头部新增
+  说明、前缀字节较前一轮增长（合法增长，非缓存失稳缺陷）。与 §7.7 同口径。
+- 会话键头剔除与保留名校验（`R5-36`/`R5-40`/D7）：会话键头的剔除为**无条件**——独立于 `PII_SCOPE_MODE`
+  （默认 `request` 模式同样剔除）且覆盖任意自定义非 `x-veil-` 头名
+  （`src/handler/llm/dispatch.rs::strip_conversation_header`）；其名与值 MUST NOT 转发上游或入日志。
+  `PII_SCOPE_KEY_HEADER` 在启动期做**保留名校验**（fail-closed）：命中真实鉴权/传输头名
+  （`authorization`/`x-api-key`/`api-key`/HOP 集/`host`/`content-length`/`content-encoding`/
+  `accept-encoding`，大小写不敏感）拒启动；除保留名外的任意自定义名 SHALL 被接受，安全性由**无条件剔除**保证（转发前剥离、不入上游请求头与日志，无需额外 allow-list）。
+- 熵源故障 fail-closed（`R5-14`/D5）：PII 注册失败区分两类——待注册值**本身即 token 形态/保留前缀**时
+  静默跳过（既有语义，不替换、不改写、不失败）；`rand8` 的 `OsRng` **熵源/内部故障**时记 `warn!`
+  （不含明文/token/键/头值）并计入指标，且**拒绝以未脱敏正文转发上游**：请求以 HTTP `502` + 错误码
+  `E_PII_UNAVAILABLE`（码字面定义于 `src/error.rs`）收敛；响应侧新 PII 注册同样 fail-closed。
+- `previous_response_id` 映射容量与写回观测（`R5-09`/`R5-10`/D10）：映射容量由 `PII_PREV_ID_MAX_ENTRIES`
+  承载（**未设置时取 `PII_SCOPE_MAX_CONVERSATIONS` 的生效值**，任意配置下零行为变化），与 PII 会话容量
+  解耦；因达容量逐出最旧条目时计映射逐出计数。写回仅限 `Protocol::Responses` 的响应完成处
+  （`src/handler/llm/pump/spawn/event_loop.rs` 与 `src/handler/llm/nonstream.rs`，
+  门控在 `src/service/redaction/conversation_key.rs::record_response_id`），仅「响应 id 缺失/为空」
+  计一次 `conversation_writeback_miss`，无写回上下文与非 Responses 门控不计入。计数范围（D7）：**至多每响应一次**；
+  流式仅在官方 Responses 终端帧（`response.completed`/`response.failed`/`response.incomplete`）处判定且该流**从未见 id** 时计一次；
+  非流仅对 `status < 400` 的 JSON 响应体缺 id 计一次；`status >= 400` 错误响应与**流中段截断**声明为范围之外、不计入。
+- 会话键回退可观测（`R5-08`/D9）：仅三类**可判定**降级事件记 `tracing::warn!`（不含键/头值/明文/token）
+  与内部计数——键推导返 `None` 落第 4 级、`ConversationScopeStore` 缺失、显式会话键头存在但非法被
+  静默丢弃；「中途换键/变级」因键推导为逐请求无状态纯函数而不可观测，登记为非目标，**不新增**下游
+  可观测响应头（`x-veil-scope` 及等价物非目标）。
 - 模式开关：`PII_SCOPE_MODE` 默认 `request` 即现行为，**非 BREAKING**；`PII_SCOPE_TTL_SECS`
   （默认 `1800`）、`PII_SCOPE_MAX_CONVERSATIONS`（默认 `1024`）、`PII_SCOPE_KEY_HEADER`
   （默认 `x-veil-conversation-id`）为 `conversation` 模式参数；非法值拒启动（fail-closed）。
@@ -824,6 +918,8 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   上游基址自带 query（`?x=y`）时把入站 query 以 `&` 合并到基址 query 之后，不产生双 `?`。
 - 每次透传记 `GatewayMetrics.nondialog_passthrough`（流量验证用）；
   若流量验证表明该臂承载对话体需补还原/审计/用量，另立任务跟进。
+- 非对话尾的空响应按 §7.2「空体 502 四分支一致性」的**非对话豁免**分支原文透传：不转 502、
+  不计对话用量。
 
 ### 7.7 请求归一化声明（`x-veil-normalized`，注入即声明）
 
@@ -843,6 +939,12 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   下游做字节级比对须以此为准。
 - 非流两处响应与 SSE 流响应均按同一 `normalized_out` 置位（见 `src/handler/llm/nonstream.rs`、
   `src/handler/llm/pump/event.rs::build_sse_response`，  经 `pump.rs` 与 `handler/llm/mod.rs` 重导出亦可用；D9 互引见 `arch-docs-cleanup` spec（canonical，自 `veil-arch-docs-cleanup` 归档晋升）。
+- 占位符说明注入的跨轮前缀增长边界（`R5-11`，与 §7.3 同口径）：说明注入分支（置位条件③）仅在
+  脱敏后请求体仍含占位符 token 时发生（经 `src/service/llm_gateway/placeholder.rs::has_placeholder_tokens`
+  判定），故「同会话两轮前缀字节一致」仅对两轮均含 token 成立；token 首次出现的那一轮允许头部新增
+  说明、前缀字节较前一轮增长（合法增长，非缓存失稳）；既有幂等守卫（已含说明不重复前插、返回原字节）
+  不变。容器缺失时三协议不对称（Anthropic 缺 `system` 新建、Chat/Responses 容器缺失即不注入）见
+  `src/service/llm_gateway/placeholder.rs::placeholder_schema_ok` 与本节上文「置位条件」。
 
 ### 7.8 PII 还原超集与残缺清理语义（`veil-pii-parity-closeout`）
 
@@ -894,6 +996,33 @@ MUST NOT 声称已实现或已验证。残余限制（四项）：① 网关**�
 的 requirement「Anthropic 扩展思考签名连续性限制声明」为真相源；本仓 `llm-gateway` 的 requirement
 「Anthropic thinking 签名连续性（条件性收益与残余限制）」与其显式互引，已随 `veil-audit-r4-remediation`
 （2026-09-16 归档）**生效**。
+
+缓存稳定性边界（`R5-12`，与 §7.3 同口径的 MUST NOT 承诺登记）：会话级 token 稳定（及本节签名连续性的
+必要条件）仅在下列条件同时成立时才有意义——(a) 第 3 级稳定前缀的 `tools`/`system`/首个 user turn 内容
+跨轮冻结；(b) 完整上游基址（含 path/query）与客户端凭据头归一不变；(c) `PII_PLACEHOLDER_PROMPT_TEXT`
+与注入开关在会话期间冻结；(d) 正文未触发 `json_walk` 回退阈值（`src/service/json_walk.rs::SCAN_INPUT_LIMIT`
+1 MiB / `::CONTAINER_NEST_LIMIT` 128 层 / `::DEPTH_LIMIT` 5 层 stringified JSON）。任一不满足即可能换键或
+改变前缀字节，属已登记边界，不改变 token 还原正确性。
+
+### 7.12 第五轮审计（r5）用户可感知行为变更登记（非 BREAKING）
+
+本条登记 `veil-audit-r5-remediation` 引入的**用户可感知但非 BREAKING**行为变更（配置默认值与
+`PII_SCOPE_MODE=request` 逐项行为不变），release note 与运维排查以此为准：
+
+- Responses 流式 model 分桶更正（`R5-02`）：嵌套 `response.model` 三级回退，流/非流分桶不再分裂（见 §7.2）。
+- Anthropic `error` 终端计入 `upstream_error`（`R5-04`）：截断观测不再留空（见 §7.2）。
+- 流式三协议阻断帧回显 `id`/`model`（`R5-03`/`R5-39`）：原 `blocked-0`/`unknown_model` 降为缺失回退（见 §7.2）。
+- Responses 截断/真空合成帧回显 `model`（`R5-39`）：`response.failed.response.model` 由恒 `unknown_model`
+  改为回显已知流模型名（`synthesize_truncation_modeled`/`empty_stream_frames_modeled`，见 §7.2、§8.6）。
+- SSE 泵透传上游 2xx 原状态码（`R5-05`/D4）：原恒 200 改为 `201`/`202`/`206` 逐字透传（见 §7.2）。
+- `conversation` 模式下 Responses **标量 `input`** 改判为逐请求（`R5-06`/D1）：原（错误地）存在的会话级
+  稳定消失，改为明确降级 + `record_request_fallback()` 计数（见 §7.3）。
+- 脱敏熵源故障改 fail-closed（`R5-14`/D5）：新增 `502 E_PII_UNAVAILABLE`，不再静默转发未脱敏正文（见 §7.3）。
+- 会话键头**无条件**剔除 + `PII_SCOPE_KEY_HEADER` 保留名校验（`R5-36`/`R5-40`/D7）：默认 `request` 模式下
+  自定义非 `x-veil-` 头名亦于转发前剔除；误配保留名（如 `authorization`）拒启动（见 §1、§7.3）。
+- 观测面新增（D9/D10，**不新增**下游响应头）：会话键三类可判定降级记 warn + 内部计数；
+  `previous_response_id` 写回失败（仅响应 id 缺失）与映射逐出计数；`PII_PREV_ID_MAX_ENTRIES` 解耦映射容量
+  （见 §1、§7.3）。
 
 ## 8. 遗留决策记录
 
@@ -957,11 +1086,16 @@ MUST NOT 声称已实现或已验证。残余限制（四项）：① 网关**�
   （传输层终止标记，不伪造 `finish_reason`/内容/usage）；Anthropic 最小
   `message_start`+`message_stop`（空 content、null `stop_reason`、usage 全 0，不含
   `content_block_*`，不声称语义 stop_reason）；Responses 保持恰一 `response.failed` 全序列
-  （失败语义，不伪造完成）。`truncated_mode` 口径保留：Chat/Anthropic 记 `open_ended`
-  （metrics 观测），Responses 记 `synthesized_failed`——`open_ended` 仅余观测口径，
-  不再代表「不发终止帧」。实现见 `src/service/block_inject/frames.rs::empty_stream_frames`
-  与 `src/handler/llm/pump/spawn.rs` 空流合成守门；三协议对照由单测
-  `vacuum_stream_three_protocol_e2e_comparison` 锁定。
+  （失败语义，不伪造完成）。**SHALL NOT 转 502**（空体 502 仅适用非流，见 §7.2 四分支）。
+  Anthropic 三态区分（`R5-19.3`/`R5-42`，`veil-audit-r5-remediation`）：**审计阻断**恰一五件套
+  （`message_start` → `content_block_start` → `content_block_stop` → `message_delta` → `message_stop`，
+  定义于 `src/service/block_inject/frames.rs::anthropic_block_frames_modeled`）；**真空流**最小二帧
+  （上述 `message_start`+`message_stop`）；**正常上游结束** SHALL NOT 合成任何终止帧，透传原始终端。
+  `truncated_mode` 口径保留：Chat/Anthropic 记 `open_ended`（metrics 观测），Responses 记
+  `synthesized_failed`——`open_ended` 仅余观测口径，不再代表「不发终止帧」。实现见
+`src/service/block_inject/frames.rs::empty_stream_frames_modeled`（真空最小终止帧定义）与
+`src/handler/llm/pump/spawn/terminator.rs::StreamTerminator::plan_empty_stream` 空流合成守门
+（终端决策单一所有者）；三协议对照由单测 `vacuum_stream_three_protocol_e2e_comparison` 锁定。
 - 与原仓差异：原仓 Python `_ensure_nonempty_stream`（`_llm.py:2633`）对三协议均注入最小可解析
   事件以避免下游 `JSONDecodeError` 空体；本仓现按协议最小面补终止，语义面只补线级终止，
   不伪造内容/usage/成功（Anthropic `error` 本身即终端，其后不注入 `message_stop`）。
@@ -972,7 +1106,7 @@ MUST NOT 声称已实现或已验证。残余限制（四项）：① 网关**�
 - 风险：Anthropic 严格 SDK 若要求 `message_delta` 才认流闭合，最小信封可能被拒收；
   以 spec「真空流最小终止」Scenario 为准，实测需要时另立 change 补帧。
 - 中途断流与真空流区分（D6，`veil-stream-fidelity-fix`）：真空流（零字节零残余）走本节的
-  `empty_stream_frames` 最小终止；中途断流（已发内容帧或有截断信号后异常收尾）走
+  `empty_stream_frames_modeled` 最小终止；中途断流（已发内容帧或有截断信号后异常收尾）走
   「中途断流终端策略」（见 §7.2）——Chat 补恰一 `[DONE]`、Anthropic 仅记 `open_ended`
   不合成 `message_stop`、Responses 已发帧合成恰一 `response.failed`。两路径均保持三协议
   合成终端恒恰一，`truncated_mode` 观测口径保留（Chat/Anthropic `open_ended`、

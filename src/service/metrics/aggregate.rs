@@ -44,6 +44,50 @@ pub const MODEL_MAX_CHARS: usize = 128;
 /// 两面体量与消费者不同，统一任一值都会改变对端输出，故保留双常量并注释差异。
 pub const SUMMARY_MAX_CHARS: usize = 1000;
 
+/// R5-18：指标回填/序列读取的脏数据收敛累计计数（不可解析桶值、负存储计数）。
+/// 进程级只增，供测试与排障观测；收敛不中断聚合流程。
+static CORRUPT_METRIC_READS: AtomicU64 = AtomicU64::new(0);
+
+/// 脏数据收敛累计计数（测试断言用；生产面经 `warn!` 观测）。
+#[cfg(test)]
+pub(crate) fn corrupt_metric_reads_total() -> u64 { CORRUPT_METRIC_READS.load(Ordering::Relaxed) }
+
+/// R5-18：负的存储计数按 0 收敛并记 `warn!` + 计数——`i64 as u64` 会把负值
+/// 符号回绕成极大值（失真）。
+fn bounded_stored_count(value: i64, field: &str, window: &str, protocol: &str) -> u64 {
+    match u64::try_from(value) {
+        Ok(v) => v,
+        Err(_) => {
+            CORRUPT_METRIC_READS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                field,
+                window,
+                protocol,
+                value,
+                "指标存储计数为负，按 0 收敛（不符号回绕）"
+            );
+            0
+        }
+    }
+}
+
+/// R5-18：不可解析桶值按 0 收敛并记 `warn!` + 计数（不静默归零）。
+fn bounded_bucket_value(raw: &str, window: &str, protocol: &str) -> u64 {
+    match raw.trim().parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            CORRUPT_METRIC_READS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                window,
+                protocol,
+                raw,
+                "指标桶值不可解析，按 0 收敛（不静默归零）"
+            );
+            0
+        }
+    }
+}
+
 /// 模型名归一（C13）：去控制字符 + 截断 128 字符；空归 `unknown_model`
 /// （与 Python 模型分桶回退一致，防属性注入/超长破坏聚合键）。
 pub fn normalize_model(raw: &str) -> String {
@@ -455,23 +499,43 @@ fn query_series_blocking(
     }
     let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(refs.as_slice(), |row| {
+        let window: String = row.get(0)?;
+        let protocol: String = row.get(1)?;
+        let count = |idx: usize, field: &str| -> rusqlite::Result<u64> {
+            let v: i64 = row.get(idx)?;
+            Ok(bounded_stored_count(v, field, &window, &protocol))
+        };
+        let requests = count(2, "requests")?;
+        let prompt_tokens = count(3, "prompt_tokens")?;
+        let completion_tokens = count(4, "completion_tokens")?;
+        let total_tokens = count(5, "total_tokens")?;
+        let cached_read = count(6, "cached_read")?;
+        let cached_write = count(7, "cached_write")?;
+        let unknown = count(8, "unknown")?;
+        let pii_hits = count(9, "pii_hits")?;
+        let cred_hits = count(10, "cred_hits")?;
+        let audit_blocks = count(11, "audit_blocks")?;
+        let truncated_silent_discard = count(12, "t_silent")?;
+        let truncated_open_ended = count(13, "t_open")?;
+        let truncated_synthesized_failed = count(14, "t_synth")?;
+        let truncated_upstream_error = count(15, "t_upstream_error")?;
         Ok(SeriesPoint {
-            window: row.get(0)?,
-            protocol: row.get(1)?,
-            requests: row.get::<_, i64>(2)? as u64,
-            prompt_tokens: row.get::<_, i64>(3)? as u64,
-            completion_tokens: row.get::<_, i64>(4)? as u64,
-            total_tokens: row.get::<_, i64>(5)? as u64,
-            cached_read: row.get::<_, i64>(6)? as u64,
-            cached_write: row.get::<_, i64>(7)? as u64,
-            unknown: row.get::<_, i64>(8)? as u64,
-            pii_hits: row.get::<_, i64>(9)? as u64,
-            cred_hits: row.get::<_, i64>(10)? as u64,
-            audit_blocks: row.get::<_, i64>(11)? as u64,
-            truncated_silent_discard: row.get::<_, i64>(12)? as u64,
-            truncated_open_ended: row.get::<_, i64>(13)? as u64,
-            truncated_synthesized_failed: row.get::<_, i64>(14)? as u64,
-            truncated_upstream_error: row.get::<_, i64>(15)? as u64,
+            window,
+            protocol,
+            requests,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_read,
+            cached_write,
+            unknown,
+            pii_hits,
+            cred_hits,
+            audit_blocks,
+            truncated_silent_discard,
+            truncated_open_ended,
+            truncated_synthesized_failed,
+            truncated_upstream_error,
         })
     })?;
     let mut out = Vec::new();
@@ -497,32 +561,52 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
              t_silent, t_open, t_synth, t_upstream_error, buckets FROM {table}"
         ))?;
         let rows = stmt.query_map([], |row| {
+            let window: String = row.get(0)?;
+            let protocol: String = row.get(1)?;
             let buckets_s: String = row.get(16)?;
             let mut buckets = [0u64; LATENCY_BUCKETS];
             for (i, part) in buckets_s.split(',').enumerate().take(LATENCY_BUCKETS) {
-                buckets[i] = part.trim().parse().unwrap_or(0);
+                buckets[i] = bounded_bucket_value(part, &window, &protocol);
             }
+            let count = |idx: usize, field: &str| -> rusqlite::Result<u64> {
+                let v: i64 = row.get(idx)?;
+                Ok(bounded_stored_count(v, field, &window, &protocol))
+            };
+            let requests = count(2, "requests")?;
+            let prompt = count(3, "prompt_tokens")?;
+            let completion = count(4, "completion_tokens")?;
+            let total = count(5, "total_tokens")?;
+            let cached_read = count(6, "cached_read")?;
+            let cached_write = count(7, "cached_write")?;
+            let unknown = count(8, "unknown")?;
+            let pii_hits = count(9, "pii_hits")?;
+            let cred_hits = count(10, "cred_hits")?;
+            let audit_blocks = count(11, "audit_blocks")?;
+            let t_silent = count(12, "t_silent")?;
+            let t_open = count(13, "t_open")?;
+            let t_synth = count(14, "t_synth")?;
+            let t_upstream_error = count(15, "t_upstream_error")?;
             Ok((
                 AggKey {
                     granularity: gran,
-                    window: row.get(0)?,
-                    protocol: row.get(1)?,
+                    window,
+                    protocol,
                 },
                 WindowAgg {
-                    count: row.get::<_, i64>(2)? as u64,
-                    prompt: row.get::<_, i64>(3)? as u64,
-                    completion: row.get::<_, i64>(4)? as u64,
-                    total: row.get::<_, i64>(5)? as u64,
-                    cached_read: row.get::<_, i64>(6)? as u64,
-                    cached_write: row.get::<_, i64>(7)? as u64,
-                    unknown: row.get::<_, i64>(8)? as u64,
-                    pii_hits: row.get::<_, i64>(9)? as u64,
-                    cred_hits: row.get::<_, i64>(10)? as u64,
-                    audit_blocks: row.get::<_, i64>(11)? as u64,
-                    t_silent: row.get::<_, i64>(12)? as u64,
-                    t_open: row.get::<_, i64>(13)? as u64,
-                    t_synth: row.get::<_, i64>(14)? as u64,
-                    t_upstream_error: row.get::<_, i64>(15)? as u64,
+                    count: requests,
+                    prompt,
+                    completion,
+                    total,
+                    cached_read,
+                    cached_write,
+                    unknown,
+                    pii_hits,
+                    cred_hits,
+                    audit_blocks,
+                    t_silent,
+                    t_open,
+                    t_synth,
+                    t_upstream_error,
                     buckets,
                     updated: 0,
                 },

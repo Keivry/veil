@@ -687,7 +687,7 @@ mod tests {
                 None,
                 None
             )),
-            stable(&chat_block_frames("policy"))
+            stable(&chat_block_frames_full("policy", Some("c1"), ""))
         );
         assert_eq!(
             protocol_block_frames(P::Anthropic, "policy", Some("a1"), 2, None, None),

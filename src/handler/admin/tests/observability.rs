@@ -496,16 +496,35 @@ async fn admin_metrics_scope_no_secret_leak() {
     let mut headers = HeaderMap::new();
     headers.insert("x-veil-conversation-id", header_value.parse().unwrap());
     let body = serde_json::json!({"messages": [{"role": "user", "content": plaintext}]});
-    let scope =
-        crate::handler::llm::dispatch::build_request_scope(&state, &headers, upstream, Some(&body));
+    let scope = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &headers,
+        crate::service::llm_gateway::Protocol::Chat,
+        upstream,
+        Some(&body),
+    );
     let token = scope.pii_scope().register(plaintext, false).unwrap();
     // 第二轮命中同一会话键，确保复用计数路径确实执行（计数 > 0 才可断言无泄露）。
-    let _ =
-        crate::handler::llm::dispatch::build_request_scope(&state, &headers, upstream, Some(&body));
+    let _ = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &headers,
+        crate::service::llm_gateway::Protocol::Chat,
+        upstream,
+        Some(&body),
+    );
     let secret = state.conversation_secret.as_ref();
     let fp = tenant_fingerprint(secret, upstream, &[]);
-    let key =
-        derive_conversation_key(secret, &fp, Some(header_value), None, None, None, None).unwrap();
+    let key = derive_conversation_key(
+        secret,
+        &fp,
+        crate::service::llm_gateway::Protocol::Chat,
+        Some(header_value),
+        None,
+        None,
+        &serde_json::json!({}),
+        &state.previous_response_map,
+    )
+    .unwrap();
     let v = metrics_body(state.clone()).await;
     let text = serde_json::to_string(&v).unwrap();
     assert!(

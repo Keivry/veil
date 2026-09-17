@@ -24,7 +24,8 @@ fn prefix_body() -> serde_json::Value {
 #[test]
 fn conversation_key_layered_precedence() {
     let body = prefix_body();
-    let stable = stable_prefix_key(SECRET, TENANT, &body).expect("三者齐备须产出稳定前缀键");
+    let stable =
+        stable_prefix_key(SECRET, TENANT, Protocol::Chat, &body).expect("三者齐备须产出稳定前缀键");
     let map = PreviousResponseMap::new(8);
     map.record(SECRET, TENANT, "resp_1", &stable);
 
@@ -32,63 +33,231 @@ fn conversation_key_layered_precedence() {
     let k = derive_conversation_key(
         SECRET,
         TENANT,
+        Protocol::Chat,
         Some("conv-1"),
         Some("pck"),
         Some("resp_1"),
-        Some(&body),
-        Some(&map),
+        &body,
+        &map,
     )
     .unwrap();
     assert_eq!(k, scoped_key(SECRET, TENANT, "conv-1"));
-    // ② prompt_cache_key 次之。
+    // ② prompt_cache_key 次之（Chat 接受）。
     let k = derive_conversation_key(
         SECRET,
         TENANT,
+        Protocol::Chat,
         None,
         Some("pck"),
         Some("resp_1"),
-        Some(&body),
-        Some(&map),
+        &body,
+        &map,
     )
     .unwrap();
     assert_eq!(k, scoped_key(SECRET, TENANT, "pck"));
-    // ③ previous_response_id 映射。
+    // ③ previous_response_id 映射（Responses 接受）。
     let k = derive_conversation_key(
         SECRET,
         TENANT,
+        Protocol::Responses,
         None,
         None,
         Some("resp_1"),
-        Some(&body),
-        Some(&map),
+        &json!({}),
+        &map,
     )
     .unwrap();
     assert_eq!(k, stable);
     // ④ 稳定前缀。
-    let k =
-        derive_conversation_key(SECRET, TENANT, None, None, None, Some(&body), Some(&map)).unwrap();
+    let k = derive_conversation_key(
+        SECRET,
+        TENANT,
+        Protocol::Chat,
+        None,
+        None,
+        None,
+        &body,
+        &map,
+    )
+    .unwrap();
     assert_eq!(k, stable);
     // ⑤ 全级不可用 → None。
     assert!(
         derive_conversation_key(
             SECRET,
             TENANT,
+            Protocol::Chat,
             None,
             None,
             None,
-            Some(&json!({"model": "m"})),
-            Some(&map)
+            &json!({"model": "m"}),
+            &map
         )
         .is_none()
     );
 }
 
 #[test]
+fn conversation_key_native_keys_protocol_whitelist() {
+    // R5-07/D1 正例：Chat/Responses 接受 `prompt_cache_key`。
+    for protocol in [Protocol::Chat, Protocol::Responses] {
+        let k = derive_conversation_key(
+            SECRET,
+            TENANT,
+            protocol,
+            None,
+            Some("pck"),
+            None,
+            &json!({}),
+            &PreviousResponseMap::new(1),
+        )
+        .unwrap();
+        assert_eq!(k, scoped_key(SECRET, TENANT, "pck"), "{protocol:?}");
+    }
+    // 反例：Chat 体带 `previous_response_id` 不命中第 2 级。
+    let map = PreviousResponseMap::new(4);
+    let key = scoped_key(SECRET, TENANT, "conv-x");
+    map.record(SECRET, TENANT, "resp_9", &key);
+    let body = json!({"previous_response_id": "resp_9"});
+    assert!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            None,
+            Some("resp_9"),
+            &body,
+            &map
+        )
+        .is_none(),
+        "Chat 的 previous_response_id MUST NOT 命中第 2 级"
+    );
+    assert_eq!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Responses,
+            None,
+            None,
+            Some("resp_9"),
+            &body,
+            &map
+        ),
+        Some(key),
+        "Responses 接受 previous_response_id"
+    );
+    // 反例：Anthropic 体带 `prompt_cache_key` 不命中第 2 级。
+    let pck_body = json!({"prompt_cache_key": "pck"});
+    assert!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Anthropic,
+            None,
+            Some("pck"),
+            None,
+            &pck_body,
+            &map
+        )
+        .is_none(),
+        "Anthropic 的 prompt_cache_key MUST NOT 命中第 2 级"
+    );
+    assert_eq!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            Some("pck"),
+            None,
+            &pck_body,
+            &map
+        ),
+        Some(scoped_key(SECRET, TENANT, "pck"))
+    );
+}
+
+#[test]
+fn conversation_key_prefix_fields_protocol_whitelist() {
+    // R5-07/D1：Chat 用 messages/system；Responses 用 input/instructions。
+    let chat_body = json!({
+        "tools": [{"name": "t"}],
+        "instructions": "be nice",
+        "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+    });
+    assert!(
+        stable_prefix_key(SECRET, TENANT, Protocol::Chat, &chat_body).is_some(),
+        "Chat 从 messages 取 system/first user，instructions 不参与"
+    );
+    assert!(
+        stable_prefix_key(SECRET, TENANT, Protocol::Responses, &chat_body).is_none(),
+        "Responses 的 messages MUST NOT 作首个 user turn（缺 input）"
+    );
+}
+
+#[test]
+fn conversation_key_responses_scalar_input_falls_to_level4() {
+    // R5-06/D1：Responses 标量 input 不参与第 3 级 → 落第 4 级（None）。
+    let scalar = json!({
+        "tools": [{"name": "t"}],
+        "instructions": "be nice",
+        "input": "当前轮全文，随轮次增长",
+    });
+    assert!(
+        stable_prefix_key(SECRET, TENANT, Protocol::Responses, &scalar).is_none(),
+        "标量 input 不作 turn 锚点"
+    );
+    assert!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Responses,
+            None,
+            None,
+            None,
+            &scalar,
+            &PreviousResponseMap::new(1),
+        )
+        .is_none()
+    );
+    // 数组 input 正常命中第 3 级。
+    let array = json!({
+        "tools": [{"name": "t"}],
+        "instructions": "be nice",
+        "input": [{"role": "user", "content": "hello"}],
+    });
+    assert!(stable_prefix_key(SECRET, TENANT, Protocol::Responses, &array).is_some());
+}
+
+#[test]
 fn conversation_key_never_uses_user_field() {
+    let map = PreviousResponseMap::new(1);
     let body = json!({"user": "alice", "model": "m"});
-    assert!(derive_conversation_key(SECRET, TENANT, None, None, None, Some(&body), None).is_none());
+    assert!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            None,
+            None,
+            &body,
+            &map
+        )
+        .is_none()
+    );
     assert_ne!(
-        derive_conversation_key(SECRET, TENANT, None, None, None, Some(&body), None),
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            None,
+            None,
+            &body,
+            &map
+        ),
         Some(scoped_key(SECRET, TENANT, "alice"))
     );
     let multi = json!({
@@ -96,7 +265,17 @@ fn conversation_key_never_uses_user_field() {
         "messages": [{"role": "user", "content": "hi"}],
     });
     assert!(
-        derive_conversation_key(SECRET, TENANT, None, None, None, Some(&multi), None).is_none()
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            None,
+            None,
+            &multi,
+            &map
+        )
+        .is_none()
     );
 }
 
@@ -114,9 +293,9 @@ fn conversation_key_stable_prefix_deterministic() {
         "tools": [{"name": "alpha"}, {"name": "beta"}],
         "system": "s",
     });
-    let k1 = stable_prefix_key(SECRET, TENANT, &a).unwrap();
-    let k2 = stable_prefix_key(SECRET, TENANT, &a).unwrap();
-    let k3 = stable_prefix_key(SECRET, TENANT, &b).unwrap();
+    let k1 = stable_prefix_key(SECRET, TENANT, Protocol::Chat, &a).unwrap();
+    let k2 = stable_prefix_key(SECRET, TENANT, Protocol::Chat, &a).unwrap();
+    let k3 = stable_prefix_key(SECRET, TENANT, Protocol::Chat, &b).unwrap();
     assert_eq!(k1, k2, "同输入两次须同键");
     assert_eq!(k1, k3, "键序/工具序扰动后仍须同键");
 }
@@ -129,8 +308,17 @@ fn conversation_key_header_too_long_rejected() {
     // 含控制字符亦不命中。
     assert!(explicit_header(true, Some("bad\tvalue")).is_none());
     // 超长头不命中但按优先级继续到 prompt_cache_key；键非原始超长值的哈希。
-    let k = derive_conversation_key(SECRET, TENANT, Some(&long), Some("pck"), None, None, None)
-        .unwrap();
+    let k = derive_conversation_key(
+        SECRET,
+        TENANT,
+        Protocol::Chat,
+        Some(&long),
+        Some("pck"),
+        None,
+        &json!({}),
+        &PreviousResponseMap::new(1),
+    )
+    .unwrap();
     assert_eq!(k, scoped_key(SECRET, TENANT, "pck"));
     assert_ne!(k, scoped_key(SECRET, TENANT, &long));
 }
@@ -147,7 +335,17 @@ fn conversation_key_plain_multiturn_falls_to_per_request() {
         ],
     });
     assert!(
-        derive_conversation_key(SECRET, TENANT, None, None, None, Some(&body), None).is_none(),
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            None,
+            None,
+            &body,
+            &PreviousResponseMap::new(1)
+        )
+        .is_none(),
         "无 tools 的纯多轮 messages 须落第 4 级"
     );
 }
@@ -224,18 +422,28 @@ fn previous_response_id_map_hit_and_miss() {
     assert_eq!(map.resolve(SECRET, TENANT, "resp_1"), Some(key.clone()));
     assert_eq!(map.resolve(SECRET, TENANT, "resp_missing"), None);
     assert_eq!(
-        derive_conversation_key(SECRET, TENANT, None, None, Some("resp_1"), None, Some(&map)),
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Responses,
+            None,
+            None,
+            Some("resp_1"),
+            &json!({}),
+            &map
+        ),
         Some(key)
     );
     assert_eq!(
         derive_conversation_key(
             SECRET,
             TENANT,
+            Protocol::Responses,
             None,
             None,
             Some("resp_missing"),
-            None,
-            Some(&map)
+            &json!({}),
+            &map
         ),
         None,
         "未命中须继续下一级（此处无后续级即 None）"
@@ -271,9 +479,39 @@ fn previous_response_id_resolves_via_faithful_response_id() {
     let key = scoped_key(SECRET, TENANT, "conv");
     map.record(SECRET, TENANT, id, &key);
     assert_eq!(
-        derive_conversation_key(SECRET, TENANT, None, None, Some(id), None, Some(&map)),
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Responses,
+            None,
+            None,
+            Some(id),
+            &json!({}),
+            &map
+        ),
         Some(key)
     );
+}
+
+#[test]
+fn previous_response_map_capacity_eviction_counted() {
+    // R5-10/D10：达容量逐出最旧条目并计映射逐出计数；显式容量独立生效。
+    let metrics = Arc::new(crate::service::llm_gateway::GatewayMetrics::default());
+    let map = PreviousResponseMap::new(2).with_metrics(metrics.clone());
+    assert_eq!(map.capacity(), 2);
+    let key = scoped_key(SECRET, TENANT, "conv");
+    map.record(SECRET, TENANT, "resp_1", &key);
+    map.record(SECRET, TENANT, "resp_2", &key);
+    assert_eq!(metrics.previous_response_eviction_count(), 0, "未满不逐出");
+    map.record(SECRET, TENANT, "resp_3", &key);
+    assert_eq!(map.len(), 2, "容量有界");
+    assert_eq!(
+        metrics.previous_response_eviction_count(),
+        1,
+        "逐出最旧须计一次"
+    );
+    assert_eq!(map.resolve(SECRET, TENANT, "resp_1"), None, "最旧须被逐出");
+    assert!(map.resolve(SECRET, TENANT, "resp_3").is_some());
 }
 
 #[test]

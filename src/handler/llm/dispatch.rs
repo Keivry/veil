@@ -15,7 +15,9 @@ use {
         spawn_stream_pump,
     },
     crate::{
+        error::VeilError,
         service::{
+            json_walk,
             llm_gateway::{self, Protocol, resolve_protocol, resolve_upstream},
             redaction::{
                 Scope,
@@ -45,6 +47,23 @@ fn payload_too_large(limit: usize) -> Response {
         Json(json!({"error":{"code":"E_PAYLOAD_TOO_LARGE","message":format!("请求体超过上限 {limit} 字节")}})),
     )
         .into_response()
+}
+
+/// R5-23（5.1）：生产请求体 JSON 解析统一经中央 `json_walk::{strip_bom, jloads}`——
+/// 先剥前导 BOM 再解析，使 BOM 前缀体与非 BOM 体解析结果一致（不再落解析失败回退）。
+fn parse_request_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| json_walk::jloads(json_walk::strip_bom(s)).ok())
+}
+
+/// R5-14/D5：脱敏链 fail-closed 守门——`Scope` 报告 rand8 熵源/内部故障时，以
+/// `502 + E_PII_UNAVAILABLE`（`VeilError::into_response` 集中装配错误体）收敛，
+/// MUST NOT 转发未脱敏/部分脱敏正文。返回 `None` 表示脱敏链健康、可继续。
+fn pii_fail_closed(scope: &Scope) -> Option<Response> {
+    scope
+        .pii_unavailable()
+        .then(|| VeilError::PiiUnavailable.into_response())
 }
 
 /// spawn 包裹 + 立即 await 的语义容器（A3/D2）：
@@ -135,9 +154,20 @@ pub(crate) fn strip_conversation_header(headers: &mut HeaderMap, header_name: &s
 /// 作用域选择（3.1）：`request` 逐请求 `PiiScope`；`conversation` 按 D1 四级推导
 /// 会话键并从共享存储取 `Arc<PiiScope>`，键不可推导时回退逐请求（缓存失配、不报错）。
 /// D12：`conversation` 模式下的逐请求回退计入 `request_fallback`（`request` 模式不计）。
+/// R5-07/D1：`protocol` 传入键推导，原生键按协议白名单收窄（Anthropic 忽略
+/// `prompt_cache_key`/`previous_response_id`；Chat 忽略 `previous_response_id`）。
+///
+/// R5-08/D9 可判定降级事件：仅三类记内部计数 + `warn!`（不含键/头值/明文/token）——
+/// ① 键推导返 `None` 落第 4 级；② `ConversationScopeStore` 缺失回退；③ 显式会话键头
+/// 存在但非法被丢弃。
+///
+/// 非目标（`R5-08`/D9）：键推导为**逐请求无状态纯函数**，网关不保留「上次命中级别/
+/// 上次键」状态，故「同一会话在非首轮静默换键或级别变化」**不可观测**；本函数不提供
+/// 该信号（须新增每租户/会话状态面并另立 change），亦不新增下游可观测响应头。
 pub(crate) fn build_request_scope(
     state: &AppState,
     headers: &HeaderMap,
+    protocol: Protocol,
     upstream_base: &str,
     body: Option<&serde_json::Value>,
 ) -> Arc<Scope> {
@@ -148,7 +178,10 @@ pub(crate) fn build_request_scope(
         return per_request();
     }
     let Some(store) = state.conversation_scope_store.as_ref() else {
+        // R5-08/D9（可判定事件 ②）：`conversation` 模式但存储缺失——回退逐请求。
         state.gateway_metrics.record_request_fallback();
+        state.gateway_metrics.record_conversation_store_missing();
+        tracing::warn!("conversation 模式会话存储缺失，回退逐请求作用域（缓存失配属预期降级）");
         return per_request();
     };
     let secret = state.conversation_secret.as_ref();
@@ -156,6 +189,15 @@ pub(crate) fn build_request_scope(
         .get(state.config.pii_scope_key_header.as_str())
         .and_then(|v| v.to_str().ok());
     let explicit = explicit_header(true, explicit_raw);
+    // R5-08/D9（可判定事件 ③）：显式会话键头存在但非法（超长/控制字符/非 UTF-8）
+    // 被静默丢弃——记内部计数 + warn（头名可现，头值/明文/token MUST NOT 出现）。
+    if explicit.is_none() && headers.contains_key(state.config.pii_scope_key_header.as_str()) {
+        state.gateway_metrics.record_conversation_header_invalid();
+        tracing::warn!(
+            header = %state.config.pii_scope_key_header,
+            "显式会话键头存在但非法，已丢弃且不参与键推导"
+        );
+    }
     let prompt_cache_key = body
         .and_then(|v| v.get("prompt_cache_key"))
         .and_then(serde_json::Value::as_str);
@@ -167,17 +209,24 @@ pub(crate) fn build_request_scope(
         .filter_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
         .collect();
     let tenant_fp = tenant_fingerprint(secret, upstream_base, &credentials);
+    // 请求体非 JSON 时以 `Null` 参与推导（稳定前缀不可得），显式头仍可命中第 1 级
+    // （保持既有语义：显式头键不依赖请求体）。
+    let null_body = serde_json::Value::Null;
+    let body_value = body.unwrap_or(&null_body);
     let Some(key) = derive_conversation_key(
         secret,
         &tenant_fp,
+        protocol,
         explicit.as_deref(),
         prompt_cache_key,
         previous_response_id,
-        body,
-        Some(&state.previous_response_map),
+        body_value,
+        &state.previous_response_map,
     ) else {
-        // D12：键推导失败（纯多轮 messages 等）回退逐请求，不伪造键。
+        // D12 + R5-08/D9（可判定事件 ①）：键推导失败（纯多轮 messages、Responses 标量
+        // `input` 等）回退逐请求，不伪造键；记回退计数 + warn（不含键/头值/明文/token）。
         state.gateway_metrics.record_request_fallback();
+        tracing::warn!("会话键推导失败，回退逐请求作用域（缓存失配属预期降级）");
         return per_request();
     };
     let pii = store.get_or_insert(&key);
@@ -247,13 +296,12 @@ pub(crate) async fn gateway_serve(
         0
     };
 
-    // 会话键头由网关消费且 MUST NOT 转发上游（含自定义头名）：转发前统一剔除，
-    // 覆盖 NonDialog 透传与对话臂两条路径（spec 要求自定义头名亦须在转发前剔除）。
-    // 键推导（`build_request_scope`）仍读原始 `parts.headers`，故此处只改转发克隆体。
+    // R5-36/D7：会话键头由网关消费且 MUST NOT 转发上游（含自定义非 `x-veil-` 头名），
+    // 剔除为**无条件**——独立于 `PII_SCOPE_MODE`（默认 `request` 模式同样剔除），覆盖
+    // NonDialog 透传与对话臂两条路径。键推导（`build_request_scope`）仍读原始
+    // `parts.headers`，故此处只改转发克隆体。
     let mut fwd_headers = parts.headers.clone();
-    if state.config.pii_scope_mode.is_conversation() {
-        let _ = strip_conversation_header(&mut fwd_headers, &state.config.pii_scope_key_header);
-    }
+    let _ = strip_conversation_header(&mut fwd_headers, &state.config.pii_scope_key_header);
 
     if !is_chat {
         // H11/D11：NonDialog 走专用透传入口（返回 `Response`，无 `Stream` 死臂）；
@@ -272,7 +320,7 @@ pub(crate) async fn gateway_serve(
         .await;
     }
 
-    let req_value = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+    let req_value = parse_request_json(&body_bytes);
     // NLP-2/3.9：请求侧 `model` 快照，流式响应帧缺失有效 model 时回退分桶。
     let req_model = req_value
         .as_ref()
@@ -283,7 +331,13 @@ pub(crate) async fn gateway_serve(
         .to_string();
     // 作用域选择（veil-pii-conversation-cache 1.5/3.1）：`request` 逐请求、
     // `conversation` 取存储共享的 `Arc<PiiScope>`；脱敏前 `req_value` 供键推导。
-    let scope = build_request_scope(state, &parts.headers, &upstream_base, req_value.as_ref());
+    let scope = build_request_scope(
+        state,
+        &parts.headers,
+        protocol,
+        &upstream_base,
+        req_value.as_ref(),
+    );
     let rw = super::request_rewrite(
         body_bytes,
         protocol,
@@ -293,6 +347,10 @@ pub(crate) async fn gateway_serve(
         detector.clone(),
     )
     .await;
+    // R5-14/D5：请求侧脱敏链熵源/内部故障 fail-closed——MUST NOT 转发未脱敏正文上游。
+    if let Some(resp) = pii_fail_closed(scope.as_ref()) {
+        return resp;
+    }
     let dialog_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
     // ARH-3（7.2）：单一装配点构造共享请求上下文，流式/非流路径复用。
@@ -335,6 +393,8 @@ pub(crate) async fn gateway_serve(
         {
             Ok(up) => {
                 let status_u16 = up.status().as_u16();
+                // R5-05/D4：透传上游 2xx 原状态（StatusCode 为 Copy，入泵前快照）。
+                let upstream_status = up.status();
                 let resp_ct = up
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -359,7 +419,7 @@ pub(crate) async fn gateway_serve(
                 // D3/ARH-1：不 detach 泵任务——JoinHandle 交响应体持有，客户端断开
                 // 时由响应体 drop 触发 abort 回收（避免上游连接与任务泄漏）。
                 let pump = spawn_stream_pump(up, tx, pump_ctx());
-                build_sse_response(rx, rw.normalized_out, pump)
+                build_sse_response(rx, rw.normalized_out, pump, upstream_status)
             }
             Err(_) => super::empty_body_response(protocol),
         }
@@ -380,8 +440,9 @@ pub(crate) async fn gateway_serve(
                 if req_conv.is_some() {
                     pctx.init_conv = req_conv;
                 }
+                let upstream_status = up.status();
                 let pump = spawn_stream_pump(up, tx, pctx);
-                build_sse_response(rx, rw.normalized_out, pump)
+                build_sse_response(rx, rw.normalized_out, pump, upstream_status)
             }
         }
     }
@@ -458,6 +519,12 @@ pub(super) async fn stream_upstream_passthrough(
         .body(Body::from(bytes))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
 }
+
+/// R5-08/D9 + R5-14/D5 + 5.1：`build_request_scope` 降级计数、fail-closed 守门与
+/// BOM 前缀解析的 sibling 测试（`#[path]` 直连，避免 `dispatch.rs` 越 800 行红线）。
+#[cfg(test)]
+#[path = "dispatch_tests.rs"]
+mod dispatch_tests;
 
 #[cfg(test)]
 mod entry_tests {
@@ -650,6 +717,50 @@ mod entry_tests {
         assert_eq!(value["error"]["code"], "E_INTERNAL");
         let ok = super::spawn_contained(async { (StatusCode::OK, "ok").into_response() }).await;
         assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bom_prefixed_request_body_parses_via_json_walk() {
+        // R5-23（5.1）：BOM 前缀体经中央 `strip_bom`/`jloads` 正常解析（原为解析失败回退）。
+        let body = "\u{feff}{\"model\":\"m\",\"messages\":[]}".as_bytes();
+        let v = super::parse_request_json(body).expect("BOM 前缀体须解析");
+        assert_eq!(v["model"], "m");
+        assert!(
+            super::parse_request_json(b"not json").is_none(),
+            "非 JSON 仍回退 None"
+        );
+        assert!(
+            super::parse_request_json(&[0xff, 0xfe]).is_none(),
+            "非 UTF-8 仍回退 None"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_side_pii_unavailable_fails_closed_502() {
+        // R5-14/D5：请求侧熵源故障守门——502 + E_PII_UNAVAILABLE，且健康 scope 不守门。
+        let scope = crate::service::redaction::Scope::with_opts(true, false);
+        scope.pii_scope().force_entropy_failure(true);
+        let vault = crate::service::credential_vault::CredentialVault::new();
+        let detector = crate::service::pii::PiiDetector::new();
+        let _ = scope
+            .redact_request_with_report(&vault, &detector, "call 13812345678")
+            .await;
+        assert!(scope.pii_unavailable(), "熵源故障须置失败信号");
+        let resp = super::pii_fail_closed(&scope).expect("故障须 fail-closed 守门");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("错误体须可读");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("错误体须为 JSON");
+        assert_eq!(value["error"]["code"], "E_PII_UNAVAILABLE");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("13812345678"),
+            "错误体不得含明文"
+        );
+        assert!(
+            super::pii_fail_closed(&crate::service::redaction::Scope::new()).is_none(),
+            "健康 scope 不得守门"
+        );
     }
 
     #[tokio::test]

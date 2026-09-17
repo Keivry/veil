@@ -6,7 +6,10 @@
 //! 直接作键，一律经 `HMAC(secret, tenant_fingerprint || conversation_id)` 命名空间化。
 
 use {
-    crate::service::{llm_gateway::Protocol, lock_recover::lock_or_recover},
+    crate::service::{
+        llm_gateway::{GatewayMetrics, Protocol},
+        lock_recover::lock_or_recover,
+    },
     serde_json::Value,
     std::{
         collections::{HashMap, VecDeque},
@@ -155,13 +158,18 @@ fn normalize_tools(tools: &[Value]) -> Vec<Value> {
     named.into_iter().map(|(_, v)| v).collect()
 }
 
-/// 系统前缀提取：Anthropic `system` / Responses `instructions` / messages 首条
-/// `system`|`developer`。
-fn extract_system(body: &Value) -> Option<Value> {
-    if let Some(s) = body.get("system").filter(|v| !v.is_null()) {
-        return Some(canonicalize(s.clone()));
+/// 系统前缀提取（按协议白名单，R5-07/D1）：Responses 取 `instructions`；
+/// Chat/Anthropic 取顶层 `system`（Anthropic 原生）或 messages 首条
+/// `system`|`developer`。协议外字段 MUST NOT 越界参与——Chat 的 `instructions`
+/// MUST NOT 被当作 `system`，Responses 的 `messages` MUST NOT 被当作 system 来源。
+fn extract_system(body: &Value, protocol: Protocol) -> Option<Value> {
+    if protocol.is_responses() {
+        return body
+            .get("instructions")
+            .filter(|v| !v.is_null())
+            .map(|v| canonicalize(v.clone()));
     }
-    if let Some(s) = body.get("instructions").filter(|v| !v.is_null()) {
+    if let Some(s) = body.get("system").filter(|v| !v.is_null()) {
         return Some(canonicalize(s.clone()));
     }
     let messages = body.get("messages")?.as_array()?;
@@ -174,32 +182,36 @@ fn extract_system(body: &Value) -> Option<Value> {
     })
 }
 
-/// 首个 user turn 提取：messages 首条 `role=user`；Responses `input` 字符串或数组
-/// 中首条 `role=user`。
-fn extract_first_user(body: &Value) -> Option<Value> {
-    if let Some(messages) = body.get("messages").and_then(Value::as_array)
-        && let Some(m) = messages
-            .iter()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-    {
-        return Some(canonicalize(m.clone()));
+/// 首个 user turn 提取（按协议白名单，R5-06/R5-07/D1）：Chat/Anthropic 取
+/// `messages` 数组首条 `role=user`；Responses 取**数组形** `input` 首条
+/// `role=user`。Responses **标量（字符串）`input`** 不参与第 3 级，返回 `None`
+/// （其内容随轮次增长、无法作稳定 turn 锚点），使推导落第 4 级逐请求并由
+/// 既有 `record_request_fallback()` 计入观测。协议外字段 MUST NOT 越界参与——
+/// Responses 的 `messages` MUST NOT 被当作首个 user turn。
+fn extract_first_user(body: &Value, protocol: Protocol) -> Option<Value> {
+    if protocol.is_responses() {
+        return match body.get("input") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+                .map(|m| canonicalize(m.clone())),
+            _ => None,
+        };
     }
-    match body.get("input") {
-        Some(Value::String(s)) => Some(Value::String(s.clone())),
-        Some(Value::Array(items)) => items
-            .iter()
-            .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
-            .map(|m| canonicalize(m.clone())),
-        _ => None,
-    }
+    let messages = body.get("messages")?.as_array()?;
+    messages
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|m| canonicalize(m.clone()))
 }
 
 /// 稳定前缀规范化串：`tools`+`system`+首个 user turn **三者齐备**才产出；
-/// 任一缺失返回 `None`（落第 4 级，不伪造键）。
-fn canonical_stable_prefix(body: &Value) -> Option<String> {
+/// 任一缺失返回 `None`（落第 4 级，不伪造键）。字段提取按协议白名单
+/// （R5-07/D1），标量 Responses `input` 在此不命中。
+fn canonical_stable_prefix(body: &Value, protocol: Protocol) -> Option<String> {
     let tools = body.get("tools")?.as_array().filter(|a| !a.is_empty())?;
-    let system = extract_system(body)?;
-    let first_user = extract_first_user(body)?;
+    let system = extract_system(body, protocol)?;
+    let first_user = extract_first_user(body, protocol)?;
     let mut obj = serde_json::Map::new();
     obj.insert("tools".to_string(), Value::Array(normalize_tools(tools)));
     obj.insert("system".to_string(), system);
@@ -208,12 +220,14 @@ fn canonical_stable_prefix(body: &Value) -> Option<String> {
 }
 
 /// 稳定前缀 HMAC 键（第 3 级）：对**脱敏前**规范化前缀做 HMAC。
+/// 字段提取按协议白名单（R5-07/D1）。
 pub fn stable_prefix_key(
     secret: &[u8],
     tenant_fingerprint: &str,
+    protocol: Protocol,
     body: &Value,
 ) -> Option<ConversationKey> {
-    let canonical = canonical_stable_prefix(body)?;
+    let canonical = canonical_stable_prefix(body, protocol)?;
     Some(ConversationKey(hmac_hex(
         secret,
         &[
@@ -225,30 +239,37 @@ pub fn stable_prefix_key(
 }
 
 /// 四级分层推导（首个可命中者胜）：
-/// ① 显式头 → ② `prompt_cache_key` → ③ `previous_response_id` 映射 →
-/// ④ 稳定前缀 → ⑤ `None`。**MUST NOT** 使用 `user` 字段。
+/// ① 显式头 → ② 协议原生键（`prompt_cache_key` / `previous_response_id` 映射，
+/// **按协议白名单**）→ ③ 稳定前缀 → ④ `None`（回退逐请求）。**MUST NOT** 使用
+/// `user` 字段。原生键白名单（R5-07/D1）：Anthropic 忽略二者；Chat 忽略
+/// `previous_response_id`；Responses 二者皆接受。
+// 签名由 tasks.md 2.2 钉定（8 参，供 `build_request_scope` 单点调用），不另加包装结构体。
+#[allow(clippy::too_many_arguments)]
 pub fn derive_conversation_key(
     secret: &[u8],
-    tenant_fingerprint: &str,
+    tenant_fp: &str,
+    protocol: Protocol,
     explicit: Option<&str>,
     prompt_cache_key: Option<&str>,
     previous_response_id: Option<&str>,
-    body: Option<&Value>,
-    previous_map: Option<&PreviousResponseMap>,
+    body: &Value,
+    previous_map: &PreviousResponseMap,
 ) -> Option<ConversationKey> {
     if let Some(v) = explicit.and_then(valid_explicit_header) {
-        return Some(scoped_key(secret, tenant_fingerprint, v));
+        return Some(scoped_key(secret, tenant_fp, v));
     }
-    if let Some(k) = prompt_cache_key.filter(|s| !s.is_empty()) {
-        return Some(scoped_key(secret, tenant_fingerprint, k));
+    if !protocol.is_anthropic()
+        && let Some(k) = prompt_cache_key.filter(|s| !s.is_empty())
+    {
+        return Some(scoped_key(secret, tenant_fp, k));
     }
-    if let Some(id) = previous_response_id.filter(|s| !s.is_empty())
-        && let Some(m) = previous_map
-        && let Some(key) = m.resolve(secret, tenant_fingerprint, id)
+    if protocol.is_responses()
+        && let Some(id) = previous_response_id.filter(|s| !s.is_empty())
+        && let Some(key) = previous_map.resolve(secret, tenant_fp, id)
     {
         return Some(key);
     }
-    body.and_then(|b| stable_prefix_key(secret, tenant_fingerprint, b))
+    stable_prefix_key(secret, tenant_fp, protocol, body)
 }
 
 /// LRU 顺序提升：命中即移到队尾，队首为最久未用。
@@ -270,6 +291,8 @@ struct PrevInner {
 pub struct PreviousResponseMap {
     inner: Mutex<PrevInner>,
     max_entries: usize,
+    /// D10：映射逐出计数落点（`PII_PREV_ID_MAX_ENTRIES` 达上限逐出最旧条目时）。
+    metrics: Option<Arc<GatewayMetrics>>,
 }
 
 /// 手工 `Debug`：映射键（HMAC hex）与会话键不得经 `{:?}` 泄漏，仅暴露条目数。
@@ -287,10 +310,21 @@ impl PreviousResponseMap {
         Self {
             inner: Mutex::new(PrevInner::default()),
             max_entries: max_entries.max(1),
+            metrics: None,
         }
     }
 
-    /// 记录响应 id → 会话键（已存在则覆盖并提升 LRU）。
+    /// D10：挂逐出计数落点（启动装配传入网关指标）。
+    pub fn with_metrics(mut self, metrics: Arc<GatewayMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// 容量（仅测试口径：断言配置驱动生效）。
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize { self.max_entries }
+
+    /// 记录响应 id → 会话键（已存在则覆盖并提升 LRU）；达容量逐出最旧条目并计数。
     pub fn record(
         &self,
         secret: &[u8],
@@ -308,6 +342,9 @@ impl PreviousResponseMap {
             && let Some(oldest) = inner.order.pop_front()
         {
             inner.map.remove(&oldest);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_previous_response_eviction();
+            }
         }
         touch_order(&mut inner.order, map_key.as_str());
         inner.map.insert(map_key.0, key.clone());

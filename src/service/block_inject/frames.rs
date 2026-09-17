@@ -35,23 +35,35 @@ use {
 /// CHC-6/2.25 声明覆盖范围：合成阻断帧仅覆盖 `choices[].index == 0` 单 choice 面；
 /// 审计阻断为流级动作（替换整条流），多 choice 流的其余 choice 不再逐条重建。
 /// 该声明由 `block_frame_choice_coverage` 测试锁定。
-pub fn chat_block_frames(reason: &str) -> Vec<String> {
+///
+/// 旧 1 参入口：委托 [`chat_block_frames_full`]（`conv_id = None` / `model = ""`），
+/// 保持既有调用点与测试零改。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
+pub fn chat_block_frames(reason: &str) -> Vec<String> { chat_block_frames_full(reason, None, "") }
+
+/// R5-03/R5-39：Chat 流阻断帧回显会话标识与归一模型名——`id` 取 `conv_id`
+/// （非空）否则 `blocked-0`，`model` 取 `normalize_model(model)`（空归
+/// `unknown_model`），与非流 [`nonstream_block_body`] 回显口径对齐。
+pub fn chat_block_frames_full(reason: &str, conv_id: Option<&str>, model: &str) -> Vec<String> {
     // CHC-3/D8：补齐 OpenAI 流式对象必需字段 `id`/`object`/`created`/`model`，
     // 使官方 SDK 可解析（`object` 为流式 `chat.completion.chunk`）。
+    let id = conv_id.filter(|s| !s.is_empty()).unwrap_or("blocked-0");
+    let model = normalize_model(model);
     let created = now_created();
     let head = serde_json::json!({
-        "id": "blocked-0",
+        "id": id,
         "object": "chat.completion.chunk",
         "created": created,
-        "model": "unknown_model",
+        "model": model,
         "choices": [{"index": 0,
             "delta": {"role": "assistant", "content": format!("[blocked: {reason}]")}}]
     });
     let tail = serde_json::json!({
-        "id": "blocked-0",
+        "id": id,
         "object": "chat.completion.chunk",
         "created": created,
-        "model": "unknown_model",
+        "model": model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     });
     vec![
@@ -91,17 +103,33 @@ fn anthropic_message_start(id: &str, model: &str) -> String {
 
 /// 旧 2 参入口：委托五件套（`conv_id = None` → `id` 回退 `blocked-0`），
 /// 保持既有测试/调用点零改。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn anthropic_block_frames(reason: &str, index: u32) -> Vec<String> {
     anthropic_block_frames_full(reason, index, None)
 }
 
 /// A-3/F-04：Anthropic 阻断五件套——既有四帧前补恰一 `message_start`
 /// （官方 Messages SSE 首事件，缺首帧时严格 SDK 流式累加器无初始 message 快照）；
-/// `id = conv_id 非空 ? conv_id : "blocked-0"`、`model` 恒 `unknown_model`；
+/// `id = conv_id 非空 ? conv_id : "blocked-0"`；`model` 旧入口恒 `unknown_model`
+/// （R5-39 回显入口见 [`anthropic_block_frames_modeled`]）。
 /// 原四帧内容与顺序不动，`message_stop` 保持空对象。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn anthropic_block_frames_full(reason: &str, index: u32, conv_id: Option<&str>) -> Vec<String> {
+    anthropic_block_frames_modeled(reason, index, conv_id, "")
+}
+
+/// R5-39：Anthropic 阻断五件套模型回显入口——`model` 经 `normalize_model` 回显
+/// （缺失归 `unknown_model`），与非流 [`nonstream_block_body`] 同口径。
+pub fn anthropic_block_frames_modeled(
+    reason: &str,
+    index: u32,
+    conv_id: Option<&str>,
+    model: &str,
+) -> Vec<String> {
     let id = conv_id.filter(|s| !s.is_empty()).unwrap_or("blocked-0");
-    let mut frames = vec![anthropic_message_start(id, "unknown_model")];
+    let mut frames = vec![anthropic_message_start(id, &normalize_model(model))];
     frames.extend([
         format!(
             "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"[blocked: {reason}]\"}}}}\n\n"
@@ -121,15 +149,24 @@ pub fn anthropic_block_frames_full(reason: &str, index: u32, conv_id: Option<&st
 /// 全链路（`item_id` 统一用 `response_id`）。
 /// delta/done 帧不计入终止计数（dedupe 仅认 completed/failed），恰一约束不受影响。
 /// A-2/F-02：真空流口径 0 起（既有 0..6 全序列不变）。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn responses_block_frames(response_id: &str) -> Vec<String> {
     responses_block_frames_at(response_id, 0)
 }
 
 /// A-2/F-02：以 `base` 为起始序号的阻断全序列——流内阻断接续上游已见最大
 /// `sequence_number`（`base = cursor.map_or(0, |c| c + 1)`），全程单调不倒退。
+/// 旧入口模型恒 `unknown_model`（R5-39 回显入口见 [`responses_block_frames_at_modeled`]）。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn responses_block_frames_at(response_id: &str, base: u64) -> Vec<String> {
-    let text = "[blocked: audit]";
-    responses_sequence(response_id, text, true, base)
+    responses_block_frames_at_modeled(response_id, base, "")
+}
+
+/// R5-39：Responses 阻断全序列模型回显入口（`model` 缺失归 `unknown_model`）。
+pub fn responses_block_frames_at_modeled(response_id: &str, base: u64, model: &str) -> Vec<String> {
+    responses_sequence(response_id, "[blocked: audit]", true, base, model)
 }
 
 /// 协议阻断帧的单一声明式分派（7.6）：收敛泵内两处重复的
@@ -138,6 +175,8 @@ pub fn responses_block_frames_at(response_id: &str, base: u64) -> Vec<String> {
 /// Responses 走归档回退（`metrics` 仅参与该回退计数）。
 /// A-2/F-02：`seq_cursor` 为泵内「已见上游序号上界」游标，Responses 合成序列
 /// 据此取 `base = cursor.map_or(0, |c| c + 1)` 接续，不再从 0 重编号。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn protocol_block_frames(
     protocol: GatewayProtocol,
     reason: &str,
@@ -146,14 +185,38 @@ pub fn protocol_block_frames(
     metrics: Option<&GatewayMetrics>,
     seq_cursor: Option<u64>,
 ) -> Vec<String> {
+    protocol_block_frames_modeled(
+        protocol,
+        reason,
+        conv_id,
+        "",
+        blocked_index,
+        metrics,
+        seq_cursor,
+    )
+}
+
+/// R5-39：阻断帧分派模型回显入口——`model` 透传到三协议各自的回显构造
+/// （缺失归 `unknown_model`），旧 [`protocol_block_frames`] 委托本函数（`model = ""`）。
+pub fn protocol_block_frames_modeled(
+    protocol: GatewayProtocol,
+    reason: &str,
+    conv_id: Option<&str>,
+    model: &str,
+    blocked_index: u32,
+    metrics: Option<&GatewayMetrics>,
+    seq_cursor: Option<u64>,
+) -> Vec<String> {
     match protocol {
-        GatewayProtocol::Chat => chat_block_frames(reason),
-        GatewayProtocol::Anthropic => anthropic_block_frames_full(reason, blocked_index, conv_id),
+        GatewayProtocol::Chat => chat_block_frames_full(reason, conv_id, model),
+        GatewayProtocol::Anthropic => {
+            anthropic_block_frames_modeled(reason, blocked_index, conv_id, model)
+        }
         GatewayProtocol::Responses => {
             let bid = conv_id
                 .map(str::to_string)
                 .unwrap_or_else(|| resolve_conv_id(None, &Value::Null, metrics, "block").0);
-            responses_block_frames_at(&bid, synth_seq_base(seq_cursor))
+            responses_block_frames_at_modeled(&bid, synth_seq_base(seq_cursor), model)
         }
         GatewayProtocol::NonDialog => vec![],
     }
@@ -167,9 +230,15 @@ fn synth_seq_base(cursor: Option<u64>) -> u64 { cursor.map_or(0, |c| c + 1) }
 /// P4/D4：本全序列**仅真空流**（`empty_stream_frames`）使用——含 `output_index`
 /// 的注入仅对无已流出 item 的零帧流安全；流中段 `error`/截断改单帧
 /// [`responses_failed_frame`]（避免重复 `output_index`）。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn responses_truncated_frames(response_id: &str) -> Vec<String> {
-    let text = "[truncated]";
-    responses_sequence(response_id, text, false, 0)
+    responses_truncated_frames_modeled(response_id, "")
+}
+
+/// R5-39：Responses 真空/截断全序列模型回显入口（`model` 缺失归 `unknown_model`）。
+pub fn responses_truncated_frames_modeled(response_id: &str, model: &str) -> Vec<String> {
+    responses_sequence(response_id, "[truncated]", false, 0, model)
 }
 
 /// P4/D4 + D5 + TRN-2：`type:"error"` 单帧合成——`response.failed` 单帧携带上游
@@ -177,16 +246,29 @@ pub fn responses_truncated_frames(response_id: &str) -> Vec<String> {
 /// 既有 `{"id","status"}` 形态，不带 error 字段）；`sequence_number` 可得时写入
 /// 载荷顶层（对齐官方 `ResponseErrorEvent`）；不注入
 /// `output_index`/`output_item.*` 序列，不与已流出 item 冲突。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn responses_failed_frame(
     response_id: &str,
     error: Option<&Value>,
     sequence_number: Option<u64>,
 ) -> String {
+    responses_failed_frame_modeled(response_id, error, sequence_number, "")
+}
+
+/// R5-39：`response.failed` 单帧模型回显入口——`model` 经 `normalize_model`
+/// （缺失归 `unknown_model`），与非流 [`nonstream_block_body`] 同口径。
+pub fn responses_failed_frame_modeled(
+    response_id: &str,
+    error: Option<&Value>,
+    sequence_number: Option<u64>,
+    model: &str,
+) -> String {
     // RSP-4/D9：合成 `response` 对象补齐必需字段（`object`/`created_at`/`model`/
     // `output`/`status`），使 SDK 解析不因缺 `output` 抛 `TypeError`。
     let mut response = serde_json::json!({
         "id": response_id, "object": "response", "created_at": now_created(),
-        "model": "unknown_model", "status": "failed", "output": []
+        "model": normalize_model(model), "status": "failed", "output": []
     });
     if let Some(err) = error {
         response["error"] = err.clone();
@@ -204,8 +286,15 @@ fn responses_frame(event: &str, mut payload: Value, seq: u64) -> String {
     format!("event: {event}\ndata: {payload}\n\n")
 }
 
-fn responses_sequence(response_id: &str, text: &str, completed: bool, base: u64) -> Vec<String> {
+fn responses_sequence(
+    response_id: &str,
+    text: &str,
+    completed: bool,
+    base: u64,
+    model: &str,
+) -> Vec<String> {
     let created = now_created();
+    let model = normalize_model(model);
     let output_item = serde_json::json!({
         "id": response_id, "type": "message", "role": "assistant",
         "content": [{"type": "output_text", "text": text, "annotations": []}]
@@ -217,7 +306,7 @@ fn responses_sequence(response_id: &str, text: &str, completed: bool, base: u64)
             "type": "response.completed",
             "response": {
                 "id": response_id, "object": "response", "created_at": created,
-                "model": "unknown_model", "status": "completed",
+                "model": model, "status": "completed",
                 "output": [output_item.clone()],
                 "parallel_tool_calls": false, "tool_choice": "auto", "tools": [],
                 "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -228,7 +317,7 @@ fn responses_sequence(response_id: &str, text: &str, completed: bool, base: u64)
             "type": "response.failed",
             "response": {
                 "id": response_id, "object": "response", "created_at": created,
-                "model": "unknown_model", "status": "failed",
+                "model": model, "status": "failed",
                 "output": [output_item.clone()],
                 "error": {"message": text},
                 "parallel_tool_calls": false, "tool_choice": "auto", "tools": []
@@ -482,18 +571,32 @@ pub fn evaluate_nonstream(
 /// 返回帧由调用方经 `ensure_event_lines` 归一化后发送。
 /// A-2/F-02：`seq_cursor` 为泵内上游序号上界游标——单帧 `sequence_number` 取
 /// `base = cursor.map_or(0, |c| c + 1)`，接续已发序号（修正原误传 `None` 致缺字段）。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn synthesize_truncation(
     protocol: GatewayProtocol,
     conv_id: &str,
     seq_cursor: Option<u64>,
 ) -> Vec<String> {
+    synthesize_truncation_modeled(protocol, conv_id, seq_cursor, "")
+}
+
+/// R5-39：截断合成模型回显入口（`response.failed` 单帧携带 `model`，缺失归
+/// `unknown_model`）；旧 [`synthesize_truncation`] 委托本函数（`model = ""`）。
+pub fn synthesize_truncation_modeled(
+    protocol: GatewayProtocol,
+    conv_id: &str,
+    seq_cursor: Option<u64>,
+    model: &str,
+) -> Vec<String> {
     if !protocol.is_responses() {
         return vec![];
     }
-    vec![responses_failed_frame(
+    vec![responses_failed_frame_modeled(
         conv_id,
         Some(&serde_json::json!({"message": "truncated"})),
         Some(synth_seq_base(seq_cursor)),
+        model,
     )]
 }
 
@@ -502,26 +605,34 @@ pub fn synthesize_truncation(
 /// anthropic 最小 `message_start`+`message_stop`（空 content、null stop_reason、
 /// usage 全 0，不含 `content_block_*`，不伪造成功）；responses 保持
 /// `response.failed` 全序列（失败语义不伪造完成）；未知协议空实现。
+/// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
+#[cfg(test)]
 pub fn empty_stream_frames(protocol: &str, conv_id: &str) -> Vec<String> {
+    empty_stream_frames_modeled(protocol, conv_id, "")
+}
+
+/// R5-39：空流/真空流合成模型回显入口（Anthropic/Responses 回显 `model`，
+/// 缺失归 `unknown_model`）；旧 [`empty_stream_frames`] 委托本函数（`model = ""`）。
+pub fn empty_stream_frames_modeled(protocol: &str, conv_id: &str, model: &str) -> Vec<String> {
     match protocol {
         "chat" => vec![chat_done_frame()],
-        "anthropic" => anthropic_vacuum_frames(conv_id),
-        "responses" => responses_truncated_frames(conv_id),
+        "anthropic" => anthropic_vacuum_frames(conv_id, model),
+        "responses" => responses_truncated_frames_modeled(conv_id, model),
         _ => vec![],
     }
 }
 
 /// P2/D3：Anthropic 真空流最小终止信封——首帧复用 [`anthropic_message_start`]
-/// 构造（空 content、null `stop_reason`、usage 全 0），`model` 置 `unknown_model`；
-/// 不注入 `content_block_*`、不声称语义 stop_reason。
-fn anthropic_vacuum_frames(conv_id: &str) -> Vec<String> {
+/// 构造（空 content、null `stop_reason`、usage 全 0），`model` 经 `normalize_model`
+/// 回显；不注入 `content_block_*`、不声称语义 stop_reason。
+fn anthropic_vacuum_frames(conv_id: &str, model: &str) -> Vec<String> {
     let id = if conv_id.is_empty() {
         "vacuum-0"
     } else {
         conv_id
     };
     vec![
-        anthropic_message_start(id, "unknown_model"),
+        anthropic_message_start(id, &normalize_model(model)),
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ]
 }

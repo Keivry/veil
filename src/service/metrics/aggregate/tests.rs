@@ -411,6 +411,69 @@ mod observability_parity_tests {
     }
 }
 
+#[tokio::test]
+async fn r5_18_negative_stored_counter_converges_no_sign_distortion() {
+    use crate::fs_perm::open_wal;
+    let db = tmp_db("negative-counter");
+    let _ = std::fs::remove_file(&db);
+    let store = MetricsStore::new(db.clone());
+    store.flush().await.unwrap();
+    {
+        let conn = open_wal(&db).unwrap();
+        conn.execute(
+            "INSERT INTO metrics_daily(window, protocol, requests, buckets) \
+             VALUES('d9001','chat/completions',-5,'0,0,0,0,0,0,0,0,0,0,0,0')",
+            [],
+        )
+        .unwrap();
+    }
+    let before = corrupt_metric_reads_total();
+    let pts = store.query_series("daily", None, None).await.unwrap();
+    let row = pts
+        .iter()
+        .find(|p| p.window == "d9001")
+        .expect("插入行须可读");
+    assert_eq!(row.requests, 0, "负存储值须按 0 收敛，不得符号回绕为极大值");
+    assert!(corrupt_metric_reads_total() > before, "须记脏数据计数");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn r5_18_corrupt_bucket_value_warns_and_counts() {
+    use crate::fs_perm::open_wal;
+    let db = tmp_db("corrupt-bucket");
+    let _ = std::fs::remove_file(&db);
+    let store = MetricsStore::new(db.clone());
+    store.flush().await.unwrap();
+    {
+        let conn = open_wal(&db).unwrap();
+        conn.execute(
+            "INSERT INTO metrics_daily(window, protocol, buckets) \
+             VALUES('d9002','chat/completions','bogus,1,0,0,0,0,0,0,0,0,0,0')",
+            [],
+        )
+        .unwrap();
+    }
+    let before = corrupt_metric_reads_total();
+    let n = store.backfill_from_sqlite().await.unwrap();
+    assert!(n >= 1, "回填须读到行");
+    {
+        let aggs = store.aggs.lock().expect("聚合锁无毒");
+        let agg = aggs
+            .iter()
+            .find(|(k, _)| k.window == "d9002")
+            .map(|(_, v)| v)
+            .expect("回填行");
+        assert_eq!(agg.buckets[0], 0, "不可解析桶值按 0 有界收敛");
+        assert_eq!(agg.buckets[1], 1, "合法桶值不受污染");
+    }
+    assert!(
+        corrupt_metric_reads_total() > before,
+        "不可解析桶值须记 warn 计数（不静默归零）"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
 #[test]
 fn aggs_retention_eviction() {
     let store = MetricsStore::new(tmp_db("aggs-retention"));

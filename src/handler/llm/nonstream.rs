@@ -11,8 +11,10 @@ use {
     },
     crate::{
         config::AuditMode,
+        error::VeilError,
         service::{
             block_inject,
+            json_walk,
             llm_gateway::{
                 self,
                 EmptyAction,
@@ -56,6 +58,14 @@ pub enum NonstreamOutcome {
     Stream(reqwest::Response, Option<String>),
 }
 
+/// R5-23（5.1/D1）：生产请求体/上游响应体 JSON 解析统一经中央 `json_walk`——
+/// 先按 UTF-8 解码再剥前导 BOM，使 BOM 前缀体与非 BOM 体解析结果一致。
+fn parse_json_bytes(bytes: &[u8]) -> Option<Value> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| json_walk::jloads(json_walk::strip_bom(s)).ok())
+}
+
 /// 2.2 `nonstream` 一发一收：接收改写后请求，返回完整上游响应；
 /// 上游超时/不可达映射为网关级错误状态码而非挂起。
 /// `client` 为只读引用（单例由 1.x 负责），本单元内不新建 Client。
@@ -70,7 +80,7 @@ pub async fn serve_nonstream(
     let fwd_headers = forward_headers(&headers, &ctx.req.gateway_metrics);
     // E12/D7：转泵用请求会话标识（fetch 会 move `body`，须提前提取）。
     // NLP-2：同时快照请求侧 `model`，供响应体缺失 `model` 时回退分桶。
-    let req_value = serde_json::from_slice::<Value>(&body).ok();
+    let req_value = parse_json_bytes(&body);
     let req_conv = req_value.as_ref().and_then(llm_gateway::extract_conv_id);
     let req_model = req_value
         .as_ref()
@@ -152,7 +162,7 @@ pub async fn serve_nonstream(
             }
         }
     };
-    let is_json = serde_json::from_slice::<Value>(&bytes).is_ok();
+    let is_json = parse_json_bytes(&bytes).is_some();
     // F2/D2：先定空体分类（对齐 Python 先算 `_is_empty`），再判超限
     // （严格 `len > cap`，体形态对齐 `_llm.py:2951-2961`），最后才落空体 502：
     // 空体 len=0 恒不超限，非 JSON 超限体不落空体分支（与 Python 可观测结果一致）。
@@ -179,7 +189,7 @@ pub async fn serve_nonstream(
             is_json.then_some("application/json"),
         ));
     }
-    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+    if let Some(v) = parse_json_bytes(&bytes) {
         let usage = extract_usage_nonstream(ctx.req.protocol, &v);
         // C13/NLP-2：模型分桶优先上游回显值，缺失回退请求 model（对照 Python
         // `_llm.py:2975-2977`），双侧均缺才归 `unknown_model`。
@@ -221,10 +231,23 @@ pub async fn serve_nonstream(
                 }
             }
         }
-        if let Some(resp_id) = llm_gateway::extract_conv_id(&v) {
-            let _ = ctx.req.scope.record_response_id(ctx.req.protocol, &resp_id);
+        let response_id = llm_gateway::extract_conv_id(&v);
+        let wrote = response_id
+            .as_deref()
+            .is_some_and(|id| ctx.req.scope.record_response_id(ctx.req.protocol, id));
+        // R5-09/D10：写回失败仅「响应 id 缺失/为空」这一真实失败计一次；无写回上下文
+        // （`request` 模式/键未推导）与非 Responses 协议门控 MUST NOT 计入。
+        // D7：仅成功响应（`status<400`）计入——`status>=400` 错误体（如 400）本就不承载
+        // 可写回的响应 id，非真实写回失败，不得虚计。
+        if !wrote
+            && status_u16 < 400
+            && ctx.req.protocol.is_responses()
+            && response_id.is_none()
+            && ctx.req.scope.has_conversation()
+        {
+            ctx.req.gateway_metrics.record_conversation_writeback_miss();
         }
-        let conv_id = llm_gateway::extract_conv_id(&v).unwrap_or_else(|| {
+        let conv_id = response_id.unwrap_or_else(|| {
             llm_gateway::resolve_conv_id(
                 None,
                 &v,
@@ -288,6 +311,11 @@ pub async fn serve_nonstream(
             .scope
             .redact_response_new_pii_with_skip(&ctx.req.vault, &ctx.req.detector, &restored, &spans)
             .await;
+        // R5-14/D5：响应侧新检出注册遇熵源/内部故障 fail-closed——不将未 token 化的
+        // 明文下发（MUST NOT 明文外泄），以 502 + E_PII_UNAVAILABLE 收敛。
+        if ctx.req.scope.pii_unavailable() {
+            return NonstreamOutcome::Responded(VeilError::PiiUnavailable.into_response());
+        }
         // P0-1.2：还原后双 `_jloads` 校验（对标 Python `_nonstream_build`）：
         // 还原/脱敏可能把未转义明文写回 JSON 串内致破裂；E5/D3 先 `strip_partials`
         // 重试一次（半截形态可挽回时用剥离体），仍失败才回退上游原文并记 metrics + warn。
@@ -373,7 +401,10 @@ pub async fn serve_nondialog_passthrough(
 }
 
 /// ARC-4/D4：上游响应头克隆 + 逐跳过滤单一 helper——downstream 方向克隆上游头，
-/// 按 `downstream_decode_enabled` 做解码配对剥头并记 `hop_filtered_total`。
+/// 按 `downstream_decode_enabled` 做解码配对剥头并经
+/// `src/service/llm_gateway/metrics.rs::GatewayMetrics::record_hop_filtered` 计数
+/// （读取侧 `hop_filtered_count`；`hop_filtered_total` 为其 Prometheus **度量名**
+/// 约定、非可解析的 Rust 符号）。
 /// `passthrough_upstream_response` 与 `snapshot_downstream_headers` 共用本 helper；
 /// 调用方各自保留 `x-veil-*` 剔除与响应装配职责。
 fn clone_upstream_headers(up: &reqwest::Response, metrics: &GatewayMetrics) -> HeaderMap {
@@ -537,7 +568,7 @@ fn error_streaming_response(
 /// 剥离体（挽回），否则返回 `None`（调用方回退上游原文）。
 fn retry_stripped(restored: &str) -> Option<String> {
     let stripped = crate::service::redaction::strip_partials(restored);
-    serde_json::from_str::<Value>(&stripped)
+    json_walk::jloads(json_walk::strip_bom(&stripped))
         .is_ok()
         .then_some(stripped)
 }
@@ -598,3 +629,6 @@ mod tests;
 
 #[cfg(test)]
 mod read_error_tests;
+
+#[cfg(test)]
+mod pii_fail_closed_tests;

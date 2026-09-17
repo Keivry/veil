@@ -44,7 +44,7 @@ fn base_env() -> HashMap<String, String> {
 
 fn test_config() -> Config { Config::load_from(&base_env()).expect("测试配置须合法") }
 
-fn test_ctx(protocol: Protocol) -> NonstreamCtx {
+pub(super) fn test_ctx(protocol: Protocol) -> NonstreamCtx {
     let _ = test_config();
     NonstreamCtx {
         req: RequestCtx {
@@ -71,7 +71,7 @@ fn test_ctx(protocol: Protocol) -> NonstreamCtx {
     }
 }
 
-async fn loopback_server(
+pub(super) async fn loopback_server(
     status: u16,
     content_type: &str,
     body: Vec<u8>,
@@ -336,6 +336,44 @@ async fn b3_nonempty_body_unaffected_passthrough() {
         panic!("非空 JSON 上游须直接响应");
     };
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn b3_bom_prefixed_json_response_passes_through_not_502() {
+    // R5-23/D1：上游 200 JSON 体带前导 BOM 时经中央 `strip_bom`/`jloads` 判为 JSON，
+    // 不再落 `is_json=false` → `E_EMPTY_BODY` 502，按正常后处理链透传 200。
+    let client = reqwest::Client::new();
+    let mut upstream = vec![0xEF, 0xBB, 0xBF];
+    upstream.extend_from_slice(
+        br#"{"id":"cmpl-bom","model":"m","choices":[{"message":{"content":"hi"}}]}"#,
+    );
+    let (url, server) = loopback_server(200, "application/json", upstream).await;
+    let outcome = serve_nonstream(
+        &client,
+        reqwest::Method::POST,
+        &url,
+        axum::http::HeaderMap::new(),
+        br#"{"model":"m","messages":[]}"#.to_vec(),
+        test_ctx(Protocol::Chat),
+    )
+    .await;
+    server.abort();
+    let NonstreamOutcome::Responded(resp) = outcome else {
+        panic!("BOM 前缀 JSON 上游不得转流泵");
+    };
+    assert_ne!(
+        resp.status(),
+        axum::http::StatusCode::BAD_GATEWAY,
+        "BOM 前缀合法 JSON 不得转 502 E_EMPTY_BODY"
+    );
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("响应体须可读");
+    let text = String::from_utf8_lossy(&bytes);
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .expect("透传链须产出剥 BOM 后合法 JSON");
+    assert_eq!(v["model"], "m");
 }
 
 #[test]

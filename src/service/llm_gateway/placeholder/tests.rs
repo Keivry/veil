@@ -278,6 +278,26 @@ fn placeholder_responses_partial_illegal_keeps_valid() {
 }
 
 #[test]
+fn bom_prefixed_body_injects_prompt_like_non_bom() {
+    // R5-23/D1：注入解析统一经 `json_walk::{strip_bom, jloads}`——BOM 前缀请求体
+    // 注入结果须与非 BOM 体逐字一致（BOM 不再致解析失败回退）。
+    let prompt = "PROMPT";
+    let body = serde_json::json!({"messages":[{"role":"user","content":"hi"}]}).to_string();
+    let plain = inject_placeholder_prompt(&body, prompt, Protocol::Chat).expect("非 BOM 体须注入");
+    let with_bom = inject_placeholder_prompt(&format!("\u{feff}{body}"), prompt, Protocol::Chat)
+        .expect("BOM 前缀体须注入");
+    assert_eq!(with_bom, plain, "BOM 前缀体注入结果须与非 BOM 体逐字一致");
+    let v: Value = serde_json::from_str(&with_bom).expect("注入产物须为 JSON");
+    assert_eq!(v["messages"][0]["role"], "system");
+    assert!(
+        v["messages"][0]["content"]
+            .as_str()
+            .expect("content 须为串")
+            .contains(prompt)
+    );
+}
+
+#[test]
 fn placeholder_case_sensitive() {
     use crate::service::pii::detector::{cred_token_shape_re, pii_token_re};
     // 注入门：精确大小写前缀（无折叠）。

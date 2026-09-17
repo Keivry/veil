@@ -6,6 +6,7 @@ use {
             credential_vault::P2tSnapshot,
             pii::{
                 PiiDetector,
+                PiiRegisterError,
                 PiiScope,
                 apply_spans,
                 arbitrate,
@@ -15,7 +16,10 @@ use {
         },
         scope::MintedSet,
     },
-    std::collections::HashMap,
+    std::{
+        collections::HashMap,
+        sync::atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// 归一化声明头（protocol-parity Cvem）：注入改写请求体空白归一时声明，
@@ -64,8 +68,9 @@ pub(crate) async fn prescan_custom(
     scope: &PiiScope,
     text: &str,
     cred_map: &HashMap<String, String>,
+    unavailable: &AtomicBool,
 ) -> HashMap<String, String> {
-    prescan_custom_inner(detector, scope, text, cred_map, false).await
+    prescan_custom_inner(detector, scope, text, cred_map, false, unavailable).await
 }
 
 /// 自定义预扫（响应侧）：注册进响应表。
@@ -74,18 +79,21 @@ pub(crate) async fn prescan_custom_response(
     scope: &PiiScope,
     text: &str,
     cred_map: &HashMap<String, String>,
+    unavailable: &AtomicBool,
 ) -> HashMap<String, String> {
-    prescan_custom_inner(detector, scope, text, cred_map, true).await
+    prescan_custom_inner(detector, scope, text, cred_map, true, unavailable).await
 }
 
 /// 共享私有实现：`is_response` 决定注册进请求表（`false`）还是响应表（`true`）；
-/// 去重与值→token 快照逻辑单一化，消除近同形重复（`I`/7.2）。
+/// 去重与值→token 快照逻辑单一化。失败分类（R5-14/D5）：token 形态静默跳过；
+/// 熵源/内部故障置 `unavailable` 失败信号（不吞、不吞明文）。
 async fn prescan_custom_inner(
     detector: &PiiDetector,
     scope: &PiiScope,
     text: &str,
     cred_map: &HashMap<String, String>,
     is_response: bool,
+    unavailable: &AtomicBool,
 ) -> HashMap<String, String> {
     let mut snapshot = HashMap::new();
     for (kind, value, ..) in detector.scan_custom(text, cred_map).await {
@@ -93,8 +101,14 @@ async fn prescan_custom_inner(
         if snapshot.contains_key(&value) {
             continue;
         }
-        if let Ok(tok) = scope.register(&value, is_response) {
-            snapshot.insert(value, tok);
+        match scope.register(&value, is_response) {
+            Ok(tok) => {
+                snapshot.insert(value, tok);
+            }
+            Err(PiiRegisterError::TokenShape) => {}
+            Err(PiiRegisterError::EntropyUnavailable) => {
+                unavailable.store(true, Ordering::Relaxed);
+            }
         }
     }
     snapshot
@@ -119,6 +133,7 @@ pub(crate) fn redact_leaf(
         None,
         false,
         text,
+        &AtomicBool::new(false),
     )
 }
 
@@ -131,6 +146,7 @@ pub(crate) fn redact_leaf_tracked(
     custom_snapshot: &HashMap<String, String>,
     minted: &MintedSet,
     text: String,
+    unavailable: &AtomicBool,
 ) -> String {
     redact_leaf_inner(
         scope,
@@ -140,9 +156,12 @@ pub(crate) fn redact_leaf_tracked(
         Some(minted),
         false,
         text,
+        unavailable,
     )
 }
 
+// 请求/响应两侧共享内核；参数面镜像三个公开包装（含失败信号），与既有 7 参同址。
+#[allow(clippy::too_many_arguments)]
 fn redact_leaf_inner(
     scope: &PiiScope,
     detector: &PiiDetector,
@@ -151,6 +170,7 @@ fn redact_leaf_inner(
     minted: Option<&MintedSet>,
     is_response: bool,
     text: String,
+    unavailable: &AtomicBool,
 ) -> String {
     // 1) 凭据替换（长度降序单次；快照内预编译正则）；B3 汇总实际替换产出。
     let after_cred = match minted {
@@ -205,9 +225,14 @@ fn redact_leaf_inner(
         let tok = if let Some(t) = custom_snapshot.get(&value) {
             t.clone()
         } else {
+            // R5-14/D5：token 形态静默跳过；熵源故障置失败信号（不吞、后续由调用方 502）。
             match scope.register(&value, is_response) {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(PiiRegisterError::TokenShape) => continue,
+                Err(PiiRegisterError::EntropyUnavailable) => {
+                    unavailable.store(true, Ordering::Relaxed);
+                    continue;
+                }
             }
         };
         spans.push((s, e, tok));
@@ -223,8 +248,18 @@ pub(crate) fn redact_leaf_response(
     cred_map: &P2tSnapshot,
     custom_snapshot: &HashMap<String, String>,
     text: String,
+    unavailable: &AtomicBool,
 ) -> String {
-    redact_leaf_inner(scope, detector, cred_map, custom_snapshot, None, true, text)
+    redact_leaf_inner(
+        scope,
+        detector,
+        cred_map,
+        custom_snapshot,
+        None,
+        true,
+        text,
+        unavailable,
+    )
 }
 
 /// 扫描文本中的占位符形态（凭据/PII 完整形），返回 `(起始, 结束, token)` 字节区间。

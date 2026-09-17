@@ -24,6 +24,7 @@ where
     terminal::finalize(TerminalCtx {
         protocol: env.protocol,
         conv_id: &state.conv_id,
+        stream_model: state.stream_model.as_deref(),
         transport_error,
         chat_finish_seen: state.chat_finish_seen,
         responses_seq_cursor: state.responses_seq_cursor,

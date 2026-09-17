@@ -108,7 +108,8 @@ impl AuditHold {
         }
         let entry = self.args_by_index.entry(index).or_default();
         entry.push_str(args_delta);
-        self.total_bytes += args_delta.len();
+        // R5-17：字节记账饱和——接近类型上界时回绕会令超限判定误放行。
+        self.total_bytes = self.total_bytes.saturating_add(args_delta.len());
         if self.total_bytes > self.max_bytes || self.entries_over_cap() {
             return self.reject_and_clear();
         }
@@ -132,7 +133,7 @@ impl AuditHold {
                 HoldVerdict::Approved
             };
         }
-        self.pending_frames += 1;
+        self.pending_frames = self.pending_frames.saturating_add(1);
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
         if self.pending_frames > AUDIT_HOLD_MAX_ENTRIES || self.pending_bytes > self.max_bytes {
             return self.reject_and_clear();
@@ -200,10 +201,11 @@ impl AuditHold {
         }
         let seq_no = seq.unwrap_or_else(|| {
             let n = slot.next_seq;
-            slot.next_seq += 1;
+            // R5-17：游标饱和推进——`seq_no == u64::MAX` 时不得回绕复用 `BTreeMap` 键。
+            slot.next_seq = slot.next_seq.saturating_add(1);
             n
         });
-        slot.next_seq = slot.next_seq.max(seq_no + 1);
+        slot.next_seq = slot.next_seq.max(seq_no.saturating_add(1));
         let added_bytes = match slot.frags.entry(seq_no) {
             std::collections::btree_map::Entry::Vacant(e) => {
                 e.insert(args_delta.to_string());
@@ -211,7 +213,7 @@ impl AuditHold {
             }
             std::collections::btree_map::Entry::Occupied(_) => 0,
         };
-        self.total_bytes += added_bytes;
+        self.total_bytes = self.total_bytes.saturating_add(added_bytes);
         if self.total_bytes > self.max_bytes || self.entries_over_cap() {
             return self.reject_and_clear();
         }

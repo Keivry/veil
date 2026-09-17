@@ -3,7 +3,7 @@
 use {
     crate::service::{
         credential_vault::CredentialVault,
-        json_walk::strip_bom,
+        json_walk::{jloads, strip_bom},
         llm_gateway::GatewayMetrics,
         pii::PiiDetector,
         redaction::{BoundaryHold, PrefixHold, restore_guard::restore_guard_ok},
@@ -23,9 +23,7 @@ pub(super) fn residual_frame_payload(raw: &str) -> Option<String> {
         .strip_prefix("data:")
         .map(str::trim_start)
         .unwrap_or(trimmed);
-    if (payload.starts_with('{') || payload.starts_with('['))
-        && serde_json::from_str::<Value>(payload).is_ok()
-    {
+    if (payload.starts_with('{') || payload.starts_with('[')) && jloads(payload).is_ok() {
         Some(payload.to_string())
     } else {
         None
@@ -211,6 +209,27 @@ mod tests {
         assert!(
             residual_frame_payload("data: {\"a\": 1").is_none(),
             "半帧须按 Python 丢弃"
+        );
+    }
+
+    #[test]
+    fn residual_frame_bom_prefixed_complete_json_accepted() {
+        // R5-23/D1：BOM 前缀完整 JSON 残余经中央 `jloads` 接受；半帧/非 JSON 仍丢弃。
+        assert_eq!(
+            residual_frame_payload("\u{feff}{\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(
+            residual_frame_payload("\u{feff}data: {\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert!(
+            residual_frame_payload("\u{feff}{\"a\": 1").is_none(),
+            "BOM 前缀半帧仍须丢弃"
+        );
+        assert!(
+            residual_frame_payload("\u{feff}not json").is_none(),
+            "BOM 前缀非 JSON 仍须丢弃"
         );
     }
 

@@ -95,6 +95,14 @@ pub struct GatewayMetrics {
     conversation_eviction: AtomicU64,
     /// D12：会话作用域——会话键推导失败回退逐请求的次数（`request` 模式恒 0）。
     request_fallback: AtomicU64,
+    /// R5-08/D9：`ConversationScopeStore` 缺失导致的回退次数（`conversation` 模式）。
+    conversation_store_missing: AtomicU64,
+    /// R5-08/D9：显式会话键头存在但非法被静默丢弃的次数。
+    conversation_header_invalid: AtomicU64,
+    /// R5-09/D10：Responses 响应 id 缺失/为空的写回失败次数（仅真实写回失败）。
+    conversation_writeback_miss: AtomicU64,
+    /// R5-10/D10：`PreviousResponseMap` 达容量逐出最旧条目的累计次数。
+    previous_response_eviction: AtomicU64,
 }
 
 impl Default for GatewayMetrics {
@@ -115,6 +123,10 @@ impl Default for GatewayMetrics {
             conversation_reuse: AtomicU64::new(0),
             conversation_eviction: AtomicU64::new(0),
             request_fallback: AtomicU64::new(0),
+            conversation_store_missing: AtomicU64::new(0),
+            conversation_header_invalid: AtomicU64::new(0),
+            conversation_writeback_miss: AtomicU64::new(0),
+            previous_response_eviction: AtomicU64::new(0),
         }
     }
 }
@@ -227,4 +239,44 @@ impl GatewayMetrics {
     }
 
     pub fn request_fallback_count(&self) -> u64 { self.request_fallback.load(Ordering::Relaxed) }
+
+    /// R5-08/D9：`ConversationScopeStore` 缺失回退（`conversation` 模式）。
+    pub fn record_conversation_store_missing(&self) {
+        self.conversation_store_missing
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// R5-08/D9：显式会话键头存在但非法（超长/控制字符）被丢弃。
+    pub fn record_conversation_header_invalid(&self) {
+        self.conversation_header_invalid
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// R5-09/D10：Responses 响应 id 缺失/为空的写回失败（仅 (c) 类计一次）。
+    pub fn record_conversation_writeback_miss(&self) {
+        self.conversation_writeback_miss
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// R5-10/D10：`PreviousResponseMap` 逐出最旧条目一次。
+    pub fn record_previous_response_eviction(&self) {
+        self.previous_response_eviction
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn conversation_store_missing_count(&self) -> u64 {
+        self.conversation_store_missing.load(Ordering::Relaxed)
+    }
+
+    pub fn conversation_header_invalid_count(&self) -> u64 {
+        self.conversation_header_invalid.load(Ordering::Relaxed)
+    }
+
+    pub fn conversation_writeback_miss_count(&self) -> u64 {
+        self.conversation_writeback_miss.load(Ordering::Relaxed)
+    }
+
+    pub fn previous_response_eviction_count(&self) -> u64 {
+        self.previous_response_eviction.load(Ordering::Relaxed)
+    }
 }

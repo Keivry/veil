@@ -71,6 +71,9 @@ pub(in crate::handler::llm::pump) struct StreamTerminator {
     rejected_sticky: bool,
     /// 取代 `audit_blocked`：I-1 阻断命中（`finish` 的 `record_aux_counts` 读取）。
     audit_blocked: bool,
+    /// R5-35/D3：已终端后收尾审计命中 `Block`——独立于终端帧位的阻断语义位，
+    /// 其置位 SHALL NOT 触发 `mark_terminal`/`terminal_injected`。
+    terminal_block_sticky: bool,
     /// 取代 `responses_failed_sent`：上游 failed 分类（非终端位）。
     responses_failed_seen: bool,
     /// 帧发送事实（[`Self::note_frame_sent`] 唯一写点）。
@@ -85,6 +88,7 @@ impl StreamTerminator {
             loop_terminated: false,
             rejected_sticky: false,
             audit_blocked: false,
+            terminal_block_sticky: false,
             responses_failed_seen: false,
             any_frame_sent: false,
         }
@@ -108,12 +112,13 @@ impl StreamTerminator {
         )
     }
 
-    /// `block_injected` 语义（I-1/I-2/I-4；`decide` + `PumpOutcome`）。
+    /// `block_injected` 语义（I-1/I-2/I-4 + R5-35 已终端后收尾阻断；`decide` + `PumpOutcome`）。
     pub(in crate::handler::llm::pump) fn block_injected(&self) -> bool {
-        matches!(
-            self.state,
-            TerminalState::Blocked | TerminalState::EmptyStream
-        )
+        self.terminal_block_sticky
+            || matches!(
+                self.state,
+                TerminalState::Blocked | TerminalState::EmptyStream
+            )
     }
 
     /// `loop_terminated`（`run_pump` 循环跳出）。
@@ -152,6 +157,14 @@ impl StreamTerminator {
         self.audit_blocked = true;
     }
 
+    /// R5-35/D3：已终端后收尾审计命中 `Block`——置独立阻断语义位（不触发
+    /// `mark_terminal`/`terminal_injected`），并显式经 [`Self::note_sticky_rejected`]
+    /// 计入 `audit_blocked`（`finish` 的 `record_aux_counts` 读取）。
+    pub(in crate::handler::llm::pump) fn note_terminal_reject_block(&mut self) {
+        self.terminal_block_sticky = true;
+        self.note_sticky_rejected();
+    }
+
     /// `responses_failed_seen` 写点（`event_loop` Responses 分类）。
     pub(in crate::handler::llm::pump) fn note_responses_failed(&mut self) {
         self.responses_failed_seen = true;
@@ -164,12 +177,16 @@ impl StreamTerminator {
 
     // ---- 注入计划（`!is_open()` 时一律返回 `TerminalPlan::None`）----
 
-    /// I-1/I-2 协议阻断帧计划；`metrics` 仅参与 Responses 归档回退计数。
+    /// I-1/I-2 协议阻断帧计划；`metrics` 仅参与 Responses 归档回退计数；
+    /// `model` 为流式回显模型（缺失归 `unknown_model`，R5-39）。
+    // R5-39：`model` 入参使参数数超 clippy 默认阈值；聚合结构会加大调用点 churn，故就地允许。
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::handler::llm::pump) fn plan_block(
         &self,
         protocol: Protocol,
         reason: &str,
         conv_id: Option<&str>,
+        model: &str,
         blocked_index: u32,
         seq_cursor: Option<u64>,
         metrics: Option<&GatewayMetrics>,
@@ -179,10 +196,11 @@ impl StreamTerminator {
         }
         TerminalPlan::Frames {
             kind: TerminalKind::Block,
-            frames: block_inject::ensure_event_lines(block_inject::protocol_block_frames(
+            frames: block_inject::ensure_event_lines(block_inject::protocol_block_frames_modeled(
                 protocol,
                 reason,
                 conv_id,
+                model,
                 blocked_index,
                 metrics,
                 seq_cursor,
@@ -203,6 +221,7 @@ impl StreamTerminator {
         &self,
         protocol: Protocol,
         conv_id: Option<&str>,
+        model: &str,
         clean_close: bool,
         seq_cursor: Option<u64>,
         metrics: Option<&GatewayMetrics>,
@@ -231,9 +250,11 @@ impl StreamTerminator {
                 });
                 TerminalPlan::Frames {
                     kind: TerminalKind::Midstream,
-                    frames: block_inject::ensure_event_lines(block_inject::synthesize_truncation(
-                        protocol, &tid, seq_cursor,
-                    )),
+                    frames: block_inject::ensure_event_lines(
+                        block_inject::synthesize_truncation_modeled(
+                            protocol, &tid, seq_cursor, model,
+                        ),
+                    ),
                     truncated: Some(TruncatedMode::SynthesizedFailed),
                 }
             }
@@ -254,13 +275,15 @@ impl StreamTerminator {
         &self,
         protocol_name: &str,
         conv_id: &str,
+        model: &str,
     ) -> TerminalPlan {
         if !self.is_open() {
             return TerminalPlan::None;
         }
-        let frames = block_inject::ensure_event_lines(block_inject::empty_stream_frames(
+        let frames = block_inject::ensure_event_lines(block_inject::empty_stream_frames_modeled(
             protocol_name,
             conv_id,
+            model,
         ));
         let truncated = if protocol_name == "responses" {
             TruncatedMode::SynthesizedFailed
@@ -281,17 +304,16 @@ impl StreamTerminator {
         fid: &str,
         error: Option<&serde_json::Value>,
         sequence_number: Option<u64>,
+        model: &str,
     ) -> TerminalPlan {
         if !self.is_open() {
             return TerminalPlan::None;
         }
         TerminalPlan::Frames {
             kind: TerminalKind::ResponsesError,
-            frames: block_inject::ensure_event_lines(vec![block_inject::responses_failed_frame(
-                fid,
-                error,
-                sequence_number,
-            )]),
+            frames: block_inject::ensure_event_lines(vec![
+                block_inject::responses_failed_frame_modeled(fid, error, sequence_number, model),
+            ]),
             truncated: None,
         }
     }
@@ -371,7 +393,15 @@ mod tests {
             kind,
             frames,
             truncated,
-        } = t.plan_block(Protocol::Chat, "audit-policy-block", None, 0, None, None)
+        } = t.plan_block(
+            Protocol::Chat,
+            "audit-policy-block",
+            None,
+            "",
+            0,
+            None,
+            None,
+        )
         else {
             panic!("Open 态 plan_block 须产出 Frames");
         };
@@ -383,19 +413,19 @@ mod tests {
         assert!(meta.terminal_injected, "commit 须回填 terminal_injected");
         // MAJOR-6 幂等：已终端后各 plan 一律 None。
         assert!(matches!(
-            t.plan_block(Protocol::Chat, "r", None, 0, None, None),
+            t.plan_block(Protocol::Chat, "r", None, "", 0, None, None),
             TerminalPlan::None
         ));
         assert!(matches!(
-            t.plan_midstream(Protocol::Chat, None, false, None, None),
+            t.plan_midstream(Protocol::Chat, None, "", false, None, None),
             TerminalPlan::None
         ));
         assert!(matches!(
-            t.plan_empty_stream("chat", "c"),
+            t.plan_empty_stream("chat", "c", ""),
             TerminalPlan::None
         ));
         assert!(matches!(
-            t.plan_responses_error("r", None, None),
+            t.plan_responses_error("r", None, None, ""),
             TerminalPlan::None
         ));
     }
@@ -408,14 +438,14 @@ mod tests {
             kind,
             frames,
             truncated,
-        } = t.plan_midstream(Protocol::Anthropic, None, false, None, None)
+        } = t.plan_midstream(Protocol::Anthropic, None, "", false, None, None)
         else {
             panic!("Anthropic 中途断流须为 Frames");
         };
         assert_eq!(kind, TerminalKind::Midstream);
         assert!(frames.is_empty());
         assert_eq!(truncated, Some(TruncatedMode::OpenEnded));
-        let plan = t.plan_empty_stream("chat", "c");
+        let plan = t.plan_empty_stream("chat", "c", "");
         assert!(matches!(
             plan,
             TerminalPlan::Frames {
@@ -437,5 +467,39 @@ mod tests {
             "零合成帧收尾仍须闭合终端位"
         );
         assert!(!meta.terminal_injected, "零合成帧不得置 terminal_injected");
+    }
+
+    #[test]
+    fn terminal_sticky_block_keeps_semantics_without_second_terminal() {
+        // R5-35/D3：已终端后收尾审计命中 Block——不注入第二终端，但 block_injected/
+        // audit_blocked 为真、terminal_injected 保持不变。
+        let mut t = StreamTerminator::new();
+        let meta = StreamMeta::default();
+        t.mark_upstream_terminal();
+        assert!(t.terminal_sent() && !t.block_injected(), "上游终端初始态");
+        assert!(
+            matches!(
+                t.plan_block(
+                    Protocol::Chat,
+                    "audit-policy-block",
+                    None,
+                    "",
+                    0,
+                    None,
+                    None
+                ),
+                TerminalPlan::None
+            ),
+            "已终端后 plan_block 须 None（不注入第二终端）"
+        );
+        t.note_terminal_reject_block();
+        assert!(t.block_injected(), "block_injected 须为 true");
+        assert!(
+            t.audit_blocked(),
+            "audit_blocked 须置位（audit_blocks 计数）"
+        );
+        assert!(t.rejected_sticky(), "须显式走 note_sticky_rejected 语义");
+        assert!(t.terminal_sent(), "终端帧位须保持");
+        assert!(!meta.terminal_injected, "不得置 terminal_injected");
     }
 }

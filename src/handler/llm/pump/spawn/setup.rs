@@ -64,9 +64,10 @@ pub(super) struct PumpLoopState {
     pub meta: StreamMeta,
     pub agg: String,
     pub forwarded: usize,
-    /// 1.2：终端状态机（取代 7 枚终端相关 bool：`any_frame_sent`/`terminated`/
-    /// `rejected_sticky`/`block_injected`/`audit_blocked`/`terminal_sent`/
-    /// `responses_failed_sent`），单所有者、经访问器/变更器读写。
+    /// 1.2：终端状态机（`StreamTerminator` 为终端状态**唯一所有者**，取代此前 7 枚
+    /// 散落 bool：`any_frame_sent`/`terminated`/`rejected_sticky`/`block_injected`/
+    /// `audit_blocked`/`terminal_sent`/`responses_failed_sent`），经访问器/变更器读写。
+    /// `decide.rs`/`event.rs` 中的同名项为**纯函数入参**，不构成第二份状态。
     pub terminator: StreamTerminator,
     /// A-2/F-02：Responses「已见上游序号上界」游标（仅 Responses 帧更新；
     /// 缺 `sequence_number` 不推进、回退忽略），供阻断/截断合成取 `base = max + 1`。

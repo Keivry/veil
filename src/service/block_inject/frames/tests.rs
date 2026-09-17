@@ -341,3 +341,76 @@ fn nonstream_responses_block_body_upstream_echo() {
     assert_eq!(no_conv["model"], "unknown_model");
     assert!(no_conv["output"].as_array().is_some_and(|o| o.is_empty()));
 }
+
+#[test]
+fn streaming_block_frames_echo_id_model_match_nonstream() {
+    // R5-03/R5-39：三协议流式阻断帧的 id/model 回显须与非流 `nonstream_block_body`
+    // 同口径（上游 id/model 已知时不得硬编码 blocked-0/unknown_model）。
+    let chat_upstream = serde_json::json!({"id": "conv-1", "model": "gpt-4o"});
+    let chat = ensure_event_lines(chat_block_frames_full("audit", Some("conv-1"), "gpt-4o"));
+    let head = data_payloads(&chat[0]).remove(0);
+    let ns = nonstream_block_body(
+        GatewayProtocol::Chat,
+        "audit",
+        "conv-1",
+        Some(&chat_upstream),
+    );
+    assert_eq!(head["id"], ns["id"], "Chat 阻断帧 id 须与非流一致");
+    assert_eq!(head["model"], ns["model"], "Chat 阻断帧 model 须与非流一致");
+    assert_eq!(head["model"], "gpt-4o");
+
+    let anth = ensure_event_lines(anthropic_block_frames_modeled(
+        "audit",
+        0,
+        Some("msg-1"),
+        "claude-3",
+    ));
+    let anth_start = data_payloads(&anth[0]).remove(0);
+    let anth_ns = nonstream_block_body(
+        GatewayProtocol::Anthropic,
+        "audit",
+        "msg-1",
+        Some(&serde_json::json!({"model": "claude-3"})),
+    );
+    assert_eq!(anth_start["message"]["id"], anth_ns["id"]);
+    assert_eq!(anth_start["message"]["model"], anth_ns["model"]);
+    assert_eq!(anth_start["message"]["model"], "claude-3");
+
+    let resp = ensure_event_lines(responses_block_frames_at_modeled("resp-1", 0, "gpt-5.1"));
+    let completed = resp
+        .iter()
+        .find(|f| f.contains("response.completed"))
+        .expect("须含 response.completed");
+    let terminal = data_payloads(completed).remove(0);
+    let resp_ns = nonstream_block_body(
+        GatewayProtocol::Responses,
+        "audit",
+        "resp-1",
+        Some(&serde_json::json!({"id": "resp-1", "model": "gpt-5.1"})),
+    );
+    assert_eq!(terminal["response"]["id"], resp_ns["id"]);
+    assert_eq!(terminal["response"]["model"], resp_ns["model"]);
+    assert_eq!(terminal["response"]["model"], "gpt-5.1");
+
+    // 缺失回退口径：conv 缺失归 blocked-0，model 缺失归 unknown_model。
+    let fallback = ensure_event_lines(chat_block_frames_full("audit", None, ""));
+    let fb = data_payloads(&fallback[0]).remove(0);
+    assert_eq!(fb["id"], "blocked-0");
+    assert_eq!(fb["model"], "unknown_model");
+    let anth_fb = ensure_event_lines(anthropic_block_frames_modeled("audit", 0, None, ""));
+    assert_eq!(
+        data_payloads(&anth_fb[0]).remove(0)["message"]["model"],
+        "unknown_model"
+    );
+}
+
+#[test]
+fn responses_failed_frame_echoes_model() {
+    // R5-39：`responses_failed_frame_modeled` 回显模型；旧入口维持 unknown_model。
+    let modeled = responses_failed_frame_modeled("r1", None, None, "gpt-5.1");
+    assert!(modeled.contains("\"model\":\"gpt-5.1\""), "{modeled}");
+    let legacy = responses_failed_frame("r1", None, None);
+    assert!(legacy.contains("\"model\":\"unknown_model\""), "{legacy}");
+    let trunc = synthesize_truncation_modeled(GatewayProtocol::Responses, "r1", None, "gpt-5.1");
+    assert!(trunc[0].contains("\"model\":\"gpt-5.1\""), "{}", trunc[0]);
+}

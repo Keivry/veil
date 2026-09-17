@@ -10,6 +10,19 @@ pub enum Protocol {
     NonDialog,
 }
 
+/// 协议差异的**最小只读声明**（D8 第一步）：只承载 `done_terminator` 与
+/// `terminal_event_types`，仅服务明确列出的已迁移消费者（`[DONE]` 短路门控 +
+/// [`crate::handler::llm::pump::event::is_terminal_event`]）。**全量字段迁移**
+/// （`line_terminator`/`accepts_stream_options`/`empty_stream_frames`/`block_frames`
+/// 等）为后续独立 change 的非目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolSpec {
+    /// Chat 的传输层终止标记（`data: [DONE]`）；非 Chat 恒 `None`（视为非事件）。
+    pub done_terminator: Option<&'static str>,
+    /// 流式真终端事件 `type` 集合——`is_terminal_event` 唯一来源。
+    pub terminal_event_types: &'static [&'static str],
+}
+
 impl Protocol {
     pub fn as_tail(&self) -> &'static str {
         match self {
@@ -43,6 +56,34 @@ impl Protocol {
 
     /// 对话协议（`Chat`/`Anthropic`/`Responses`）——`NonDialog` 为唯一字节透传协议。
     pub fn is_dialog(self) -> bool { !self.is_nondialog() }
+
+    /// 协议差异的最小只读声明（唯一来源，见 [`ProtocolSpec`]）。仅 Chat 有终止标记。
+    pub fn spec(self) -> ProtocolSpec {
+        match self {
+            // Chat 以传输层 `data: [DONE]` 收尾，真终端事件集合为空（错误帧由
+            // `is_chat_error_terminal` 独立承载，不并入 spec）。
+            Self::Chat => ProtocolSpec {
+                done_terminator: Some("[DONE]"),
+                terminal_event_types: &[],
+            },
+            Self::Anthropic => ProtocolSpec {
+                done_terminator: None,
+                terminal_event_types: &["message_stop", "error"],
+            },
+            Self::Responses => ProtocolSpec {
+                done_terminator: None,
+                terminal_event_types: &[
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                ],
+            },
+            Self::NonDialog => ProtocolSpec {
+                done_terminator: None,
+                terminal_event_types: &[],
+            },
+        }
+    }
 }
 
 // 新增协议检查清单（D6/hygiene-round5）：新增第 4 协议时，除本表外还须同步：
@@ -51,6 +92,26 @@ impl Protocol {
 // `handler/llm/mod.rs::protocol_header_value`（下游协议头）、`rewrite.rs`（请求改写）、
 // `block_inject.rs`（阻断体）。本清单为最低覆盖，新增协议 change 仍须全量
 // grep `Protocol::` 复查（见 design D6）。
+//
+// `ProtocolSpec` 迁移进度（R5-24/D8/5.5，第一步，仅本 change 范围）：
+// - 已落字段：`done_terminator: Option<&str>` + `terminal_event_types`（见 `spec()`）。
+// - 已迁移消费者：① `[DONE]` 短路协议门控 `handler/llm/pump/spawn/event_loop.rs::handle_event` 的
+//   `[DONE]` 分支（经 `done_terminator`）；② `handler/llm/pump/event.rs::is_terminal_event` （经
+//   `terminal_event_types`）。
+// - 未迁移的四组语义不同事件集合（保持原判定，SHALL NOT 被单一字段强制替换）： ① 真终端集合（已迁移
+//   `is_terminal_event`）；② 粘滞抑制集合 `event.rs::sticky_terminal_precise`（含
+//   `content_block_stop`/`message_delta`）； ③ Responses 失败/未完成分类
+//   `event.rs::responses_failed_incomplete`； ④ Chat 错误终端集合
+//   `event.rs::is_chat_error_terminal`。
+// - `is_done_payload` 其余调用点清单（低层字符串判定，协议门控在消费点）： ①
+//   `service/sse/parser.rs:402`（`residual_json_aware`）——非目标（残余层）； ②
+//   `service/sse/parser.rs:432`（`classify_residue`）——非目标（残余层）； ③
+//   `handler/llm/pump/event.rs::parse_event_data`——非目标（帧解析对 DONE 返回 None）； ④
+//   `handler/llm/pump/spawn/event_loop.rs` 粘滞抑制分支的 `is_done`——非目标
+//   （粘滞态丢弃判定，与协议终态无关）；⑤ `event_loop.rs::handle_event` 的 `[DONE]`
+//   分支——**已迁移**（本 change 经 `spec().done_terminator` 门控）。
+// - 全量字段迁移（`line_terminator`/`accepts_stream_options`/`empty_stream_frames`/
+//   `block_frames`/`synthetic_status` 等）为后续独立 change 的非目标。
 const STRICT_TAILS: [(&str, Protocol); 3] = [
     ("chat/completions", Protocol::Chat),
     ("v1/messages", Protocol::Anthropic),
@@ -490,5 +551,32 @@ mod tests {
             inject_stream_options(&mut fixed);
             assert_eq!(fixed["stream_options"]["include_usage"], true, "{fixed}");
         }
+    }
+
+    #[test]
+    fn protocol_spec_minimal_fields() {
+        // R5-24/D8：仅 Chat 有终止标记；三协议真终端集合按 spec 声明。
+        assert_eq!(Protocol::Chat.spec().done_terminator, Some("[DONE]"));
+        for p in [
+            Protocol::Anthropic,
+            Protocol::Responses,
+            Protocol::NonDialog,
+        ] {
+            assert_eq!(p.spec().done_terminator, None, "{p:?} 不得有 DONE 终止标记");
+        }
+        assert_eq!(
+            Protocol::Anthropic.spec().terminal_event_types,
+            &["message_stop", "error"]
+        );
+        assert_eq!(
+            Protocol::Responses.spec().terminal_event_types,
+            &[
+                "response.completed",
+                "response.failed",
+                "response.incomplete"
+            ]
+        );
+        assert!(Protocol::Chat.spec().terminal_event_types.is_empty());
+        assert!(Protocol::NonDialog.spec().terminal_event_types.is_empty());
     }
 }

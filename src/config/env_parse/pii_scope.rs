@@ -48,9 +48,32 @@ pub struct PiiScopeParts {
     pub ttl_secs: i64,
     pub max_conversations: usize,
     pub key_header: String,
+    pub prev_id_max_entries: usize,
 }
 
-/// 解析 `PII_SCOPE_*`：模式非法与 TTL/上限非正整数一律拒启动并指明变量。
+/// 保留会话键头名（R5-40/D7，大小写不敏感对比）：与真实鉴权头冲突者。
+/// HOP 集经 `service::llm_gateway::HOP_HEADERS` 单一来源并入，避免两处漂移。
+const RESERVED_KEY_HEADERS: [&str; 7] = [
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "host",
+    "content-length",
+    "content-encoding",
+    "accept-encoding",
+];
+
+/// 会话键头保留名判定（R5-40/D7）：命中即拒启动——无条件剔除会令 `request`
+/// 模式亦删除真实鉴权/传输头转发上游而静默断链。
+fn is_reserved_key_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    RESERVED_KEY_HEADERS.contains(&lower.as_str())
+        || crate::service::llm_gateway::HOP_HEADERS.contains(&lower.as_str())
+}
+
+/// 解析 `PII_SCOPE_*`：模式非法与 TTL/上限非正整数一律拒启动并指明变量；
+/// 保留会话键头名拒启动（R5-40/D7）。`PII_PREV_ID_MAX_ENTRIES` 未设置时取
+/// `PII_SCOPE_MAX_CONVERSATIONS` 的**生效值**（配置相关默认，非钉死 1024）。
 pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
     let mode = match get("PII_SCOPE_MODE").filter(|v| !v.is_empty()) {
         Some(v) => v.parse().map_err(|message| VeilError::Config {
@@ -68,11 +91,23 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
     let key_header = get("PII_SCOPE_KEY_HEADER")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| PII_SCOPE_KEY_HEADER_DEFAULT.to_string());
+    if is_reserved_key_header(&key_header) {
+        return Err(VeilError::Config {
+            var: "PII_SCOPE_KEY_HEADER".to_string(),
+            message: format!(
+                "PII_SCOPE_KEY_HEADER 取值 {key_header:?} 与保留鉴权/传输头名冲突，拒绝启动\
+                （会话键头无条件剔除，保留名会在转发上游前删除真实头）"
+            ),
+        });
+    }
+    let prev_id_max_entries =
+        parse_positive_usize(get, "PII_PREV_ID_MAX_ENTRIES", max_conversations)?;
     Ok(PiiScopeParts {
         mode,
         ttl_secs,
         max_conversations,
         key_header,
+        prev_id_max_entries,
     })
 }
 

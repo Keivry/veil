@@ -77,6 +77,10 @@ pub enum VeilError {
     /// keepass-real：自动放行路径 KDBX 查询失败 → 500（`AUTH-8`：对外脱敏，细节仅日志）。
     #[error("KeePass 内部错误: {message}")]
     KeePass { message: String },
+
+    /// R5-14/D5：PII 脱敏熵源/内部故障 → fail-closed（`502`），不转发未脱敏正文。
+    #[error("PII 脱敏不可用")]
+    PiiUnavailable,
 }
 
 impl VeilError {
@@ -97,6 +101,7 @@ impl VeilError {
             Self::BadRequest { .. } => "E_BAD_REQUEST",
             Self::NotFound { .. } => "E_NOT_FOUND",
             Self::KeePass { .. } => "E_KEEPASS",
+            Self::PiiUnavailable => "E_PII_UNAVAILABLE",
         }
     }
 
@@ -108,6 +113,7 @@ impl VeilError {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
             Self::EmptyBody => StatusCode::BAD_GATEWAY,
+            Self::PiiUnavailable => StatusCode::BAD_GATEWAY,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -133,6 +139,7 @@ impl VeilError {
             | Self::Upstream { message, .. }
             | Self::Config { message, .. } => message.clone(),
             Self::EmptyBody => "上游返回空响应体".to_string(),
+            Self::PiiUnavailable => "PII 脱敏不可用".to_string(),
             Self::Unauthorized { message }
             | Self::Conflict { message }
             | Self::PendingApproval { message }
@@ -236,6 +243,18 @@ mod tests {
     #[test]
     fn empty_body_maps_to_bad_gateway() {
         assert_eq!(VeilError::EmptyBody.status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn pii_unavailable_maps_to_bad_gateway_with_code() {
+        // R5-14/D5：熵源故障 fail-closed 码固定为 502 + E_PII_UNAVAILABLE，错误体形态不改。
+        let response = VeilError::PiiUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "E_PII_UNAVAILABLE");
     }
 
     #[test]

@@ -224,3 +224,56 @@ async fn b7_sse_abrupt_disconnect_releases_slot() {
     assert!(poll_sse_connect(&client, &base).await, "异常断开后槽须释放");
     handle.abort();
 }
+
+// R5-27：`/_admin/health` 限流豁免的**行为面**断言——health handler 不调用
+// `check_admin_rate`（`admin_rate_exempt_paths()`/`is_rate_exempt()` 仅声明/文档用途），
+// 故连续 11 次 health 均 200；非豁免 `/_admin/metrics` 在 10/min 桶内第 11 次 429 + retry-after。
+#[tokio::test]
+async fn r5_27_health_exempt_behavioral_metrics_11th_429() {
+    let (base, handle) = serve(test_app_router(&[])).await;
+    let client = reqwest::Client::new();
+    for i in 0..11 {
+        let resp = client
+            .get(format!("{base}/_admin/health"))
+            .header("X-Admin-Token", ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "第 {i} 次 /_admin/health 不得 429（health 不占通用限流桶）"
+        );
+    }
+    // 非豁免 `/_admin/metrics`：10/min 桶内第 1..=10 次恒 200，第 11 次 429 + retry-after。
+    // 恰 10 次断言可锁死阈值——阈值调低任一处即在前 10 次内出现 429 而失败。
+    for i in 1..=10 {
+        let resp = client
+            .get(format!("{base}/_admin/metrics"))
+            .header("X-Admin-Token", ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "第 {i} 次 /_admin/metrics 须放行（health 不占桶，阈值恰 10/min）"
+        );
+    }
+    let eleventh = client
+        .get(format!("{base}/_admin/metrics"))
+        .header("X-Admin-Token", ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        eleventh.status().as_u16(),
+        429,
+        "第 11 次 /_admin/metrics 须 429（阈值不得高于 10）"
+    );
+    assert!(
+        eleventh.headers().contains_key("retry-after"),
+        "429 须携带 retry-after"
+    );
+    handle.abort();
+}

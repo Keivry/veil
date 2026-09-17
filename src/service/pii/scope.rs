@@ -53,6 +53,9 @@ pub(crate) fn parse_pii_seq(token: &str) -> Option<usize> {
 pub struct PiiScope {
     inner: Mutex<ScopeInner>,
     malformed: Mutex<HashMap<String, u64>>,
+    /// 仅测试：强制 `register` 走熵源故障分支（R5-14/D5 fail-closed 注入）。
+    #[cfg(test)]
+    force_entropy_failure: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -63,83 +66,117 @@ struct ScopeInner {
     resp_t2p: HashMap<String, String>,
     pii_order: VecDeque<String>,
     resp_order: VecDeque<String>,
-    /// F5/D4 分配游标：下一个候选序号（1 起），与 `used_seqs` 配套均摊 O(1)。
-    next_seq: usize,
-    /// F5/D4 全部在用序号（请求/响应表共享序号空间；分配插入、淘汰移除）。
-    used_seqs: HashSet<usize>,
+    /// F5/D4 请求表分配游标：下一个候选序号（1 起），与 `req_used` 配套均摊 O(1)。
+    req_next_seq: usize,
+    /// F5/D4 响应表分配游标：下一个候选序号（1 起），与 `resp_used` 配套均摊 O(1)。
+    resp_next_seq: usize,
+    /// F5/D4 请求表在用序号（**独立序号空间**；分配插入、淘汰移除）。
+    req_used: HashSet<usize>,
+    /// F5/D4 响应表在用序号（**独立序号空间**；分配插入、淘汰移除）。
+    resp_used: HashSet<usize>,
     /// 分配探测步数（仅测试观测线性有界；生产零成本）。
     #[cfg(test)]
     scan_steps: usize,
 }
 
 impl ScopeInner {
-    /// F5/D4：游标 + 已用集分配。自游标起找首个未用序号，越顶回卷；
-    /// 全满时返回 `PII_MAX_ENTRIES + 1`（与旧 `next_hole` 全占语义一致，
-    /// 紧随的 LRU 淘汰会把空洞重新释放）。
-    fn alloc_seq(&mut self) -> usize {
-        let start = self.next_seq.max(1);
-        let mut seq = if start > PII_MAX_ENTRIES { 1 } else { start };
-        seq = self.find_free_from(seq);
-        if seq > PII_MAX_ENTRIES {
-            seq = self.find_free_from(1);
+    /// F5/D4：游标 + 已用集分配。请求表与响应表**各自独立序号空间**（D6），
+    /// 自游标起找首个未用序号，越顶回卷；单表全满时返回 `PII_MAX_ENTRIES + 1`
+    /// （与旧 `next_hole` 全占语义一致，紧随的 LRU 淘汰会把空洞重新释放）。
+    fn alloc_seq(&mut self, response_side: bool) -> usize {
+        let max = PII_MAX_ENTRIES;
+        let (next, used) = if response_side {
+            (&mut self.resp_next_seq, &self.resp_used)
+        } else {
+            (&mut self.req_next_seq, &self.req_used)
+        };
+        let start = (*next).max(1);
+        let mut probes = 0usize;
+        let mut find_free = |from: usize| -> usize {
+            let mut seq = from;
+            while seq <= max {
+                probes += 1;
+                if !used.contains(&seq) {
+                    return seq;
+                }
+                seq += 1;
+            }
+            max + 1
+        };
+        let mut seq = find_free(if start > max { 1 } else { start });
+        if seq > max {
+            seq = find_free(1);
         }
-        self.next_seq = if seq >= PII_MAX_ENTRIES { 1 } else { seq + 1 };
+        *next = if seq >= max { 1 } else { seq + 1 };
+        #[cfg(test)]
+        {
+            self.scan_steps += probes;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = probes;
+        }
         seq
     }
 
-    fn find_free_from(&mut self, from: usize) -> usize {
-        let mut seq = from;
-        while seq <= PII_MAX_ENTRIES {
-            self.note_probe();
-            if !self.used_seqs.contains(&seq) {
-                return seq;
-            }
-            seq += 1;
-        }
-        PII_MAX_ENTRIES + 1
-    }
-
-    /// 回收淘汰条目的序号（空洞复用来源）。
-    fn release_seq(&mut self, token: &str) {
+    /// 回收淘汰条目的序号（空洞复用来源；按表释放到对应序号空间）。
+    fn release_seq(&mut self, token: &str, response_side: bool) {
         if let Some(seq) = parse_pii_seq(token) {
-            self.used_seqs.remove(&seq);
+            if response_side {
+                self.resp_used.remove(&seq);
+            } else {
+                self.req_used.remove(&seq);
+            }
         }
     }
-
-    #[cfg(test)]
-    fn note_probe(&mut self) { self.scan_steps += 1; }
-
-    #[cfg(not(test))]
-    fn note_probe(&mut self) {}
 }
 
-/// PII 值注册拒绝：值命中内部 token 形态或含保留前缀。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PiiReject(&'static str);
+/// PII 值注册失败分类（R5-14/D5）：token 形态拒绝与熵源/内部故障 MUST NOT
+/// 共用同一错误分支——前者静默跳过，后者 fail-closed。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiiRegisterError {
+    /// 值本身即内部 token 形态或含保留前缀（`__PII_`/`__VG_CRED_`）→ 静默跳过。
+    TokenShape,
+    /// rand8 的 `OsRng` 熵源/内部生成不可用 → fail-closed。
+    EntropyUnavailable,
+}
 
-impl std::fmt::Display for PiiReject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) }
+impl std::fmt::Display for PiiRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TokenShape => "PII 值不能匹配内部 token 格式或以 token 前缀开头",
+            Self::EntropyUnavailable => "CSPRNG 熵源不可用",
+        })
+    }
 }
 
 impl PiiScope {
     /// 新建空 Scope（每请求一个，请求结束即销毁）。
     pub fn new() -> Self { Self::default() }
 
-    /// 空洞跳过：返回全序号空间最小空闲序号（仅测试口径；
+    /// 空洞跳过：返回**请求表**序号空间最小空闲序号（仅测试口径；
     /// 分配本身走 [`ScopeInner::alloc_seq`] 游标，不做全量重建）。
     #[cfg(test)]
     fn next_available_index(&self) -> usize {
         let inner = lock_or_recover(self.inner.lock());
         let mut seq = 1;
-        while inner.used_seqs.contains(&seq) {
+        while inner.req_used.contains(&seq) {
             seq += 1;
         }
         seq
     }
 
+    /// 仅测试：强制 `register` 走熵源故障分支（R5-14/D5 fail-closed 注入）。
+    #[cfg(test)]
+    pub(crate) fn force_entropy_failure(&self, on: bool) {
+        self.force_entropy_failure
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 注册 PII 值并返回 token。同值复用；`response_side=true` 进响应表
-    /// （不进请求还原表）；token 形态值拒绝注册。
-    pub fn register(&self, value: &str, response_side: bool) -> Result<String, PiiReject> {
+    /// （不进请求还原表）；token 形态值拒绝注册。失败分类见 [`PiiRegisterError`]：
+    /// token 形态静默跳过，熵源故障 fail-closed（R5-14/D5）。
+    pub fn register(&self, value: &str, response_side: bool) -> Result<String, PiiRegisterError> {
         if value.is_empty() {
             return Ok(value.to_string());
         }
@@ -148,9 +185,15 @@ impl PiiScope {
             || value.contains(crate::service::credential_vault::TOKEN_PREFIX)
             || cred_token_shape_re().is_match(value)
         {
-            return Err(PiiReject(
-                "PII 值不能匹配内部 token 格式或以 token 前缀开头",
-            ));
+            return Err(PiiRegisterError::TokenShape);
+        }
+        #[cfg(test)]
+        if self
+            .force_entropy_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!("PII 令牌生成熵源不可用（测试注入），请求将 fail-closed");
+            return Err(PiiRegisterError::EntropyUnavailable);
         }
         let mut inner = lock_or_recover(self.inner.lock());
         if response_side {
@@ -162,8 +205,11 @@ impl PiiScope {
             touch_order(&mut inner.pii_order, value);
             return Ok(tok);
         }
-        let seq = inner.alloc_seq();
-        let rand8 = gen_rand8().map_err(|_| PiiReject("CSPRNG 熵源不可用"))?;
+        let seq = inner.alloc_seq(response_side);
+        let Ok(rand8) = gen_rand8() else {
+            tracing::warn!("PII 令牌生成熵源不可用，请求将 fail-closed（R5-14/D5）");
+            return Err(PiiRegisterError::EntropyUnavailable);
+        };
         let token = make_pii_token(seq, &rand8);
         if response_side {
             if inner.resp_p2t.len() >= PII_MAX_ENTRIES
@@ -171,9 +217,9 @@ impl PiiScope {
                 && let Some(old_tok) = inner.resp_p2t.remove(&oldest)
             {
                 inner.resp_t2p.remove(&old_tok);
-                inner.release_seq(&old_tok);
+                inner.release_seq(&old_tok, true);
             }
-            inner.used_seqs.insert(seq);
+            inner.resp_used.insert(seq);
             inner.resp_order.push_back(value.to_string());
             inner.resp_p2t.insert(value.to_string(), token.clone());
             inner.resp_t2p.insert(token.clone(), value.to_string());
@@ -183,9 +229,9 @@ impl PiiScope {
                 && let Some(old_tok) = inner.pii_p2t.remove(&oldest)
             {
                 inner.pii_t2p.remove(&old_tok);
-                inner.release_seq(&old_tok);
+                inner.release_seq(&old_tok, false);
             }
-            inner.used_seqs.insert(seq);
+            inner.req_used.insert(seq);
             inner.pii_order.push_back(value.to_string());
             inner.pii_p2t.insert(value.to_string(), token.clone());
             inner.pii_t2p.insert(token.clone(), value.to_string());

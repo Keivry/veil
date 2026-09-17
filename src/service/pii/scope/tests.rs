@@ -24,8 +24,9 @@ fn same_value_reuse_and_gap_skip_stable_index() {
     let restored = scope.restore(&format!("{t1} {rt}"));
     assert!(restored.contains("13812345678"));
     assert!(restored.contains(&rt), "响应期 token 原样保留不还原");
-    // 空洞跳过：直接构造空洞断言 next_available_index。
-    assert_eq!(scope.next_available_index(), 3);
+    // 空洞跳过：请求表独立序号空间，仅 t1 占用 1 → 下一空闲为 2
+    //（响应表 rt 用其自身空间，互不影响）。
+    assert_eq!(scope.next_available_index(), 2);
 }
 
 #[test]
@@ -161,15 +162,15 @@ fn f5_hole_reuse_after_eviction_no_conflict() {
     let reused = scope.register("f5-reused", false).unwrap();
     assert_eq!(parse_pii_seq(&reused), Some(first_seq), "空洞须被复用");
     let inner = lock_or_recover(scope.inner.lock());
-    let all: Vec<usize> = inner
+    let req_seqs: Vec<usize> = inner
         .pii_t2p
         .keys()
-        .chain(inner.resp_t2p.keys())
         .filter_map(|t| parse_pii_seq(t))
         .collect();
-    let uniq: HashSet<usize> = all.iter().copied().collect();
-    assert_eq!(uniq.len(), all.len(), "两表在用序号不得重复");
-    assert_eq!(inner.used_seqs, uniq, "已用集须与表内容一致");
+    let uniq: HashSet<usize> = req_seqs.iter().copied().collect();
+    assert_eq!(uniq.len(), req_seqs.len(), "请求表在用序号不得重复");
+    assert_eq!(inner.req_used, uniq, "请求表已用集须与表内容一致");
+    assert!(inner.resp_used.is_empty(), "未写响应表时其序号空间须为空");
 }
 
 #[test]
@@ -522,7 +523,7 @@ fn alloc_seq_cursor() {
     {
         let mut inner = lock_or_recover(scope.inner.lock());
         // 满表：直接分配返回 PII_MAX_ENTRIES + 1，探测步数线性有界（非全量重建）。
-        assert_eq!(inner.alloc_seq(), PII_MAX_ENTRIES + 1);
+        assert_eq!(inner.alloc_seq(false), PII_MAX_ENTRIES + 1);
         assert!(
             inner.scan_steps <= 3 * PII_MAX_ENTRIES + 4,
             "分配探测步数须线性有界，实际 {}",
@@ -566,5 +567,149 @@ fn fuzzy_unknown_seq_not_restored() {
         scope.audit_count("unregistered"),
         1,
         "未知完整形态须计 unregistered"
+    );
+}
+
+#[test]
+fn register_error_classification_token_shape_vs_entropy() {
+    // R5-14/D5：token 形态拒绝与熵源故障必须分开，MUST NOT 共用同一错误分支。
+    let scope = PiiScope::new();
+    assert_eq!(
+        scope.register("__PII_1_ab12cd34__", false),
+        Err(PiiRegisterError::TokenShape)
+    );
+    assert_eq!(
+        scope.register("__VG_CRED_42__", false),
+        Err(PiiRegisterError::TokenShape)
+    );
+    scope.force_entropy_failure(true);
+    assert_eq!(
+        scope.register("13812345678", false),
+        Err(PiiRegisterError::EntropyUnavailable)
+    );
+    // token 形态判定先于熵源：故障注入下仍归 TokenShape。
+    assert_eq!(
+        scope.register("__PII_1_ab12cd34__", false),
+        Err(PiiRegisterError::TokenShape)
+    );
+    scope.force_entropy_failure(false);
+    assert!(scope.register("13812345678", false).is_ok());
+}
+
+#[test]
+fn saturated_table_keeps_per_table_uniqueness_and_request_only_fuzzy() {
+    // R5-15/D6：单表饱和后再注册第 N+1 个值，锁定真实可观测不变量——
+    // ① 第 N+1 个值仍可用且可精确还原；② 同表内不存在两条在用条目共享序号；
+    // ③ 按序号回查的 fuzzy 还原只映射请求表，MUST NOT 跨表解析到响应表明文；
+    // ④ 两表序号空间独立：填满一表不消耗另一表在 1..=PII_MAX_ENTRIES 内的分配。
+    // 诚实声明：本测试**不**主张「饱和哨兵从不出现」——满表时 `alloc_seq` 确会返回
+    // `PII_MAX_ENTRIES + 1`（既有 `alloc_seq_cursor` 已锁定该行为），紧随的 LRU 淘汰
+    // 释放一个空洞，故哨兵序号至多驻留于一条在用条目上。此处只锁定「唯一性 + 不串表」。
+    let scope = PiiScope::new();
+
+    // 阶段 1：请求表与响应表各自从 1 起分配（独立序号空间，同序号值不同表）。
+    let req_alpha = scope.register("req-sat-alpha", false).unwrap();
+    let resp_alpha = scope.register("resp-sat-alpha", true).unwrap();
+    assert_eq!(parse_pii_seq(&req_alpha), Some(1));
+    assert_eq!(
+        parse_pii_seq(&resp_alpha),
+        Some(1),
+        "两表独立序号空间各自从 1 起"
+    );
+
+    // 阶段 2：填满请求表（1..=PII_MAX_ENTRIES）；响应表条目数不受影响。
+    for i in 1..PII_MAX_ENTRIES {
+        scope.register(&format!("req-sat-{i:04}"), false).unwrap();
+    }
+    assert_eq!(
+        scope.table_sizes(),
+        (PII_MAX_ENTRIES, 1),
+        "填满请求表不得增响应表条目"
+    );
+
+    // 阶段 3：第 N+1 个不同值走满表饱和/淘汰路径，仍须在用且可精确还原。
+    let req_overflow = scope.register("req-sat-overflow", false).unwrap();
+    assert_eq!(
+        parse_pii_seq(&req_overflow),
+        Some(PII_MAX_ENTRIES + 1),
+        "满表分配返回饱和哨兵（既有行为，非缺陷；已由 alloc_seq_cursor 锁定）"
+    );
+    assert!(scope.contains_request_token(&req_overflow));
+    assert_eq!(
+        scope.restore(&format!("回 {req_overflow} 结束")),
+        "回 req-sat-overflow 结束",
+        "第 N+1 个值须可精确还原"
+    );
+
+    // 阶段 4：同表序号唯一 + 已用集与表内容一致（请求表饱和后仍成立）。
+    // 淘汰使 req-sat-alpha（序号 1）离场；请求表在序号 2..=1000 与哨兵 1001 上各一条。
+    {
+        let inner = lock_or_recover(scope.inner.lock());
+        let req_seqs: Vec<usize> = inner
+            .pii_t2p
+            .keys()
+            .filter_map(|t| parse_pii_seq(t))
+            .collect();
+        let resp_seqs: Vec<usize> = inner
+            .resp_t2p
+            .keys()
+            .filter_map(|t| parse_pii_seq(t))
+            .collect();
+        assert_eq!(req_seqs.len(), PII_MAX_ENTRIES);
+        assert_eq!(resp_seqs.len(), 1);
+        for (label, seqs, used) in [
+            ("请求表", &req_seqs, &inner.req_used),
+            ("响应表", &resp_seqs, &inner.resp_used),
+        ] {
+            let uniq: HashSet<usize> = seqs.iter().copied().collect();
+            assert_eq!(uniq.len(), seqs.len(), "{label}在用序号不得重复");
+            assert_eq!(used, &uniq, "{label}已用集须与表内容一致");
+        }
+        assert!(!inner.req_used.contains(&1), "序号 1 已被淘汰释放");
+    }
+
+    // 阶段 5：关键跨表断言——响应表独立分配到与请求表**同序号**的在用条目
+    //（请求表序号 2 ↔ 响应表序号 2）；截断形按序号回查只映射请求表明文。
+    let resp_beta = scope.register("resp-sat-beta", true).unwrap();
+    assert_eq!(parse_pii_seq(&resp_beta), Some(2), "响应表独立分配到序号 2");
+    let rewritten = "__PII_2_ZZZZZZZZ__";
+    let out = scope.restore_with_fuzzy(&format!("回 {rewritten} 结束"), true);
+    assert_eq!(
+        out, "回 req-sat-0001 结束",
+        "序号 2 的 fuzzy 回查须唯一命中请求表明文"
+    );
+    assert!(
+        !out.contains("resp-sat-beta"),
+        "fuzzy 回查 MUST NOT 跨表解析到响应表明文: {out}"
+    );
+    assert_eq!(scope.audit_count("fuzzy"), 1, "请求表序号命中计一次 fuzzy");
+    assert_eq!(
+        scope.restore(&resp_beta),
+        resp_beta,
+        "响应表 token 精确形态须原样保留"
+    );
+
+    // 阶段 6：响应表独立填满至 PII_MAX_ENTRIES，两表各自在 1..=PII_MAX_ENTRIES 内
+    // 唯一分配、互不消费对方序号空间；请求表饱和哨兵与容量保持不变。
+    for i in 2..PII_MAX_ENTRIES {
+        scope.register(&format!("resp-fill-{i:04}"), true).unwrap();
+    }
+    let inner = lock_or_recover(scope.inner.lock());
+    let resp_uniq: HashSet<usize> = inner
+        .resp_t2p
+        .keys()
+        .filter_map(|t| parse_pii_seq(t))
+        .collect();
+    assert_eq!(inner.pii_t2p.len(), PII_MAX_ENTRIES);
+    assert_eq!(inner.resp_t2p.len(), PII_MAX_ENTRIES);
+    assert_eq!(resp_uniq.len(), PII_MAX_ENTRIES, "响应表序号不得重复");
+    assert!(
+        resp_uniq.iter().all(|s| (1..=PII_MAX_ENTRIES).contains(s)),
+        "响应表独立分配须落在 [1, {PII_MAX_ENTRIES}]"
+    );
+    assert_eq!(inner.resp_used, resp_uniq, "响应表已用集须与表内容一致");
+    assert!(
+        inner.req_used.contains(&(PII_MAX_ENTRIES + 1)),
+        "请求表饱和哨兵仍驻留，未被响应表填充回收"
     );
 }

@@ -2,7 +2,10 @@
 //! （`nonstream.rs`）共用的「还原后 JSON 完整性」谓词，原两份逐字拷贝收敛至此。
 //! 零 axum 依赖（仅 `serde_json` 与 `json_walk`），判定与 handler 职责解耦。
 
-use {super::super::json_walk::strip_bom, serde_json::Value};
+use {
+    super::super::json_walk::{jloads, strip_bom},
+    serde_json::Value,
+};
 
 /// 还原守卫谓词（NLP-3/D12 + H2/D1）：`restored` 须可解析为 JSON，且当占位符帧的
 /// 字符串值内嵌 stringified JSON 时，还原后内层仍须同构可解析（内层破损
@@ -14,12 +17,12 @@ pub(crate) fn restore_guard_ok(
     placeholder: &str,
     placeholder_parsed: Option<&Value>,
 ) -> bool {
-    let Ok(rv) = serde_json::from_str::<Value>(strip_bom(restored)) else {
+    let Ok(rv) = jloads(strip_bom(restored)) else {
         return false;
     };
     match placeholder_parsed {
         Some(pv) => inner_json_intact(pv, &rv),
-        None => match serde_json::from_str::<Value>(strip_bom(placeholder)) {
+        None => match jloads(strip_bom(placeholder)) {
             Ok(pv) => inner_json_intact(&pv, &rv),
             Err(_) => true,
         },
@@ -33,10 +36,10 @@ pub(crate) fn inner_json_intact(placeholder: &Value, restored: &Value) -> bool {
         (Value::String(p), Value::String(r)) => {
             let pt = strip_bom(p).trim();
             if (pt.starts_with('{') || pt.starts_with('['))
-                && let Ok(pv) = serde_json::from_str::<Value>(pt)
+                && let Ok(pv) = jloads(pt)
                 && matches!(pv, Value::Object(_) | Value::Array(_))
             {
-                return serde_json::from_str::<Value>(strip_bom(r).trim())
+                return jloads(strip_bom(r).trim())
                     .ok()
                     .filter(|rv| matches!(rv, Value::Object(_) | Value::Array(_)))
                     .is_some_and(|rv| inner_json_intact(&pv, &rv));
@@ -89,6 +92,27 @@ mod tests {
             restore_guard_ok("\u{feff}{\"a\":1}", "{not json", None),
             "BOM 前缀按帧路径口径剥离"
         );
+    }
+
+    #[test]
+    fn restore_guard_bom_prefixed_valid_json_equivalent() {
+        // R5-23/D1：BOM 前缀合法 JSON（外层与内层 stringified）判定与非 BOM 一致。
+        let placeholder = r#"{"k":"__VG_CRED_000001__"}"#;
+        let intact = r#"{"k":"secret"}"#;
+        assert!(restore_guard_ok(intact, placeholder, None));
+        assert!(restore_guard_ok(
+            &format!("\u{feff}{intact}"),
+            placeholder,
+            None
+        ));
+        let placeholder_inner = r#"{"s":"{\"k\":\"__VG_CRED_000001__\"}"}"#;
+        let restored_inner = r#"{"s":"{\"k\":\"p@ss\"}"}"#;
+        assert!(restore_guard_ok(restored_inner, placeholder_inner, None));
+        assert!(restore_guard_ok(
+            &format!("\u{feff}{restored_inner}"),
+            placeholder_inner,
+            None
+        ));
     }
 
     #[test]

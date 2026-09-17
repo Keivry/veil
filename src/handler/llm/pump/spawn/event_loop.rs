@@ -12,6 +12,7 @@ use {
                 is_chat_error_terminal,
                 is_minor_event,
                 is_terminal_event,
+                is_upstream_error_terminal,
                 outer_event_index,
                 parse_event_data,
                 record_emitted_events,
@@ -43,6 +44,16 @@ use {
     },
     serde_json::Value,
 };
+
+mod reject;
+
+use reject::apply_reject_block;
+
+#[cfg(test)]
+mod non_chat_done_tests;
+
+#[cfg(test)]
+mod pii_unavailable_tests;
 
 /// 单事件处理的控制流：`Next` 继续下一事件；`BreakFor` 因下游发送失败中止本块事件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,50 +142,6 @@ where
     transport_error
 }
 
-/// C-3/D1（5.4）：fail-closed 阻断臂（`audit-policy-block` 与缓冲记账超限
-/// `audit-hold-overflow` 共用）——置粘滞拒绝态、归还并清空 pending 缓冲（阻断
-/// 非截断，不记截断计数）、恰一注入协议阻断帧；返回本帧是否属 tool/完成事件
-/// （为真时调用方不再继续透出）。
-async fn apply_reject_block(
-    state: &mut PumpLoopState,
-    env: &PumpEnv,
-    v: &Value,
-    reason: &str,
-    is_tool_or_complete: bool,
-) -> bool {
-    state.terminator.note_sticky_rejected();
-    state.agg.clear();
-    state.boundary.clear();
-    state.prefix_hold.clear();
-    // P0-3.1：阻断丢弃缓冲（阻断非截断，不记截断计数）；记账同步归还。
-    let released: usize = state
-        .pending_tool_frames
-        .iter()
-        .map(|(_, p, d)| p.len() + d.len())
-        .sum();
-    state
-        .hold
-        .release_pending_frames(state.pending_tool_frames.len(), released);
-    state.pending_tool_frames.clear();
-    // 2.1 收敛：I-1 无 `add_sse_event`（BLOCKER-1 不得新增）；`plan_block` 的
-    // `None` 门等价既有 `if !block_injected` 幂等守卫。
-    let blocked_index = outer_event_index(env.protocol, v).unwrap_or(0);
-    if let TerminalPlan::Frames { kind, frames, .. } = state.terminator.plan_block(
-        env.protocol,
-        reason,
-        state.conv_id.as_deref(),
-        blocked_index,
-        state.responses_seq_cursor,
-        Some(&env.metrics),
-    ) {
-        for f in frames {
-            let _ = env.pump_tx.send(f).await;
-        }
-        state.terminator.commit(&mut state.meta, kind, true, true);
-    }
-    is_tool_or_complete
-}
-
 /// ARC-1：单事件处理（原 `spawn_stream_pump` 循环体搬移，分支/顺序/等待点不变）。
 pub(super) async fn handle_event<F>(
     state: &mut PumpLoopState,
@@ -204,11 +171,26 @@ where
     // 产物供本函数各判定复用；空帧/`[DONE]`/非法 JSON 为 `None`。
     let parsed: Option<Value> = parse_event_data(&ev.data);
     if let Some(v) = parsed.as_ref() {
-        if let Some(id) = llm_gateway::extract_conv_id(v) {
+        let response_id = llm_gateway::extract_conv_id(v);
+        let wrote = response_id
+            .as_deref()
+            .is_some_and(|id| env.resp_scope.record_response_id(env.protocol, id));
+        // R5-09/D10：写回失败仅「响应 id 缺失/为空」计一次；无写回上下文（`request`
+        // 模式/键未推导）与非 Responses 协议门控 MUST NOT 计入。计数点取 Responses
+        // 官方终端帧且本流从未见过 id，保证一次响应恰一次（不回退为逐帧误计）。
+        if !wrote
+            && env.protocol.is_responses()
+            && response_id.is_none()
+            && env.resp_scope.has_conversation()
+            && state.conv_id.is_none()
+            && is_terminal_event(env.protocol, v)
+        {
+            env.metrics.record_conversation_writeback_miss();
+        }
+        if let Some(id) = response_id {
             if state.stream_first_id.is_none() {
                 state.stream_first_id = Some(id.clone());
             }
-            let _ = env.resp_scope.record_response_id(env.protocol, &id);
             state.conv_id = Some(id);
         }
         if let Some(m) = stream_model_of(v).filter(|m| !m.is_empty()) {
@@ -224,10 +206,10 @@ where
         if env.protocol.is_chat() && AuditHold::chat_finish_reason_present(v) {
             state.chat_finish_seen = true;
         }
-        // A-6/F-08：错误载荷帧即终端（顶层 `error` 且无 `choices`）——观测记
-        // `upstream_error`（区别于 `open_ended`）；本帧仍作终端帧透出，其后数据帧
-        // 由终端守卫丢弃，流末不再补 `[DONE]`。
-        if is_chat_error_terminal(env.protocol, v) && !state.terminator.terminal_sent() {
+        // A-6/F-08 + R5-04：上游错误即终端（Chat 顶层 `error` 无 `choices`；Anthropic
+        // `type:"error"`）——观测记 `upstream_error`（区别于 `open_ended`）；本帧仍作
+        // 终端帧透出，其后数据帧由终端守卫丢弃，流末不再补合成终端。
+        if is_upstream_error_terminal(env.protocol, v) && !state.terminator.terminal_sent() {
             let _ = set_truncated(
                 &mut state.meta,
                 env.protocol,
@@ -326,6 +308,7 @@ where
                         &fid,
                         err_obj.as_ref().map(|(v, _)| v),
                         err_obj.as_ref().and_then(|(_, s)| *s),
+                        state.stream_model.as_deref().unwrap_or(""),
                     )
                 {
                     for f in frames {
@@ -606,19 +589,10 @@ where
                 state.hold.release_audited();
             }
             if let Some(reason) = &reject_reason {
-                if apply_reject_block(
-                    state,
-                    env,
-                    v,
-                    reason,
-                    is_tool_event
-                        || AuditHold::is_audit_due_event(env.protocol, v)
-                        || AuditHold::is_index_complete_event(v),
-                )
-                .await
-                {
-                    return EventFlow::Next;
-                }
+                // R5-26：拒绝即消费——阻断入口恒消费触发帧，调用点无条件早返回，
+                // 不落正常还原/放行路径（structurally 保证，不依赖 reject_reason 门控）。
+                apply_reject_block(state, env, v, reason).await;
+                return EventFlow::Next;
             } else if AuditHold::is_complete_event(v) && !approve_held {
                 state.hold.mark_completed();
             }
@@ -675,6 +649,13 @@ where
                         &spans,
                     )
                     .await;
+                // R5-14/D5：响应侧新检出注册遇熵源/内部故障 fail-closed——不将未 token 化
+                // 的明文帧下发；复用阻断臂（reason 不含明文/键/头值）产出协议正确阻断帧，
+                // 粘滞拒绝态令后续帧继续被抑制（不引入第二套终端机制）。
+                if env.resp_scope.pii_unavailable() {
+                    apply_reject_block(state, env, v, "pii-unavailable").await;
+                    return EventFlow::Next;
+                }
                 let parsed_opt = (cleaned == ev.data).then_some(parsed.as_ref()).flatten();
                 emit_restored_json_frame(
                     &mut FrameSink {
@@ -708,7 +689,7 @@ where
                 if state.hold.account_pending_frame(pending_bytes)
                     == crate::service::audit::HoldVerdict::Rejected
                 {
-                    let _ = apply_reject_block(state, env, v, "audit-hold-overflow", true).await;
+                    apply_reject_block(state, env, v, "audit-hold-overflow").await;
                     return EventFlow::Next;
                 }
                 state
@@ -741,6 +722,11 @@ where
                     &spans,
                 )
                 .await;
+            // R5-14/D5：非 JSON 帧同口径 fail-closed——不将未 token 化的明文下发。
+            if env.resp_scope.pii_unavailable() {
+                apply_reject_block(state, env, &serde_json::Value::Null, "pii-unavailable").await;
+                return EventFlow::Next;
+            }
             let prefix = envelope_prefix(ev);
             feed_output_frame(
                 &mut state.prefix_hold,
@@ -758,7 +744,13 @@ where
         // 真空流保持 open-ended，见 C8）。
         return EventFlow::Next;
     } else {
-        // `[DONE]`（含 BOM 前缀）：恰一终止帧，多余去重。
+        // R5-01/D2：`data: [DONE]` 仅 Chat 为终端标记（`spec().done_terminator`）；非 Chat
+        // 视为**非事件**——不置终端、不透出，交既有中途断流/真空流合成产出协议正确的
+        // 恰一终端（下游不再出现 `[DONE]`，`add_sse_event` 不再计该帧，属已声明变更）。
+        if env.protocol.spec().done_terminator.is_none() {
+            return EventFlow::Next;
+        }
+        // Chat：恰一终止帧，多余去重。
         // 滞留帧先于终止帧放行（保序：滞留内容属于终止前的数据）。
         if state.terminator.terminal_sent() {
             return EventFlow::Next;

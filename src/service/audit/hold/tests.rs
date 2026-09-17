@@ -622,6 +622,56 @@ fn responses_dedup_keeps_audit_verdict() {
 }
 
 #[test]
+fn r5_17_sequence_extreme_saturates_no_panic_no_key_reuse() {
+    // R5-17/D12：`seq_no == u64::MAX` 极值入参分支——游标与字节均饱和，
+    // 不 panic、不回绕、不复用既有 `BTreeMap` 键。
+    let mut hold = AuditHold::new(1024);
+    let key = AuditHold::responses_key(Some("item-max"), 0);
+    assert_eq!(
+        hold.push_responses_fragment(&key, 0, Some(u64::MAX), Some("item-max"), Some("run"), "a"),
+        HoldVerdict::Approved
+    );
+    {
+        let slot = hold.responses_slots.get(&key).expect("槽存在");
+        assert_eq!(slot.next_seq, u64::MAX, "极值入参后游标饱和不回绕");
+        assert_eq!(slot.frags.len(), 1, "不重复插入键");
+        assert!(slot.frags.contains_key(&u64::MAX));
+    }
+    // 无 seq 后续分片：游标保持饱和，落回既有极值键（Occupied 不覆盖），不回绕到 0。
+    assert_eq!(
+        hold.push_responses_fragment(&key, 0, None, None, None, "b"),
+        HoldVerdict::Approved
+    );
+    let slot = hold.responses_slots.get(&key).expect("槽存在");
+    assert_eq!(slot.next_seq, u64::MAX, "推进不得回绕为 0");
+    assert_eq!(slot.frags.len(), 1, "不得回绕复用键 0");
+    assert_eq!(hold.total_bytes, 1, "总字节不因回绕暴涨");
+}
+
+#[test]
+fn r5_17_byte_accounting_saturates_without_wrap() {
+    // R5-17：累计字节接近上界时饱和累加，无符号回绕为小值（否则超限判定误放行）。
+    let mut sat = AuditHold::new(1024);
+    sat.total_bytes = usize::MAX;
+    assert_eq!(
+        sat.push_fragment(0, None, None, "x"),
+        HoldVerdict::Rejected,
+        "饱和后仍超限，须 fail-closed 清仓"
+    );
+    assert!(sat.is_rejected());
+    assert_eq!(sat.total_bytes, 0, "清仓归零");
+    let mut resp = AuditHold::new(1024);
+    resp.total_bytes = usize::MAX;
+    let key = AuditHold::responses_key(Some("item-sat"), 0);
+    assert_eq!(
+        resp.push_responses_fragment(&key, 0, Some(0), None, None, "y"),
+        HoldVerdict::Rejected
+    );
+    assert!(resp.is_rejected());
+    assert_eq!(resp.total_bytes, 0);
+}
+
+#[test]
 fn hold_zero_byte_flood_bounded() {
     // STP-5/D6：零字节分片洪泛（不同 index）不增 `total_bytes`，
     // 条目数维度须独立 fail-closed 清仓，使内存有界。

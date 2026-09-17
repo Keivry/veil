@@ -116,25 +116,23 @@ fn has_placeholder_token_shape(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if text[i..].starts_with("__PII_") {
-            let rest = &text[i + 6..];
-            if let Some(us) = rest.find('_')
-                && rest[..us].bytes().all(|c| c.is_ascii_digit())
+        // R5-13：全程字节级匹配，绝不按字节下标切 `str`（中文等多字节字符不 panic）。
+        if bytes[i..].starts_with(b"__PII_") {
+            let rest = &bytes[i + 6..];
+            if let Some(us) = rest.iter().position(|b| *b == b'_')
                 && !rest[..us].is_empty()
+                && rest[..us].iter().all(|c| c.is_ascii_digit())
             {
                 let after = &rest[us + 1..];
-                if after.len() >= 10
-                    && is_hex8(&after.as_bytes()[..8])
-                    && after[8..].starts_with("__")
-                {
+                if after.len() >= 10 && is_hex8(&after[..8]) && after[8..].starts_with(b"__") {
                     return true;
                 }
             }
         }
-        if text[i..].starts_with("__VG_CRED_") {
-            let rest = &text[i + 10..];
-            let digits: usize = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
-            if digits > 0 && rest[digits..].starts_with("__") {
+        if bytes[i..].starts_with(b"__VG_CRED_") {
+            let rest = &bytes[i + 10..];
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits > 0 && rest[digits..].starts_with(b"__") {
                 return true;
             }
         }
@@ -743,5 +741,20 @@ mod tests {
                 "校验真源与 Matrix 门禁须同结论: {s:?}"
             );
         }
+    }
+
+    /// R5-13：字节级匹配——中文等多字节文案不 panic，且不误判为 token 形态。
+    #[test]
+    fn placeholder_shape_multibyte_no_panic() {
+        assert!(!has_placeholder_token_shape("请勿回显占位符说明文本"));
+        assert!(!has_placeholder_token_shape("中文__PII_"));
+        assert!(!has_placeholder_token_shape("中文 __PII_x__ 结尾"));
+        assert!(!has_placeholder_token_shape(&"占".repeat(2000)));
+        assert!(has_placeholder_token_shape("中文 __PII_1_ab12cd34__ 结尾"));
+        assert!(has_placeholder_token_shape("中文 __VG_CRED_42__ 结尾"));
+        assert!(has_placeholder_token_shape(&format!(
+            "{}__PII_1_ab12cd34__",
+            "占".repeat(2000)
+        )));
     }
 }

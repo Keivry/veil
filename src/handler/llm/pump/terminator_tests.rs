@@ -255,12 +255,17 @@ async fn stream_terminator_exact_one_terminal_matrix() {
 
     let anth_err =
         b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
-    let (_, frames, _m) = pump_ok(Protocol::Anthropic, anth_err, false).await;
+    let (_, frames, m) = pump_ok(Protocol::Anthropic, anth_err, false).await;
     assert_eq!(
         block_inject::terminal_count(&frames, "anthropic"),
         0,
         "Anthropic 上游 error 零合成终端帧: {}",
         frames.join("")
+    );
+    assert_eq!(
+        m.truncated_count("upstream_error"),
+        1,
+        "R5-04：Anthropic 上游 error 须记 upstream_error（非 None/open_ended）"
     );
 
     let resp_err = b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
@@ -289,28 +294,102 @@ fn stream_terminator_injection_idempotent() {
         assert!(!t.is_open(), "{kind:?} commit 后须闭合");
         assert!(
             matches!(
-                t.plan_block(Protocol::Chat, "audit-policy-block", None, 0, None, None),
+                t.plan_block(
+                    Protocol::Chat,
+                    "audit-policy-block",
+                    None,
+                    "",
+                    0,
+                    None,
+                    None
+                ),
                 TerminalPlan::None
             ),
             "{kind:?} 闭合后 plan_block 须 None"
         );
         assert!(
             matches!(
-                t.plan_midstream(Protocol::Chat, None, false, None, None),
+                t.plan_midstream(Protocol::Chat, None, "", false, None, None),
                 TerminalPlan::None
             ),
             "{kind:?} 闭合后 plan_midstream 须 None"
         );
         assert!(
-            matches!(t.plan_empty_stream("chat", "c"), TerminalPlan::None),
+            matches!(t.plan_empty_stream("chat", "c", ""), TerminalPlan::None),
             "{kind:?} 闭合后 plan_empty_stream 须 None"
         );
         assert!(
-            matches!(t.plan_responses_error("r", None, None), TerminalPlan::None),
+            matches!(
+                t.plan_responses_error("r", None, None, ""),
+                TerminalPlan::None
+            ),
             "{kind:?} 闭合后 plan_responses_error 须 None"
         );
         // 终态后重复 commit 为 no-op，不产生第二终端。
         t.commit(&mut meta, TerminalKind::Block, true, true);
         assert!(!t.is_open(), "{kind:?} 重复 commit 不得回退");
     }
+}
+
+#[tokio::test]
+async fn block_frames_echo_stream_model_and_conv() {
+    // R5-03/R5-39：泵内阻断帧回显流内 model 与会话 id（不得硬编码 unknown_model/blocked-0）。
+    let body = concat!(
+        "data: {\"id\":\"chatcmpl-echo\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-bad\",\"type\":\"function\",",
+        "\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"command\\\":\\\"rm -rf /\\\"}\"}}]}}]}\n\n",
+        "data: {\"id\":\"chatcmpl-echo\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,",
+        "\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    )
+    .as_bytes()
+    .to_vec();
+    let (outcome, frames, _m) = pump_ok(Protocol::Chat, body, true).await;
+    assert!(outcome.block_injected, "须阻断");
+    let joined = frames.join("");
+    assert!(
+        joined.contains("\"model\":\"gpt-4o\""),
+        "阻断帧须回显流内 model: {joined}"
+    );
+    assert!(
+        !joined.contains("\"model\":\"unknown_model\""),
+        "不得硬编码 unknown_model: {joined}"
+    );
+    assert!(
+        joined.contains("\"id\":\"chatcmpl-echo\""),
+        "阻断帧须回显会话 id: {joined}"
+    );
+    // R5-26：拒绝即消费——触发阻断的 tool 帧内容不得在阻断终端之后下行。
+    assert!(
+        !joined.contains("rm -rf /") && !joined.contains("\"name\":\"exec\""),
+        "触发帧内容不得透出: {joined}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_then_final_block_no_second_terminal_but_observable() {
+    // R5-35/D3：流已终端（Chat 错误帧）后收尾终审命中 Block——不注入第二终端，
+    // 但 block_injected 为真、terminal_injected 不变（观测语义保留）。
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"id\":\"call-late\",\"type\":\"function\",\"function\":{\"name\":\"exec\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"rm -rf /\\\"}\"}}]}}]}\n\n",
+        "data: {\"error\":{\"message\":\"boom\"}}\n\n",
+    )
+    .as_bytes()
+    .to_vec();
+    let (outcome, frames, _m) = pump_ok(Protocol::Chat, body, true).await;
+    let joined = frames.join("");
+    assert!(
+        outcome.block_injected,
+        "收尾命中 Block 须保留 block_injected: {joined}"
+    );
+    assert_eq!(
+        block_inject::terminal_count(&frames, "chat"),
+        0,
+        "已终端后不得注入第二终端: {joined}"
+    );
+    assert!(
+        !outcome.terminal_injected,
+        "不得置 terminal_injected（未下行第二终端）: {joined}"
+    );
 }

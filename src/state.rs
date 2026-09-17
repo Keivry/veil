@@ -189,9 +189,10 @@ impl AppState {
         } else {
             Arc::<[u8]>::from(&[][..])
         };
-        let previous_response_map = Arc::new(crate::service::redaction::PreviousResponseMap::new(
-            config.pii_scope_max_conversations,
-        ));
+        let previous_response_map = Arc::new(
+            crate::service::redaction::PreviousResponseMap::new(config.pii_prev_id_max_entries)
+                .with_metrics(gateway_metrics.clone()),
+        );
         Ok(Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),

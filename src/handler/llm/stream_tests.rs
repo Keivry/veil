@@ -632,7 +632,7 @@ async fn responses_incomplete_passthrough() {
 async fn sse_response_builder_headers_compliant() {
     let (_tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let pump = tokio::spawn(async { std::future::pending::<PumpOutcome>().await });
-    let resp = build_sse_response(rx, true, pump);
+    let resp = build_sse_response(rx, true, pump, StatusCode::OK);
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()

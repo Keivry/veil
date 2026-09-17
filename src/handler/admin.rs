@@ -352,7 +352,10 @@ pub async fn admin_index(
     with_admin_cookie(body, &headers, &state.config().observability_admin_token)
 }
 
-/// `GET /_admin/health`：存活探针（透出 sqlite 健康；豁免通用限流，见 `is_rate_exempt`）。
+/// `GET /_admin/health`：存活探针（透出 sqlite 健康）。
+/// 豁免通用限流的**真实实现**是本 handler 不调用 `admin::check_admin_rate`，故 health
+/// 请求不占通用限流桶；`admin::admin_rate_exempt_paths()`/`is_rate_exempt()` 仅为声明/
+/// 文档用途（下方 `debug_assert!` 在发布构建被剥离），不被生产路径消费。
 pub async fn admin_health(
     State(state): State<AppState>,
     addr: PeerIp,

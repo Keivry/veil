@@ -446,6 +446,7 @@ fn pii_scope_counters_zero_in_request_mode() {
     let _ = crate::handler::llm::dispatch::build_request_scope(
         &state,
         &headers,
+        crate::service::llm_gateway::Protocol::Chat,
         "https://up.example.com/v1",
         Some(&body),
     );
@@ -511,6 +512,7 @@ fn conversation_key_not_logged() {
         let scope = crate::handler::llm::dispatch::build_request_scope(
             &state,
             &headers,
+            crate::service::llm_gateway::Protocol::Responses,
             upstream,
             Some(&body),
         );
@@ -535,8 +537,17 @@ fn conversation_key_not_logged() {
     );
     let secret = state.conversation_secret.as_ref();
     let fp = tenant_fingerprint(secret, upstream, &[]);
-    let key = derive_conversation_key(secret, &fp, Some(header_value), None, None, None, None)
-        .expect("显式头须可推导会话键");
+    let key = derive_conversation_key(
+        secret,
+        &fp,
+        crate::service::llm_gateway::Protocol::Chat,
+        Some(header_value),
+        None,
+        None,
+        &serde_json::json!({}),
+        &state.previous_response_map,
+    )
+    .expect("显式头须可推导会话键");
     let lines = sink.lock().unwrap().clone();
     assert!(
         lines.iter().any(|l| l.contains("capture-active")),
@@ -548,5 +559,67 @@ fn conversation_key_not_logged() {
         assert!(!line.contains(&token), "日志不得含 token: {line}");
         assert!(!line.contains(key.as_str()), "日志不得含会话键: {line}");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn responses_scalar_input_falls_to_per_request_counted() {
+    // R5-06/D1：Responses 标量 input 落第 4 级逐请求并计 `request_fallback`；
+    // 数组 input 正常命中第 3 级、不产生回退。
+    let (state, dir) = test_state(Some("conversation"));
+    let headers = HeaderMap::new();
+    let upstream = "https://up.example.com/v1";
+    let scalar = serde_json::json!({
+        "tools": [{"name": "t"}],
+        "instructions": "be nice",
+        "input": "当前轮全文，随轮次增长",
+    });
+    let _ = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &headers,
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream,
+        Some(&scalar),
+    );
+    assert_eq!(
+        state.gateway_metrics.request_fallback_count(),
+        1,
+        "标量 input 须计回退"
+    );
+    assert_eq!(
+        state
+            .conversation_scope_store
+            .as_ref()
+            .expect("conversation 模式须构造存储")
+            .len(),
+        0,
+        "落第 4 级不得插入会话存储"
+    );
+    let array = serde_json::json!({
+        "tools": [{"name": "t"}],
+        "instructions": "be nice",
+        "input": [{"role": "user", "content": "hello"}],
+    });
+    let _ = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &headers,
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream,
+        Some(&array),
+    );
+    assert_eq!(
+        state.gateway_metrics.request_fallback_count(),
+        1,
+        "数组 input 不得回退"
+    );
+    assert_eq!(
+        state
+            .conversation_scope_store
+            .as_ref()
+            .expect("conversation 模式须构造存储")
+            .len(),
+        1,
+        "数组 input 须命中第 3 级并插入会话"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
