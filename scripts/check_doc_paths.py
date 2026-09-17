@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""文档源码/spec 路径与行号校验（veil-docs-contract-fix 1.3；veil-docs-contract-resync 3.1 扩展；
-veil-audit-r2-remediation 9.10 扩展行号引用；veil-audit-r3-remediation 7.4 降级措辞为行号范围校验）。
+"""文档源码/spec 路径、行号与符号校验（veil-docs-contract-fix 1.3；veil-docs-contract-resync 3.1 扩展；
+veil-audit-r2-remediation 9.10 扩展行号引用；veil-audit-r3-remediation 7.4 降级措辞为行号范围校验；
+veil-doc-symbol-anchor-guard 扩展 `::symbol` 末段标识符存在性校验）。
 
-扫描 README.md + openspec/**/*.md + scripts/*.md 中的 `src/...rs`、spec 路径与
-`path:line` 引用，断言每个路径引用对应磁盘上真实存在的文件、每个行号落在目标文件
-实际行数内；缺失/越界即非零退出。
+扫描 README.md + openspec/**/*.md + scripts/*.md 中的 `src/...rs`、spec 路径、
+`path:line` 与 `文件::符号` 引用，断言每个路径引用对应磁盘上真实存在的文件、每个行号
+落在目标文件实际行数内、每个符号引用的末段标识符在目标文件（或门面模块子树）内出现；
+缺失/越界/符号不存在即非零退出。
 
-校验范围声明：本脚本仅做行号**范围**校验（路径存在 + `1 <= start <= end <= 行数`），
-SHALL NOT 校验被引行的内容与文档语义；被引行内容与文档语义的一致性由 code review 保证。
+校验范围声明：本脚本做**结构**校验（路径存在 + `1 <= start <= end <= 行数` + 符号末段
+标识符存在），SHALL NOT 校验被引行内容、符号可见性/签名或文档叙述语义；被引内容与
+文档语义的一致性由 code review 保证。符号解析为启发式：目标为门面模块（`X.rs` 与
+`X/` 目录并存）时在模块子树 `X/**/*.rs` 内解析，以覆盖 `pub use <子模块>::*` 重导出。
 升级触发条件：若同类内容漂移再现，改为登记式语义锚点表（`(源文件, 引用原文) → 期望正则`，
 仅登记关键锚点）。
 
@@ -16,7 +20,10 @@ SHALL NOT 校验被引行的内容与文档语义；被引行内容与文档语�
   不参与存在性断言。
 - 含 `<!-- doc-paths-ignore -->` 的行整行跳过：用于故意举例过期路径
   的行（如 change spec 中 stale-path 反例）。
-- `src/` 引用：匹配 `src/...rs`；`::Symbol` / `:行号` 后缀自动剥离。
+- `src/` 引用：匹配 `src/...rs`；`::Symbol` / `:行号` 后缀自动剥离（符号与行号各走
+  独立通道校验，见下条；符号引用的路径部分同时计入本通道计数）。
+- `文件::符号` 引用：取末段标识符在目标文件内做标识符存在性断言；目标为门面模块
+  （`X.rs` 与 `X/` 并存）时回退到模块子树 `X/**/*.rs`；解析失败非零退出。
 - spec 引用：匹配 canonical `openspec/specs/<capability>/spec.md` 与
   change-local `openspec/changes/<change>/specs/<capability>/spec.md`
   两种完整路径形态，输出报告各自校验计数。
@@ -35,10 +42,11 @@ SHALL NOT 校验被引行的内容与文档语义；被引行内容与文档语�
   对现行源码做在界断言无判定意义（canonical docs-test-parity「指向冻结归档语料的
   引用 SHALL NOT 被回改」），故整体豁免行号在界断言并按处数打印
   「归档文档行号引用 N 处未校验」；其 `src/...rs` 路径存在性仍照常校验
-  （悬空引用须按 PENDING_REFS 逐项登记）。
+  （悬空引用须按 PENDING_REFS 逐项登记）。`::Symbol` 引用同为冻结快照，
+  整体豁免存在性断言并按处数打印「归档文档符号引用 N 处未校验」。
 
 用法：`python3 scripts/check_doc_paths.py`（仓库根目录执行）。
-自测：`python3 scripts/check_doc_paths.py --self-test`（校验越界行号可被检出）。
+自测：`python3 scripts/check_doc_paths.py --self-test`（校验越界行号与缺失符号可被检出）。
 """
 from __future__ import annotations
 
@@ -51,6 +59,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SCAN_DIRS = [ROOT / "README.md", ROOT / "openspec", ROOT / "scripts"]
 
 SRC_REF_RE = re.compile(r"src/[A-Za-z0-9_./-]+\.rs")
+SYMBOL_REF_RE = re.compile(
+    r"(src/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)"
+)
 SPEC_REF_RE = re.compile(
     r"openspec/(?:changes/[A-Za-z0-9_.-]+/specs/[A-Za-z0-9_.-]+|specs/[A-Za-z0-9_.-]+)/spec\.md"
 )
@@ -267,6 +278,50 @@ def line_refs_in_file(path: Path) -> list[tuple[int, str, int, int]]:
     return out
 
 
+def symbol_refs_in_file(path: Path) -> list[tuple[int, str, str]]:
+    out: list[tuple[int, str, str]] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if IGNORE_MARKER in line:
+            continue
+        line = ERRATUM_RE.sub("", line)
+        for m in SYMBOL_REF_RE.finditer(line):
+            if "..." in m.group(1):  # 占位省略写法（如 `src/...rs::Sym`），非真实引用
+                continue
+            out.append((lineno, m.group(1), m.group(2)))
+    return out
+
+
+def symbol_exists(target_path: Path, symbol: str) -> bool:
+    """末段标识符在目标文件内出现，或在门面模块子树（同名目录 `**/*.rs`）内出现。"""
+    ident = symbol.split("::")[-1]
+    pattern = re.compile(r"\b" + re.escape(ident) + r"\b")
+    if pattern.search(target_path.read_text(encoding="utf-8")):
+        return True
+    module_dir = target_path.with_suffix("")
+    if module_dir.is_dir():
+        for sub in sorted(module_dir.rglob("*.rs")):
+            if pattern.search(sub.read_text(encoding="utf-8")):
+                return True
+    return False
+
+
+def collect_symbol_violations(
+    rel: str,
+    lineno: int,
+    target: str,
+    symbol: str,
+    violations: list[str],
+    base: Path = ROOT,
+) -> None:
+    """校验 `target::symbol` 末段标识符存在性；目标文件缺失时交由路径校验处理。"""
+    target_path = base / target
+    if not target_path.is_file():
+        return
+    if symbol_exists(target_path, symbol):
+        return
+    violations.append(f"{rel}:{lineno}: {target}::{symbol}")
+
+
 def collect_missing(rel: str, lineno: int, ref: str, missing: list[str], pending: list[str]) -> None:
     if (ROOT / ref).is_file():
         return
@@ -313,10 +368,13 @@ def main() -> int:
     pending: list[str] = []
     line_violations: list[str] = []
     line_pending: list[str] = []
+    symbol_violations: list[str] = []
     src_checked = 0
     spec_checked = 0
     line_checked = 0
+    symbol_checked = 0
     archived_line_refs = 0
+    archived_symbol_refs = 0
     for path in targets:
         rel = path.relative_to(ROOT).as_posix()
         for lineno, ref in refs_in_file(path, SRC_REF_RE):
@@ -333,21 +391,28 @@ def main() -> int:
             collect_line_violations(
                 rel, lineno, target, start, end, line_violations, line_pending
             )
+        for lineno, target, symbol in symbol_refs_in_file(path):
+            if is_archived_doc(rel):
+                archived_symbol_refs += 1
+                continue
+            symbol_checked += 1
+            collect_symbol_violations(rel, lineno, target, symbol, symbol_violations)
     print(
         f"计数：src/*.rs 引用 {src_checked} 处；spec 引用 {spec_checked} 处；"
-        f"行号引用 {line_checked} 处"
+        f"行号引用 {line_checked} 处；符号引用 {symbol_checked} 处"
         f"（其中登记 PENDING {len(pending) + len(line_pending)} 处："
         f"路径 {len(pending)}、行号 {len(line_pending)}）。"
     )
     print(
         f"归档 change 文档行号引用 {archived_line_refs} 处未校验"
-        f"（行号冻结快照，路径存在性仍校验）。"
+        f"（行号冻结快照，路径存在性仍校验）；"
+        f"归档 change 文档符号引用 {archived_symbol_refs} 处未校验（符号冻结快照）。"
     )
     for item in pending:
         print(f"PENDING: {item}")
     for item in line_pending:
         print(f"PENDING(line): {item}")
-    if missing or line_violations:
+    if missing or line_violations or symbol_violations:
         if missing:
             print(f"FAIL: {len(missing)} 个文档路径不存在：")
             for item in missing:
@@ -356,16 +421,20 @@ def main() -> int:
             print(f"FAIL: {len(line_violations)} 个行号引用越界：")
             for item in line_violations:
                 print(f"  {item}")
+        if symbol_violations:
+            print(f"FAIL: {len(symbol_violations)} 个符号引用不存在：")
+            for item in symbol_violations:
+                print(f"  {item}")
         return 1
     print(
-        f"OK: {src_checked} 处 src/*.rs 引用、{spec_checked} 处 spec 引用与 "
-        f"{line_checked} 处行号引用全部通过。"
+        f"OK: {src_checked} 处 src/*.rs 引用、{spec_checked} 处 spec 引用、"
+        f"{line_checked} 处行号引用与 {symbol_checked} 处符号引用全部通过。"
     )
     return 0
 
 
 def self_test() -> int:
-    """行号校验自测：越界检出、合法放行（含 start-end 形态）、归档目录判定。"""
+    """结构校验自测：行号越界检出、符号存在性（直接/门面子树/缺失/缺文件）、归档目录判定。"""
     if is_archived_doc("openspec/changes/veil-audit-r3-remediation/tasks.md") or not is_archived_doc(
         "openspec/changes/archive/2026-09-11-x/tasks.md"
     ):
@@ -392,7 +461,33 @@ def self_test() -> int:
         if len(violations_rev) != 1:
             print("self-test FAIL：逆序区间未被检出")
             return 1
-    print("self-test OK：越界/逆序行号可检出，合法区间放行，归档目录判定正确")
+        (base / "f.rs").write_text("pub use inner_mod::*;\n", encoding="utf-8")
+        (base / "f").mkdir(exist_ok=True)
+        (base / "f" / "inner_mod.rs").write_text("pub fn routed() {}\n", encoding="utf-8")
+        sym_direct: list[str] = []
+        collect_symbol_violations("doc.md", 1, "f.rs", "inner_mod", sym_direct, base=base)
+        if sym_direct:
+            print("self-test FAIL：门面文件内符号被误报")
+            return 1
+        sym_routed: list[str] = []
+        collect_symbol_violations("doc.md", 1, "f.rs", "routed", sym_routed, base=base)
+        if sym_routed:
+            print("self-test FAIL：门面子树符号被误报")
+            return 1
+        sym_missing: list[str] = []
+        collect_symbol_violations("doc.md", 1, "f.rs", "missing_sym", sym_missing, base=base)
+        if len(sym_missing) != 1:
+            print("self-test FAIL：缺失符号未被检出")
+            return 1
+        sym_absent_file: list[str] = []
+        collect_symbol_violations("doc.md", 1, "nope.rs", "x", sym_absent_file, base=base)
+        if sym_absent_file:
+            print("self-test FAIL：缺失文件应由路径通道处理，符号通道不得重复报错")
+            return 1
+    print(
+        "self-test OK：越界/逆序行号与缺失符号可检出，合法区间与门面符号放行，"
+        "归档目录判定正确"
+    )
     return 0
 
 

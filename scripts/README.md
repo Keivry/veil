@@ -27,15 +27,18 @@
   版本指令明确报错并非零退出，fail-closed），脚本 **SHALL NOT** 增加版本字符串比较。
   跳过语义：缺 venv/SDK/Go 默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与
   `GATE_SKIP_GO=1`（第 7 步）为显式跳过并打印跳过理由（不静默）。文档口径见 README §8.5。
-- `check_doc_paths.py` — 文档源码/spec 路径与行号校验（`veil-docs-contract-fix` 1.3；
+- `check_doc_paths.py` — 文档源码/spec 路径、行号与符号校验（`veil-docs-contract-fix` 1.3；
   `veil-docs-contract-resync` 3.1 扩展 spec 引用；`veil-audit-r2-remediation` 9.10 扩展行号引用；
-  `veil-audit-r3-remediation` 7.4 降级措辞为行号范围校验（存在性 + 在界内）——
-  被引行内容与文档语义的一致性由 code review 保证，脚本不校验）：
+  `veil-audit-r3-remediation` 7.4 降级措辞为行号范围校验（存在性 + 在界内）；
+  `veil-doc-symbol-anchor-guard` 扩展 `::symbol` 末段标识符存在性校验——
+  被引行内容、符号可见性/签名与文档语义的一致性由 code review 保证，脚本不校验，只做结构校验）：
   扫描 `README.md` + `openspec/**/*.md` + `scripts/*.md` 的 `src/...rs` 与 spec 完整路径引用并断言
-  存在，另解析 `path:line` / `path:start-end` 引用并校验行号落在目标文件实际行数内，任一缺失/越界即非零退出；
-  勘误注内旧路径与 `<!-- doc-paths-ignore -->` 行自动跳过。
-  归档 change 目录（`openspec/changes/archive/**`）的行号引用为归档时刻冻结快照，整体豁免行号在界
-  校验并按处数打印 `归档文档行号引用 N 处未校验`；其 `src/...rs` 路径存在性仍校验（悬空须按 `PENDING_REFS` 登记）。
+  存在，解析 `path:line` / `path:start-end` 引用并校验行号落在目标文件实际行数内，另解析
+  `文件::符号` 引用并校验末段标识符在目标文件或门面模块子树（`X.rs` 与 `X/` 目录并存时取 `X/**/*.rs`）
+  内出现，任一缺失/越界/符号不存在即非零退出；勘误注内旧路径与 `<!-- doc-paths-ignore -->` 行自动跳过。
+  归档 change 目录（`openspec/changes/archive/**`）的行号与符号引用均为归档时刻冻结快照，整体豁免
+  对应断言并按处数打印（`归档文档行号引用 N 处未校验` / `归档文档符号引用 N 处未校验`）；其
+  `src/...rs` 路径存在性仍校验（悬空须按 `PENDING_REFS` 登记）。
   `PENDING_REFS` 例外机制：仅登记**历史/情景性悬空引用**（其他 change 目录、已归档 change、
   canonical 中的旧 change-local 路径），键为精确「源文件相对路径 + 引用原文」组合并附登记理由；
   命中即打印 `PENDING` 且**不算失败**（可复核的例外名单，脚本内 `PENDING_REFS` 即权威来源）。
