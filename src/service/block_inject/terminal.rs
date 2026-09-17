@@ -20,6 +20,9 @@ pub fn normalize_chat_done(frames: Vec<String>) -> Vec<String> {
     kept
 }
 
+/// R7-07：仅测试引用的终端去重 helper，`#[cfg(test)]` 收编（与 `terminal_count`
+/// 同口径）；门面 glob 重导出随 `cfg` 自动收窄，非 test 构建不暴露。
+#[cfg(test)]
 pub fn dedupe_terminal_frames(frames: Vec<String>, protocol: &str) -> Vec<String> {
     match protocol {
         "chat" => normalize_chat_done(frames),
@@ -71,4 +74,6 @@ pub(crate) fn terminal_count(frames: &[String], protocol: &str) -> usize {
 }
 
 /// DONE 行级计数（D6 行级）：逐帧按行精确匹配裸终止行（载荷内同串不误计）。
+/// R7-07：仅测试引用，`#[cfg(test)]` 收编（与 `terminal_count` 同口径）。
+#[cfg(test)]
 pub fn count_done(frames: &[String]) -> usize { frames.iter().filter(|f| is_done_frame(f)).count() }

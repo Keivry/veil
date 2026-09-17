@@ -303,14 +303,16 @@ where
                 // I-5 逐帧成功下行记 `add_sse_event`（BLOCKER-1，不得增删）。
                 // D9/S9：合成 failed 帧 send 成功才置位终端，下游早断不撒谎。
                 let mut terminal_ok = false;
-                if let TerminalPlan::Frames { kind, frames, .. } =
-                    state.terminator.plan_responses_error(
-                        &fid,
-                        err_obj.as_ref().map(|(v, _)| v),
-                        err_obj.as_ref().and_then(|(_, s)| *s),
-                        state.stream_model.as_deref().unwrap_or(""),
-                    )
-                {
+                if let TerminalPlan::Frames {
+                    kind,
+                    frames,
+                    truncated,
+                } = state.terminator.plan_responses_error(
+                    &fid,
+                    err_obj.as_ref().map(|(v, _)| v),
+                    err_obj.as_ref().and_then(|(_, s)| *s),
+                    state.stream_model.as_deref().unwrap_or(""),
+                ) {
                     for f in frames {
                         if env.pump_tx.send(f).await.is_err() {
                             break;
@@ -325,6 +327,13 @@ where
                     state
                         .terminator
                         .commit(&mut state.meta, kind, terminal_ok, terminal_ok);
+                    // R7-03/D3：观测与终端帧位解耦——`commit` 后无条件落截断观测
+                    //（下游早断时观测仍落，不低于一次）；`set_truncated` 自带
+                    // Responses-only 守卫，调用点不重复协议门控。
+                    if let Some(mode) = truncated {
+                        let _ =
+                            set_truncated(&mut state.meta, env.protocol, mode, Some(&env.metrics));
+                    }
                 }
                 // BLOCKER-3：无帧也可终止循环（对齐旧 `event_loop.rs:341` 无条件置
                 // `terminated`）；`ResponsesAction::DuplicateFailed` 仅调本方法。
@@ -415,6 +424,13 @@ where
                                 }
                                 audit::AuditVerdict::Allow => {}
                             }
+                        }
+                        // R7-01/D1：pending 槽经完整 verdict 通道评估后释放（Allow 与
+                        // NeedApproval 均算已判定），使终端 pending 循环自然 no-op、
+                        // 同一槽 SHALL NOT 被二次审计；Block 早退已由 `mark_rejected()`
+                        // 清仓，无需释放。
+                        if reject_reason.is_none() {
+                            state.hold.release_pending_audited();
                         }
                     }
                     if reject_reason.is_none() {

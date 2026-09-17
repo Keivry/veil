@@ -173,8 +173,11 @@ fn empty_stream_yields_zero_events_without_breaking_chain() {
     assert!(events.is_empty(), "空输入应零事件");
     let tail = parser.residual_json_aware();
     assert!(tail.is_empty(), "空流残余应为空");
-    let norm = veil::service::block_inject::dedupe_terminal_frames(vec![], "chat");
-    assert_eq!(veil::service::block_inject::count_done(&norm), 1);
+    // R7-07：`dedupe_terminal_frames`/`count_done` 已随仅测试引用收编为
+    // `#[cfg(test)]`（集成测试以非 cfg(test) 链接本库、不可见），chat 空流
+    // 恰一 `[DONE]` 归一语义改由生产入口 `empty_stream_frames_modeled` 断言。
+    let norm = veil::service::block_inject::empty_stream_frames_modeled("chat", "empty-stream", "");
+    assert_eq!(norm, vec!["data: [DONE]\n\n".to_string()]);
 }
 
 #[test]

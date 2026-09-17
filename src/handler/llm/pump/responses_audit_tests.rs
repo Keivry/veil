@@ -8,7 +8,7 @@ use crate::{
         pump::StreamPumpCtx,
         stream_tests::{collect_pump, fresh_arcs, loopback_server},
     },
-    service::{block_inject, llm_gateway::Protocol},
+    service::{audit::test_whitelist, block_inject, llm_gateway::Protocol},
 };
 
 /// Block 模式 + 零边界缝窗：隔离审计缓冲行为，帧即时入 `agg`，断言确定。
@@ -21,11 +21,34 @@ fn block_ctx() -> StreamPumpCtx {
     ctx
 }
 
+/// Approve 模式 + 非空白名单：危险 pending 槽经完整 verdict 通道建单（不阻断）。
+fn approve_ctx() -> StreamPumpCtx {
+    let (scope, vault, detector) = fresh_arcs();
+    let mut ctx =
+        crate::handler::llm::stream_tests::pump_ctx(Protocol::Responses, scope, vault, detector);
+    ctx.req.audit_mode = AuditMode::Approve;
+    ctx.req.approval_whitelist = test_whitelist().to_vec();
+    ctx.pii_boundary_chars = 0;
+    ctx
+}
+
 async fn run(sse: &'static [u8]) -> (crate::handler::llm::pump::PumpOutcome, Vec<String>) {
     let (url, server) = loopback_server(200, "text/event-stream", sse.to_vec()).await;
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let out = collect_pump(upstream, block_ctx()).await;
+    server.abort();
+    out
+}
+
+async fn run_ctx(
+    sse: &'static [u8],
+    ctx: StreamPumpCtx,
+) -> (crate::handler::llm::pump::PumpOutcome, Vec<String>) {
+    let (url, server) = loopback_server(200, "text/event-stream", sse.to_vec()).await;
+    let client = reqwest::Client::new();
+    let upstream = client.get(&url).send().await.expect("回环上游须可达");
+    let out = collect_pump(upstream, ctx).await;
     server.abort();
     out
 }
@@ -369,5 +392,118 @@ data: {"type":"error","code":"server_error","message":"boom","sequence_number":6
         vec![9, 6],
         "error 自带序号须原样沿用（不按 cursor+1 重编号）: {}",
         frames.join("")
+    );
+}
+
+#[tokio::test]
+async fn responses_pending_audited_exactly_once() {
+    // R7-01/D1：清理完成（发全局完成）流中 pending 槽恰审计一次——全局完成臂审计后
+    // 释放、终端 pending 循环 no-op（无重复建单、无二次评估、阻断终端恰一）。
+    let sse = br#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":1,"item":{"type":"function_call","id":"call-1","name":"run","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"-rf /\"}"}
+
+data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}
+
+"#;
+    // ① approve：危险 pending 槽经全局完成臂 NeedApproval 建单恰一、审计事件恰一。
+    let ctx = approve_ctx();
+    let sink = ctx.req.audit_sink.clone();
+    let pending = ctx.req.pending.clone();
+    let (outcome, frames) = run_ctx(sse, ctx).await;
+    assert!(!outcome.block_injected, "approve 命中不阻断: {frames:?}");
+    assert_eq!(pending.len(), 1, "危险 pending 槽须恰建单一条");
+    assert!(
+        pending.get("audit-hold-0-run").is_some(),
+        "建单键须含槽 index 与工具名"
+    );
+    let events = sink.admin().query_events(Some("audit"), None, 20);
+    assert_eq!(
+        events.len(),
+        1,
+        "pending 槽恰审计一次（终端循环 no-op）: {events:?}"
+    );
+
+    // ② block：危险 pending 槽经全局完成臂阻断，阻断终端恰一、审计事件恰一。
+    let ctx = block_ctx();
+    let sink = ctx.req.audit_sink.clone();
+    let (outcome, frames) = run_ctx(sse, ctx).await;
+    assert!(outcome.block_injected, "危险 pending 槽须阻断: {frames:?}");
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "阻断终端恰一: {frames:?}"
+    );
+    let joined = frames.join("");
+    assert!(!joined.contains("rm -rf"), "危险明文不得到达下游: {joined}");
+    let events = sink.admin().query_events(Some("audit"), None, 20);
+    assert_eq!(
+        events.len(),
+        1,
+        "pending 槽恰审计一次（无二次评估）: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn responses_pending_blocked_on_truncation() {
+    // R7-01/D1：未发全局完成的截断流中，pending 槽在终端被最终审计并 Block——
+    // 危险明文不透出、blocked_index 取该槽自身 output_index、阻断终端恰一。
+    let ctx = block_ctx();
+    let sink = ctx.req.audit_sink.clone();
+    let sse = br#"data: {"type":"response.function_call_arguments.delta","item_id":"call-3","output_index":3,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-3","output_index":3,"delta":"-rf /\"}"}
+
+"#;
+    let (outcome, frames) = run_ctx(sse, ctx).await;
+    assert!(
+        outcome.block_injected,
+        "截断危险 pending 槽须阻断: {frames:?}"
+    );
+    assert_eq!(
+        outcome.blocked_index,
+        Some(3),
+        "blocked_index 须取该槽自身 output_index"
+    );
+    let joined = frames.join("");
+    assert!(!joined.contains("rm -rf"), "危险明文不得到达下游: {joined}");
+    assert!(
+        !joined.contains("call-3"),
+        "危险 item id 不得透传: {joined}"
+    );
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "阻断终端恰一: {joined}"
+    );
+    let blocks = sink
+        .admin()
+        .query_events(Some("audit"), None, 20)
+        .into_iter()
+        .filter(|e| e.summary.starts_with("block "))
+        .count();
+    assert_eq!(blocks, 1, "终端 pending 槽恰审计一次: {joined}");
+
+    // approve 模式对照：同类截断流命中 NeedApproval——恰建单一次（不重复）。
+    let ctx = approve_ctx();
+    let pending = ctx.req.pending.clone();
+    let sink = ctx.req.audit_sink.clone();
+    let (_outcome, _frames) = run_ctx(sse, ctx).await;
+    assert_eq!(pending.len(), 1, "截断 pending 槽须恰建单一次");
+    // 恰一次加固（Oracle 复审）：`PendingApprovals` 按 key 去重会掩盖双审，
+    // 故同时断言 verdict 事件数恰 1（`record_verdict` 每评估必推一条事件）；
+    // 截断通知事件 `truncated unfinished tool` 非 verdict，按同前缀排除
+    // （与上方 block 路径 `starts_with("block ")` 同法）。
+    let approve_events = sink
+        .admin()
+        .query_events(Some("audit"), None, 20)
+        .into_iter()
+        .filter(|e| !e.summary.starts_with("truncated unfinished tool"))
+        .count();
+    assert_eq!(
+        approve_events, 1,
+        "截断 pending 槽经终端恰审计一次（事件计数不因同键去重而掩盖）"
     );
 }

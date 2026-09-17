@@ -94,6 +94,8 @@ pub struct PumpOutcome {
     pub block_injected: bool,
     /// 终止标记是否落到 `StreamMeta`（`terminal_injected`）。
     pub terminal_injected: bool,
+    /// 终端最终审计命中 `Block` 的 triple `output_index`（未命中为 `None`）。
+    pub blocked_index: Option<u32>,
 }
 
 pub use {

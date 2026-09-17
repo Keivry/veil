@@ -442,6 +442,27 @@ impl AuditHold {
         self.responses_slots.retain(|_, slot| !slot.done_seen);
     }
 
+    /// R7-01/D1 释放入口：全局完成臂对 pending 槽完成 verdict 评估（Allow 或
+    /// `NeedApproval` 建单，均算已判定）且未 `Block` 后调用——移除全部 `!done_seen`
+    /// 的 Responses 槽，并按 [`ResponsesSlot::held_bytes`] 以饱和算术归还
+    /// `total_bytes`（口径与 [`AuditHold::release_audited`] 一致），使终端 pending
+    /// 循环在**无截断的清理完成**流上自然 no-op、同一槽 SHALL NOT 被二次审计。
+    /// 不触碰 done 槽与 `args_by_index`；拒绝态 fail-closed 不释放
+    /// （`mark_rejected()` 已清仓）。
+    pub fn release_pending_audited(&mut self) {
+        if self.rejected {
+            return;
+        }
+        let released: usize = self
+            .responses_slots
+            .values()
+            .filter(|slot| !slot.done_seen)
+            .map(ResponsesSlot::held_bytes)
+            .sum();
+        self.total_bytes = self.total_bytes.saturating_sub(released);
+        self.responses_slots.retain(|_, slot| slot.done_seen);
+    }
+
     pub fn is_rejected(&self) -> bool { self.rejected }
 
     #[cfg(test)]

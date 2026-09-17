@@ -17,7 +17,10 @@ fn prefix_body() -> serde_json::Value {
     json!({
         "tools": [{"type": "function", "function": {"name": "alpha"}}],
         "system": "you are helpful",
-        "messages": [{"role": "user", "content": "hello"}],
+        "messages": [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hello"}
+        ],
     })
 }
 
@@ -180,7 +183,8 @@ fn conversation_key_native_keys_protocol_whitelist() {
 
 #[test]
 fn conversation_key_prefix_fields_protocol_whitelist() {
-    // R5-07/D1：Chat 用 messages/system；Responses 用 input/instructions。
+    // R5-07/D1 + R7-04：Chat 仅 messages；Anthropic 顶层 system 优先、否则 messages；
+    // Responses 用 input/instructions。
     let chat_body = json!({
         "tools": [{"name": "t"}],
         "instructions": "be nice",
@@ -193,6 +197,76 @@ fn conversation_key_prefix_fields_protocol_whitelist() {
     assert!(
         stable_prefix_key(SECRET, TENANT, Protocol::Responses, &chat_body).is_none(),
         "Responses 的 messages MUST NOT 作首个 user turn（缺 input）"
+    );
+    // R7-04 正例：Anthropic 顶层 system 参与且优先于 messages 首条。
+    let anth_top = json!({
+        "tools": [{"name": "t"}],
+        "system": "NATIVE",
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"}
+        ],
+    });
+    let anth_key = stable_prefix_key(SECRET, TENANT, Protocol::Anthropic, &anth_top)
+        .expect("Anthropic 顶层 system 须命中第 3 级");
+    let anth_no_top = json!({
+        "tools": [{"name": "t"}],
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"}
+        ],
+    });
+    assert_ne!(
+        anth_key,
+        stable_prefix_key(SECRET, TENANT, Protocol::Anthropic, &anth_no_top).unwrap(),
+        "Anthropic 顶层 system 须优先于 messages 首条"
+    );
+    let anth_other = json!({
+        "tools": [{"name": "t"}],
+        "system": "OTHER",
+        "messages": [{"role": "user", "content": "u"}],
+    });
+    assert_ne!(
+        anth_key,
+        stable_prefix_key(SECRET, TENANT, Protocol::Anthropic, &anth_other).unwrap(),
+        "Anthropic 顶层 system 内容参与稳定前缀"
+    );
+    // R7-04 反例：Chat 顶层 system 不参与第 3 级——与省略时同键。
+    let chat_top = json!({
+        "tools": [{"name": "t"}],
+        "system": "TOP",
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"}
+        ],
+    });
+    assert_eq!(
+        stable_prefix_key(SECRET, TENANT, Protocol::Chat, &chat_top),
+        stable_prefix_key(SECRET, TENANT, Protocol::Chat, &chat_body),
+        "Chat 顶层 system MUST NOT 影响第 3 级结果"
+    );
+    let chat_only_user = json!({
+        "tools": [{"name": "t"}],
+        "system": "TOP",
+        "messages": [{"role": "user", "content": "u"}],
+    });
+    assert!(
+        stable_prefix_key(SECRET, TENANT, Protocol::Chat, &chat_only_user).is_none(),
+        "Chat 顶层 system MUST NOT 作 system 来源"
+    );
+    assert!(
+        derive_conversation_key(
+            SECRET,
+            TENANT,
+            Protocol::Chat,
+            None,
+            None,
+            None,
+            &chat_only_user,
+            &PreviousResponseMap::new(1),
+        )
+        .is_none(),
+        "Chat 顶层 system 不命中第 3 级须落第 4 级"
     );
 }
 
@@ -284,12 +358,18 @@ fn conversation_key_stable_prefix_deterministic() {
     let a = json!({
         "system": "s",
         "tools": [{"name": "beta"}, {"name": "alpha"}],
-        "messages": [{"role": "user", "content": "u"}],
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"}
+        ],
         "model": "m",
     });
     let b = json!({
         "model": "m",
-        "messages": [{"role": "user", "content": "u"}],
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"}
+        ],
         "tools": [{"name": "alpha"}, {"name": "beta"}],
         "system": "s",
     });

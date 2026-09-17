@@ -23,7 +23,7 @@ fn as_u64(v: &Value) -> Option<u64> {
 }
 
 /// 三协议缓存列提取（对标 `_metrics.py:155`）：Anthropic 取顶层
-/// `cache_read/cache_creation_input_tokens`；Responses 取
+/// `cache_read_input_tokens`/`cache_creation_input_tokens`；Responses 取
 /// `input_tokens_details.cached_tokens`；Chat 取
 /// `prompt_tokens_details.cached_tokens`（`null` 细节对象按缺失归零）。
 fn cached_columns(protocol: Protocol, obj: &serde_json::Map<String, Value>) -> (u64, u64) {

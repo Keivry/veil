@@ -155,11 +155,9 @@ async fn responses_error_preserves_code_param() {
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let (scope, vault, detector) = fresh_arcs();
-    let (_outcome, frames) = collect_pump(
-        upstream,
-        pump_ctx(Protocol::Responses, scope, vault, detector),
-    )
-    .await;
+    let ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+    let metrics = ctx.req.gateway_metrics.clone();
+    let (_outcome, frames) = collect_pump(upstream, ctx).await;
     let joined = frames.join("");
     let payload = frames
         .iter()
@@ -185,6 +183,42 @@ async fn responses_error_preserves_code_param() {
         "恰一终端: {joined}"
     );
     assert!(!joined.contains("response.completed"));
+    assert_eq!(
+        metrics.truncated_count("synthesized_failed"),
+        1,
+        "R7-03：Responses error 终端须落 synthesized_failed 观测"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn responses_error_truncated_observed_despite_downstream_abort() {
+    // R7-03/D3：下游早断（终端帧未送达）时观测仍落（不低于一次）；
+    // `terminal_ok` 仅影响终端帧位，不门控截断观测。
+    let sse = br#"data: {"type":"error","message":"boom"}
+
+"#
+    .to_vec();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+    let metrics = ctx.req.gateway_metrics.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let handle = super::pump::spawn_stream_pump(upstream, tx, ctx);
+    drop(rx);
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("下游早断后泵任务须在限期内结束")
+        .expect("泵任务不得 panic");
+    assert!(
+        metrics.truncated_count("synthesized_failed") >= 1,
+        "下游早断仍须落 synthesized_failed 观测（不低于一次）"
+    );
     server.abort();
 }
 

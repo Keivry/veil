@@ -297,7 +297,8 @@ impl StreamTerminator {
         }
     }
 
-    /// I-5 Responses `type:"error"` 单帧 `response.failed` 计划。
+    /// I-5 Responses `type:"error"` 单帧 `response.failed` 计划；`R7-03`：计划携带
+    /// `truncated: Some(SynthesizedFailed)`，调用点解构后在 `commit` 后无条件落观测。
     /// 3.2 起由 `event_loop::handle_event` 消费。
     pub(in crate::handler::llm::pump) fn plan_responses_error(
         &self,
@@ -314,7 +315,7 @@ impl StreamTerminator {
             frames: block_inject::ensure_event_lines(vec![
                 block_inject::responses_failed_frame_modeled(fid, error, sequence_number, model),
             ]),
-            truncated: None,
+            truncated: Some(TruncatedMode::SynthesizedFailed),
         }
     }
 
@@ -428,6 +429,24 @@ mod tests {
             t.plan_responses_error("r", None, None, ""),
             TerminalPlan::None
         ));
+    }
+
+    #[test]
+    fn plan_responses_error_carries_synthesized_failed() {
+        // R7-03/D3：error 终端计划携带 `synthesized_failed` 观测，调用点解构后
+        // 在 commit 后无条件落 `set_truncated`（下游早断不丢观测）。
+        let t = StreamTerminator::new();
+        let TerminalPlan::Frames {
+            kind,
+            frames,
+            truncated,
+        } = t.plan_responses_error("r1", None, None, "")
+        else {
+            panic!("Open 态 plan_responses_error 须产出 Frames");
+        };
+        assert_eq!(kind, TerminalKind::ResponsesError);
+        assert_eq!(frames.len(), 1, "恰一 response.failed 帧");
+        assert_eq!(truncated, Some(TruncatedMode::SynthesizedFailed));
     }
 
     #[test]

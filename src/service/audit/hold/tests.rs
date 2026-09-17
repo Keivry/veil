@@ -589,6 +589,51 @@ fn chat_tool_calls_not_global_complete() {
 }
 
 #[test]
+fn release_pending_audited_reclaims_only_pending_slots() {
+    // R7-01/D1：全局完成臂审计后释放 pending 槽——归还其记账字节并移除槽，
+    // done 槽保留；拒绝态不释放（mark_rejected 已清仓）。
+    let mut hold = AuditHold::new(1024);
+    let done_key = AuditHold::responses_key(Some("item-done"), 0);
+    let pending_key = AuditHold::responses_key(Some("item-pending"), 1);
+    hold.push_responses_fragment(
+        &done_key,
+        0,
+        Some(0),
+        Some("item-done"),
+        Some("run"),
+        "{\"x\":1}",
+    );
+    hold.mark_responses_done(&done_key, Some("{\"x\":1}"));
+    hold.push_responses_fragment(
+        &pending_key,
+        1,
+        Some(0),
+        Some("item-pending"),
+        Some("run"),
+        "{\"y\":2}",
+    );
+    assert_eq!(hold.total_bytes, 14, "done+pending 各有 7 字节");
+    hold.release_pending_audited();
+    assert_eq!(hold.total_bytes, 7, "仅 pending 槽字节归还");
+    assert!(
+        hold.responses_triples().iter().any(|(i, ..)| *i == 0),
+        "done 槽须保留"
+    );
+    assert!(
+        hold.responses_pending_triples().is_empty(),
+        "pending 槽须移除"
+    );
+    assert!(!hold.is_rejected());
+
+    let mut rejected = AuditHold::new(1024);
+    let key = AuditHold::responses_key(Some("item-r"), 0);
+    rejected.push_responses_fragment(&key, 0, Some(0), Some("item-r"), Some("run"), "abc");
+    rejected.mark_rejected();
+    rejected.release_pending_audited();
+    assert_eq!(rejected.total_bytes, 0, "拒绝态释放为 no-op（已清仓）");
+}
+
+#[test]
 fn responses_done_bytes_dedup() {
     // RED-6：`.done` 完整参数不得与已累积分片双计 `total_bytes`。
     let mut hold = AuditHold::new(16);

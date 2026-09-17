@@ -67,7 +67,7 @@ where
     pub audit_pending: &'a PendingApprovals,
 }
 
-pub(super) async fn finalize<F>(ctx: TerminalCtx<'_, F>)
+pub(super) async fn finalize<F>(ctx: TerminalCtx<'_, F>) -> Option<u32>
 where
     F: Fn(&str, usize) -> Vec<(usize, usize)>,
 {
@@ -145,6 +145,40 @@ where
                     ));
                 }
                 audit::AuditVerdict::Allow => {}
+            }
+        }
+        // R7-01/D1：pending 槽终端最终审计（done 槽在前、pending 槽在后）——
+        // 门控 `protocol.is_responses() && !hold.is_rejected()`；verdict 处置与
+        // 上方 done 循环逐字一致（`blocked_index` 取该 triple 自身 `output_index`）。
+        // 无截断的清理完成流已在全局完成臂 `release_pending_audited()` 释放，此处
+        // 集合为空天然 no-op，同一槽 SHALL NOT 被二次审计。
+        if !blocked && protocol.is_responses() && !hold.is_rejected() {
+            for (idx, name, args) in hold.responses_pending_triples() {
+                match audit_sink
+                    .evaluate_and_record(
+                        audit_mode,
+                        &name,
+                        &args,
+                        audit_policy,
+                        approval_whitelist,
+                        Some(protocol_header_value(protocol)),
+                    )
+                    .await
+                {
+                    audit::AuditVerdict::Block { .. } => {
+                        hold.mark_rejected();
+                        blocked_index = Some(idx);
+                        blocked = true;
+                        break;
+                    }
+                    audit::AuditVerdict::NeedApproval { reason, summary } => {
+                        audit_pending.insert(PendingRecord::new(
+                            &format!("audit-hold-{idx}-{name}"),
+                            &format!("{reason}: {summary}"),
+                        ));
+                    }
+                    audit::AuditVerdict::Allow => {}
+                }
             }
         }
         if blocked {
@@ -362,6 +396,7 @@ where
         }
     }
     carry.finish();
+    blocked_index
 }
 
 #[cfg(test)]

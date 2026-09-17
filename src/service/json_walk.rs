@@ -91,11 +91,24 @@ fn json_walk_nested(
             if nest >= CONTAINER_NEST_LIMIT {
                 return serde_json::Value::Object(map);
             }
-            serde_json::Value::Object(
-                map.into_iter()
-                    .map(|(k, v)| (k, json_walk_nested(v, leaf, depth_limit, depth, nest + 1)))
-                    .collect(),
-            )
+            // R7-02：键位与值位同 leaf 口径（键按纯字符串 leaf 处理，MUST NOT 走
+            // `walk_string_leaf` 的 stringified-JSON 递归展开）；以原始键集合做碰撞
+            // 回退——替换后键与任一原始键或已选键同名时保留原键，结果无重复键、
+            // 插入序保持。
+            let original: std::collections::HashSet<String> = map.keys().cloned().collect();
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                let replaced = leaf(k.clone());
+                let key = if replaced != k
+                    && (original.contains(&replaced) || out.contains_key(&replaced))
+                {
+                    k
+                } else {
+                    replaced
+                };
+                out.insert(key, json_walk_nested(v, leaf, depth_limit, depth, nest + 1));
+            }
+            serde_json::Value::Object(out)
         }
         other => other,
     }
@@ -335,6 +348,125 @@ mod tests {
         );
         let ov: serde_json::Value = serde_json::from_str(&out).expect("响应输出须合法 JSON");
         assert_eq!(ov["msg"], "hi p@ss\"quote");
+    }
+
+    #[test]
+    fn json_walk_key_pii_masked_and_parseable() {
+        // R7-02：键位 PII 同 leaf 口径替换，值不变、输出仍可 jloads。
+        let text = r#"{"13800138000":"x"}"#;
+        let out = process_text(
+            text,
+            &mut |s| s.replace("13800138000", "__PII_1_abcdef__"),
+            DEPTH_LIMIT,
+        );
+        let v: serde_json::Value = jloads(strip_bom(&out)).expect("键位替换后须为合法 JSON");
+        assert_eq!(v["__PII_1_abcdef__"], "x");
+        assert!(!out.contains("13800138000"), "键位明文不得残留: {out}");
+    }
+
+    #[test]
+    fn json_walk_key_collision_with_original_falls_back() {
+        // R7-02：替换后键与原始键同名时保留原键（两成员均在，不合并、不丢键）。
+        let text = r#"{"a":"1","b":"2"}"#;
+        let out = process_text(
+            text,
+            &mut |s| if s == "a" { "b".to_string() } else { s },
+            DEPTH_LIMIT,
+        );
+        let v: serde_json::Value = jloads(strip_bom(&out)).expect("输出须合法 JSON");
+        assert_eq!(v["a"], "1", "碰撞回退须保留原键: {out}");
+        assert_eq!(v["b"], "2");
+        assert_eq!(v.as_object().expect("对象").len(), 2, "不得合并成员: {out}");
+    }
+
+    #[test]
+    fn json_walk_key_collision_with_chosen_falls_back() {
+        // R7-02：替换后键与此前已选定的替换键同名时保留原键（先到者胜、后到回退）。
+        let text = r#"{"x":"1","y":"2"}"#;
+        let out = process_text(
+            text,
+            &mut |s| {
+                if s == "x" || s == "y" {
+                    "z".to_string()
+                } else {
+                    s
+                }
+            },
+            DEPTH_LIMIT,
+        );
+        let v: serde_json::Value = jloads(strip_bom(&out)).expect("输出须合法 JSON");
+        assert_eq!(v["z"], "1", "先到替换键胜出: {out}");
+        assert_eq!(v["y"], "2", "后到碰撞回退原键: {out}");
+        assert_eq!(v.as_object().expect("对象").len(), 2, "不得丢键: {out}");
+    }
+
+    #[test]
+    fn json_walk_key_substring_scan_and_plain_leaf() {
+        // R7-02：键串内嵌敏感子串被子串扫描替换；键串按纯字符串 leaf 处理，
+        // MUST NOT 做 stringified-JSON 递归展开（整串精确匹配叶可见键原文）。
+        let text = r#"{"prefix-13812345678-suffix":"v"}"#;
+        let out = process_text(text, &mut |s| s.replace("13812345678", "MASK"), DEPTH_LIMIT);
+        let v: serde_json::Value = jloads(strip_bom(&out)).expect("输出须合法 JSON");
+        assert_eq!(v["prefix-MASK-suffix"], "v");
+
+        let key_text = r#"{"phone":"13812345678"}"#;
+        let nested_key = serde_json::json!({ key_text: "v" }).to_string();
+        let out = process_text(
+            &nested_key,
+            &mut |s| {
+                if s == "13812345678" {
+                    "MASK".to_string()
+                } else {
+                    s
+                }
+            },
+            DEPTH_LIMIT,
+        );
+        let v: serde_json::Value = jloads(strip_bom(&out)).expect("输出须合法 JSON");
+        assert_eq!(
+            v[key_text], "v",
+            "键串 MUST NOT 被 stringified-JSON 递归展开: {out}"
+        );
+    }
+
+    #[test]
+    fn json_walk_key_token_shape_preserved() {
+        // R7-02：本身即内部 token 形态的键由 leaf 守卫跳过、原样保留。
+        let text = r#"{"__VG_CRED_000001__":"x","k":"13812345678"}"#;
+        let out = process_text(
+            text,
+            &mut |s| {
+                if s.starts_with("__VG_CRED_") || s.starts_with("__PII_") {
+                    s
+                } else {
+                    s.replace("13812345678", "MASK")
+                }
+            },
+            DEPTH_LIMIT,
+        );
+        let v: serde_json::Value = jloads(strip_bom(&out)).expect("输出须合法 JSON");
+        assert_eq!(v["__VG_CRED_000001__"], "x", "token 形态键须原样保留");
+        assert_eq!(v["k"], "MASK");
+    }
+
+    #[test]
+    fn json_walk_key_roundtrip_restores_content_and_keys() {
+        // R7-02：键位替换往返（redact→restore）后 JSON 内容与键集合一致。
+        let original = r#"{"13800138000":{"contact":"13800138000"},"ok":1}"#;
+        let redacted = process_text(
+            original,
+            &mut |s| s.replace("13800138000", "__PII_9_deadbeef__"),
+            DEPTH_LIMIT,
+        );
+        assert!(!redacted.contains("13800138000"), "脱敏后不得残留明文");
+        let restored = process_text(
+            &redacted,
+            &mut |s| s.replace("__PII_9_deadbeef__", "13800138000"),
+            DEPTH_LIMIT,
+        );
+        let a: serde_json::Value = jloads(original).expect("原文合法");
+        let b: serde_json::Value = jloads(&restored).expect("还原输出须合法 JSON");
+        assert_eq!(a, b, "往返后内容与键集合须一致: {restored}");
     }
 
     #[test]

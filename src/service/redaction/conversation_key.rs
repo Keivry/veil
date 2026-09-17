@@ -158,9 +158,10 @@ fn normalize_tools(tools: &[Value]) -> Vec<Value> {
     named.into_iter().map(|(_, v)| v).collect()
 }
 
-/// 系统前缀提取（按协议白名单，R5-07/D1）：Responses 取 `instructions`；
-/// Chat/Anthropic 取顶层 `system`（Anthropic 原生）或 messages 首条
-/// `system`|`developer`。协议外字段 MUST NOT 越界参与——Chat 的 `instructions`
+/// 系统前缀提取（按协议白名单，R5-07/D1 + R7-04）：Responses 取 `instructions`；
+/// Anthropic 取原生顶层 `system`（存在且非 null 时优先）或 `messages` 首条
+/// `system`|`developer`；Chat 仅 `messages` 首条 `system`|`developer`（顶层 `system`
+/// MUST NOT 参与）。协议外字段 MUST NOT 越界参与——Chat 的 `instructions`
 /// MUST NOT 被当作 `system`，Responses 的 `messages` MUST NOT 被当作 system 来源。
 fn extract_system(body: &Value, protocol: Protocol) -> Option<Value> {
     if protocol.is_responses() {
@@ -169,7 +170,9 @@ fn extract_system(body: &Value, protocol: Protocol) -> Option<Value> {
             .filter(|v| !v.is_null())
             .map(|v| canonicalize(v.clone()));
     }
-    if let Some(s) = body.get("system").filter(|v| !v.is_null()) {
+    if protocol.is_anthropic()
+        && let Some(s) = body.get("system").filter(|v| !v.is_null())
+    {
         return Some(canonicalize(s.clone()));
     }
     let messages = body.get("messages")?.as_array()?;

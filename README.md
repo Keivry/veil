@@ -595,7 +595,7 @@ Responses 取数顶层优先：非流按顶层 `usage` → `response.usage` → 
 三级回退，流式同口径（含 `response.completed` 事件；`src/service/llm_gateway/usage.rs::extract_usage_nonstream`
 与同文件 `extract_usage_stream` 共用 `usage_from_paths` 同口径）；定制双层体仍经回退命中不断链。
 缓存列 `cached_read`/`cached_write` 同样按列取 max：Anthropic 取顶层
-`cache_read/cache_creation_input_tokens`，Responses 取
+`cache_read_input_tokens`/`cache_creation_input_tokens`，Responses 取
 `input_tokens_details.cached_tokens`，Chat 取
 `prompt_tokens_details.cached_tokens`（细节对象 `null`/缺失归零；
 非 Anthropic 的 `cached_write` 恒零）。`model` 分桶与缓存列只加不改旧列。
@@ -759,6 +759,12 @@ SHALL NOT 硬编码改写为 `200`（`R5-05`/D4，`veil-audit-r5-remediation`；
 两类 client 均于启动期构造并注入 `AppState`（`http_client`/`http_stream_client`），
 请求路径不新建 `reqwest::Client`（见 `src/state.rs::build_stream_http_client`）。
 
+非流请求遇上游 SSE 口径（`R7-05`，`veil-audit-r7-remediation`）：非流请求（`stream` 未显式为 `true`）
+而上游仍返回 `status<400` 且 `content-type: text/event-stream` 时，网关**复用已取得**的上游响应经
+字节泵转发，SHALL NOT 重发上游请求（非幂等）；该路径受**非流 client 的 `HTTP_TIMEOUT_SECS`
+总超时**约束（含响应体读取），超时按中途断流终端路径 fail-closed 收尾；需长流者 SHALL 显式
+`stream:true` 以获独立无总超时 client。该口径不引入新增 `502`/错误码等 wire 行为。
+
 上游重试分类（`T13`/D11，`veil-transport-fidelity-fix`）：**拿头前**（`send()` 返回
 `Ok` 之前）的 connect/timeout/请求层瞬断（reqwest `is_connect`/`is_timeout`/`is_request`）
 统一退避重试，序列 `0.5s→1s→2s`、最多 3 次（初次 + 3 = 最多 4 次请求）；一旦拿到
@@ -796,9 +802,11 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   ① 客户端显式头 `PII_SCOPE_KEY_HEADER`（默认 `x-veil-conversation-id`，≤256 字节，且经租户命名空间
   + HMAC，原始值绝不作键）；② 协议原生键（**按协议白名单，不跨协议接受**：仅 Chat/Responses 的
   `prompt_cache_key`、仅 Responses 的 `previous_response_id`；Anthropic MUST NOT 接受二者、Chat MUST NOT
-  接受 `previous_response_id`，不匹配的原生字段按优先级继续下一级）；③ 稳定前缀（**要求 `tools` +
+  接受 `previous_response_id`；协议不匹配的原生字段**静默忽略**——不命中第 2 级、不改变第 3/4 级
+  推导结果、不告警、不计数）；③ 稳定前缀（**要求 `tools` +
   `system` + 首个 user turn 三者齐备**，对脱敏前规范化前缀做 HMAC；字段提取同按协议白名单——
-  Chat/Anthropic 取 `messages`、Responses 取**数组形** `input` 与 `instructions`，协议外字段不越界参与）。
+  Anthropic 取原生顶层 `system` 或 `messages` 首条；Chat 仅 `messages`；Responses 取 `instructions`
+  （首个 user turn 取**数组形** `input`），协议外字段不越界参与）。
   级别 1/2 依赖客户端配合（显式头 / `prompt_cache_key` / `previous_response_id`），级别 3 依赖请求形态齐备。
 - 降级行为（NB-3 + `R5-06`/D1）：**纯多轮 `messages` 请求（无工具、无会话键头、无协议原生键）即便
   `PII_SCOPE_MODE=conversation` 亦落第 4 级逐请求**，不获跨轮 token 稳定；**Responses 标量（字符串）
@@ -962,7 +970,7 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
 
 - `PII_HOLD_MAX`（默认 `64`，须 ≥1 正整数）在本仓含义为**响应侧跨帧缝窗字符数**：缝合相邻两帧的
   尾/首窗口做跨缝 PII 检测，跨缝命中后掩码缝两侧再放行上一帧（整帧延迟一级）；检测在 JSON 信封
-  过滤后的近似解码文本空间进行并映射回原帧坐标，信封字符（`{ } " [ ]`）逐字符豁免保证 JSON 恒可解析。
+  过滤后的近似解码文本空间进行并映射回原帧坐标，信封字符（`{ } " [ ] , :`）逐字符豁免保证 JSON 恒可解析。
   `PII_RESPONSE_SIDE` 关闭时窗口归零，帧按直通语义放行（不做缝窗滞留）。
 - 原仓 Python `PII_HOLD_MAX`（同名同默认 `64`）承载的是**审计 hold 尾部持有字符数**；本仓该职责由
   `AUDIT_HOLD_MAX_BYTES`（默认 `1048576` 字节）独立承载。二者维度不同（响应侧缝窗字符 vs 审计 hold 字节），

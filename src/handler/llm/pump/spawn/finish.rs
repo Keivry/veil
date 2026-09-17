@@ -21,7 +21,7 @@ pub(super) async fn finish<F>(
 where
     F: Fn(&str, usize) -> Vec<(usize, usize)>,
 {
-    terminal::finalize(TerminalCtx {
+    let blocked_index = terminal::finalize(TerminalCtx {
         protocol: env.protocol,
         conv_id: &state.conv_id,
         stream_model: state.stream_model.as_deref(),
@@ -72,5 +72,6 @@ where
         forwarded: state.forwarded,
         block_injected: state.terminator.block_injected(),
         terminal_injected: state.meta.terminal_injected,
+        blocked_index,
     }
 }
