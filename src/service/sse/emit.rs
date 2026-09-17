@@ -1,7 +1,8 @@
 //! SSE 保活帧 + 快慢径发送（H1.1 三切）。
 //!
 //! - `keepalive_frame` 流内保活唯一帧形态（`: keepalive`，注释帧，不计事件）。
-//! - `Speed::Slow` 见文即吐，`Speed::Fast` 攒至标点边界或 4KB 阈值再吐（T4）。
+//! - `Speed::Slow` 见文即吐；`Speed::Fast` 的实际边界为 `FAST_EMIT_THRESHOLD_BYTES` （4096
+//!   字节），聚合路径下标点分支不可达（`agg` 尾恒为帧终止 `\n\n`，见 T4/STP-6）。
 //! - 对外路径不变：经 `super`（`service::sse`）重导出，调用方零改。
 
 pub fn keepalive_frame() -> String { ": keepalive\n\n".to_string() }
@@ -63,7 +64,9 @@ pub enum Speed {
     Fast,
 }
 
-/// Fast 径攒批阈值（字节）：攒至标点边界或该阈值即吐出（T4）。
+/// Fast 径攒批阈值（字节）：聚合缓冲（`agg`）尾恒为帧终止 `\n\n`，故生产
+/// 路径以该阈值为唯一边界（标点边界 `is_punct_boundary` 保留为 API，聚合路径
+/// 不可达；T4/STP-6）。
 /// 硬编码理由：经验值平衡首字延迟与 SSE 帧数，调整须同步复核续跑测试。
 pub const FAST_EMIT_THRESHOLD_BYTES: usize = 4096;
 

@@ -414,7 +414,9 @@ fn clone_upstream_headers(up: &reqwest::Response, metrics: &GatewayMetrics) -> H
             k.to_string().parse::<axum::http::HeaderName>(),
             axum::http::HeaderValue::from_bytes(v.as_bytes()),
         ) {
-            resp_headers.insert(n, val);
+            // AUDIT-03：`append` 而非 `insert`——同名多值上游头（如多条
+            // `warning`/`set-cookie`）逐值保留，不得被折叠为末值。
+            resp_headers.append(n, val);
         }
     }
     // M1/D4：解码与剥头配对——tower-http 仅在实际解压成功后移除

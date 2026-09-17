@@ -1,6 +1,7 @@
 //! T2/T10 测试：非流上游响应头透传（逐跳过滤 + `x-veil-*` 覆盖）与
-//! 网关生成响应统一 `x-veil-protocol`。归属拆分：`nonstream/tests.rs` 触
-//! 800 红线后按测试外迁模板独立成子模块。
+//! 非流对话路径网关生成响应置 `x-veil-protocol`（SSE 成功路径与 NonDialog
+//! 透传不置该头，见 `handler::llm::mod::with_protocol_header` 口径）。归属
+//! 拆分：`nonstream/tests.rs` 触 800 红线后按测试外迁模板独立成子模块。
 
 use {
     super::test_ctx,
@@ -160,6 +161,49 @@ async fn nonstream_upstream_headers_forwarded() {
         header_of(&resp, "x-request-id").as_deref(),
         Some("req-429"),
         "x-request-id 须透传"
+    );
+}
+
+#[tokio::test]
+async fn nonstream_upstream_multi_value_headers_preserved() {
+    // AUDIT-03：上游同名多值响应头（`warning: a` + `warning: b`）经克隆与
+    // 装配须逐值保留，不得折叠为末值。
+    let client = reqwest::Client::new();
+    let body = br#"{"id":"x","model":"m","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
+    let (url, server) = loopback_raw(
+        200,
+        &[
+            ("content-type", "application/json"),
+            ("warning", "a"),
+            ("warning", "b"),
+        ],
+        body,
+    )
+    .await;
+    let outcome = serve_nonstream(
+        &client,
+        reqwest::Method::POST,
+        &url,
+        axum::http::HeaderMap::new(),
+        br#"{"model":"m","messages":[]}"#.to_vec(),
+        test_ctx(Protocol::Chat),
+    )
+    .await;
+    server.abort();
+    let NonstreamOutcome::Responded(resp) = outcome else {
+        panic!("JSON 上游须直接响应");
+    };
+    assert_eq!(resp.status(), StatusCode::OK);
+    let warnings: Vec<&str> = resp
+        .headers()
+        .get_all("warning")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        warnings,
+        vec!["a", "b"],
+        "同名多值上游头须逐值保留（2 值），不得折叠为末值"
     );
 }
 

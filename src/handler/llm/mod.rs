@@ -58,7 +58,9 @@ pub fn forward_headers(incoming: &HeaderMap, metrics: &GatewayMetrics) -> Header
 
 pub(crate) fn protocol_header_value(protocol: Protocol) -> &'static str { protocol.wire_name() }
 
-/// T10/D9：网关生成响应统一置 `x-veil-protocol`（与成功/阻断分支口径一致）。
+/// T10/D9：非流对话路径 + 流式错误透传路径由网关生成的响应置
+/// `x-veil-protocol`（与成功的非流分支/阻断分支口径一致）；SSE 成功路径（`build_sse_response`）与
+/// NonDialog 透传不置该头。
 pub(crate) fn with_protocol_header(mut resp: Response, protocol: Protocol) -> Response {
     resp.headers_mut().insert(
         PROTOCOL_HEADER_NAME,

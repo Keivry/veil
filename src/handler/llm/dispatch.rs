@@ -469,7 +469,9 @@ pub(super) async fn stream_upstream_passthrough(
             k.to_string().parse::<axum::http::HeaderName>(),
             axum::http::HeaderValue::from_bytes(v.as_bytes()),
         ) {
-            resp_headers.insert(n, val);
+            // AUDIT-03：`append` 而非 `insert`——同名多值上游头（如多条
+            // `warning`/`set-cookie`）逐值保留，不得被折叠为末值。
+            resp_headers.append(n, val);
         }
     }
     // TRN-4：剔除上游 `x-veil-*` 内部头（大小写不敏感），网关自置头在剔除后写入，

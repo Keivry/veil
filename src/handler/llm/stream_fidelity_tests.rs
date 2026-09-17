@@ -732,3 +732,33 @@ async fn stream_passthrough_internal_header_override() {
         "须为网关自置值: {headers:?}"
     );
 }
+
+#[tokio::test]
+async fn stream_passthrough_error_preserves_multi_value_headers() {
+    // AUDIT-03：流式错误透传路径下上游同名多值响应头（`warning: a` +
+    // `warning: b`）须逐值保留，不得折叠为末值。
+    let body = b"{\"error\":{\"message\":\"boom\"}}".to_vec();
+    let (status, headers, _got) = passthrough_response(
+        500,
+        "application/json",
+        vec![("warning", "a"), ("warning", "b")],
+        body,
+        1024,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "错误状态须保原码"
+    );
+    let warnings: Vec<&str> = headers
+        .get_all("warning")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        warnings,
+        vec!["a", "b"],
+        "错误透传路径同名多值头须逐值保留（2 值）"
+    );
+}

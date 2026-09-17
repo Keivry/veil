@@ -8,7 +8,7 @@
 #   4) python3 scripts/check_doc_paths.py（文档路径 + `path:line` 行号范围校验（存在性 + 在界内；归档
 #      change 目录行号免校验并按处数打印），9.10；内容语义一致性由 code review 保证，脚本不校验）
 #   5) python3 scripts/check_file_sizes.py
-#   6) scripts/api_conformance.py（真 SDK 一致性，23 项）
+#   6) scripts/api_conformance.py（真 SDK 一致性，24 项）
 #   7) get/ 内 go vet ./... + go test ./...（内置 Go 客户端静态检查与单测）
 #
 # 前置条件（第 6 步）：

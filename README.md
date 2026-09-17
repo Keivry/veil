@@ -255,7 +255,7 @@ done
 | 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 是 | 速率维度；按 TCP 远端地址计数，不采信代理头 |
 | SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 是 | 并发维度；与 `10/min` 正交；`60s` ping + `5min` 强制重连 |
 | 通用请求体上限 | `10MB` | `413` | 是（入口唯一 enforcement） | 通用 JSON 检查点 |
-| 非流对话响应上限 | `NONSTREAM_MAX_BYTES` 默认 `8MB` | `502` + `response_too_large` JSON 体（`error.type`，见 `src/handler/llm/nonstream.rs:582`） | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代；与 Python 观测差异见 design D12（`T14`：无独立指标/warning、无状态门） |
+| 非流对话响应上限 | `NONSTREAM_MAX_BYTES` 默认 `8MB` | `502` + `response_too_large` JSON 体（`error.type`，见 `src/handler/llm/nonstream.rs::oversize_response`） | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代；与 Python 观测差异见 design D12（`T14`：无独立指标/warning、无状态门） |
 | 审计类上限 | `8MB` | — | 否（纯 ceiling 锚点） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `AUDIT_HOLD_MAX_BYTES` 默认 1MB 均不得超过它）；与入口 `10MB` 属不同检查点、差异有意 |
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
 | 审批超时 | `AUDIT_TIMEOUT` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
@@ -628,7 +628,7 @@ Responses 系**不注入** `stream_options`（官方规范仅接受 `include_obf
 下游发送语义 `Speed` 由 `audit_mode` 派生（`R5-19.5`，`veil-audit-r5-remediation`）：
 `src/handler/llm/pump/spawn/setup.rs` 按 `AuditMode::Off → Speed::Fast`、其余 → `Speed::Slow` 派生
 （`src/service/sse/emit.rs::select_emit` 与同文件 `Speed` 定义），MUST NOT 作为独立配置项暴露；
-两档仅描述下游发送节奏（`Slow` 见文即吐、`Fast` 攒至标点边界或 `FAST_EMIT_THRESHOLD_BYTES` 字节阈值），
+两档仅描述下游发送节奏（`Slow` 见文即吐、`Fast` 的实际边界为 `FAST_EMIT_THRESHOLD_BYTES`（4096 字节）；下游 SSE 聚合缓冲（`agg`）恒以帧终止 `\n\n` 结尾，标点分支生产不可达（`is_punct_boundary` 保留为 API，不改 `agg` 切分）），
 与 keepalive 10s 节奏无关，亦不构成「脱敏完整性」的判据。
 
 流式 model 三级回退与三协议阻断帧回显（`R5-02`/`R5-03`/`R5-39`，`veil-audit-r5-remediation`）：
@@ -719,14 +719,14 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 不再合成 `502 E_EMPTY_BODY`（见 `src/handler/llm/nonstream.rs`）。
 
 非流空体/非 JSON 错误码正面档（`J`，`veil-audit-r4-remediation`）：`E_EMPTY_BODY` 触发于非流对话上游
-**非错误状态（`status<400`）**返回空体或非 JSON 体 → 下游 `502`（`src/error.rs:86-97` 的 `code()` 映射与
-`:110` 的 `EmptyBody → BAD_GATEWAY`）。错误体的字段形态为 `{"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}}`
+**非错误状态（`status<400`）**返回空体或非 JSON 体 → 下游 `502`（`src/error.rs::VeilError::code` 的码映射与
+`src/error.rs::VeilError::status_code` 的 `EmptyBody → BAD_GATEWAY`）。错误体的字段形态为 `{"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}}`
 （网关级装配见 `src/handler/llm/mod.rs::empty_body_response`；入口级故障如上流未配置亦以同码 `502` 返回，
 见 `src/handler/llm/dispatch.rs::gateway_serve` 的 `resolve_upstream` 未配置分支）。判定先后关系：非流响应体上限（`NONSTREAM_MAX_BYTES`，超限 → `502`
 `response_too_large`，见 §4 阈值表）判定**先于**空体/非 JSON 的 `E_EMPTY_BODY` 判定——有界读取先于空体
-分类（`src/handler/llm/nonstream.rs:130-161`）；`status>=400` 的错误体不受二者改写，按上段透传语义保留
+分类（`src/handler/llm/nonstream.rs::serve_nonstream`）；`status>=400` 的错误体不受二者改写，按上段透传语义保留
 状态码与正文字节。注意两枚 502 错误体的字段名不同：`E_EMPTY_BODY` 用 `error.code`，超限 `response_too_large`
-用 `error.type`（`src/handler/llm/nonstream.rs:582`）。
+用 `error.type`（`src/handler/llm/nonstream.rs::oversize_response`）。
 
 空体 502 四分支一致性（`R5-19.6`，`veil-audit-r5-remediation`）：① 流式空流（零有效分片）SHALL 补
 最小可解析终止帧后按正常流闭合，**SHALL NOT 转 502**（见 §8.6）；② 非流空体/非 JSON（`status<400`）
@@ -879,7 +879,7 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   管理 token 源为 `OBSERVABILITY_ADMIN_TOKEN`（与 `/_admin` 同一 token，`CRD-7`）；
   `CREDENTIAL_ADMIN_TOKEN` **不再作为紧急吊销放行依据**（**BREAKING**）——仅携带旧
   `CREDENTIAL_ADMIN_TOKEN` 值且来源非内网时转常规审批，不直接吊销。迁移：将
-  `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs:555-561`）。
+  `OBSERVABILITY_ADMIN_TOKEN` 配置为有效值并与调用方对齐（`src/service/credential/vault_ops.rs::emergency_revoke`）。
 - 紧急吊销豁免网段（`C13`，`veil-credential-flow-parity`）：内网来源覆盖
   `localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、
   `169.254.0.0/16`（链路本地）、`100.64.0.0/10`（CGNAT）、`fd00::/8`（ULA）、`fe80::/10`
