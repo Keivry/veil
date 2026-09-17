@@ -292,7 +292,7 @@ mod tests {
         let detail = "/data/db/vault.kdbx 解密失败";
         let capture = LevelCapture::default();
         let sink = capture.0.clone();
-        let response = tracing::subscriber::with_default(capture, || {
+        let response = crate::test_support::with_capture_subscriber(capture, || {
             VeilError::KeePass {
                 message: detail.to_string(),
             }
@@ -374,8 +374,9 @@ mod tests {
     fn captured_level_and_status(err: VeilError) -> (Vec<tracing::Level>, StatusCode) {
         let capture = LevelCapture::default();
         let sink = capture.0.clone();
-        let status =
-            tracing::subscriber::with_default(capture, move || err.into_response().status());
+        let status = crate::test_support::with_capture_subscriber(capture, move || {
+            err.into_response().status()
+        });
         let levels = sink.lock().unwrap().clone();
         (levels, status)
     }

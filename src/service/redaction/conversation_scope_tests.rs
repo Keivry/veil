@@ -508,7 +508,7 @@ fn conversation_key_not_logged() {
     let body = serde_json::json!({"messages": [{"role": "user", "content": plaintext}]});
     let capture = LogCapture::default();
     let sink = capture.0.clone();
-    let (scope, token) = tracing::subscriber::with_default(capture, || {
+    let (scope, token) = crate::test_support::with_capture_subscriber(capture, || {
         let scope = crate::handler::llm::dispatch::build_request_scope(
             &state,
             &headers,
