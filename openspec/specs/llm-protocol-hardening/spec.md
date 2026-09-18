@@ -195,7 +195,7 @@
 
 系统 SHALL 使 Responses 合成帧（含真空流全序列与阻断序列）携带必需的 `sequence_number`，且为单调序列；SHALL NOT 省略该字段。
 
-泵内 SHALL 维护「已见上游序号上界」游标（`responses_seq_cursor: Option<u64>`）：仅当协议为 Responses 且帧为可解析 JSON 时更新，取既有游标与上游 `sequence_number` 的最大值；缺 `sequence_number` 的帧 SHALL NOT 更新游标，回退值 SHALL 被忽略，断序 SHALL NOT 升级为错误。合成注入（阻断 7 帧序列与截断单帧）的起始基准 SHALL 为 `cursor.map_or(0, |c| c + 1)`；真空流（零帧）游标为空、基准 `0`，既有 0..6 全序列 SHALL 保持不变；`type:"error"` 单帧 SHALL 沿用上游 error 自带 `sequence_number`，SHALL NOT 重新编号。
+泵内 SHALL 维护「已见上游序号上界」游标（`responses_seq_cursor: Option<u64>`）：仅当协议为 Responses 且帧为可解析 JSON 时更新，取既有游标与上游 `sequence_number` 的最大值；缺 `sequence_number` 的帧 SHALL NOT 更新游标，回退值 SHALL 被忽略，断序 SHALL NOT 升级为错误。合成注入（阻断 7 帧序列与截断单帧）的起始基准 SHALL 为 `cursor.map_or(0, |c| c.saturating_add(1))`，后续合成帧序号 SHALL 以饱和加法递增（`saturating_add`，`R8-04`）；上游 `sequence_number == u64::MAX` 时 SHALL NOT panic、SHALL NOT 回绕为非单调序列。真空流（零帧）游标为空、基准 `0`，既有 0..6 全序列 SHALL 保持不变；`type:"error"` 单帧 SHALL 沿用上游 error 自带 `sequence_number`，SHALL NOT 重新编号。
 
 #### Scenario: 合成帧带序号
 
@@ -226,6 +226,11 @@
 
 - **WHEN** 上游 `type:"error"` 自带 `sequence_number=7`
 - **THEN** 合成 `response.failed` 携带序号 7，不重新编号
+
+#### Scenario: 极值序号饱和不溢出
+
+- **WHEN** 上游 `sequence_number == u64::MAX` 后触发合成注入（阻断或截断）
+- **THEN** 合成基准与后续序号按饱和加法处理，SHALL NOT panic、SHALL NOT 回绕为非单调序列
 
 ### Requirement: Responses 合成响应对象字段完整与 conformance 不掩盖
 
@@ -259,7 +264,9 @@
 
 系统 SHALL 将带顶层 `error` 且无 `choices` 的 Chat 数据帧视为终止事件：命中即置终端已发，SHALL NOT 在流末补发 `data: [DONE]`；并以独立观测 `TruncatedMode::UpstreamError`（`upstream_error`）区别于中途截断的 `open_ended`。判据 SHALL 限定为「顶层 `error` 存在」与「`choices` 缺席」同时成立，SHALL NOT 误伤 `choice` 内含 `error` 字段或顶层 `error` 与 `choices` 共存的正常形态。
 
-系统 SHALL 使 Anthropic `error` 终端同样记录 `upstream_error` 观测（该值对非 Responses 协议本就合法）：Anthropic 流中 `type:"error"` 作为终端透出且此前未发终端时，除既有终端语义外，`truncated_mode` SHALL 置 `upstream_error`，SHALL NOT 留空（`None`）使「上游错误即终端」的第四态在 Anthropic 面失明。Responses `error` 合成 `response.failed` 走其自有路径（记 `synthesized_failed`），不受本条款影响。
+系统 SHALL 使 Anthropic `error` 终端同样记录 `upstream_error` 观测（该值对非 Responses 协议本就合法）：Anthropic 流中 `type:"error"` 作为终端透出且此前未发终端时，除既有终端语义外，`truncated_mode` SHALL 置 `upstream_error`，SHALL NOT 留空（`None`）使「上游错误即终端」的第四态在 Anthropic 面失明。
+
+Responses `type:"error"` 合成 `response.failed` SHALL 走其自有路径并记录 `synthesized_failed`（`R7-03`）：终端计划（`plan_responses_error`）SHALL 携带 `truncated: Some(TruncatedMode::SynthesizedFailed)`；调用点 SHALL 解构该观测并在 `commit` 后**无条件**调用 `set_truncated`（与中途断流调用点同口径），SHALL NOT 以终端帧是否送达（`terminal_ok`）门控观测；`terminal_ok` 仍只决定 `commit` 的终端帧位与 `StreamMeta.terminal_injected`。`set_truncated` 自带的 Responses-only 守卫 SHALL 保持不变，调用点 SHALL NOT 重复协议门控。
 
 #### Scenario: error 帧后不补 DONE
 
@@ -275,6 +282,11 @@
 
 - **WHEN** Anthropic 流透传 `type:"error"` 事件且此前未发终端
 - **THEN** 该帧仍作为终端透出，且 `truncated_mode` 记为 `upstream_error`（非 `None`、非 `open_ended`）
+
+#### Scenario: Responses error 终端记 synthesized_failed
+
+- **WHEN** Responses 流透传 `type:"error"` 事件且此前未发终端
+- **THEN** 合成恰一 `response.failed`，`truncated_mode` 记为 `synthesized_failed` 并落 metrics 分标签计数；下游早断（终端帧未送达）时观测仍落（不低于一次），`terminal_ok` 仅影响终端帧位
 
 ### Requirement: responses_failed_frame 手写信封保留声明
 
