@@ -1,6 +1,16 @@
 //! `Scope` 请求/响应编排单测（自 `scope.rs` 拆出；测试名与断言不变）。
+//!
+//! 触 800 行上限后按仓库测试外迁模板拆分子模块（`fuzzy_restore_tests`/
+//! `strip_partials_tests`/`span_restore_tests`）。
 
-use {super::*, crate::service::pii::apply_spans};
+use super::*;
+
+#[path = "scope_tests/fuzzy_restore_tests.rs"]
+mod fuzzy_restore_tests;
+#[path = "scope_tests/span_restore_tests.rs"]
+mod span_restore_tests;
+#[path = "scope_tests/strip_partials_tests.rs"]
+mod strip_partials_tests;
 
 fn vault_with_secret(secret: &str) -> CredentialVault {
     let v = CredentialVault::new();
@@ -334,159 +344,39 @@ async fn three_wrappers_nasty_scope_paths() {
     assert_eq!(lv["msg"], format!("hi {secret}"));
 }
 
-#[test]
-fn fuzzy_case_drift_exact_vs_sequence_lookup() {
-    // G1.1 对照 Python `tests/vault_stable_test.py:132-167`：
-    // `PII_FUZZY_RESTORE` 关闭时大小写漂移不还原（精确原样保留），
-    // 开启时按序号回查还原。`__PII_<seq>_ZZZZABCD__` 为大写非 hex 漂移形。
+#[tokio::test]
+async fn request_zero_replacement_keeps_token_like_fragments_byte_identical() {
+    // R8-17：零替换且自定义规则快照为空时不执行 strip_partials——
+    // 正文中形似占位符的片段（残缺/完整 token 形态）逐字节保留。
     let vault = CredentialVault::new();
-    let plain = "13812345678";
-    let exact = Scope::with_opts(true, false);
-    let token = exact
-        .pii_scope()
-        .register(plain, false)
-        .expect("注册恒成功");
-    let seq: usize = token
-        .strip_prefix("__PII_")
-        .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
-        .flatten()
-        .expect("token 恒带序号");
-    let case_drift = format!("__PII_{seq}_ZZZZABCD__");
-    // 关闭：大小写漂移不还原，原样保留。
-    let out = exact.restore_response(&vault, &format!("回拨 {case_drift} 结束"));
-    assert!(out.contains(&case_drift), "关闭态须原样保留: {out}");
-    assert!(!out.contains(plain), "关闭态不得还原: {out}");
-    // 开启：按序号回查还原。
-    let fuzzy = Scope::with_opts(true, true);
-    let token2 = fuzzy
-        .pii_scope()
-        .register(plain, false)
-        .expect("注册恒成功");
-    let seq2: usize = token2
-        .strip_prefix("__PII_")
-        .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
-        .flatten()
-        .expect("token 恒带序号");
-    let out2 = fuzzy.restore_response(&vault, &format!("回拨 __PII_{seq2}_ZZZZABCD__ 结束"));
-    assert!(out2.contains(plain), "开启态须还原: {out2}");
-    assert!(!out2.contains("__PII_"), "还原后不留 token: {out2}");
+    let detector = PiiDetector::new();
+    let scope = Scope::new();
+    let req = r#"{"a":"__VG_","b":"__PII_3_ab","c":"__VG_CRED_000","d":"keep"}"#;
+    let (out, reserialized) = scope
+        .redact_request_with_report(&vault, &detector, req)
+        .await;
+    assert_eq!(out, req, "零替换须字节保真");
+    assert!(!reserialized, "原文透传不得声明重序列化");
 }
 
-#[test]
-fn fuzzy_restore_by_sequence_lookup() {
-    let vault = CredentialVault::new();
-    let plain = "13812345678";
-    let exact = Scope::with_opts(true, false);
-    let token = exact.pii_scope().register(plain, false).unwrap();
-    let seq: usize = token
-        .strip_prefix("__PII_")
-        .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
-        .flatten()
-        .expect("token 恒带序号");
-    let fuzzy_tok = format!("__PII_{seq}_zzzz__");
-    // 精确模式保留宽松形态。
+#[tokio::test]
+async fn request_replacement_still_strips_residual_partials() {
+    // R8-17：发生替换时既有残缺清理语义不变——残缺仍被剥离，真实铸造 token 保留。
+    let vault = vault_with_secret("my-secret-001");
+    let detector = PiiDetector::new();
+    let scope = Scope::new();
+    let req = r#"{"a":"my-secret-001","b":"__VG_","c":"__PII_3_ab"}"#;
+    let (out, reserialized) = scope
+        .redact_request_with_report(&vault, &detector, req)
+        .await;
+    assert!(reserialized, "有替换且 JSON 容器须声明重序列化: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["b"].as_str(), Some(""), "残缺 __VG_ 仍须剥离: {out}");
+    assert_eq!(v["c"].as_str(), Some(""), "残缺 __PII 仍须剥离: {out}");
     assert!(
-        exact
-            .restore_response(&vault, &format!("回拨 {fuzzy_tok}"))
-            .contains(&fuzzy_tok)
+        v["a"].as_str().is_some_and(|s| s.contains("__VG_CRED_")),
+        "真实铸造 token 须保留: {out}"
     );
-    // 宽松模式按序号还原明文。
-    let scope2 = Scope::with_opts(true, true);
-    let token2 = scope2.pii_scope().register(plain, false).unwrap();
-    let seq2: usize = token2
-        .strip_prefix("__PII_")
-        .and_then(|r| r.split_once('_').map(|(s, _)| s.parse().ok()))
-        .flatten()
-        .unwrap();
-    let restored = scope2.restore_response(&vault, &format!("回拨 __PII_{seq2}_zzzz__"));
-    assert!(restored.contains(plain), "{restored}");
-    assert!(!restored.contains("__PII_"), "{restored}");
-}
-
-#[test]
-fn strip_partials_legal_text_untouched() {
-    // D7：合法正文前缀续段/单词字符逐字节不变（不得误删）。
-    for legal in [
-        "__VG_CREDENTIALS",
-        "__VG_CUSTOMER",
-        "__VG_CREDIT",
-        "__PIXEL",
-        "__PIANO",
-        "__PII_DATA",
-        "__PII_AB",
-    ] {
-        assert_eq!(strip_partials(legal), legal, "合法正文不得误删: {legal}");
-    }
-    // 真残缺仍被清理（保护不退化）。
-    for partial in ["__VG_", "__VG_CRED_000", "__PII_3_ab"] {
-        let cleaned = strip_partials(partial);
-        assert!(!cleaned.contains("__VG"), "{partial} -> {cleaned:?}");
-        assert!(!cleaned.contains("__PI"), "{partial} -> {cleaned:?}");
-    }
-}
-
-#[test]
-fn strip_partials_differential() {
-    // design D7 差分用例表（合法正文 vs 真残缺 vs 前缀本身），逐条锁定边界。
-    for legal in [
-        "__VG_CREDENTIALS",
-        "__VG_CUSTOMER",
-        "__VG_CREDIT",
-        "__VG_CREDX",
-        "__PIXEL",
-        "__PIANO",
-        "__PII_DATA",
-        "__PII_AB",
-        "__VG_CRED_000extra",
-        "__PII_3_abzz",
-    ] {
-        assert_eq!(strip_partials(legal), legal, "合法正文须不变: {legal}");
-    }
-    for partial in [
-        "__VG_",
-        "__VG__",
-        "__VG_C",
-        "__VG_CR",
-        "__VG_CRE",
-        "__VG_CRED",
-        "__VG_CRED_",
-        "__VG_CRED_000",
-        "__VG_CRED_000001",
-        "__PI",
-        "__PI_",
-        "__PII",
-        "__PII_",
-        "__PII__",
-        "__PII_3",
-        "__PII_3_",
-        "__PII_3_ab",
-    ] {
-        let out = strip_partials(partial);
-        assert!(out.is_empty(), "真残缺/前缀须剥净: {partial:?} -> {out:?}");
-    }
-    // 完整形态口径：凭据完整剥离（还原先行）；PII 完整保留（响应期新 token）。
-    assert_eq!(strip_partials("__VG_CRED_000001__"), "");
-    assert!(
-        strip_partials("__PII_1_ab12cd34__").contains("__PII_1_ab12cd34__"),
-        "PII 完整形态须保留"
-    );
-    // 尾随边界（空白）剥离，后随合法单词字符不剥离。
-    assert_eq!(strip_partials("尾部 __VG_CRED_12 结束"), "尾部  结束");
-    assert_eq!(
-        strip_partials("正文 __PII_2_ab 结束"),
-        "正文  结束",
-        "残缺后随空白须剥离"
-    );
-}
-
-#[test]
-fn strip_partial_and_token_fn_semantics() {
-    let vault = CredentialVault::new();
-    assert_eq!(strip_partials("a __VG_CRED_00 b"), "a  b");
-    assert_eq!(strip_partials("a __PII_3_ab b"), "a  b");
-    assert_eq!(strip_token_forms(&vault, "x __VG_CRED_123456__ y"), "x  y");
-    // PII 完整形态保留（响应期新 token 语义）。
-    assert!(strip_token_forms(&vault, "x __PII_1_ab12cd34__ y").contains("__PII_1_ab12cd34__"));
 }
 
 #[tokio::test]
@@ -501,111 +391,6 @@ async fn multiline_faithful_roundtrip_bytes_identical() {
     assert!(redacted.contains("第三行 纯文本无敏感"), "{redacted}");
     let restored = scope.restore_response(&vault, &redacted);
     assert_eq!(restored, req, "往返须字节一致");
-}
-
-#[tokio::test]
-async fn restore_spans_skip_prevents_remask() {
-    let vault = CredentialVault::new();
-    let detector = PiiDetector::new();
-    let scope = Scope::new();
-    let redacted = scope
-        .redact_request(&vault, &detector, r#"{"phone":"13812345678"}"#)
-        .await;
-    assert!(redacted.contains("__PII_"), "{redacted}");
-    let (restored, spans) = scope.restore_response_with_spans(&vault, &redacted);
-    assert!(restored.contains("13812345678"), "{restored}");
-    assert!(!spans.is_empty());
-    assert!(
-        spans
-            .iter()
-            .any(|(s, e)| &restored[*s..*e] == "13812345678"),
-        "{spans:?}"
-    );
-    // 带 skip：还原明文保持明文。
-    let kept = scope
-        .redact_response_new_pii_with_skip(&vault, &detector, &restored, &spans)
-        .await;
-    assert!(kept.contains("13812345678"), "{kept}");
-    // 对照（不带 skip）：同一明文被套上响应 token，证明 skip 生效。
-    let masked = scope
-        .redact_response_new_pii(&vault, &detector, &restored)
-        .await;
-    assert!(!masked.contains("13812345678"), "{masked}");
-    assert!(masked.contains("__PII_"), "{masked}");
-}
-
-#[tokio::test]
-async fn credential_restore_spans_cover_plaintext() {
-    let vault = CredentialVault::new();
-    vault.register("my-secret-001").expect("注册恒成功");
-    let scope = Scope::new();
-    let masked = scope
-        .redact_request(&vault, &PiiDetector::new(), "密码 my-secret-001 结束")
-        .await;
-    assert!(!masked.contains("my-secret-001"), "{masked}");
-    let (restored, spans) = scope.restore_response_with_spans(&vault, &masked);
-    assert_eq!(restored, "密码 my-secret-001 结束");
-    assert_eq!(spans.len(), 1);
-    assert_eq!(&restored[spans[0].0..spans[0].1], "my-secret-001");
-    // 未知 token 不产生 span。
-    let (unchanged, empty) = scope.restore_response_with_spans(&vault, "纯文本无 token");
-    assert_eq!(unchanged, "纯文本无 token");
-    assert!(empty.is_empty());
-}
-
-#[tokio::test]
-async fn per_token_lookup_does_not_snapshot_full_vault() {
-    let vault = CredentialVault::new();
-    let secret = "complexity-secret-001";
-    let token = vault.register(secret).unwrap();
-    let scope = Scope::new();
-    mint_cred(&scope, &vault, secret).await;
-    let text = format!("{token} {token} {token}");
-    let before = vault.snapshot_calls();
-    let (restored, spans) = scope.restore_response_with_spans(&vault, &text);
-    assert_eq!(restored, format!("{secret} {secret} {secret}"));
-    assert_eq!(spans.len(), 3);
-    // B2/D2：主还原与 span 回查均逐 token 直查，全量快照计数零增量。
-    assert_eq!(
-        vault.snapshot_calls() - before,
-        0,
-        "逐 token 直查不得触发全表克隆（含主还原路径）"
-    );
-}
-
-#[tokio::test]
-async fn restore_per_token_parity() {
-    let vault = CredentialVault::new();
-    let scope = Scope::new();
-    let a = vault.register("parity-secret-alpha").unwrap();
-    let b = vault.register("parity-secret-beta").unwrap();
-    mint_cred(&scope, &vault, "parity-secret-alpha parity-secret-beta").await;
-    let pii_tok = scope.pii_scope().register("13812345678", false).unwrap();
-    let sample = format!(
-        "{{\"x\":\"{a}{b}\",\"y\":\"__VG_CRED_999999__\",\"z\":\"{pii_tok}\",\"e\":\"换行\\n引号\\\"\"}}"
-    );
-    let per_token = scope.restore_response(&vault, &sample);
-    let full = {
-        let step1 = vault.restore(&sample);
-        let step2 = scope.pii_scope().restore(&step1);
-        let step3 = vault.strip_hallucinated(&step2, None);
-        strip_partials(&step3)
-    };
-    assert_eq!(per_token, full, "逐 token 还原须与全量路径逐字节一致");
-    assert!(per_token.contains("parity-secret-alpha"), "{per_token}");
-    assert!(per_token.contains("parity-secret-beta"), "{per_token}");
-    assert!(!per_token.contains("__VG_CRED_999999__"), "{per_token}");
-    assert!(per_token.contains("13812345678"), "{per_token}");
-}
-
-#[test]
-fn span_apply_dedup_semantics() {
-    let out = apply_spans(
-        "hello world",
-        &[(6, 11, "W".to_string()), (6, 11, "W".to_string())],
-        true,
-    );
-    assert_eq!(out, "hello W");
 }
 
 #[test]

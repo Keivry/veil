@@ -442,7 +442,7 @@ async fn admin_metrics_existing_keys_unchanged() {
     let dir = metrics_test_dir("pii-scope-existing-keys");
     let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
     let body = metrics_body(state.clone()).await;
-    const EXISTING: [&str; 19] = [
+    const EXISTING: [&str; 20] = [
         "ok",
         "is_precise",
         "requests",
@@ -454,6 +454,7 @@ async fn admin_metrics_existing_keys_unchanged() {
         "truncated",
         "chat_tail_lenient",
         "sse_events",
+        "truncated_line_dropped_bytes",
         "ring_len",
         "dropped",
         "approval_decision_overflow_total",
@@ -481,6 +482,46 @@ async fn admin_metrics_existing_keys_unchanged() {
         assert!(body["truncated"][k].is_u64(), "truncated.{k}: {body}");
     }
     assert!(body["pii_scope"].is_object(), "新增项须为对象: {body}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R8-13：C11 超长行截断丢弃字节数经只读 getter 暴露——字段存在、为计数、
+/// 随累计丢弃递增，且与既有 `truncated` 四态对象互不干扰。
+#[tokio::test]
+async fn admin_metrics_truncated_line_dropped_bytes_observable() {
+    let dir = metrics_test_dir("truncated-line-dropped-bytes");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let before = metrics_body(state.clone()).await;
+    assert!(
+        before
+            .get("truncated_line_dropped_bytes")
+            .is_some_and(|v| v.is_u64()),
+        "字段须为计数: {before}"
+    );
+    let base = before["truncated_line_dropped_bytes"].as_u64().unwrap();
+    state
+        .gateway_metrics()
+        .record_truncated_line_dropped_bytes(2048);
+    state
+        .gateway_metrics()
+        .record_truncated_line_dropped_bytes(512);
+    let after = metrics_body(state.clone()).await;
+    assert_eq!(
+        after["truncated_line_dropped_bytes"].as_u64(),
+        Some(base + 2560),
+        "字段须反映累计丢弃字节: {after}"
+    );
+    for k in [
+        "silent_discard",
+        "open_ended",
+        "synthesized_failed",
+        "upstream_error",
+    ] {
+        assert!(
+            after["truncated"][k].is_u64(),
+            "既有 truncated.{k} 形态不变: {after}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -3,7 +3,11 @@
 //! 零 axum 依赖（仅 `serde_json` 与 `json_walk`），判定与 handler 职责解耦。
 
 use {
-    super::super::json_walk::{jloads, strip_bom},
+    super::super::{
+        credential_vault::{TOKEN_PREFIX, TOKEN_SUFFIX},
+        json_walk::{jloads, strip_bom},
+        pii::detector::PII_TOKEN_PREFIX,
+    },
     serde_json::Value,
 };
 
@@ -29,6 +33,32 @@ pub(crate) fn restore_guard_ok(
     }
 }
 
+/// R8-18/D6：键是否为**完整**占位符 token 形态——`__VG_CRED_` + ≥6 位数字
+/// （mint 侧 `{n:06}` 随序号增长，故位数只增不减）+ `__`，
+/// 或 `__PII_` + 数字序号 + `_` + 恰 8 位小写十六进制 + `__`。前缀相同但形态不完整
+/// （如 `__VG_CRED_0001__`、`__PII_12_zzzzzzzz__`）不得作为配对依据。
+fn is_token_shaped_key(k: &str) -> bool {
+    if let Some(rest) = k.strip_prefix(TOKEN_PREFIX) {
+        let Some(digits) = rest.strip_suffix(TOKEN_SUFFIX) else {
+            return false;
+        };
+        return digits.len() >= 6 && digits.bytes().all(|b| b.is_ascii_digit());
+    }
+    if let Some(rest) = k.strip_prefix(PII_TOKEN_PREFIX) {
+        let Some(body) = rest.strip_suffix(TOKEN_SUFFIX) else {
+            return false;
+        };
+        let Some((seq, rand)) = body.split_once('_') else {
+            return false;
+        };
+        return !seq.is_empty()
+            && seq.bytes().all(|b| b.is_ascii_digit())
+            && rand.len() == 8
+            && rand.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    }
+    false
+}
+
 /// RED-1：递归比对占位符帧与还原帧的字符串值。占位符字符串值若为
 /// stringified JSON，则还原后仍须可解析为同构容器（内层破损 fail-closed）。
 pub(crate) fn inner_json_intact(placeholder: &Value, restored: &Value) -> bool {
@@ -49,9 +79,35 @@ pub(crate) fn inner_json_intact(placeholder: &Value, restored: &Value) -> bool {
         (Value::Array(pa), Value::Array(ra)) => {
             pa.len() == ra.len() && pa.iter().zip(ra).all(|(p, r)| inner_json_intact(p, r))
         }
-        (Value::Object(pm), Value::Object(rm)) => pm
-            .iter()
-            .all(|(k, pv)| rm.get(k).is_some_and(|rv| inner_json_intact(pv, rv))),
+        (Value::Object(pm), Value::Object(rm)) => {
+            // R8-18/D6：条目数恒等；同名键逐键递归；非同名键仅允许
+            // 「占位符侧完整 token 形态 ↔ 还原侧新增键」一一配对（双射且与
+            // 同名键集互补，故等价于计数相等 + 占位符侧全部 token 形态）。
+            if pm.len() != rm.len() {
+                return false;
+            }
+            let mut restored_only = 0usize;
+            for (k, rv) in rm {
+                match pm.get(k) {
+                    Some(pv) => {
+                        if !inner_json_intact(pv, rv) {
+                            return false;
+                        }
+                    }
+                    None => restored_only += 1,
+                }
+            }
+            let placeholder_only: Vec<&str> = pm
+                .keys()
+                .filter(|k| !rm.contains_key(*k))
+                .map(String::as_str)
+                .collect();
+            restored_only == placeholder_only.len()
+                && placeholder_only.iter().all(|k| is_token_shaped_key(k))
+        }
+        // R8-18/D6：容器与非容器（Object↔String 等）类型漂移一律拒绝；标量
+        // （Number/Bool/Null，还原不改写其类型）维持既有 `_ => true` 兜底口径。
+        (Value::Object(_) | Value::Array(_), _) | (_, Value::Object(_) | Value::Array(_)) => false,
         _ => true,
     }
 }
@@ -117,20 +173,50 @@ mod tests {
 
     #[test]
     fn inner_json_intact_recursive_cases() {
+        // R8-18/D6：键级还原（占位符键 → 明文键）在条目数相等、占位符侧为完整
+        // token 形态、值与容器结构完好时接受；其余结构差异一律拒绝。
+        // 正例：完整 token 键与还原侧新增明文键配对，值结构完好。
         assert!(inner_json_intact(
-            &json!({"a": 1}),
-            &json!({"a": 1, "b": 2})
+            &json!({"__VG_CRED_000001__": "v", "keep": [1, 2]}),
+            &json!({"user_password": "v", "keep": [1, 2]})
         ));
-        assert!(!inner_json_intact(&json!({"a": 1}), &json!({"b": 1})));
-        assert!(!inner_json_intact(&json!([1, 2]), &json!([1])));
+        assert!(inner_json_intact(
+            &json!({"__PII_12_ab12cd34__": {"k": 1}}),
+            &json!({"email": {"k": 1}})
+        ));
         assert!(inner_json_intact(&json!([1, 2]), &json!([1, 2])));
-        assert!(!inner_json_intact(
-            &json!({"s": "{\"k\": 1}"}),
-            &json!({"s": "{\"k\": }"})
+        // 正例：mint 序号 ≥1e6 后位数增长（`{n:06}`），仍属完整 token 形态。
+        assert!(inner_json_intact(
+            &json!({"__VG_CRED_1234567__": "v"}),
+            &json!({"user_password": "v"})
         ));
         assert!(inner_json_intact(
             &json!({"s": "{\"k\": 1}"}),
             &json!({"s": "{\"k\": 1}"})
         ));
+        // 负例：还原侧多一非 token 键（条目数不等；既有断言 `true` 按 D6 改判 `false`）。
+        assert!(!inner_json_intact(
+            &json!({"a": 1}),
+            &json!({"a": 1, "b": 2})
+        ));
+        // 负例：非 token 形态的键改名（无配对依据）。
+        assert!(!inner_json_intact(&json!({"a": 1}), &json!({"b": 1})));
+        // 负例：条目数不等即便占位符侧为完整 token 形态。
+        assert!(!inner_json_intact(
+            &json!({"__VG_CRED_000001__": 1}),
+            &json!({"a": 1, "b": 2})
+        ));
+        // 负例：前缀相同但非完整形态（6 位数字不满足）不得配对。
+        assert!(!inner_json_intact(
+            &json!({"__VG_CRED_0001__": 1}),
+            &json!({"a": 1})
+        ));
+        // 负例：数组长度不等；内层 stringified JSON 破损；Object↔String 类型漂移。
+        assert!(!inner_json_intact(&json!([1, 2]), &json!([1])));
+        assert!(!inner_json_intact(
+            &json!({"s": "{\"k\": 1}"}),
+            &json!({"s": "{\"k\": }"})
+        ));
+        assert!(!inner_json_intact(&json!({"a": 1}), &json!("{\"a\": 1}")));
     }
 }

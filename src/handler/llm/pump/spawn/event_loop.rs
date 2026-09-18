@@ -1,4 +1,7 @@
 //! ARC-1：流泵主循环与单事件处理（自 `spawn.rs` 拆出，纯搬移行为不变）。
+//!
+//! 子模块：`observe`（单帧 JSON 观测写回）、`reject`（fail-closed 阻断臂）、
+//! `responses_error`（Responses 上游 `error` 失败终端合成）。
 
 use {
     super::{
@@ -7,29 +10,22 @@ use {
             event::{
                 advance_responses_seq_cursor,
                 extract_responses_seq,
-                is_anthropic_opaque_event,
-                is_anthropic_thinking_event,
+                is_anthropic_seam_transparent,
                 is_chat_error_terminal,
                 is_minor_event,
                 is_terminal_event,
-                is_upstream_error_terminal,
                 outer_event_index,
                 parse_event_data,
                 record_emitted_events,
-                responses_error_object,
                 responses_failed_incomplete,
-                responses_synth_conv_id,
                 sticky_terminal_event,
-                stream_model_of,
             },
             fragments::extract_tool_fragments,
-            synth_flush::flush_pre_terminal,
             toolbuf::take_pending_tool_inputs,
         },
         frame_feed::{drain_prefix_hold, feed_output_frame},
         restore_emit::{FrameSink, RestoredFrame, emit_restored_json_frame},
         setup::{PumpEnv, PumpLoopState},
-        terminator::TerminalPlan,
     },
     crate::{
         approval::PendingRecord,
@@ -38,16 +34,21 @@ use {
         service::{
             audit::{self, AuditHold},
             block_inject,
-            llm_gateway,
-            sse::{SseEvent, SseParser, TruncatedMode, data_frame, is_done_payload, set_truncated},
+            sse::{SseEvent, SseParser, data_frame, is_done_payload},
         },
     },
     serde_json::Value,
 };
 
+mod observe;
 mod reject;
+mod responses_error;
 
-use reject::apply_reject_block;
+use {
+    observe::observe_parsed_frame,
+    reject::apply_reject_block,
+    responses_error::synthesize_responses_failed,
+};
 
 #[cfg(test)]
 mod non_chat_done_tests;
@@ -171,52 +172,7 @@ where
     // 产物供本函数各判定复用；空帧/`[DONE]`/非法 JSON 为 `None`。
     let parsed: Option<Value> = parse_event_data(&ev.data);
     if let Some(v) = parsed.as_ref() {
-        let response_id = llm_gateway::extract_conv_id(v);
-        let wrote = response_id
-            .as_deref()
-            .is_some_and(|id| env.resp_scope.record_response_id(env.protocol, id));
-        // R5-09/D10：写回失败仅「响应 id 缺失/为空」计一次；无写回上下文（`request`
-        // 模式/键未推导）与非 Responses 协议门控 MUST NOT 计入。计数点取 Responses
-        // 官方终端帧且本流从未见过 id，保证一次响应恰一次（不回退为逐帧误计）。
-        if !wrote
-            && env.protocol.is_responses()
-            && response_id.is_none()
-            && env.resp_scope.has_conversation()
-            && state.conv_id.is_none()
-            && is_terminal_event(env.protocol, v)
-        {
-            env.metrics.record_conversation_writeback_miss();
-        }
-        if let Some(id) = response_id {
-            if state.stream_first_id.is_none() {
-                state.stream_first_id = Some(id.clone());
-            }
-            state.conv_id = Some(id);
-        }
-        if let Some(m) = stream_model_of(v).filter(|m| !m.is_empty()) {
-            state.stream_model = Some(m.to_string());
-            state.stream_model_from_resp = true;
-        } else if !state.stream_model_from_resp && !env.req_model.is_empty() {
-            state.stream_model = Some(env.req_model.clone());
-        }
-        llm_gateway::accumulate_usage(
-            &mut state.stream_usage,
-            llm_gateway::extract_usage_stream(env.protocol, v),
-        );
-        if env.protocol.is_chat() && AuditHold::chat_finish_reason_present(v) {
-            state.chat_finish_seen = true;
-        }
-        // A-6/F-08 + R5-04：上游错误即终端（Chat 顶层 `error` 无 `choices`；Anthropic
-        // `type:"error"`）——观测记 `upstream_error`（区别于 `open_ended`）；本帧仍作
-        // 终端帧透出，其后数据帧由终端守卫丢弃，流末不再补合成终端。
-        if is_upstream_error_terminal(env.protocol, v) && !state.terminator.terminal_sent() {
-            let _ = set_truncated(
-                &mut state.meta,
-                env.protocol,
-                TruncatedMode::UpstreamError,
-                Some(&env.metrics),
-            );
-        }
+        observe_parsed_frame(state, env, v);
     }
     // A-2/F-02：Responses 序号游标——每帧解析后、任何分流前推进（次要帧/被 hold
     // 缓冲帧/被替换的 error 帧同样参与），取已见上游序号上界；缺序号不推进、
@@ -270,75 +226,8 @@ where
         ) {
             ResponsesAction::Ignore => return EventFlow::Next,
             ResponsesAction::SynthesizeFailed => {
-                // P4/D4：`error` 仅合成单帧 `response.failed`
-                //（`response.error.message` 携带上游 error 文案），不注入
-                // `output_index` 序列；`incomplete` 不在此列——原样透传并作为
-                // 唯一终端（保留 `incomplete_details`，由 `is_terminal_event` 置位）。
-                state.terminator.note_responses_failed();
-                let fid = responses_synth_conv_id(
-                    state.stream_first_id.as_deref(),
-                    state.conv_id.as_deref(),
-                    &env.metrics,
-                );
-                let err_obj = responses_error_object(parsed.as_ref());
-                // D3/S3：合成终端前先 flush 边界滞留帧，保证末段增量先下行。
-                drain_prefix_hold(
-                    &mut state.prefix_hold,
-                    &mut state.boundary,
-                    &boundary_spans,
-                    &mut state.agg,
-                );
-                if flush_pre_terminal(
-                    &mut state.boundary,
-                    &mut state.agg,
-                    &env.pump_tx,
-                    &env.metrics,
-                )
-                .await
-                {
-                    state.forwarded += 1;
-                    state.terminator.note_frame_sent();
-                }
-                // 3.2 收敛：`responses_failed_frame` 构造迁入 `plan_responses_error`；
-                // I-5 逐帧成功下行记 `add_sse_event`（BLOCKER-1，不得增删）。
-                // D9/S9：合成 failed 帧 send 成功才置位终端，下游早断不撒谎。
-                let mut terminal_ok = false;
-                if let TerminalPlan::Frames {
-                    kind,
-                    frames,
-                    truncated,
-                } = state.terminator.plan_responses_error(
-                    &fid,
-                    err_obj.as_ref().map(|(v, _)| v),
-                    err_obj.as_ref().and_then(|(_, s)| *s),
-                    state.stream_model.as_deref().unwrap_or(""),
-                ) {
-                    for f in frames {
-                        if env.pump_tx.send(f).await.is_err() {
-                            break;
-                        }
-                        env.metrics.add_sse_event();
-                        state.forwarded += 1;
-                        state.terminator.note_frame_sent();
-                        terminal_ok = true;
-                    }
-                    // BLOCKER-3：传实际 `terminal_ok`，不得硬编码 `true`
-                    //（`send` 失败即不置终端帧位、不落 `terminal_injected`）。
-                    state
-                        .terminator
-                        .commit(&mut state.meta, kind, terminal_ok, terminal_ok);
-                    // R7-03/D3：观测与终端帧位解耦——`commit` 后无条件落截断观测
-                    //（下游早断时观测仍落，不低于一次）；`set_truncated` 自带
-                    // Responses-only 守卫，调用点不重复协议门控。
-                    if let Some(mode) = truncated {
-                        let _ =
-                            set_truncated(&mut state.meta, env.protocol, mode, Some(&env.metrics));
-                    }
-                }
-                // BLOCKER-3：无帧也可终止循环（对齐旧 `event_loop.rs:341` 无条件置
-                // `terminated`）；`ResponsesAction::DuplicateFailed` 仅调本方法。
-                state.terminator.mark_loop_terminated();
-                return EventFlow::Next;
+                return synthesize_responses_failed(state, env, parsed.as_ref(), boundary_spans)
+                    .await;
             }
             ResponsesAction::DuplicateFailed => {
                 state.terminator.mark_loop_terminated();
@@ -618,82 +507,91 @@ where
             let prefix = envelope_prefix(ev);
             if event_terminal {
                 state.terminator.mark_upstream_terminal();
-            }
-            let (restored_data, emitted) = if env.protocol.is_anthropic()
-                && is_anthropic_opaque_event(v)
-                && !is_anthropic_thinking_event(v)
-            {
-                // M3/D6：opaque（signature/redacted/thinking+signature）帧跳过
-                // 响应侧新 PII 扫描与 `json_aware_line` 重序列化，仅做字节级还原
-                //（JSON 转义变体保证不破帧）；审计 hold/次要判定维持现状。
-                let (restored, _spans) = env
-                    .resp_scope
-                    .restore_response_with_spans_json(&env.resp_vault, &ev.data);
-                emit_restored_json_frame(
-                    &mut FrameSink {
-                        prefix_hold: &mut state.prefix_hold,
-                        boundary: &mut state.boundary,
-                        detector: &env.resp_detector,
-                        vault: &env.resp_vault,
-                        boundary_spans,
-                        agg: &mut state.agg,
-                    },
-                    RestoredFrame {
-                        prefix: &prefix,
-                        restored,
-                        placeholder: &ev.data,
-                        placeholder_parsed: parsed.as_ref(),
-                        json_aware: false,
-                        feed: !buffer_tool_frame,
-                    },
-                    &env.metrics,
-                )
-                .await
-            } else {
-                // MSP-4/2.28：thinking 明文 opaque 增量与其他文本同路——接入
-                // `TokenCarry` 做跨帧缝合，不绕过携带。
-                let cleaned = state.carry.prepare(&ev.data);
-                let (restored, spans) = env
-                    .resp_scope
-                    .restore_response_with_spans_json(&env.resp_vault, &cleaned);
-                let scanned = env
-                    .resp_scope
-                    .redact_response_new_pii_with_skip(
-                        &env.resp_vault,
-                        &env.resp_detector,
-                        &restored,
-                        &spans,
-                    )
-                    .await;
-                // R5-14/D5：响应侧新检出注册遇熵源/内部故障 fail-closed——不将未 token 化
-                // 的明文帧下发；复用阻断臂（reason 不含明文/键/头值）产出协议正确阻断帧，
-                // 粘滞拒绝态令后续帧继续被抑制（不引入第二套终端机制）。
-                if env.resp_scope.pii_unavailable() {
-                    apply_reject_block(state, env, v, "pii-unavailable").await;
-                    return EventFlow::Next;
+                // R8-06：Anthropic/Responses 上游终端帧即时推进循环终止——终端帧经
+                // `finish`→`terminal::finalize` 的 flush 立即送达下游，不依赖上游 EOF；
+                // Chat `[DONE]` 路径（下方 `is_done_payload` 分支）保持既有 flush 语义
+                //（usage 尾帧照常透传），不在此列。
+                if env.protocol.is_anthropic() || env.protocol.is_responses() {
+                    state.terminator.mark_loop_terminated();
                 }
-                let parsed_opt = (cleaned == ev.data).then_some(parsed.as_ref()).flatten();
-                emit_restored_json_frame(
-                    &mut FrameSink {
-                        prefix_hold: &mut state.prefix_hold,
-                        boundary: &mut state.boundary,
-                        detector: &env.resp_detector,
-                        vault: &env.resp_vault,
-                        boundary_spans,
-                        agg: &mut state.agg,
-                    },
-                    RestoredFrame {
-                        prefix: &prefix,
-                        restored: scanned,
-                        placeholder: &cleaned,
-                        placeholder_parsed: parsed_opt,
-                        json_aware: true,
-                        feed: !buffer_tool_frame,
-                    },
-                    &env.metrics,
-                )
-                .await
-            };
+            }
+            let (restored_data, emitted) =
+                if env.protocol.is_anthropic() && is_anthropic_seam_transparent(v) {
+                    // M3/D6 + R8-08/D9：签名/密文载体帧跳过响应侧新 PII 扫描与
+                    // `json_aware_line` 重序列化，仅做字节级还原，且不进跨缝蒙版路径
+                    //（`mask_fallback:false` 无掩码直通）；审计 hold/次要判定维持现状。
+                    let (restored, _spans) = env
+                        .resp_scope
+                        .restore_response_with_spans_json(&env.resp_vault, &ev.data);
+                    emit_restored_json_frame(
+                        &mut FrameSink {
+                            prefix_hold: &mut state.prefix_hold,
+                            boundary: &mut state.boundary,
+                            detector: &env.resp_detector,
+                            vault: &env.resp_vault,
+                            scope: &env.resp_scope,
+                            boundary_spans,
+                            agg: &mut state.agg,
+                        },
+                        RestoredFrame {
+                            prefix: &prefix,
+                            restored,
+                            placeholder: &ev.data,
+                            placeholder_parsed: parsed.as_ref(),
+                            json_aware: false,
+                            mask_fallback: false,
+                            feed: !buffer_tool_frame,
+                        },
+                        &env.metrics,
+                    )
+                    .await
+                } else {
+                    // MSP-4/2.28：thinking 明文 opaque 增量与其他文本同路——接入
+                    // `TokenCarry` 做跨帧缝合，不绕过携带。
+                    let cleaned = state.carry.prepare(&ev.data);
+                    let (restored, spans) = env
+                        .resp_scope
+                        .restore_response_with_spans_json(&env.resp_vault, &cleaned);
+                    let scanned = env
+                        .resp_scope
+                        .redact_response_new_pii_with_skip(
+                            &env.resp_vault,
+                            &env.resp_detector,
+                            &restored,
+                            &spans,
+                        )
+                        .await;
+                    // R5-14/D5：响应侧新检出注册遇熵源/内部故障 fail-closed——不将未 token 化
+                    // 的明文帧下发；复用阻断臂（reason 不含明文/键/头值）产出协议正确阻断帧，
+                    // 粘滞拒绝态令后续帧继续被抑制（不引入第二套终端机制）。
+                    if env.resp_scope.pii_unavailable() {
+                        apply_reject_block(state, env, v, "pii-unavailable").await;
+                        return EventFlow::Next;
+                    }
+                    let parsed_opt = (cleaned == ev.data).then_some(parsed.as_ref()).flatten();
+                    emit_restored_json_frame(
+                        &mut FrameSink {
+                            prefix_hold: &mut state.prefix_hold,
+                            boundary: &mut state.boundary,
+                            detector: &env.resp_detector,
+                            vault: &env.resp_vault,
+                            scope: &env.resp_scope,
+                            boundary_spans,
+                            agg: &mut state.agg,
+                        },
+                        RestoredFrame {
+                            prefix: &prefix,
+                            restored: scanned,
+                            placeholder: &cleaned,
+                            placeholder_parsed: parsed_opt,
+                            json_aware: true,
+                            mask_fallback: true,
+                            feed: !buffer_tool_frame,
+                        },
+                        &env.metrics,
+                    )
+                    .await
+                };
             // P0-3.1：未完成 tool 分片不进边界 hold、不进 `agg`
             // （hold-until-complete），直接缓冲还原后输入；完成帧走
             // 正常透传（此前缓冲已在本帧前重放进边界 hold）。

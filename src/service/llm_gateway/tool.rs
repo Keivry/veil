@@ -16,7 +16,13 @@ pub(crate) use super::tool_responses::{
 mod bucket;
 
 pub use bucket::{anthropic_bucket_index, chat_bucket};
-pub(crate) use bucket::{bucket_index_of, chat_bucket_raw, responses_output_bucket};
+pub(crate) use bucket::{
+    anthropic_item_bucket,
+    bucket_from_raw_index,
+    bucket_index_of,
+    chat_bucket_raw,
+    responses_output_bucket,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
@@ -327,7 +333,11 @@ pub(crate) fn extract_tool_calls_with(
                         Value::Array(a) => {
                             for (j, item) in a.iter().enumerate() {
                                 if let Some(obj) = item.as_object()
-                                    && let Some(c) = custom_obj_to_call(emit_warn, j as u32, obj)
+                                    && let Some(c) = custom_obj_to_call(
+                                        emit_warn,
+                                        anthropic_item_bucket(bucket, j as u32),
+                                        obj,
+                                    )
                                 {
                                     out.push(c);
                                 }

@@ -105,10 +105,9 @@ pub struct SseParser {
     block_comments: Vec<String>,
     line_bytes: usize,
     event_start: Option<Instant>,
-    /// STP-10：统一事件计数口径——解析出的数据事件与经
-    /// [`SseParser::record_injected_event`] 纳入的注入合成帧（审计阻断/截断收尾等）
-    /// 共用本计数，与生产指标 `GatewayMetrics::add_sse_event()` 逐一致；纯注释块与
-    /// 纯信封块不计入。生产注入点 SHALL 经 `record_injected_event` 计数。
+    /// 解析层数据事件计数（分块/同块等价口径基准）；注入帧生产计数唯一为
+    /// `GatewayMetrics::add_sse_event`，解析计数按 `stream-fidelity-fix`
+    /// 「SSE 事件计数口径一致」显式排除合成帧。纯注释块与纯信封块不计入。
     pub sse_event_count: u64,
     pub line_overflow: bool,
     /// C11：超长行截断丢弃的尾部字节累计（调用方经
@@ -170,11 +169,6 @@ impl SseParser {
     pub fn take_pending_events_dropped(&mut self) -> u64 {
         std::mem::take(&mut self.pending_events_dropped)
     }
-
-    /// STP-10：把注入的合成帧并入统一事件计数（与解析事件同源），
-    /// 使 `sse_event_count` 与生产指标 `GatewayMetrics::add_sse_event()` 一致。
-    #[cfg(test)]
-    pub(crate) fn record_injected_event(&mut self) { self.sse_event_count += 1; }
 
     /// D2/STP-2：仅单测使用，暴露未终结行尾缓冲长度以断言有界。
     #[cfg(test)]

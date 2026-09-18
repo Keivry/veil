@@ -81,6 +81,7 @@ fn nonstream_ctx(
         },
         stream_flag: false,
         nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
+        non_json_passthrough: false,
     }
 }
 

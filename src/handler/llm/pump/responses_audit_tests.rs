@@ -6,7 +6,7 @@ use crate::{
     config::AuditMode,
     handler::llm::{
         pump::StreamPumpCtx,
-        stream_tests::{collect_pump, fresh_arcs, loopback_server},
+        stream_tests::{collect_pump, fresh_arcs, loopback_server, loopback_server_hold_open},
     },
     service::{audit::test_whitelist, block_inject, llm_gateway::Protocol},
 };
@@ -505,5 +505,116 @@ data: {"type":"response.function_call_arguments.delta","item_id":"call-3","outpu
     assert_eq!(
         approve_events, 1,
         "截断 pending 槽经终端恰审计一次（事件计数不因同键去重而掩盖）"
+    );
+}
+
+#[tokio::test]
+async fn residual_after_audit_block_is_dropped() {
+    // R8-02/D1：审计阻断已注入后，同流无空行收尾的完整 JSON 残余恒丢弃。
+    let sse = br#"data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"-rf /\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-1","output_index":0,"arguments":"{\"command\":\"rm -rf /\"}"}
+
+data: {"type":"response.output_text.delta","sequence_number":9,"delta":"late-after-block"}"#;
+    let (outcome, frames) = run(sse).await;
+    assert!(outcome.block_injected, "危险参数须阻断: {frames:?}");
+    let joined = frames.join("");
+    assert!(
+        !joined.contains("late-after-block"),
+        "阻断后残余须丢弃: {joined}"
+    );
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "阻断终端恰一: {joined}"
+    );
+}
+
+#[tokio::test]
+async fn responses_block_terminates_without_upstream_eof_preserving_usage() {
+    // R8-07/D3：阻断提交后上游不 EOF 时泵任务立即结束、下游流闭合、恰一终端；
+    // 阻断前已累计 usage 不丢失（经 finish 的 record_chat 落指标快照）。
+    let sse = br#"data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"r1","status":"in_progress","usage":{"input_tokens":5,"output_tokens":7,"total_tokens":12}}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"-rf /\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-1","output_index":0,"arguments":"{\"command\":\"rm -rf /\"}"}
+
+data: {"type":"response.output_text.delta","sequence_number":9,"delta":"late-after-block"}
+"#;
+    let (url, server) = loopback_server_hold_open("text/event-stream", sse.to_vec()).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let ctx = block_ctx();
+    let metrics = ctx.req.admin_metrics.clone();
+    let (outcome, frames) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        collect_pump(upstream, ctx),
+    )
+    .await
+    .expect("阻断后上游不 EOF 时泵须立即闭合，不得挂起");
+    server.abort();
+    assert!(outcome.block_injected, "危险参数须阻断: {frames:?}");
+    let joined = frames.join("");
+    assert!(!joined.contains("rm -rf"), "危险明文不得到达下游: {joined}");
+    assert!(
+        !joined.contains("late-after-block"),
+        "阻断后残余须丢弃: {joined}"
+    );
+    assert_eq!(
+        block_inject::terminal_count(&frames, "responses"),
+        1,
+        "阻断终端恰一: {joined}"
+    );
+    assert_eq!(
+        metrics.snapshot().total_tokens,
+        12,
+        "阻断前已累计 usage 不丢失"
+    );
+}
+
+#[tokio::test]
+async fn responses_block_sequence_saturates_at_u64_max() {
+    // R8-04：上游 `sequence_number = u64::MAX` 后触发阻断合成——不 panic、
+    // 不回绕非单调（饱和加法使合成序列保持 u64::MAX）。
+    let sse = br#"data: {"type":"response.output_item.added","output_index":0,"sequence_number":18446744073709551615,"item":{"type":"function_call","id":"call-1","name":"run","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"{\"command\":\"rm "}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":0,"delta":"-rf /\"}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"call-1","output_index":0,"arguments":"{\"command\":\"rm -rf /\"}"}
+
+"#;
+    let (outcome, frames) = run(sse).await;
+    assert!(outcome.block_injected, "危险参数须阻断: {frames:?}");
+    let mut seqs = Vec::new();
+    for f in &frames {
+        for line in f.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+                && let Some(s) = v.get("sequence_number").and_then(|x| x.as_u64())
+            {
+                seqs.push(s);
+            }
+        }
+    }
+    assert_eq!(seqs.len(), 7, "阻断 7 帧全序列须带序号: {seqs:?}");
+    assert!(
+        seqs.iter().all(|s| *s == u64::MAX),
+        "饱和后不得回绕: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[0] <= w[1]),
+        "合成序列不得非单调: {seqs:?}"
     );
 }

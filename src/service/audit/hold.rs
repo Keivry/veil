@@ -230,8 +230,11 @@ impl AuditHold {
         let Some(args) = full_args.filter(|a| !a.is_empty()) else {
             return;
         };
-        // RED-6：完整参数替代已累积分片文本，字节只计一次（先归还分片计数）。
-        let old: usize = slot.frags.values().map(|s| s.len()).sum();
+        // RED-6：完整参数替代已累积分片文本，字节只计一次（先归还旧值计数）。
+        // R8-01：旧值须取 `held_bytes()`（与 [`ResponsesSlot::full_args`] 及释放
+        // 口径同源）——官方双投递下第二次 `.done` 时 `frags` 已清空但 `done_args`
+        // 在持，若按分片和取 0 会二次累加字节。
+        let old = slot.held_bytes();
         slot.done_args = Some(args.to_string());
         slot.frags.clear();
         self.total_bytes = self
@@ -566,3 +569,7 @@ mod keepalive_tests;
 /// 同 index 零字节分片洪泛记账测试（触 800 红线后按同一测试外迁模板独立成子模块）。
 #[cfg(test)]
 mod zero_byte_tests;
+
+/// R8-01 双投递字节去重与守恒测试（触 800 红线后按同一测试外迁模板独立成子模块）。
+#[cfg(test)]
+mod double_done_tests;

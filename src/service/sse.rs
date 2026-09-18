@@ -260,17 +260,21 @@ mod speed_split_parity_tests {
 
     #[test]
     fn sse_event_count_consistency() {
-        // STP-10：解析计数与生产指标计数统一口径——注入合成帧经
-        // `record_injected_event` 纳入同一 `sse_event_count`，与 `add_sse_event` 一致。
+        // D4（R8-10/R8-14）：解析计数仅统计解析路径数据事件；注入合成帧按
+        // `stream-fidelity-fix`「SSE 事件计数口径一致」显式排除，其生产计数
+        // 唯一为 `add_sse_event`。本用例锁定声明差值，不断言两口径逐帧相等。
         let mut p = SseParser::new();
         let _ = p.push_bytes(b"data: a\n\ndata: b\n\n");
         assert_eq!(p.sse_event_count, 2);
-        p.record_injected_event();
-        assert_eq!(p.sse_event_count, 3, "注入帧须纳入同一计数");
         let m = GatewayMetrics::default();
         for _ in 0..3 {
             m.add_sse_event();
         }
-        assert_eq!(m.sse_event_total(), p.sse_event_count, "两口径须一致");
+        assert_eq!(m.sse_event_total(), 3, "生产指标覆盖下游实际发出的全部帧");
+        assert_eq!(
+            m.sse_event_total() - p.sse_event_count,
+            1,
+            "合成帧仅计入生产指标，解析计数显式排除"
+        );
     }
 }

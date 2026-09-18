@@ -215,6 +215,50 @@ fn synth_frames_sequence_number_after_block() {
 }
 
 #[test]
+fn synth_frames_sequence_saturates_at_u64_max() {
+    // R8-04：上游序号上界 `u64::MAX` 后合成序列按饱和加法——不 panic、
+    // 不回绕非单调（基准与后续帧均保持 `u64::MAX`）。
+    assert_eq!(synth_seq_base(Some(u64::MAX)), u64::MAX, "基准须饱和");
+    assert_eq!(synth_seq_base(Some(5)), 6, "常规基准仍为 max+1");
+    let blocked = ensure_event_lines(protocol_block_frames(
+        GatewayProtocol::Responses,
+        "audit",
+        Some("r1"),
+        0,
+        None,
+        Some(u64::MAX),
+    ));
+    let seqs: Vec<u64> = blocked
+        .iter()
+        .flat_map(|f| data_payloads(f))
+        .filter_map(|p| p["sequence_number"].as_u64())
+        .collect();
+    assert_eq!(seqs.len(), 7, "7 帧均须带序号: {seqs:?}");
+    assert!(
+        seqs.iter().all(|s| *s == u64::MAX),
+        "饱和后不得回绕: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[0] <= w[1]),
+        "合成序列不得非单调: {seqs:?}"
+    );
+
+    let trunc = synthesize_truncation(GatewayProtocol::Responses, "r1", Some(u64::MAX));
+    assert_eq!(
+        data_payloads(&trunc[0]).remove(0)["sequence_number"],
+        u64::MAX,
+        "截断单帧须饱和"
+    );
+    let vacuum = empty_stream_frames("responses", "r1");
+    let vseqs: Vec<u64> = vacuum
+        .iter()
+        .flat_map(|f| data_payloads(f))
+        .filter_map(|p| p["sequence_number"].as_u64())
+        .collect();
+    assert_eq!(vseqs, (0..7u64).collect::<Vec<u64>>(), "真空流 0..6 不变");
+}
+
+#[test]
 fn anthropic_block_frames_message_start_first() {
     // A-3/F-04：阻断五件套——首帧 `message_start` 恰一（空 content、null
     // stop_reason、usage 全 0、id 取会话标识），原四帧内容/顺序不动。

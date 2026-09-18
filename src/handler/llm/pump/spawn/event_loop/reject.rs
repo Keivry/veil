@@ -55,4 +55,8 @@ pub(super) async fn apply_reject_block(
         }
         state.terminator.commit(&mut state.meta, kind, true, true);
     }
+    // R8-07/D3：阻断帧提交后立即终止泵读取循环（`Frames` 与幂等 `None` 两分支
+    // 统一）——下游 mpsc 随泵任务结束而关闭，SHALL NOT 保持连接等待上游 EOF；
+    // 阻断前已累计的 usage/观测保留，R7-01 的 `finalize` pending 终审仍恰一次。
+    state.terminator.mark_loop_terminated();
 }

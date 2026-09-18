@@ -706,3 +706,44 @@ fn anthropic_message_start_conv_id() {
     let empty = serde_json::json!({"type":"message_start","message":{"id":"","model":"claude-x"}});
     assert!(extract_conv_id(&empty).is_none(), "空 id 不得命中");
 }
+
+#[test]
+fn anthropic_array_items_across_blocks_use_distinct_composite_buckets() {
+    // R8-15/D10：同一事件两个 `content_block` 各含 2 项 `custom_tool_call`
+    // （非流消息解析常态：`outer_index` 缺失）——4 个桶键两两互异，参数不串扰。
+    let event = serde_json::json!({
+        "content": [
+            {"custom_tool_call": [
+                {"id": "a0", "name": "t", "input": {"p": 0}},
+                {"id": "a1", "name": "t", "input": {"p": 1}}
+            ]},
+            {"custom_tool_call": [
+                {"id": "b0", "name": "t", "input": {"p": 2}},
+                {"id": "b1", "name": "t", "input": {"p": 3}}
+            ]}
+        ]
+    });
+    let calls = extract_tool_calls(Protocol::Anthropic, &event);
+    assert_eq!(calls.len(), 4, "两块各 2 项须全部提取: {calls:?}");
+    let mut buckets: Vec<u32> = calls.iter().map(|c| c.index).collect();
+    buckets.sort_unstable();
+    buckets.dedup();
+    assert_eq!(buckets.len(), 4, "4 个桶键须两两互异: {calls:?}");
+    // `item_index == 0` 退化为纯块键（块枚举位 0/1），块内第二项进复合位域。
+    assert!(
+        calls.iter().any(|c| c.index == 0 && c.id == "a0"),
+        "块 0 首项须为块键 0"
+    );
+    assert!(
+        calls.iter().any(|c| c.index == 1 && c.id == "b0"),
+        "块 1 首项须为块键 1"
+    );
+    assert!(
+        calls.iter().filter(|c| c.index >= (1 << 24)).count() == 2,
+        "两块各一复合项: {calls:?}"
+    );
+    assert!(
+        calls.iter().all(|c| c.index < 0xFF00_0000),
+        "合法域不触保留带"
+    );
+}

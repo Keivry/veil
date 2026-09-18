@@ -68,6 +68,7 @@ pub(super) fn test_ctx(protocol: Protocol) -> NonstreamCtx {
         },
         stream_flag: false,
         nonstream_max_bytes: crate::config::NONSTREAM_MAX_BYTES_DEFAULT,
+        non_json_passthrough: false,
     }
 }
 
@@ -255,6 +256,7 @@ mod headers;
 mod nlp_error_sse;
 mod nlp_p2;
 mod restore;
+mod restore_ladder;
 mod t4_bounded;
 #[tokio::test]
 async fn llm_empty_e2e_upstream_empty_body_returns_502() {

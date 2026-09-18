@@ -668,14 +668,15 @@ SSE 出口信封保真（`TRN-1`，`veil-gateway-transport-fidelity`）：出口
 保真透出 `id:`（WHATWG last-event-id——最近一次出现的 `id` 对后续无 `id` 事件持续有效，
 空值 `id:` 重置）与合法整数 `retry:`（非数字值不透出）；上游把 `event:`/`id:` 与 `data:`
 分置于不同块时，网关按 `event` FIFO、`id` 最近值跨块暂存并与后续含 `data` 块**同块重建**，
-不产生无 `data` 的孤立 `event:` 块；跨块暂存不改事件/帧计数语义——分块信封流与同内容同块流的
-`sse_event_count`、`add_sse_event()` 计数与转发帧数逐一致（见
-`src/service/sse/parser.rs`、`src/handler/llm/pump/spawn.rs`）。
+不产生无 `data` 的孤立 `event:` 块；跨块暂存不改事件/帧计数语义——**无合成帧**的纯上游流下
+`sse_event_count`、`add_sse_event()` 与转发帧数逐一致；注入合成帧（阻断/截断/真空终止）仅计入
+`add_sse_event`，解析计数按 `stream-fidelity-fix`「SSE 事件计数口径一致」显式排除（声明与实现一致；
+见 `src/service/sse/parser.rs`、`src/handler/llm/pump/spawn/event_loop.rs`）。
 
 Anthropic `message_start` 会话/模型提取（`TRN-7`，`veil-gateway-transport-fidelity`）：会话标识
 从嵌套 `message.id` 提取，模型名顶层 `model` 优先、回退 `message.model`，使 `message_start`
 之后不再恒为 `unknown_model`（见 `src/service/llm_gateway/tool.rs::extract_conv_id`、
-`src/handler/llm/pump/spawn.rs`）。
+`src/handler/llm/pump/event.rs`）。
 
 Anthropic 阻断帧 index 与参数累积清洁（`TRN-6`，`veil-gateway-transport-fidelity`）：阻断帧
 使用触发本次阻断的**真实 content block index**（仅无法获知时回退 `0`），多块流中不再错位；
@@ -737,9 +738,11 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 流式上游错误状态透传（S6/D7，`veil-stream-fidelity-fix`；`TRN-3`/`TRN-4`，`veil-gateway-transport-fidelity`）：
 `stream:true` 请求仅在
 上游 `status<400` 且响应 `content-type` 为 `text/event-stream` 时进入 SSE 泵；
-上游 `status>=400`（4xx/5xx 的 JSON/HTML/空体）或 2xx 非 `text/event-stream`
-正文一律按非流口径保状态与正文字节透传（hop 头过滤 + `x-veil-protocol`，受
-`NONSTREAM_MAX_BYTES` 约束），不改写为 200 SSE 假流；进入 SSE 泵的上游 2xx（`status<400` 且
+上游 `status>=400`（4xx/5xx 的 JSON/HTML/空体）按非流口径保状态与正文字节透传
+（hop 头过滤 + `x-veil-protocol`，受 `NONSTREAM_MAX_BYTES` 约束），不改写为 200 SSE 假流；
+2xx 非 `text/event-stream` 且正文为 `application/json` 者（`R8-16`）走**非流完整后处理链**
+（用量 + 审计 + 还原 + 响应侧新 PII 掩码；审计命中 `Block` 以 `nonstream_block_body` 替换），
+2xx 非 JSON 正文按字节透传状态与正文并记 warn 与计数；进入 SSE 泵的上游 2xx（`status<400` 且
 `content-type: text/event-stream`）下游 SHALL 逐字携带上游原状态码（如 `201`/`202`/`206`），
 SHALL NOT 硬编码改写为 `200`（`R5-05`/D4，`veil-audit-r5-remediation`；实现见
 `src/handler/llm/pump/event.rs::build_sse_response`），`<400` 入泵门不放宽；仅非错误状态（`status<400`）
@@ -939,7 +942,8 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   纯脱敏替换与原文透传口径：JSON 容器内的脱敏替换经 `json_walk` loads→walk→dumps
   紧凑重序列化（`scope.rs::redact_request`），重序列化即置位 `x-veil-normalized`
   （change `veil-gateway-fidelity-fix`（H1）已落地：`normalized_out` 随实际重序列化置位，不再有缺口）；原文透传（零替换）
-  与非 JSON 字节级替换不置位。
+  与非 JSON 字节级替换不置位。零替换且自定义规则快照为空时不执行残缺剥离
+  （`strip_cred_partials`/`strip_pii_partials`），转发体逐字节等于客户端输入（R8-17）。
 - 响应侧字节保真与已知偏离（H1）：响应帧零替换/零命中时逐字节透传，不触发
   `loads→walk→dumps`，键序、数字表示（如 `1e3`）与空白均不改写；必须重序列化
   （响应侧新 PII 掩码）时对象键序保持原序（`serde_json` `preserve_order`），

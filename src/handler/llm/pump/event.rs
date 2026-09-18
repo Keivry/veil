@@ -280,13 +280,15 @@ pub(super) fn advance_responses_seq_cursor(cursor: &mut Option<u64>, v: &Value) 
 /// （`content_block_start/delta.index`），responses 取 `output_index`；
 /// 缺失返回 None（调用方跳过按槽清理，不误清）。
 pub(super) fn outer_event_index(protocol: Protocol, v: &Value) -> Option<u32> {
-    use crate::service::llm_gateway::Protocol as P;
+    use crate::service::llm_gateway::{Protocol as P, tool::bucket_from_raw_index};
     let n = match protocol {
         P::Anthropic => v.get("index")?.as_u64()?,
         P::Responses => v.get("output_index").or_else(|| v.get("index"))?.as_u64()?,
         _ => return None,
     };
-    Some(n as u32)
+    // R8-05：越界索引 SHALL NOT `u64 as u32` 静默截断后操作错误槽——经
+    // `bucket_from_raw_index` 路由至保留带有界哈希溢出桶（带内值原样直用）。
+    Some(bucket_from_raw_index(n))
 }
 
 pub(super) fn extract_responses_seq(v: &Value) -> Option<u64> {
@@ -336,6 +338,15 @@ pub(super) fn is_anthropic_thinking_event(v: &Value) -> bool {
         .and_then(|d| d.get("type"))
         .and_then(|x| x.as_str())
         .is_some_and(is_thinking)
+}
+
+/// R8-08/D9：Anthropic **跨缝合透明**帧（签名/密文载体）——`is_anthropic_opaque_event`
+/// 排除纯 `thinking_delta`（`is_anthropic_thinking_event`）。仅此载体帧 SHALL 旁路
+/// `PrefixHold`/`BoundaryHold` 跨缝合掩码（无掩码直通，`emit_restored_json_frame`
+/// 的 `mask_fallback:false` 臂）；MUST NOT 复用裸 `is_anthropic_opaque_event` 做该
+/// 旁路（会切断 thinking 缝合，回归 MSP-4/2.28）。
+pub(super) fn is_anthropic_seam_transparent(v: &Value) -> bool {
+    is_anthropic_opaque_event(v) && !is_anthropic_thinking_event(v)
 }
 
 pub(super) fn is_minor_event(protocol: Protocol, v: &Value) -> bool {

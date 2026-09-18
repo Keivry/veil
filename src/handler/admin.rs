@@ -138,6 +138,7 @@ fn admin_metrics_body(state: &AppState) -> serde_json::Value {
             "v1/responses": gm.lenient_count("v1/responses"),
         },
         "sse_events": gm.sse_event_total(),
+        "truncated_line_dropped_bytes": gm.truncated_line_dropped_bytes_count(),
         "ring_len": snap.ring_len,
         "dropped": snap.dropped,
         "approval_decision_overflow_total": decision_overflow,

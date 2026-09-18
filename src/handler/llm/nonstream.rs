@@ -48,6 +48,11 @@ pub struct NonstreamCtx {
     pub stream_flag: bool,
     /// F2：非流对话响应体上限（`NONSTREAM_MAX_BYTES`，严格超限 502）。
     pub nonstream_max_bytes: usize,
+    /// R8-16/D12：2xx 非 `text/event-stream` 分流的非 JSON 策略位。
+    /// `false`（原生非流）：2xx 非 JSON/空体维持 502 `E_EMPTY_BODY` 语义不变；
+    /// `true`（`stream:true` + 2xx 非 SSE，仅 dispatch 新分流臂）：非 JSON 正文
+    /// 按字节透传 + warn + 透传计数，JSON 正文照常走完整后处理链。
+    pub non_json_passthrough: bool,
 }
 
 /// `serve_nonstream` 的结果：完整响应，或上游意外回 SSE 时把未消费的
@@ -69,6 +74,8 @@ fn parse_json_bytes(bytes: &[u8]) -> Option<Value> {
 /// 2.2 `nonstream` 一发一收：接收改写后请求，返回完整上游响应；
 /// 上游超时/不可达映射为网关级错误状态码而非挂起。
 /// `client` 为只读引用（单例由 1.x 负责），本单元内不新建 Client。
+/// R8-16/D12：本函数只保留转发前装配（转发头、请求快照、fetch 与失败收敛），
+/// 取回上游响应后的全部分类/后处理委托 [`process_upstream_response`]。
 pub async fn serve_nonstream(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -93,6 +100,19 @@ pub async fn serve_nonstream(
         Ok(up) => up,
         Err(_) => return NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol)),
     };
+    process_upstream_response(up, ctx, req_conv, req_model).await
+}
+
+/// R8-16/D5/D12：上游响应取得后的统一后处理入口（原 `serve_nonstream` 尾段逐字抽取）——
+/// 非对话透传 / SSE 转泵 / 有界读 / 空体分类 / redact-only / JSON 完整链 / 错误体透传
+/// 全在本函数内；JSON 与非 JSON 的分类内置（`up` 在此被消费，调用方无法先读后传）。
+/// `req_conv`/`req_model` 为 fetch 前的请求体快照派生值，随参传入。
+pub(super) async fn process_upstream_response(
+    up: reqwest::Response,
+    ctx: NonstreamCtx,
+    req_conv: Option<String>,
+    req_model: &str,
+) -> NonstreamOutcome {
     if llm_gateway::is_passthrough(ctx.req.protocol) {
         // P0-4.2/F1：非对话臂保持字节透传（与 Python 直通语义一致：无用量/
         // 审计/还原），记 `nondialog_passthrough` 供流量验证；专用入口
@@ -163,6 +183,26 @@ pub async fn serve_nonstream(
         }
     };
     let is_json = parse_json_bytes(&bytes).is_some();
+    // R8-16/D5/D12：`stream:true` + 2xx 非 SSE 非 JSON 分流的字节透传臂——先于
+    // `classify_empty`（原生非流 `non_json_passthrough:false` 仍走下方 502 语义）。
+    // 非 JSON 无结构化字段可审计/还原，按状态与正文字节透传并记 warn 与既有
+    // 透传类计数（`GatewayMetrics` 层、非 admin 导出字段，不新增 admin 键）。
+    if status_u16 < 400 && !is_json && ctx.non_json_passthrough {
+        tracing::warn!(
+            status = status_u16,
+            protocol = ?ctx.req.protocol,
+            "stream 请求上游 2xx 非 SSE 非 JSON 正文，按字节透传（R8-16）"
+        );
+        ctx.req.gateway_metrics.record_nondialog_passthrough();
+        return NonstreamOutcome::Responded(build_downstream_response(
+            StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
+            &resp_headers,
+            bytes,
+            ctx.req.protocol,
+            ctx.req.normalized_out,
+            None,
+        ));
+    }
     // F2/D2：先定空体分类（对齐 Python 先算 `_is_empty`），再判超限
     // （严格 `len > cap`，体形态对齐 `_llm.py:2951-2961`），最后才落空体 502：
     // 空体 len=0 恒不超限，非 JSON 超限体不落空体分支（与 Python 可观测结果一致）。
@@ -306,7 +346,7 @@ pub async fn serve_nonstream(
             .req
             .scope
             .restore_response_with_spans_json(&ctx.req.vault, &text);
-        let mut restored = ctx
+        let restored = ctx
             .req
             .scope
             .redact_response_new_pii_with_skip(&ctx.req.vault, &ctx.req.detector, &restored, &spans)
@@ -316,22 +356,14 @@ pub async fn serve_nonstream(
         if ctx.req.scope.pii_unavailable() {
             return NonstreamOutcome::Responded(VeilError::PiiUnavailable.into_response());
         }
-        // P0-1.2：还原后双 `_jloads` 校验（对标 Python `_nonstream_build`）：
-        // 还原/脱敏可能把未转义明文写回 JSON 串内致破裂；E5/D3 先 `strip_partials`
-        // 重试一次（半截形态可挽回时用剥离体），仍失败才回退上游原文并记 metrics + warn。
-        if !restore_guard_ok(&restored, &text, None) {
-            if let Some(stripped) =
-                retry_stripped(&restored).filter(|s| restore_guard_ok(s, &text, None))
-            {
-                tracing::warn!("非流还原后 JSON 校验失败，残缺剥离后挽回");
-                restored = stripped;
-            } else {
-                let preview: String = restored.chars().take(4000).collect();
-                tracing::warn!("非流还原后 JSON 校验失败，已回退上游原文: {preview}");
-                ctx.req.gateway_metrics.record_restore_fallback();
-                restored = text;
-            }
-        }
+        // P0-1.2 + R8-03/D2：还原后双 `_jloads` 校验（对标 Python `_nonstream_build`）
+        // 与回退阶梯——守卫破裂先 `retry_stripped` 挽回，仍失败回退已掩码占位符帧，
+        // 掩码回退本身失败则 502 `E_PII_UNAVAILABLE` fail-closed；MUST NOT 回退未掩码
+        // 上游原文（旧 `restored = text` 路径已删除）。
+        let restored = match restore_ladder(&ctx.req, restored, &text).await {
+            Ok(r) => r,
+            Err(err) => return NonstreamOutcome::Responded(err.into_response()),
+        };
         // P0-1.3：出口显式残缺剥离（凭据 `__VG_CRED_` + PII `__PII_` 半截形态）。
         // 还原/脱敏路径内已带剥离，此处幂等兜底响应侧关闭等旁路。
         let restored = crate::service::redaction::strip_partials(&restored);
@@ -406,8 +438,12 @@ pub async fn serve_nondialog_passthrough(
 /// （读取侧 `hop_filtered_count`；`hop_filtered_total` 为其 Prometheus **度量名**
 /// 约定、非可解析的 Rust 符号）。
 /// `passthrough_upstream_response` 与 `snapshot_downstream_headers` 共用本 helper；
-/// 调用方各自保留 `x-veil-*` 剔除与响应装配职责。
-fn clone_upstream_headers(up: &reqwest::Response, metrics: &GatewayMetrics) -> HeaderMap {
+/// 调用方各自保留 `x-veil-*` 剔除与响应装配职责。R8-09：`dispatch.rs::
+/// stream_upstream_passthrough` 亦改调本 helper（不再内联重复克隆）。
+pub(super) fn clone_upstream_headers(
+    up: &reqwest::Response,
+    metrics: &GatewayMetrics,
+) -> HeaderMap {
     let mut resp_headers = HeaderMap::new();
     for (k, v) in up.headers().iter() {
         if let (Ok(n), Ok(val)) = (
@@ -566,8 +602,40 @@ fn error_streaming_response(
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
 }
 
+/// R8-03/D2：非流还原回退阶梯——① `restored`（已掩码）② `retry_stripped` 残缺
+/// 剥离挽回 ③ 回退**已应用响应侧新 PII 掩码**的占位符帧 ④ 掩码回退本身失败
+/// （PII 注册熵源/内部故障）→ `VeilError::PiiUnavailable`（502 fail-closed）。
+/// MUST NOT 回退未掩码上游原文或未掩码占位符帧；失败记 warn + `restore_fallback`
+/// 恰一次，使回退可观测（与流式 `emit_restored_json_frame` 同阶梯）。
+async fn restore_ladder(
+    req: &RequestCtx,
+    restored: String,
+    placeholder: &str,
+) -> Result<String, VeilError> {
+    if restore_guard_ok(&restored, placeholder, None) {
+        return Ok(restored);
+    }
+    if let Some(stripped) =
+        retry_stripped(&restored).filter(|s| restore_guard_ok(s, placeholder, None))
+    {
+        tracing::warn!("非流还原后 JSON 校验失败，残缺剥离后挽回");
+        return Ok(stripped);
+    }
+    tracing::warn!("非流还原后 JSON 校验失败，回退已掩码占位符帧（fail-closed）");
+    req.gateway_metrics.record_restore_fallback();
+    let masked = req
+        .scope
+        .redact_response_new_pii_with_skip(&req.vault, &req.detector, placeholder, &[])
+        .await;
+    if req.scope.pii_unavailable() {
+        tracing::warn!("非流占位符帧掩码回退失败（PII 不可用），改 502 fail-closed");
+        return Err(VeilError::PiiUnavailable);
+    }
+    Ok(masked)
+}
+
 /// E5/D3 重试判定（纯函数）：还原体破裂时剥离残缺形态，剥离后可解析则返回
-/// 剥离体（挽回），否则返回 `None`（调用方回退上游原文）。
+/// 剥离体（挽回），否则返回 `None`（调用方回退占位符帧）。
 fn retry_stripped(restored: &str) -> Option<String> {
     let stripped = crate::service::redaction::strip_partials(restored);
     json_walk::jloads(json_walk::strip_bom(&stripped))

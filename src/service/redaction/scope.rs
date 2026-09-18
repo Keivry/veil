@@ -213,7 +213,7 @@ impl Scope {
         if replaced.get() || !custom_snapshot.is_empty() {
             (strip_partials(&out), is_json_container(text))
         } else {
-            (strip_partials(text), false)
+            (text.to_string(), false)
         }
     }
 

@@ -81,7 +81,7 @@ pub struct GatewayMetrics {
     truncated_line_dropped_bytes: AtomicU64,
     /// P0-4.2/F1：NonDialog 非对话臂透传次数（流量验证用）。
     nondialog_passthrough: AtomicU64,
-    /// E5/D3：非流还原破裂重试仍失败、回退上游原文的次数。
+    /// E5/D3：还原守卫回退次数（流/非流；掩码占位符帧回退或 opaque 字节恒等回退）。
     restore_fallback: AtomicU64,
     /// E8：Responses/Anthropic 终止判定 JSON 解析失败回退 contains 的次数。
     terminal_fallback: AtomicU64,
@@ -171,6 +171,13 @@ impl GatewayMetrics {
     pub fn record_truncated_line_dropped_bytes(&self, n: u64) {
         self.truncated_line_dropped_bytes
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// R8-13：C11 超长 SSE 行截断丢弃字节数只读观测
+    /// （`/_admin/metrics` 顶层 `truncated_line_dropped_bytes`），与
+    /// [`GatewayMetrics::record_truncated_line_dropped_bytes`] 同源、只增不重置。
+    pub fn truncated_line_dropped_bytes_count(&self) -> u64 {
+        self.truncated_line_dropped_bytes.load(Ordering::Relaxed)
     }
 
     pub fn record_nondialog_passthrough(&self) {

@@ -10,6 +10,7 @@ use {
         build_sse_response,
         forward_headers,
         is_event_stream,
+        nonstream::process_upstream_response,
         serve_nondialog_passthrough,
         serve_nonstream,
         spawn_stream_pump,
@@ -402,10 +403,10 @@ pub(crate) async fn gateway_serve(
                     .unwrap_or("")
                     .to_string();
                 // S6/D7：仅 `status<400` 且上游正文为 `text/event-stream` 才转 SSE 泵；
-                // 上游错误状态（4xx/5xx）或 2xx 非 SSE 正文按非流口径保状态保正文透传，
-                // 不得改写为 200 SSE 假流（客户端会误判为流式成功）。F-09：谓词与
+                // 上游错误状态（4xx/5xx）按非流口径保状态保正文透传，不得改写为
+                // 200 SSE 假流（客户端会误判为流式成功）。F-09：谓词与
                 // `should_pump_stream` 共用同一实现（`;` 前段 + trim + 大小写不敏感）。
-                if status_u16 >= 400 || !is_event_stream(&resp_ct) {
+                if status_u16 >= 400 {
                     return stream_upstream_passthrough(
                         up,
                         rw.normalized_out,
@@ -414,6 +415,22 @@ pub(crate) async fn gateway_serve(
                         &state.gateway_metrics,
                     )
                     .await;
+                }
+                if !is_event_stream(&resp_ct) {
+                    // R8-16/D5/D12：`status<400` 非 `text/event-stream` 无条件走非流完整
+                    // 后处理链——JSON → 用量/审计/还原/响应侧新 PII 掩码（`Block` →
+                    // `nonstream_block_body`）；非 JSON → 字节透传 + warn + 计数。
+                    let nctx = NonstreamCtx {
+                        req: req.clone(),
+                        stream_flag: false,
+                        nonstream_max_bytes: state.config.nonstream_max_bytes,
+                        non_json_passthrough: true,
+                    };
+                    return nonstream_response(
+                        process_upstream_response(up, nctx, rw.init_conv.clone(), &req_model).await,
+                        rw.normalized_out,
+                        pump_ctx(),
+                    );
                 }
                 let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
                 // D3/ARH-1：不 detach 泵任务——JoinHandle 交响应体持有，客户端断开
@@ -428,22 +445,36 @@ pub(crate) async fn gateway_serve(
             req: req.clone(),
             stream_flag: false,
             nonstream_max_bytes: state.config.nonstream_max_bytes,
+            non_json_passthrough: false,
         };
-        match serve_nonstream(client, dialog_method, &url, fwd_headers, rw.body, nctx).await {
-            NonstreamOutcome::Responded(resp) => resp,
-            // 客户端未要求流但上游回 SSE 时，转字节泵保证终止闭合。
-            // E12/D7：泵 conv 首选透传的请求会话（与 `rw.init_conv` 同源），
-            // 缺失才用改写输出的会话。
-            NonstreamOutcome::Stream(up, req_conv) => {
-                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-                let mut pctx = pump_ctx();
-                if req_conv.is_some() {
-                    pctx.init_conv = req_conv;
-                }
-                let upstream_status = up.status();
-                let pump = spawn_stream_pump(up, tx, pctx);
-                build_sse_response(rx, rw.normalized_out, pump, upstream_status)
+        nonstream_response(
+            serve_nonstream(client, dialog_method, &url, fwd_headers, rw.body, nctx).await,
+            rw.normalized_out,
+            pump_ctx(),
+        )
+    }
+}
+
+/// E12/D7 + R7-05：非流结果的统一收敛——`Responded` 直回；`Stream` 臂转字节泵
+/// （非流请求遇上游 SSE 时复用已取得响应，SHALL NOT 重发上游），泵 conv 首选
+/// 透传的请求会话（与 `rw.init_conv` 同源），缺失才用改写输出的会话。
+/// R8-16/D5/D12：流式 `status<400` 非 SSE 分流臂与非流臂共用本收敛。
+fn nonstream_response(
+    outcome: NonstreamOutcome,
+    normalized_out: bool,
+    pump_ctx: StreamPumpCtx,
+) -> Response {
+    match outcome {
+        NonstreamOutcome::Responded(resp) => resp,
+        NonstreamOutcome::Stream(up, req_conv) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+            let mut pctx = pump_ctx;
+            if req_conv.is_some() {
+                pctx.init_conv = req_conv;
             }
+            let upstream_status = up.status();
+            let pump = spawn_stream_pump(up, tx, pctx);
+            build_sse_response(rx, normalized_out, pump, upstream_status)
         }
     }
 }
@@ -463,21 +494,12 @@ pub(super) async fn stream_upstream_passthrough(
     // ARH-10（7.7）：上游状态码经受约束类型承载；非法值按现状回退 `502`。
     let upstream_status = llm_gateway::UpstreamStatus::new(up.status().as_u16());
     let is_error = upstream_status.is_none_or(|s| s.is_error());
-    let mut resp_headers = HeaderMap::new();
-    for (k, v) in up.headers().iter() {
-        if let (Ok(n), Ok(val)) = (
-            k.to_string().parse::<axum::http::HeaderName>(),
-            axum::http::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            // AUDIT-03：`append` 而非 `insert`——同名多值上游头（如多条
-            // `warning`/`set-cookie`）逐值保留，不得被折叠为末值。
-            resp_headers.append(n, val);
-        }
-    }
+    // R8-09：克隆 + 解码配对剥头共用 `nonstream::clone_upstream_headers`（单一实现，
+    // 不再内联重复克隆；多值头 `append` 语义与 AUDIT-03 由该 helper 承载）。
+    let mut resp_headers = super::nonstream::clone_upstream_headers(&up, metrics);
     // TRN-4：剔除上游 `x-veil-*` 内部头（大小写不敏感），网关自置头在剔除后写入，
     // 上游同名声不得覆盖或泄漏。
     llm_gateway::strip_veil_internal_headers(&mut resp_headers);
-    let decode_enabled = llm_gateway::downstream_decode_enabled(up.headers());
     // TRN-3：先判 `content-length`（仅非错误状态），超限即 502 且不读 body。
     if !is_error
         && up
@@ -486,12 +508,6 @@ pub(super) async fn stream_upstream_passthrough(
     {
         return super::nonstream::oversize_response(protocol);
     }
-    llm_gateway::filter_hop_headers_counted(
-        &mut resp_headers,
-        "downstream",
-        decode_enabled,
-        Some(metrics),
-    );
     let status = upstream_status
         .and_then(|s| StatusCode::from_u16(s.as_u16()).ok())
         .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -574,6 +590,7 @@ mod entry_tests {
             req,
             stream_flag: true,
             nonstream_max_bytes: 8,
+            non_json_passthrough: false,
         };
         assert_eq!(stream.req.protocol, nonstream.req.protocol);
         assert_eq!(stream.req.audit_mode, nonstream.req.audit_mode);

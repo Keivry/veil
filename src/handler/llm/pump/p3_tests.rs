@@ -321,3 +321,106 @@ async fn anthropic_midstream_eof_no_message_stop() {
     assert_eq!(metrics.truncated_count("open_ended"), 1);
     assert_eq!(metrics.truncated_count("upstream_error"), 0);
 }
+
+#[tokio::test]
+async fn signature_delta_bytes_identical_while_neighbor_pii_masked() {
+    // R8-08/D9：签名/密文载体帧无掩码直通——邻帧新检出 PII 被掩码，signature
+    // 载荷（含 PII 形数字串）字节恒等、未被 `mask_span_bytes` 改写。
+    let phone = "13812345678";
+    let plain = format!(
+        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"call {phone}"}}}}"#
+    );
+    let signature = format!(
+        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"signature_delta","signature":"sig {phone} \"x"}}}}"#
+    );
+    let sse = format!(
+        "event: content_block_delta\ndata: {plain}\n\nevent: content_block_delta\ndata: {signature}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    )
+    .into_bytes();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (scope, vault, detector) = fresh_arcs();
+    let (_outcome, frames) = collect_pump(
+        upstream,
+        pump_ctx(Protocol::Anthropic, scope, vault, detector),
+    )
+    .await;
+    server.abort();
+    let downstream_plain = frames
+        .iter()
+        .flat_map(|f| f.lines())
+        .find_map(|l| {
+            l.strip_prefix("data: ")
+                .filter(|p| p.contains("text_delta"))
+        })
+        .expect("普通帧须送达下游");
+    assert!(
+        !downstream_plain.contains(phone),
+        "邻帧新检出 PII 须掩码: {downstream_plain}"
+    );
+    assert!(
+        downstream_plain.contains("__PII_"),
+        "须注入响应侧 token: {downstream_plain}"
+    );
+    let downstream_sig = frames
+        .iter()
+        .flat_map(|f| f.lines())
+        .find_map(|l| {
+            l.strip_prefix("data: ")
+                .filter(|p| p.contains("signature_delta"))
+        })
+        .expect("签名帧须送达下游");
+    assert_eq!(downstream_sig, signature, "签名帧须字节恒等");
+}
+
+#[tokio::test]
+async fn thinking_delta_masks_pii_and_stitches_token() {
+    // R8-19/D9 对照：纯 `thinking_delta` 走普通帧路径——响应侧新 PII 被掩码，
+    // 跨帧切开的凭据 token 仍经 `TokenCarry` 缝合还原（不被 opaque 直通旁路）。
+    let (scope, vault, detector) = fresh_arcs();
+    let token = vault.register("my-secret-001").expect("注册恒成功");
+    let _ = scope
+        .redact_request_plain(&vault, &detector, "my-secret-001")
+        .await;
+    let (head, tail) = token.split_at(8);
+    let sse = format!(
+        r#"event: content_block_delta
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{head}"}}}}
+
+event: content_block_delta
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{tail} call 13812345678"}}}}
+
+event: message_stop
+data: {{"type":"message_stop"}}
+
+"#
+    )
+    .into_bytes();
+    let (url, server) = loopback_server(200, "text/event-stream", sse).await;
+    let upstream = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("回环上游须可达");
+    let (_outcome, frames) = collect_pump(
+        upstream,
+        pump_ctx(Protocol::Anthropic, scope, vault, detector),
+    )
+    .await;
+    server.abort();
+    let joined = frames.join("");
+    assert!(
+        joined.contains("my-secret-001"),
+        "thinking 跨帧 token 须缝合还原: {joined}"
+    );
+    assert!(!joined.contains(&token), "token 不得残留: {joined}");
+    assert!(
+        !joined.contains("13812345678"),
+        "thinking 明文中的 PII 须掩码: {joined}"
+    );
+    assert!(joined.contains("__PII_"), "须注入响应侧 token: {joined}");
+}

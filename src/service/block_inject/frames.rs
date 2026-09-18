@@ -156,7 +156,8 @@ pub fn responses_block_frames(response_id: &str) -> Vec<String> {
 }
 
 /// A-2/F-02：以 `base` 为起始序号的阻断全序列——流内阻断接续上游已见最大
-/// `sequence_number`（`base = cursor.map_or(0, |c| c + 1)`），全程单调不倒退。
+/// `sequence_number`（`base = cursor.map_or(0, |c| c.saturating_add(1))`，R8-04），
+/// 全程单调不倒退（`u64::MAX` 饱和不溢出）。
 /// 旧入口模型恒 `unknown_model`（R5-39 回显入口见 [`responses_block_frames_at_modeled`]）。
 /// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
 #[cfg(test)]
@@ -223,7 +224,8 @@ pub fn protocol_block_frames_modeled(
 }
 
 /// A-2/F-02：合成序列起始基准——真空流/无上游序号时取 0，否则接续 `max + 1`。
-fn synth_seq_base(cursor: Option<u64>) -> u64 { cursor.map_or(0, |c| c + 1) }
+/// R8-04：`max == u64::MAX` 时按饱和加法保持 `u64::MAX`（不回绕、不 panic）。
+fn synth_seq_base(cursor: Option<u64>) -> u64 { cursor.map_or(0, |c| c.saturating_add(1)) }
 
 /// Responses 截断全序列（D3）：与阻断同序列，尾帧改 `response.failed`
 /// （失败语义，不伪造完成），`terminal_count==1` 且不含 `completed`。
@@ -345,7 +347,7 @@ fn responses_sequence(
                 "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": "", "annotations": []}
             }),
-            1 + base,
+            base.saturating_add(1),
         ),
         responses_frame(
             "response.output_text.delta",
@@ -353,7 +355,7 @@ fn responses_sequence(
                 "type": "response.output_text.delta", "item_id": response_id,
                 "output_index": 0, "content_index": 0, "delta": text
             }),
-            2 + base,
+            base.saturating_add(2),
         ),
         responses_frame(
             "response.output_text.done",
@@ -361,7 +363,7 @@ fn responses_sequence(
                 "type": "response.output_text.done", "item_id": response_id,
                 "output_index": 0, "content_index": 0, "text": text
             }),
-            3 + base,
+            base.saturating_add(3),
         ),
         responses_frame(
             "response.content_part.done",
@@ -370,16 +372,16 @@ fn responses_sequence(
                 "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": text, "annotations": []}
             }),
-            4 + base,
+            base.saturating_add(4),
         ),
         responses_frame(
             "response.output_item.done",
             serde_json::json!({
                 "type": "response.output_item.done", "output_index": 0, "item": output_item
             }),
-            5 + base,
+            base.saturating_add(5),
         ),
-        responses_frame(terminal_event, terminal, 6 + base),
+        responses_frame(terminal_event, terminal, base.saturating_add(6)),
     ]
 }
 
@@ -570,7 +572,8 @@ pub fn evaluate_nonstream(
 /// 不合成成功终止（open-ended，以已透传块收尾；残缺分片由泵内 TSS-03 缓冲丢弃）。
 /// 返回帧由调用方经 `ensure_event_lines` 归一化后发送。
 /// A-2/F-02：`seq_cursor` 为泵内上游序号上界游标——单帧 `sequence_number` 取
-/// `base = cursor.map_or(0, |c| c + 1)`，接续已发序号（修正原误传 `None` 致缺字段）。
+/// `base = cursor.map_or(0, |c| c.saturating_add(1))`（R8-04 饱和），接续已发序号
+/// （修正原误传 `None` 致缺字段）。
 /// R5-39：生产合成一律经 `_modeled` 入口；本入口 `#[cfg(test)]` 收编防生产误用。
 #[cfg(test)]
 pub fn synthesize_truncation(

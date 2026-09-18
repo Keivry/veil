@@ -4,13 +4,15 @@ use {
     crate::service::{
         credential_vault::CredentialVault,
         json_walk::{jloads, strip_bom},
-        llm_gateway::GatewayMetrics,
         pii::PiiDetector,
         redaction::{BoundaryHold, PrefixHold, restore_guard::restore_guard_ok},
         sse::{classify_residue, data_frame},
     },
     serde_json::Value,
 };
+
+#[cfg(test)]
+use crate::service::llm_gateway::GatewayMetrics;
 
 /// CHC-2/D7：截断残余帧归一化——对齐 Python `_llm.py:2718-2720`「丢弃残余」：
 /// 先剥 BOM 与已存在的 `data:` 前缀，再要求载荷为**完整 JSON 容器**；半帧
@@ -30,33 +32,33 @@ pub(super) fn residual_frame_payload(raw: &str) -> Option<String> {
     }
 }
 
-/// H2/D1 兜底回退：还原后帧 `jloads` 校验（BOM 感知）；失败时回退**还原前占位符帧**
-/// （fail-closed，token 形态保留、不破帧），记 warn + `restore_fallback` 计数，
-/// 对齐非流 `retry_stripped` 回退语义（`nonstream.rs::retry_stripped`）。
-/// RED-1：外层合法时进一步校验字符串值内的 stringified JSON 结构有效性——
-/// 外层合法会掩盖内层破损，内层破损须回退而非静默透传。
+/// H2/D1 兜底回退（**测试专用**包装；生产回退阶梯见
+/// `restore_emit::emit_restored_json_frame`）：还原后帧 `jloads` 校验（BOM 感知）；
+/// 失败时回退**还原前占位符帧**（fail-closed，token 形态保留、不破帧），记 warn +
+/// `restore_fallback` 计数，对齐非流 `retry_stripped` 回退语义。
 #[cfg(test)]
 pub(crate) fn guard_restored_frame(
     restored: String,
     placeholder_frame: &str,
     metrics: &GatewayMetrics,
 ) -> String {
-    guard_restored_frame_parsed(restored, placeholder_frame, None, metrics)
-}
-
-/// ARH-2（7.1）：调用方已持有占位符帧的解析产物时复用，避免同帧二次解析。
-pub(crate) fn guard_restored_frame_parsed(
-    restored: String,
-    placeholder_frame: &str,
-    placeholder_parsed: Option<&Value>,
-    metrics: &GatewayMetrics,
-) -> String {
-    if restore_guard_ok(&restored, placeholder_frame, placeholder_parsed) {
+    if guard_restored_frame_parsed(&restored, placeholder_frame, None) {
         return restored;
     }
     tracing::warn!("流式还原后 JSON 校验失败，已回退还原前占位符帧（fail-closed）");
     metrics.record_restore_fallback();
     placeholder_frame.to_string()
+}
+
+/// ARH-2（7.1）：调用方已持有占位符帧的解析产物时复用，避免同帧二次解析。
+/// R8-03/D2：纯判定（无回退逻辑与指标副作用），回退阶梯由
+/// `restore_emit::emit_restored_json_frame` 单一承载。
+pub(crate) fn guard_restored_frame_parsed(
+    restored: &str,
+    placeholder_frame: &str,
+    placeholder_parsed: Option<&Value>,
+) -> bool {
+    restore_guard_ok(restored, placeholder_frame, placeholder_parsed)
 }
 
 /// 把一帧送入边界 hold，仅在可放行时并入 `agg`；返回本轮是否有非空数据放行
@@ -104,6 +106,29 @@ pub(super) async fn feed_output_frame(
         emitted |= push_frame(boundary, boundary_spans, agg, p, d);
     }
     emitted
+}
+
+/// R8-08/D9：签名/密文载体帧**无掩码直通**——先排空 `PrefixHold`/`BoundaryHold`
+/// 滞留的常规帧（沿正常缝窗掩码口径放行，保序，不影响其他帧的跨缝检测口径），
+/// 载体帧本身不进 hold、不经 `mask_span_bytes`，逐字节并入 `agg`；后续帧从空 hold
+/// 状态重启。返回本帧是否有非空数据放行。
+pub(super) fn feed_seam_transparent_frame(
+    prefix_hold: &mut PrefixHold,
+    boundary: &mut BoundaryHold,
+    boundary_spans: &impl Fn(&str, usize) -> Vec<(usize, usize)>,
+    agg: &mut String,
+    frame: (String, String),
+) -> bool {
+    for (p, d) in prefix_hold.flush() {
+        push_frame(boundary, boundary_spans, agg, p, d);
+    }
+    if let Some((fp, fd)) = boundary.flush() {
+        agg.push_str(&data_frame(&fp, &fd));
+    }
+    let (prefix, data) = frame;
+    let nonempty = !data.is_empty();
+    agg.push_str(&data_frame(&prefix, &data));
+    nonempty
 }
 
 /// 终止/合成终端前把前缀 hold 滞留帧排入边界 hold（保序、不丢内容）。

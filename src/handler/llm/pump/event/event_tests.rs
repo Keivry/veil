@@ -426,3 +426,44 @@ fn anthropic_error_is_upstream_error_terminal() {
         &serde_json::json!({"error":{"message":"boom"}})
     ));
 }
+
+#[test]
+fn outer_event_index_out_of_range_routes_to_overflow_not_truncated() {
+    // R8-05：越界 `index`/`output_index` SHALL NOT `u64 as u32` 静默截断
+    // （2^32 截断为 0 会误清/误操作 0 号合法槽），须路由至保留带溢出桶。
+    use crate::service::llm_gateway::Protocol as P;
+    let overflow_band = 0xFF00_0000u32..0xFF00_0100;
+    let huge = 1u64 << 32;
+    let anth = outer_event_index(P::Anthropic, &serde_json::json!({"index": huge}))
+        .expect("越界值须路由而非缺失");
+    assert_ne!(anth, 0, "2^32 不得截断为合法槽 0");
+    assert!(overflow_band.contains(&anth), "须落溢出桶保留带: {anth:#x}");
+    let resp = outer_event_index(P::Responses, &serde_json::json!({"output_index": huge}))
+        .expect("越界值须路由而非缺失");
+    assert_ne!(resp, 0, "output_index 2^32 不得截断为合法槽 0");
+    assert!(overflow_band.contains(&resp), "须落溢出桶保留带: {resp:#x}");
+    let band_edge = outer_event_index(P::Anthropic, &serde_json::json!({"index": 0xFF00_0000u64}))
+        .expect("桶域边界值须路由");
+    assert!(overflow_band.contains(&band_edge));
+    // 带内值原样直用（既有分桶零回归）；缺失/非适用协议仍为 None。
+    assert_eq!(
+        outer_event_index(P::Anthropic, &serde_json::json!({"index": 5})),
+        Some(5)
+    );
+    assert_eq!(
+        outer_event_index(P::Responses, &serde_json::json!({"output_index": 7})),
+        Some(7)
+    );
+    assert_eq!(
+        outer_event_index(P::Responses, &serde_json::json!({"index": 9})),
+        Some(9)
+    );
+    assert_eq!(
+        outer_event_index(P::Anthropic, &serde_json::json!({})),
+        None
+    );
+    assert_eq!(
+        outer_event_index(P::Chat, &serde_json::json!({"index": 1})),
+        None
+    );
+}

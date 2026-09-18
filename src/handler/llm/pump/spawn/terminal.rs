@@ -246,9 +246,16 @@ where
         terminator.note_frame_sent();
     }
     let residual = parser.residual_json_aware();
+    let residual_payload = residual_frame_payload(&residual);
     // CHC-2/D7：残余分类（§2.6）+ 半帧丢弃——BOM/`[DONE]`/空白/半帧/非 JSON 一律
     // 丢弃；仅完整 JSON 载荷（已剥 `data:` 前缀）才放行，杜绝二次加前缀转发。
-    if let Some(payload) = residual_frame_payload(&residual) {
+    // R8-02/D1：任一终端（上游终端/阻断）已发出后，残余帧恒丢弃——终端之后
+    // SHALL NOT 下发任何数据帧；本守卫不影响上方 `drain_prefix_hold`/`boundary.flush`
+    // 的终端前滞留送达通道，也不改正常 EOF（无终端）的残余放行语义。
+    if !terminator.terminal_sent()
+        && !terminator.block_injected()
+        && let Some(payload) = residual_payload
+    {
         // B1/A-9：残余帧由 `residual_frame_payload` 保证为完整 JSON，还原须走
         // `_json` 变体（按深度转义）——明文含 `"`/`\`/控制字符时仍为合法 JSON，
         // 与正常帧（`event_loop.rs` 两处）同口径；逐字插入变体会破帧。
@@ -291,6 +298,7 @@ where
                     boundary: &mut *boundary,
                     detector: resp_detector,
                     vault: resp_vault,
+                    scope: resp_scope,
                     boundary_spans,
                     agg: &mut *agg,
                 },
@@ -300,6 +308,7 @@ where
                     placeholder: &payload,
                     placeholder_parsed: None,
                     json_aware: true,
+                    mask_fallback: true,
                     feed: true,
                 },
                 metrics,
@@ -403,8 +412,65 @@ where
 mod residual_tests {
     use {
         super::*,
-        crate::handler::llm::stream_tests::{collect_pump, fresh_arcs, loopback_server, pump_ctx},
+        crate::{
+            handler::llm::stream_tests::{collect_pump, fresh_arcs, loopback_server, pump_ctx},
+            service::block_inject,
+        },
     };
+
+    #[tokio::test]
+    async fn residual_after_upstream_terminal_is_dropped() {
+        // R8-02/D1：上游终端帧后无空行收尾的完整 JSON 残余恒丢弃——
+        // 终端后零数据帧、恰一终端。
+        let body = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"delta\":\"late-residual\"}".to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", body).await;
+        let upstream = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+        ctx.pii_boundary_chars = 0;
+        let (outcome, frames) = collect_pump(upstream, ctx).await;
+        server.abort();
+        let joined = frames.join("");
+        assert!(
+            joined.contains("response.completed"),
+            "上游终端须送达: {joined}"
+        );
+        assert!(
+            !joined.contains("late-residual"),
+            "终端后残余须丢弃（零数据帧）: {joined}"
+        );
+        assert_eq!(
+            block_inject::terminal_count(&frames, "responses"),
+            1,
+            "终端恰一: {joined}"
+        );
+        assert!(!outcome.block_injected, "正常终端非阻断: {joined}");
+    }
+
+    #[tokio::test]
+    async fn residual_without_terminal_still_passes() {
+        // R8-02/D1 对照：正常 EOF 且尚无任何终端时，残余放行语义与修复前一致。
+        let body =
+            b"data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"tail-kept\"}"
+                .to_vec();
+        let (url, server) = loopback_server(200, "text/event-stream", body).await;
+        let upstream = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("回环上游须可达");
+        let (scope, vault, detector) = fresh_arcs();
+        let mut ctx = pump_ctx(Protocol::Responses, scope, vault, detector);
+        ctx.pii_boundary_chars = 0;
+        let (_outcome, frames) = collect_pump(upstream, ctx).await;
+        server.abort();
+        let joined = frames.join("");
+        assert!(joined.contains("tail-kept"), "无终端时残余须放行: {joined}");
+    }
 
     #[tokio::test]
     async fn residual_frame_json_escape_restore() {
