@@ -1,0 +1,1445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>veil · 管理控制台</title>
+<link rel="icon" href="data:,">
+<script>
+(function () { try {
+  var m = document.cookie.match(/(?:^|;\s*)veil_theme=(dark|light)/);
+  var sys = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  document.documentElement.dataset.theme = m ? m[1] : (sys ? 'light' : 'dark');
+} catch (e) {} })();
+</script>
+<style>
+  :root {
+    --bg: #0e1016;
+    --bg2: #12151f;
+    --panel: #161a25;
+    --panel2: #1d2231;
+    --panel3: #232a3a;
+    --border: #252b3a;
+    --border2: #333b4e;
+    --text: #e4e9f5;
+    --dim: #8b94ab;
+    --faint: #5c6478;
+    --accent: #5cc8ff;
+    --accent-2: #7c9cff;
+    --accent-ink: #05121d;
+    --accent-soft: rgba(92, 200, 255, .14);
+    --accent-line: rgba(92, 200, 255, .32);
+    --ok: #3ddc97;
+    --warn: #f7c04a;
+    --err: #ff7b72;
+    --ok-soft: rgba(61, 220, 151, .16);
+    --warn-soft: rgba(247, 192, 74, .13);
+    --err-soft: rgba(255, 123, 114, .14);
+    --ring: rgba(92, 200, 255, .55);
+    --radius: 14px;
+    --radius-sm: 9px;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .28), 0 10px 30px -14px rgba(0, 0, 0, .55);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .24);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6fb;
+    --bg2: #ffffff;
+    --panel: #ffffff;
+    --panel2: #f4f6fb;
+    --panel3: #eaeef7;
+    --border: #e4e8f2;
+    --border2: #ccd5e5;
+    --text: #1a2233;
+    --dim: #5d6883;
+    --faint: #96a1b8;
+    --accent: #0d8be0;
+    --accent-2: #5b6cff;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(13, 139, 224, .10);
+    --accent-line: rgba(13, 139, 224, .30);
+    --ok: #0f9d63;
+    --warn: #b98200;
+    --err: #d64a45;
+    --ok-soft: rgba(15, 157, 99, .13);
+    --warn-soft: rgba(185, 130, 0, .11);
+    --err-soft: rgba(214, 74, 69, .12);
+    --ring: rgba(13, 139, 224, .45);
+    --shadow: 0 1px 2px rgba(20, 30, 60, .06), 0 12px 32px -20px rgba(20, 30, 60, .34);
+    --shadow-sm: 0 1px 2px rgba(20, 30, 60, .06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.55 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  #app { min-height: 100vh; }
+  .layout { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh; }
+  .side {
+    position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column;
+    gap: 6px; padding: 20px 14px; background: var(--bg2);
+    border-right: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 11px; padding: 4px 8px 16px; }
+  .brand .mark {
+    width: 34px; height: 34px; border-radius: 10px; flex: none; display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: var(--accent-ink); box-shadow: var(--shadow-sm);
+  }
+  .brand .mark svg { width: 19px; height: 19px; }
+  .brand .bt { font-size: 15px; font-weight: 700; letter-spacing: .2px; line-height: 1.25; }
+  .brand small { display: block; color: var(--faint); font-size: 11px; font-weight: 500; margin-top: 3px; }
+  .nav { display: flex; flex-direction: column; gap: 3px; }
+  .nav button {
+    appearance: none; border: 1px solid transparent; background: transparent; color: var(--dim);
+    text-align: left; padding: 9px 12px; border-radius: var(--radius-sm); font-size: 13px;
+    font-family: inherit; cursor: pointer; display: flex; align-items: center; gap: 10px;
+    transition: background .16s, color .16s, border-color .16s, transform .12s;
+  }
+  .nav button:hover { background: var(--panel2); color: var(--text); }
+  .nav button:active { transform: scale(.985); }
+  .nav button.active {
+    background: linear-gradient(180deg, var(--accent-soft), transparent), var(--panel);
+    color: var(--accent); font-weight: 600; border-color: var(--accent-line); box-shadow: var(--shadow-sm);
+  }
+  .nav button svg { width: 16px; height: 16px; flex: none; }
+  .side-foot {
+    margin-top: auto; display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; padding: 12px 6px 2px; border-top: 1px solid var(--border);
+  }
+  .theme-btn {
+    display: inline-flex; align-items: center; gap: 7px; background: var(--panel2);
+    color: var(--dim); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 7px 11px; font-size: 12px; font-family: inherit; cursor: pointer;
+    transition: color .16s, border-color .16s, background .16s;
+  }
+  .theme-btn:hover { color: var(--text); border-color: var(--border2); background: var(--panel3); }
+  .theme-btn svg { width: 14px; height: 14px; }
+  :root[data-theme="dark"] .ico-moon { display: none; }
+  :root[data-theme="light"] .ico-sun { display: none; }
+  .main { min-width: 0; padding: 24px 28px 44px; }
+  .topbar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin-bottom: 18px; position: relative;
+  }
+  .topbar h1 { font-size: 20px; font-weight: 700; margin-right: auto; letter-spacing: -.2px; }
+  .banner {
+    display: none; padding: 10px 14px; border-radius: var(--radius-sm); margin-bottom: 16px;
+    background: var(--warn-soft); border: 1px solid rgba(247, 192, 74, .4); color: var(--warn);
+  }
+  .banner.show { display: block; }
+  .kpis { display: flex; flex-direction: column; gap: 18px; margin-bottom: 18px; }
+  .kpi-group { display: flex; flex-direction: column; gap: 9px; }
+  .kpi-group-h {
+    font-size: 11px; font-weight: 700; letter-spacing: .09em; color: var(--faint);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .kpi-group-h::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 13px 15px; box-shadow: var(--shadow-sm);
+    transition: border-color .18s, transform .18s, box-shadow .18s;
+  }
+  .kpi:hover { border-color: var(--border2); transform: translateY(-1px); box-shadow: var(--shadow); }
+  .kpi .label { color: var(--dim); font-size: 12px; margin-bottom: 7px; }
+  .kpi .value { font-size: 22px; font-weight: 700; font-family: var(--mono); letter-spacing: -.5px; line-height: 1.1; overflow-wrap: anywhere; word-break: break-word; }
+  .kpi .hint { color: var(--faint); font-size: 11px; margin-top: 5px; }
+  .kpi.primary { background: linear-gradient(180deg, var(--accent-soft), transparent 64%), var(--panel); border-color: var(--accent-line); }
+  .kpi.primary .label { color: var(--accent); font-weight: 600; }
+  .kpi.primary .value { font-size: 27px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
+  }
+  .panel h2 {
+    font-size: 13px; font-weight: 650; margin-bottom: 14px; letter-spacing: .01em;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .panel h2::before {
+    content: ''; width: 7px; height: 7px; border-radius: 2px; flex: none;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .h2-sub { color: var(--dim); font-weight: 400; font-size: 11.5px; margin-left: auto; }
+  .sub-h { color: var(--dim); font-size: 11px; margin: 12px 0 6px; }
+  .sub-h:first-of-type { margin-top: 0; }
+  .hintline { color: var(--faint); font-size: 11px; margin-top: 10px; line-height: 1.6; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; position: relative; }
+  .toolbar button, .toolbar input {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 7px 12px; font-size: 12px; font-family: inherit;
+    cursor: pointer; transition: border-color .16s, background .16s, color .16s;
+  }
+  .toolbar input { cursor: text; min-width: 150px; }
+  .toolbar button:hover { border-color: var(--border2); }
+  .toolbar input:disabled, .toolbar button:disabled { opacity: .5; cursor: not-allowed; }
+  .toolbar button.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  #range-bar { background: var(--panel); border: 1px solid var(--border); border-radius: 11px; padding: 3px; gap: 2px; box-shadow: var(--shadow-sm); }
+  #range-bar button { border: none; background: transparent; border-radius: 8px; padding: 6px 14px; font-variant-numeric: tabular-nums; }
+  #range-bar button:hover { background: var(--panel2); border-color: transparent; }
+  #range-bar button.active { background: var(--accent); color: var(--accent-ink); box-shadow: var(--shadow-sm); }
+  .rt-tip {
+    position: absolute; top: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+    background: var(--err); color: #fff; padding: 6px 12px; border-radius: 6px;
+    font-size: 11px; white-space: nowrap; box-shadow: var(--shadow);
+    display: none; z-index: 140; pointer-events: none;
+  }
+  .rt-tip.show { display: block; }
+  .rt-tip::before {
+    content: ''; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+    border: 5px solid transparent; border-bottom-color: var(--err);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; letter-spacing: .02em; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  td.sum { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr.clickable { cursor: pointer; transition: background .12s; }
+  tr.clickable:hover { background: var(--panel2); }
+  tr.clickable:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+  tbody tr:last-child td { border-bottom: none; }
+  .tooltip {
+    position: fixed; z-index: 150; max-width: 480px; max-height: 60vh; overflow: auto;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius-sm);
+    padding: 11px 13px; font-size: 12px; box-shadow: 0 14px 44px rgba(0, 0, 0, .5);
+  }
+  .tooltip pre { white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 11px; margin: 0; }
+  .login { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: var(--bg); z-index: 200; }
+  .login.show { display: flex; }
+  .login-box { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 30px; width: 368px; box-shadow: var(--shadow); }
+  .login-box h2 { font-size: 17px; margin-bottom: 16px; }
+  .login-box input {
+    width: 100%; padding: 11px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); margin-bottom: 10px; font-size: 14px; font-family: inherit;
+    transition: border-color .16s;
+  }
+  .login-box input:focus { outline: none; border-color: var(--accent); }
+  .login-box button {
+    width: 100%; padding: 11px; border-radius: var(--radius-sm); border: none; cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--accent-ink);
+    font-weight: 700; font-size: 14px; font-family: inherit; transition: filter .16s;
+  }
+  .login-box button:hover { filter: brightness(1.08); }
+  .login-box button:disabled { opacity: .5; cursor: not-allowed; }
+  .login-box .note { color: var(--faint); font-size: 11px; margin-top: 12px; line-height: 1.55; }
+  .login-err { color: var(--err); font-size: 12px; min-height: 18px; margin-bottom: 6px; }
+  .live-ind { display: inline-flex; align-items: center; gap: 7px; color: var(--ok); font-size: 12px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; box-shadow: 0 0 0 3px var(--ok-soft); }
+  .dot.off { background: var(--faint); box-shadow: 0 0 0 3px var(--panel2); }
+  .live-ind .dot:not(.off) { animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 3px var(--ok-soft); } 50% { box-shadow: 0 0 0 6px transparent; } }
+  svg text { fill: var(--dim); font-size: 10px; }
+  svg text.v { fill: var(--text); font-weight: 700; font-size: 10.5px; }
+  svg .axis { stroke: var(--border2); stroke-width: 1; }
+  svg .grid { stroke: var(--border); stroke-width: 0.5; }
+  svg .bar-rect { stroke: var(--accent-line); stroke-width: 1; transition: filter .15s; }
+  svg .bar-rect:hover, svg .bar-rect:focus { filter: brightness(1.18); }
+  svg .trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  svg .pt { fill: var(--accent); stroke: var(--panel); stroke-width: 1.5; pointer-events: none; }
+  svg .hit { fill: transparent; cursor: pointer; }
+  svg .track { fill: var(--panel2); }
+  svg .axis-lab { fill: var(--dim); }
+  svg rect[tabindex="0"]:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .tokens4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tok { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 11px 13px; box-shadow: var(--shadow-sm); transition: border-color .18s, transform .18s; }
+  .tok:hover { border-color: var(--border2); transform: translateY(-1px); }
+  .tok .l { color: var(--dim); font-size: 11px; }
+  .tok .v { font-family: var(--mono); font-size: 17px; font-weight: 650; margin-top: 3px; }
+  .brow { display: grid; grid-template-columns: 84px 1fr 64px 46px; align-items: center; gap: 10px; font-size: 11px; margin: 5px 0; }
+  .brow .bl { color: var(--dim); font-family: var(--mono); text-align: right; }
+  .brow .track { height: 12px; background: var(--panel2); border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .brow .bar { display: block; height: 100%; border-radius: 7px; min-width: 2px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .4s cubic-bezier(.2, .8, .2, 1); }
+  .brow .bv { font-family: var(--mono); color: var(--text); text-align: right; }
+  .brow .bp { font-family: var(--mono); color: var(--faint); text-align: right; }
+  .health-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .health-label { color: var(--dim); font-size: 12px; }
+  .health-chip {
+    display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    padding: 6px 13px; border-radius: 999px; font-size: 11.5px; font-family: var(--mono);
+    background: var(--panel); border: 1px solid var(--border); color: var(--dim);
+    box-shadow: var(--shadow-sm); transition: border-color .18s;
+  }
+  .health-chip.ok { border-color: rgba(61, 220, 151, .4); }
+  .health-chip.err { border-color: rgba(255, 123, 114, .45); }
+  .health-chip .hc-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+  .health-chip.ok .hc-dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+  .health-chip.err .hc-dot { background: var(--err); box-shadow: 0 0 0 3px var(--err-soft); }
+  .health-chip b { color: var(--text); font-weight: 600; }
+  .health-chip .hc-sep { width: 1px; height: 12px; background: var(--border2); }
+  .empty {
+    display: flex; align-items: center; justify-content: center; gap: 9px;
+    color: var(--faint); font-size: 12px; padding: 30px 14px; text-align: center;
+    border: 1px dashed var(--border2); border-radius: var(--radius-sm); background: var(--panel2);
+  }
+  .empty::before {
+    content: ''; width: 22px; height: 22px; flex: none; border-radius: 6px;
+    border: 1px dashed var(--border2); background: linear-gradient(135deg, var(--panel3), var(--panel2));
+  }
+  td .empty { padding: 16px 12px; border: none; background: transparent; }
+  td .empty::before { display: none; }
+  .sec { animation: fade .2s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  .nav button:focus-visible { outline-offset: -2px; }
+  @media (max-width: 860px) {
+    .layout { grid-template-columns: 1fr; }
+    .side {
+      position: static; height: auto; flex-direction: row; align-items: center; flex-wrap: wrap;
+      border-right: none; border-bottom: 1px solid var(--border); padding: 12px 14px; gap: 10px;
+    }
+    .brand { padding: 0; flex: none; }
+    .brand small { display: none; }
+    .nav { flex-direction: row; flex: 1; overflow-x: auto; }
+    .nav button { white-space: nowrap; }
+    .side-foot { margin-top: 0; border-top: none; padding: 0; margin-left: auto; }
+    .main { padding: 18px 16px 36px; }
+    .grid2 { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .kpi-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+    .topbar h1 { font-size: 17px; }
+    .brow { grid-template-columns: 70px 1fr 54px 40px; gap: 7px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
+</style>
+</head>
+<body>
+<div class="login show" id="login">
+  <div class="login-box">
+    <h2>veil · 管理员登录</h2>
+    <div class="login-err" id="login-err"></div>
+    <input type="password" id="pass" autocomplete="current-password" placeholder="OBSERVABILITY_ADMIN_TOKEN">
+    <button id="login-btn">进入大盘</button>
+    <div class="note">登录请求发往探针端点，服务端签发 Cookie 后持久化；令牌仅保留在当前页面内存中，不写入任何持久化存储，不拼接到地址栏。</div>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+  <div class="layout">
+    <aside class="side">
+      <div class="brand">
+        <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.4-3 8.2-7 10-4-1.8-7-5.6-7-10V6z"/></svg></span>
+        <span class="bt">veil · 管理控制台<small>脱敏网关可观测性大盘</small></span>
+      </div>
+      <nav class="nav" id="nav">
+        <button data-sec="overview" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>概览</button>
+        <button data-sec="redaction"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.4-3 8.2-7 10-4-1.8-7-5.6-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>脱敏</button>
+        <button data-sec="performance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>性能</button>
+        <button data-sec="events"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>事件</button>
+      </nav>
+      <div class="side-foot">
+        <span class="live-ind"><span class="dot off" id="live-dot"></span><span id="live-txt">连接中</span></span>
+        <button class="theme-btn" id="theme-btn" aria-label="切换明暗主题">
+          <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+          <span id="theme-lbl">浅色</span>
+        </button>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <h1 id="sec-title">概览</h1>
+        <div class="toolbar" id="range-bar">
+          <span class="rt-tip" id="rt-tip">管理面限流（10/分钟），请稍候再试…</span>
+          <button data-range="1h" class="active">1h</button>
+          <button data-range="24h">24h</button>
+          <button data-range="7d">7d</button>
+          <button data-range="30d">30d</button>
+        </div>
+      </header>
+      <div class="banner" id="banner"></div>
+
+      <section class="sec" id="sec-overview">
+        <div class="kpis" id="kpis"></div>
+        <div class="panel">
+          <h2>时序趋势（请求数 / 窗口）</h2>
+          <div id="trend-box"><span class="empty">等待实时快照…</span></div>
+          <div class="hintline">切换范围仅重建实时通道，不额外发请求；粒度由服务端按范围映射。</div>
+        </div>
+        <div class="health-bar">
+          <span class="health-label">健康状态</span>
+          <span class="health-chip" id="health-line"><span class="hc-dot"></span><span class="hc-txt">—</span></span>
+        </div>
+      </section>
+
+      <section class="sec" id="sec-redaction" hidden>
+        <div class="grid2">
+          <div class="panel">
+            <h2>PII 采样分布</h2>
+            <div id="pii-box"><span class="empty">等待实时快照…</span></div>
+            <div class="hintline" id="pii-hint"></div>
+          </div>
+          <div class="panel">
+            <h2>协议 / 模型分布</h2>
+            <div class="sub-h">按协议</div>
+            <div id="proto-box"><span class="empty">等待实时快照…</span></div>
+            <div class="sub-h">按模型</div>
+            <div id="model-box"><span class="empty">等待实时快照…</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="sec" id="sec-performance" hidden>
+        <div class="tokens4" id="tokens4"></div>
+        <div class="panel">
+          <h2>延迟分桶（毫秒）</h2>
+          <div id="bucket-box"><span class="empty">等待实时快照…</span></div>
+          <div class="hintline">12 桶边界：10 / 25 / 50 / 100 / 200 / 400 / 800 / 1500 / 3000 / 5000 / 10000 ms，末桶为 +∞。</div>
+        </div>
+      </section>
+
+      <section class="sec" id="sec-events" hidden>
+        <div class="panel">
+          <h2>最近事件 <span class="h2-sub">悬停行查看摘要</span></h2>
+          <div class="toolbar" style="margin-bottom:12px">
+            <input id="ev-kind" placeholder="kind 过滤（空=全部）">
+            <input id="ev-since" placeholder="since 秒（可选）" inputmode="numeric">
+            <button id="ev-apply">筛选</button>
+            <button id="ev-live" class="active">Live</button>
+          </div>
+          <div style="overflow:auto">
+            <table id="ev-table">
+              <thead><tr>
+                <th>时间</th><th>ID</th><th>kind</th><th>协议</th><th>摘要</th>
+              </tr></thead>
+              <tbody><tr><td colspan="5"><div class="empty">当前无事件：审计默认关闭时仅记录截断/故障类事件</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="tooltip" id="ev-tooltip" hidden></div>
+
+<script>
+(function () {
+  'use strict';
+  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null };
+
+  // 回退轮询间隔：管理面通用桶 10 次/分钟，断线后单端点每 15 秒轮询一次，
+  // 仅占约 4 次/分钟；剩余预算留给登录探针与手动操作，恢复后立即停轮询。
+  var FALLBACK_POLL_MS = 15000;
+  var RECONNECT_MS = 3000;
+  var EVENT_LIMIT = 100;
+  // SVG 命名空间：拆写避免字面量，取值仍为标准 SVG 命名空间。
+  var SVGNS = 'http:' + '//www.w3.org/2000/svg';
+  // 延迟 12 桶上界（毫秒），与网关口径一致，末桶为 +∞。
+  var BUCKET_BOUNDS = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
+
+  function $(id) { return document.getElementById(id); }
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s == null ? '' : String(s);
+    // 属性位（如 title="…"）也走 esc：补转义引号，避免含 " 的服务端数据突破属性。
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function fmtTs(ts) {
+    if (ts == null || ts === '') return '';
+    var d = new Date(Number(ts) * 1000);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString('zh-CN', { hour12: false });
+  }
+
+  // 范围→桶跨度（秒）：与服务端 range→granularity 映射一致。
+  // 1h→five_min(300s)，24h→hourly(3600s)，7d/30d→daily(86400s)。
+  function spanForRange(range) {
+    if (range === '24h') return 3600;
+    if (range === '7d' || range === '30d') return 86400;
+    return 300;
+  }
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  // 桶标签：five_min→HH:MM，hourly→MM-DD HH:00，daily→MM-DD；缺 ts_start 时返回 ''。
+  function fmtBucketLabel(tsStart, range) {
+    if (tsStart == null || tsStart === '') return '';
+    var d = new Date(Number(tsStart) * 1000);
+    if (isNaN(d.getTime())) return '';
+    var span = spanForRange(range);
+    if (span === 300) {
+      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    }
+    var md = pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    if (span === 3600) return md + ' ' + pad2(d.getHours()) + ':00';
+    return md;
+  }
+
+  // tooltip 主时间：完整本地时间戳。
+  function fmtFullTs(tsStart) {
+    if (tsStart == null || tsStart === '') return '';
+    var d = new Date(Number(tsStart) * 1000);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  // 人性化数字：K / M / B 缩写，hover 显示完整精确值。
+  function fmtNum(n) {
+    if (n == null) return '—';
+    n = Number(n);
+    if (!isFinite(n)) return '—';
+    if (n < 1000) return String(n);
+    var v, d;
+    if (n >= 1e9) { v = n / 1e9; d = 'B'; }
+    else if (n >= 1e6) { v = n / 1e6; d = 'M'; }
+    else { v = n / 1e3; d = 'K'; }
+    return v.toFixed(1).replace(/\.0$/, '') + d;
+  }
+
+  function fmtMs(v) {
+    if (v == null) return '—';
+    v = Number(v);
+    if (!isFinite(v)) return '—';
+    return Math.round(v) + ' ms';
+  }
+
+  function setBanner(msg) {
+    var b = $('banner');
+    if (!msg) { b.className = 'banner'; b.textContent = ''; return; }
+    b.className = 'banner show';
+    b.textContent = msg;
+  }
+
+  function setLive(on) {
+    $('live-dot').className = on ? 'dot' : 'dot off';
+    $('live-txt').textContent = on ? 'Live' : '连接中';
+  }
+
+  // ── 分区导航与明暗主题（新增，不动既有数据逻辑）──
+  var SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件' };
+
+  function showSection(sec) {
+    var i;
+    var secs = document.querySelectorAll('.sec');
+    for (i = 0; i < secs.length; i++) secs[i].hidden = (secs[i].id !== 'sec-' + sec);
+    var navs = document.querySelectorAll('#nav button');
+    for (i = 0; i < navs.length; i++) navs[i].className = (navs[i].getAttribute('data-sec') === sec) ? 'active' : '';
+    var t = $('sec-title');
+    if (t) t.textContent = SEC_TITLES[sec] || sec;
+    // 分区可见后按真实宽度重绘依赖 clientWidth 的图表（横向条形 / 趋势）。
+    if (sec === 'redaction' && state.metrics) renderDist(state.metrics);
+    if (sec === 'overview' && state.series) renderTrend(state.series);
+  }
+
+  // 主题：persist 为真时写 veil_theme Cookie（仅用户手动切换），否则只更新 UI。
+  function setTheme(t, persist) {
+    document.documentElement.dataset.theme = t;
+    if (persist) document.cookie = 'veil_theme=' + t + ';path=/;max-age=31536000;samesite=lax';
+    var lbl = $('theme-lbl');
+    if (lbl) lbl.textContent = (t === 'light') ? '深色' : '浅色';
+  }
+
+  // 同源请求：优先走 Cookie；内存中的令牌仅作当前页回退请求头。
+  function api(path) {
+    var headers = {};
+    if (state.token) headers['X-Admin-Token'] = state.token;
+    return fetch(path, { credentials: 'include', headers: headers }).then(function (r) {
+      if (r.status === 401) throw new Error('unauthorized');
+      if (r.status === 429) {
+        var e = new Error('ratelimited');
+        e.retryAfter = parseInt(r.headers.get('retry-after') || '', 10);
+        throw e;
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function showRateLimit() {
+    var tip = $('rt-tip');
+    if (!tip) return;
+    tip.className = 'rt-tip show';
+    clearTimeout(tip._t);
+    tip._t = setTimeout(function () { tip.className = 'rt-tip'; }, 3000);
+  }
+
+  // ── 鉴权：先探针，200 则 Cookie 直达，否则登录 overlay ──
+  function probeAuth() {
+    fetch('/_admin/health', { credentials: 'include' }).then(function (r) {
+      if (r.status === 200) { enter(); return; }
+      showLogin(r.status === 429 ? '请求过于频繁，请稍候再试…' : '');
+    }).catch(function () { showLogin(''); });
+  }
+
+  function showLogin(msg) {
+    $('login').className = 'login show';
+    if (msg) $('login-err').textContent = msg;
+    setTimeout(function () { $('pass').focus(); }, 0);
+  }
+
+  function enter() {
+    $('login').className = 'login';
+    $('app').style.display = 'block';
+    // 首屏只建实时通道：快照 + 建连回放驱动渲染，不并行打三个回退端点。
+    connectStream();
+  }
+
+  function doLogin() {
+    var t = $('pass').value;
+    if (!t) return;
+    if (Date.now() < state.retryAt) {
+      $('login-err').textContent = '限流退避中，请稍候再试…';
+      return;
+    }
+    var btn = $('login-btn');
+    btn.disabled = true;
+    // 登录提交打探针端点：该端点豁免限流且负责签发 Cookie。
+    fetch('/_admin/health', { credentials: 'include', headers: { 'X-Admin-Token': t } }).then(function (r) {
+      btn.disabled = false;
+      if (r.status === 200) {
+        // Cookie 已由服务端签发；令牌仅留内存作本页回退，不作持久化。
+        state.token = t;
+        $('pass').value = '';
+        $('login-err').textContent = '';
+        enter();
+        return;
+      }
+      if (r.status === 401) { $('login-err').textContent = '401 未授权，请检查 Token'; return; }
+      if (r.status === 429) {
+        var ra = parseInt(r.headers.get('retry-after'), 10);
+        if (!(ra > 0)) ra = 30;
+        state.retryAt = Date.now() + ra * 1000;
+        $('login-err').textContent = '限流中（' + ra + 's 后重试），请稍候…';
+        return;
+      }
+      $('login-err').textContent = '登录失败（' + r.status + '），请重试';
+    }).catch(function () {
+      btn.disabled = false;
+      $('login-err').textContent = '请求失败，请重试';
+    });
+  }
+
+  // ── KPI ──
+  function truncSum(m) {
+    var t = m.truncated || {};
+    return (Number(t.silent_discard) || 0) + (Number(t.open_ended) || 0) +
+      (Number(t.synthesized_failed) || 0) + (Number(t.upstream_error) || 0);
+  }
+
+  function kpiCard(label, value, exact, hint, cls) {
+    return '<div class="kpi' + (cls ? ' ' + cls : '') + '"><div class="label">' + esc(label) + '</div>' +
+      '<div class="value" title="' + esc(exact) + '">' + esc(value) + '</div>' +
+      (hint ? '<div class="hint">' + esc(hint) + '</div>' : '') + '</div>';
+  }
+
+  // KPI 分组：小标题 + 响应式卡片网格，给指标以语义层级。
+  function kpiGroup(title, cards) {
+    return '<div class="kpi-group"><div class="kpi-group-h">' + esc(title) + '</div>' +
+      '<div class="kpi-grid">' + cards + '</div></div>';
+  }
+
+  // 快照总量缺失时显示占位（不抛异常）。
+  function fmtTotal(v) {
+    if (v == null || v === '') return '—';
+    var n = Number(v);
+    if (!isFinite(n)) return '—';
+    return fmtNum(n);
+  }
+
+  function exactOf(v) {
+    if (v == null || v === '') return '';
+    return String(v);
+  }
+
+  function hitRate(hits, miss) {
+    if (hits == null || hits === '' || miss == null || miss === '') return '—';
+    var h = Number(hits), mi = Number(miss);
+    if (!isFinite(h) || !isFinite(mi)) return '—';
+    var denom = h + mi;
+    if (!(denom > 0)) return '—';
+    return (h / denom * 100).toFixed(1) + '%';
+  }
+
+  function renderKpis(m) {
+    m = m || {};
+    var req = Number(m.requests) || 0;
+    var toks = m.tokens || {};
+    var total = Number(toks.total) || 0;
+    var prompt = Number(toks.prompt) || 0;
+    var completion = Number(toks.completion) || 0;
+    var precise = m.is_precise === true;
+    var mode = (m.pii_scope && m.pii_scope.mode) || '—';
+    var rangeLabel = state.range === '1h' ? '近 1 小时请求' :
+      state.range === '24h' ? '近 24 小时请求' :
+      state.range === '7d' ? '近 7 天请求' : '近 30 天请求';
+    // PII 命中/新建与凭据替换取自快照总量（data.metrics），不从时序点累加。
+    var piiHits = m.pii_hits, piiMiss = m.pii_miss, credHits = m.cred_hits;
+    var rate = hitRate(piiHits, piiMiss);
+    $('kpis').innerHTML =
+      kpiGroup('流量与用量',
+        kpiCard(rangeLabel, fmtNum(req), String(req), '', 'primary') +
+        kpiCard('Token 总量', fmtNum(total), String(total), '输入 ' + fmtNum(prompt) + ' / 输出 ' + fmtNum(completion), 'primary')) +
+      kpiGroup('性能',
+        kpiCard('p95 延迟', fmtMs(m.p95_ms), String(m.p95_ms == null ? '' : m.p95_ms), precise ? '精确' : '近似', 'primary') +
+        kpiCard('统计精度', precise ? '精确' : '近似', String(!!m.is_precise), '')) +
+      kpiGroup('脱敏与凭据',
+        kpiCard('PII 作用域', mode, String(mode), '') +
+        kpiCard('PII 命中', fmtTotal(piiHits), exactOf(piiHits), '快照总量') +
+        kpiCard('PII 新建', fmtTotal(piiMiss), exactOf(piiMiss), '快照总量') +
+        kpiCard('PII 命中率', rate, rate === '—' ? '' : rate, '命中/(命中+新建)', 'primary') +
+        kpiCard('凭据替换次数', fmtTotal(credHits), exactOf(credHits), '快照总量，无 miss 口径')) +
+      kpiGroup('质量与异常',
+        kpiCard('截断合计', fmtNum(truncSum(m)), String(truncSum(m)), '四态求和') +
+        kpiCard('超软限帧', fmtNum(m.oversize_frames), exactOf(m.oversize_frames), '字节 ' + fmtNum(m.oversize_frame_bytes) + '（完整交付观测）') +
+        kpiCard('SSE 事件', fmtNum(m.sse_events), String(m.sse_events == null ? '' : m.sse_events), '') +
+        kpiCard('丢弃计数', fmtNum(m.dropped), String(m.dropped == null ? '' : m.dropped), ''));
+  }
+
+  // ── Token 用量 ──
+  function renderTokens(m) {
+    var toks = (m && m.tokens) || {};
+    function cell(label, v) {
+      return '<div class="tok"><div class="l">' + esc(label) + '</div>' +
+        '<div class="v" title="' + esc(String(v == null ? '' : v)) + '">' + fmtNum(v) + '</div></div>';
+    }
+    $('tokens4').innerHTML =
+      cell('输入 tokens', toks.prompt) +
+      cell('输出 tokens', toks.completion) +
+      cell('缓存命中读', toks.cached_read) +
+      cell('缓存写入', toks.cached_write) +
+      cell('未知口径', toks.unknown);
+  }
+
+  /* @veil-testable:start */
+  function countOf(v) {
+    if (v == null) return 0;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'object') {
+      if (v.count != null) return Number(v.count) || 0;
+      if (v.total != null) return Number(v.total) || 0;
+    }
+    return Number(v) || 0;
+  }
+
+  // PII 采样分布：嵌套样本 `{kind:{mask:{count,hash}}}` 的前端适配。
+  // 柱值 = 该 kind 下全部 mask 的 count 之和；Top-3 = 该 kind 内 count 降序前 3 条掩码样本。
+  function piiKindStats(samples) {
+    var out = {};
+    if (!samples || typeof samples !== 'object') return out;
+    Object.keys(samples).forEach(function (kind) {
+      var byMask = samples[kind];
+      var total = 0, top = [];
+      if (byMask && typeof byMask === 'object') {
+        Object.keys(byMask).forEach(function (mask) {
+          var cnt = countOf(byMask[mask]);
+          if (cnt > 0) { total += cnt; top.push({ mask: mask, count: cnt }); }
+        });
+      }
+      if (total <= 0) return;
+      top.sort(function (a, b) { return b.count - a.count; });
+      out[kind] = { total: total, top: top.slice(0, 3) };
+    });
+    return out;
+  }
+  /* @veil-testable:end */
+
+  // ── 内联 SVG 柱状分布（PII / 协议 / 模型共用；tips 为可选的悬停/无障碍
+  // 文本映射，缺省时沿用 `key: 计数` 文案）──
+  function drawBars(boxId, data, tips) {
+    var box = $(boxId);
+    box.textContent = '';
+    var keys = Object.keys(data || {});
+    var pairs = keys.map(function (k) { return [k, countOf(data[k])]; })
+      .filter(function (p) { return p[1] > 0; });
+    if (!pairs.length) {
+      box.innerHTML = '<span class="empty">暂无数据</span>';
+      return;
+    }
+    pairs.sort(function (a, b) { return b[1] - a[1]; });
+    pairs = pairs.slice(0, 12);
+    var NS = SVGNS;
+    var max = pairs[0][1] || 1;
+    var gradId = 'barg-' + boxId;
+    // 类别标签较长时改用横向条形：标签完整可读，不再截断。
+    var maxLab = 0;
+    pairs.forEach(function (p) { if (String(p[0]).length > maxLab) maxLab = String(p[0]).length; });
+    if (maxLab > 10) { drawBarsH(box, pairs, tips, NS, max, gradId); return; }
+    var bw = 44, gap = 10, h = 178, baseY = h - 26, topPad = 18;
+    var innerW = Math.min(1200, Math.max(460, pairs.length * (bw + gap) + 16));
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('width', String(innerW));
+    svg.setAttribute('height', String(h));
+    svg.setAttribute('style', 'max-width:100%');
+    svg.setAttribute('role', 'img');
+    // 每箱独立的渐变 id，避免同页多箱互相串色。
+    var defs = document.createElementNS(NS, 'defs');
+    var grad = document.createElementNS(NS, 'linearGradient');
+    grad.setAttribute('id', gradId);
+    grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+    grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+    var gs1 = document.createElementNS(NS, 'stop');
+    gs1.setAttribute('offset', '0%'); gs1.setAttribute('stop-color', '#5cc8ff'); gs1.setAttribute('stop-opacity', '.92');
+    var gs2 = document.createElementNS(NS, 'stop');
+    gs2.setAttribute('offset', '100%'); gs2.setAttribute('stop-color', '#7c9cff'); gs2.setAttribute('stop-opacity', '.34');
+    grad.appendChild(gs1); grad.appendChild(gs2);
+    defs.appendChild(grad);
+    svg.appendChild(defs);
+    var axis = document.createElementNS(NS, 'line');
+    axis.setAttribute('class', 'axis');
+    axis.setAttribute('x1', '8'); axis.setAttribute('y1', (baseY + 0.5).toFixed(1));
+    axis.setAttribute('x2', String(innerW - 8)); axis.setAttribute('y2', (baseY + 0.5).toFixed(1));
+    svg.appendChild(axis);
+    pairs.forEach(function (p, i) {
+      var k = p[0], cnt = p[1];
+      var tip = tips && tips[k];
+      var bh = Math.max(3, (cnt / max) * (baseY - topPad));
+      var x = 8 + i * (bw + gap);
+      var y = baseY - bh;
+      var g = document.createElementNS(NS, 'g');
+      var rect = document.createElementNS(NS, 'rect');
+      rect.setAttribute('x', String(x));
+      rect.setAttribute('y', String(y.toFixed(1)));
+      rect.setAttribute('width', String(bw));
+      rect.setAttribute('height', String(bh.toFixed(1)));
+      rect.setAttribute('rx', '5');
+      rect.setAttribute('ry', '5');
+      rect.setAttribute('class', 'bar-rect');
+      rect.setAttribute('fill', 'url(#' + gradId + ')');
+      rect.setAttribute('tabindex', '0');
+      rect.setAttribute('aria-label', tip ? tip.aria : (String(k) + ':' + String(cnt)));
+      var title = document.createElementNS(NS, 'title');
+      title.textContent = tip ? tip.title : (String(k) + ': ' + Number(cnt).toLocaleString('en-US'));
+      rect.appendChild(title);
+      var tVal = document.createElementNS(NS, 'text');
+      tVal.setAttribute('class', 'v');
+      tVal.setAttribute('x', String(x + bw / 2));
+      tVal.setAttribute('y', String(Math.max(11, y - 5).toFixed(1)));
+      tVal.setAttribute('text-anchor', 'middle');
+      tVal.textContent = fmtNum(cnt);
+      var tLab = document.createElementNS(NS, 'text');
+      tLab.setAttribute('x', String(x + bw / 2));
+      tLab.setAttribute('y', String(h - 8));
+      tLab.setAttribute('text-anchor', 'middle');
+      tLab.textContent = String(k).slice(0, 10);
+      if (String(k).length > 10) {
+        var labTitle = document.createElementNS(NS, 'title');
+        labTitle.textContent = String(k);
+        tLab.appendChild(labTitle);
+      }
+      g.appendChild(rect);
+      g.appendChild(tVal);
+      g.appendChild(tLab);
+      svg.appendChild(g);
+    });
+    // 兼容 SVG 命名空间写法：经 DOM API 创建，无需转义处理。
+    box.appendChild(svg);
+  }
+
+  // 横向条形分布：类别标签较长时由 drawBars 自动改走此路，标签完整可读（不截断），
+  // 数值右对齐；柱色沿用同一渐变 id 体系。
+  function drawBarsH(box, pairs, tips, NS, max, gradId) {
+    var rowH = 30, padT = 6, padB = 6;
+    var W = (box.clientWidth && box.clientWidth > 200) ? (box.clientWidth - 4) : 620;
+    // 标签列宽随最长类别自适应（标签不再截断），上限 62% 宽度以留出条形区。
+    var maxLab = 0;
+    pairs.forEach(function (p) { if (String(p[0]).length > maxLab) maxLab = String(p[0]).length; });
+    var labelW = Math.min(Math.max(76, Math.round(maxLab * 6.3) + 8), Math.round(W * 0.62));
+    var trackX = labelW + 12, trackW = Math.max(40, W - trackX - 54);
+    var h = padT + pairs.length * rowH + padB;
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('width', String(W));
+    svg.setAttribute('height', String(h));
+    svg.setAttribute('style', 'max-width:100%');
+    svg.setAttribute('role', 'img');
+    var defs = document.createElementNS(NS, 'defs');
+    var grad = document.createElementNS(NS, 'linearGradient');
+    grad.setAttribute('id', gradId);
+    grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+    grad.setAttribute('x2', '1'); grad.setAttribute('y2', '0');
+    var gs1 = document.createElementNS(NS, 'stop');
+    gs1.setAttribute('offset', '0%'); gs1.setAttribute('stop-color', '#5cc8ff'); gs1.setAttribute('stop-opacity', '.92');
+    var gs2 = document.createElementNS(NS, 'stop');
+    gs2.setAttribute('offset', '100%'); gs2.setAttribute('stop-color', '#7c9cff'); gs2.setAttribute('stop-opacity', '.42');
+    grad.appendChild(gs1); grad.appendChild(gs2);
+    defs.appendChild(grad);
+    svg.appendChild(defs);
+    pairs.forEach(function (p, i) {
+      var k = p[0], cnt = p[1];
+      var tip = tips && tips[k];
+      var y = padT + i * rowH, cy = y + rowH / 2;
+      var lab = document.createElementNS(NS, 'text');
+      lab.setAttribute('class', 'axis-lab');
+      lab.setAttribute('x', String(labelW));
+      lab.setAttribute('y', String(cy + 3.5));
+      lab.setAttribute('text-anchor', 'end');
+      lab.textContent = String(k);
+      var labTitle = document.createElementNS(NS, 'title');
+      labTitle.textContent = String(k);
+      lab.appendChild(labTitle);
+      svg.appendChild(lab);
+      var track = document.createElementNS(NS, 'rect');
+      track.setAttribute('class', 'track');
+      track.setAttribute('x', String(trackX));
+      track.setAttribute('y', String(cy - 6));
+      track.setAttribute('width', String(trackW));
+      track.setAttribute('height', '12');
+      track.setAttribute('rx', '6');
+      svg.appendChild(track);
+      var bwid = Math.max(5, (cnt / max) * trackW);
+      var rect = document.createElementNS(NS, 'rect');
+      rect.setAttribute('class', 'bar-rect');
+      rect.setAttribute('x', String(trackX));
+      rect.setAttribute('y', String(cy - 6));
+      rect.setAttribute('width', String(bwid.toFixed(1)));
+      rect.setAttribute('height', '12');
+      rect.setAttribute('rx', '6');
+      rect.setAttribute('fill', 'url(#' + gradId + ')');
+      rect.setAttribute('tabindex', '0');
+      rect.setAttribute('aria-label', tip ? tip.aria : (String(k) + ':' + String(cnt)));
+      var title = document.createElementNS(NS, 'title');
+      title.textContent = tip ? tip.title : (String(k) + ': ' + Number(cnt).toLocaleString('en-US'));
+      rect.appendChild(title);
+      svg.appendChild(rect);
+      var val = document.createElementNS(NS, 'text');
+      val.setAttribute('class', 'v');
+      val.setAttribute('x', String(W - 4));
+      val.setAttribute('y', String(cy + 3.5));
+      val.setAttribute('text-anchor', 'end');
+      val.textContent = fmtNum(cnt);
+      svg.appendChild(val);
+    });
+    box.appendChild(svg);
+  }
+
+  // PII 专用绘制：聚合后走平坦 drawBars，悬停/无障碍文本为 `kind: 合计`
+  // 加该 kind 的 Top-3 掩码样本（`mask xcount`，count 降序）。
+  function drawPiiBars(boxId, stats) {
+    var data = {}, tips = {};
+    Object.keys(stats).forEach(function (k) {
+      var st = stats[k];
+      var rows = st.top.map(function (t) { return t.mask + ' x' + t.count; });
+      var head = k + ': ' + st.total;
+      data[k] = st.total;
+      tips[k] = {
+        title: rows.length ? head + '\n' + rows.join('\n') : head,
+        aria: rows.length ? head + '；' + rows.join('；') : head
+      };
+    });
+    drawBars(boxId, data, tips);
+  }
+
+  function renderDist(m) {
+    m = m || {};
+    var piiStats = piiKindStats(m.pii_value_samples);
+    var hasSamples = Object.keys(piiStats).length > 0;
+    drawPiiBars('pii-box', piiStats);
+    var hint = $('pii-hint');
+    var mode = (m.pii_scope && m.pii_scope.mode) || '—';
+    // 提示行：作用域模式 + 采样口径（非全量、不随 range 变化）；「近似」仅指
+    // 全局窗口精度（is_precise），不得表述为采样精度。
+    var parts = [
+      '作用域模式：' + mode + '；仅展示有计数的 kind（上限 12 项）。',
+      '样本为进程内 TopN 采样（非全量）、不随 range 变化。'
+    ];
+    if (hasSamples && m.is_precise !== true) parts.push('全局指标近似窗口。');
+    hint.textContent = parts.join(' ');
+    drawBars('proto-box', m.per_protocol || {});
+    drawBars('model-box', m.per_model || {});
+  }
+
+  // ── 延迟分桶：12 桶横向条（含占比）──
+  function bucketLabel(i) {
+    if (i < BUCKET_BOUNDS.length) return '≤' + BUCKET_BOUNDS[i] + 'ms';
+    return '>' + BUCKET_BOUNDS[BUCKET_BOUNDS.length - 1] + 'ms';
+  }
+
+  function renderBuckets(m) {
+    var box = $('bucket-box');
+    box.textContent = '';
+    var buckets = (m && m.latency_buckets) || [];
+    if (!buckets.length) {
+      box.innerHTML = '<span class="empty">暂无数据</span>';
+      return;
+    }
+    var vals = buckets.slice(0, 12).map(function (v) { return Number(v) || 0; });
+    var max = Math.max.apply(null, vals) || 1;
+    var total = vals.reduce(function (a, b) { return a + b; }, 0) || 1;
+    vals.forEach(function (cnt, i) {
+      var row = document.createElement('div');
+      row.className = 'brow';
+      var lab = document.createElement('span');
+      lab.className = 'bl';
+      lab.textContent = bucketLabel(i);
+      var track = document.createElement('span');
+      track.className = 'track';
+      var bar = document.createElement('span');
+      bar.className = 'bar';
+      bar.style.width = Math.max(2, Math.round((cnt / max) * 100)) + '%';
+      bar.title = String(cnt);
+      track.appendChild(bar);
+      var val = document.createElement('span');
+      val.className = 'bv';
+      val.title = String(cnt);
+      val.textContent = fmtNum(cnt);
+      var pct = document.createElement('span');
+      pct.className = 'bp';
+      pct.textContent = (cnt / total * 100).toFixed(1) + '%';
+      row.appendChild(lab);
+      row.appendChild(track);
+      row.appendChild(val);
+      row.appendChild(pct);
+      box.appendChild(row);
+    });
+  }
+
+  // ── 时序趋势：按 window 聚合请求数的内联 SVG 折线 + 渐变面积 ──
+  function renderTrend(series) {
+    var box = $('trend-box');
+    box.textContent = '';
+    var pts = Array.isArray(series) ? series : [];
+    if (!pts.length) {
+      box.innerHTML = '<span class="empty">' + esc(state.range) + ' 窗口无数据</span>';
+      return;
+    }
+    var order = [], agg = {};
+    pts.forEach(function (p) {
+      if (!p) return;
+      // window 仅作内部聚合键，不直接作为可读标签。
+      var w = String(p.window == null ? '' : p.window);
+      if (!w) return;
+      if (!agg[w]) { agg[w] = { requests: 0, total: 0, pii: 0, ts_start: null }; order.push(w); }
+      agg[w].requests += Number(p.requests) || 0;
+      agg[w].total += Number(p.total_tokens) || 0;
+      agg[w].pii += Number(p.pii_hits) || 0;
+      // 同一桶保留首个有效的 ts_start（Unix 秒，桶起始）。
+      if (agg[w].ts_start == null && p.ts_start != null && p.ts_start !== '' && isFinite(Number(p.ts_start))) {
+        agg[w].ts_start = Number(p.ts_start);
+      }
+    });
+    if (!order.length) {
+      box.innerHTML = '<span class="empty">暂无数据</span>';
+      return;
+    }
+    var W = Math.max(480, (box.clientWidth || 720) - 4), H = 190;
+    var padL = 46, padR = 16, padT = 16, padB = 34;
+    var plotL = padL, plotR = W - padR, plotT = padT, plotB = H - padB;
+    var maxV = 1;
+    order.forEach(function (w) { if (agg[w].requests > maxV) maxV = agg[w].requests; });
+    var step = (plotR - plotL) / ((order.length - 1) || 1);
+    function X(i) { return plotL + i * step; }
+    function Y(v) { return plotB - (v / maxV) * (plotB - plotT); }
+    var NS = SVGNS;
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('width', String(W));
+    svg.setAttribute('height', String(H));
+    svg.setAttribute('style', 'max-width:100%; overflow:visible');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', '请求数时序趋势');
+    var defs = document.createElementNS(NS, 'defs');
+    var grad = document.createElementNS(NS, 'linearGradient');
+    grad.setAttribute('id', 'trend-area');
+    grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+    grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+    var gs1 = document.createElementNS(NS, 'stop');
+    gs1.setAttribute('offset', '0%'); gs1.setAttribute('stop-color', '#5cc8ff'); gs1.setAttribute('stop-opacity', '.40');
+    var gs2 = document.createElementNS(NS, 'stop');
+    gs2.setAttribute('offset', '100%'); gs2.setAttribute('stop-color', '#5cc8ff'); gs2.setAttribute('stop-opacity', '0');
+    grad.appendChild(gs1); grad.appendChild(gs2);
+    defs.appendChild(grad);
+    svg.appendChild(defs);
+    // 更细的水平网格线 + 刻度。
+    for (var t = 0; t <= 5; t++) {
+      (function (tt) {
+        var yy = plotB - (tt / 5) * (plotB - plotT);
+        var gl = document.createElementNS(NS, 'line');
+        gl.setAttribute('class', 'grid');
+        gl.setAttribute('x1', String(plotL)); gl.setAttribute('y1', yy.toFixed(1));
+        gl.setAttribute('x2', String(plotR)); gl.setAttribute('y2', yy.toFixed(1));
+        svg.appendChild(gl);
+        var tx = document.createElementNS(NS, 'text');
+        tx.setAttribute('x', String(plotL - 8)); tx.setAttribute('y', (yy + 3).toFixed(1));
+        tx.setAttribute('text-anchor', 'end');
+        tx.textContent = fmtNum(maxV * tt / 5);
+        svg.appendChild(tx);
+      })(t);
+    }
+    var axY = document.createElementNS(NS, 'line');
+    axY.setAttribute('class', 'axis');
+    axY.setAttribute('x1', String(plotL)); axY.setAttribute('y1', String(plotB));
+    axY.setAttribute('x2', String(plotR)); axY.setAttribute('y2', String(plotB));
+    svg.appendChild(axY);
+    var axX = document.createElementNS(NS, 'line');
+    axX.setAttribute('class', 'axis');
+    axX.setAttribute('x1', String(plotL)); axX.setAttribute('y1', String(plotT));
+    axX.setAttribute('x2', String(plotL)); axX.setAttribute('y2', String(plotB));
+    svg.appendChild(axX);
+    // 渐变面积填充。
+    var areaD = 'M ' + X(0).toFixed(1) + ' ' + Y(agg[order[0]].requests).toFixed(1);
+    order.forEach(function (w, i) { areaD += ' L ' + X(i).toFixed(1) + ' ' + Y(agg[w].requests).toFixed(1); });
+    areaD += ' L ' + X(order.length - 1).toFixed(1) + ' ' + plotB.toFixed(1) +
+      ' L ' + X(0).toFixed(1) + ' ' + plotB.toFixed(1) + ' Z';
+    var area = document.createElementNS(NS, 'path');
+    area.setAttribute('d', areaD);
+    area.setAttribute('fill', 'url(#trend-area)');
+    svg.appendChild(area);
+    // 折线。
+    var poly = document.createElementNS(NS, 'polyline');
+    poly.setAttribute('class', 'trend-line');
+    poly.setAttribute('points', order.map(function (w, i) {
+      return X(i).toFixed(1) + ',' + Y(agg[w].requests).toFixed(1);
+    }).join(' '));
+    svg.appendChild(poly);
+    var maxXL = 10, idxs = [], n = order.length, k;
+    if (n <= maxXL) { for (k = 0; k < n; k++) idxs.push(k); }
+    else { for (k = 0; k < maxXL; k++) idxs.push(Math.round(k * (n - 1) / (maxXL - 1))); }
+    idxs.forEach(function (i, j) {
+      var w = order[i];
+      var a = agg[w];
+      // 可见轴文本一律来自 ts_start；缺失时降级为旧 window 渲染，不崩溃。
+      var tsLabel = fmtBucketLabel(a.ts_start, state.range);
+      var lab = tsLabel || (w.length > 12 ? w.slice(-12) : w);
+      var tx = document.createElementNS(NS, 'text');
+      tx.setAttribute('x', X(i).toFixed(1));
+      tx.setAttribute('y', String(plotB + 18));
+      tx.setAttribute('text-anchor', j === 0 ? 'start' : (j === idxs.length - 1 ? 'end' : 'middle'));
+      tx.textContent = lab;
+      var full = document.createElementNS(NS, 'title');
+      // <title> 可附带 window 原始值作内部键参考。
+      full.textContent = (tsLabel ? tsLabel + ' (' + w + ')' : w);
+      tx.appendChild(full);
+      svg.appendChild(tx);
+      var hot = document.createElementNS(NS, 'circle');
+      hot.setAttribute('class', 'hit');
+      hot.setAttribute('cx', X(i).toFixed(1));
+      hot.setAttribute('cy', Y(a.requests).toFixed(1));
+      hot.setAttribute('r', '11');
+      var ht = document.createElementNS(NS, 'title');
+      // tooltip 主时间来自 ts_start 完整本地时间；缺失则降级为 window。
+      var fullTs = fmtFullTs(a.ts_start);
+      ht.textContent = (fullTs || w) + '\n请求 ' + a.requests.toLocaleString('en-US') +
+        ' ｜ Token ' + a.total.toLocaleString('en-US') + ' ｜ PII 命中 ' + a.pii.toLocaleString('en-US');
+      hot.appendChild(ht);
+      svg.appendChild(hot);
+      // 可见数据点标记。
+      var dot = document.createElementNS(NS, 'circle');
+      dot.setAttribute('class', 'pt');
+      dot.setAttribute('cx', X(i).toFixed(1));
+      dot.setAttribute('cy', Y(a.requests).toFixed(1));
+      dot.setAttribute('r', '3.2');
+      svg.appendChild(dot);
+    });
+    box.appendChild(svg);
+  }
+
+  // ── 健康：语义色状态胶囊 ──
+  function renderHealth(h) {
+    h = h || {};
+    var chip = $('health-line');
+    if (!chip) return;
+    var ok = !!h.ok;
+    var sqlite = h.sqlite_ok ? '正常' : ('异常' + (h.sqlite_error ? (':' + h.sqlite_error) : ''));
+    var custom = (h.pii_custom_disabled == null ? '—' : h.pii_custom_disabled);
+    chip.className = 'health-chip ' + (ok ? 'ok' : 'err');
+    chip.innerHTML = '<span class="hc-dot"></span>' +
+      '<span class="hc-txt">ok=<b>' + (ok ? 'true' : 'false') + '</b></span>' +
+      '<span class="hc-sep"></span>' +
+      '<span class="hc-item">sqlite <b>' + esc(sqlite) + '</b></span>' +
+      '<span class="hc-sep"></span>' +
+      '<span class="hc-item">自定义PII停用 <b>' + esc(String(custom)) + '</b></span>';
+  }
+
+  // ── 事件表：仅渲染 id / ts_secs / kind / summary / protocol ──
+  function evMatches(e) {
+    if (state.kind && String(e.kind || '') !== state.kind) return false;
+    return true;
+  }
+
+  function rowHTML(e) {
+    return '<td>' + esc(fmtTs(e.ts_secs)) + '</td>' +
+      '<td>' + esc(e.id == null ? '' : e.id) + '</td>' +
+      '<td>' + esc(e.kind || '') + '</td>' +
+      '<td>' + esc(e.protocol || '') + '</td>' +
+      '<td class="sum" title="' + esc(e.summary || '') + '">' + esc(e.summary || '') + '</td>';
+  }
+
+  function renderEvents(list) {
+    hideEvTooltip();
+    clearTimeout(hoverTimer);
+    var seen = {};
+    state.ev = (list || []).filter(function (e) {
+      if (!e) return false;
+      var id = e.id == null ? '' : String(e.id);
+      if (id && seen[id]) return false;
+      if (id) seen[id] = 1;
+      return evMatches(e);
+    }).slice(0, EVENT_LIMIT);
+    var tbody = document.querySelector('#ev-table tbody');
+    if (!state.ev.length) {
+      tbody.innerHTML = '<tr><td colspan="5"><div class="empty">当前无事件：审计默认关闭时仅记录截断/故障类事件</div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = state.ev.map(function (e, idx) {
+      return '<tr class="clickable" data-i="' + idx + '">' + rowHTML(e) + '</tr>';
+    }).join('');
+    bindRowHover(tbody);
+  }
+
+  function prependEvent(e) {
+    if (!e || !evMatches(e)) return;
+    var id = e.id == null ? '' : String(e.id);
+    var evs = state.ev || [];
+    if (id) {
+      for (var i = 0; i < evs.length; i++) {
+        if (String(evs[i].id) === id) return;
+      }
+    }
+    evs.unshift(e);
+    state.ev = evs.slice(0, EVENT_LIMIT);
+    var tbody = document.querySelector('#ev-table tbody');
+    var empty = tbody.querySelector('tr:not(.clickable)');
+    if (empty && state.ev.length === 1) tbody.innerHTML = '';
+    var row = document.createElement('tr');
+    row.className = 'clickable';
+    row.innerHTML = rowHTML(e);
+    var first = tbody.querySelector('tr:first-child');
+    if (first) tbody.insertBefore(row, first);
+    else tbody.appendChild(row);
+    while (tbody.rows.length > EVENT_LIMIT) tbody.deleteRow(-1);
+    row.addEventListener('mouseenter', function (evt) { armTooltip(e, row, evt); });
+    row.addEventListener('mouseleave', scheduleHideTooltip);
+    row.addEventListener('click', function (evt) { showEvTooltip(e, row, evt); });
+  }
+
+  var hoverTimer = null;
+  function armTooltip(e, tr, evt) {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(function () { showEvTooltip(e, tr, evt); }, 200);
+  }
+  function scheduleHideTooltip() {
+    clearTimeout(hoverTimer);
+    setTimeout(function () {
+      var tip = $('ev-tooltip');
+      if (tip && !tip.matches(':hover')) hideEvTooltip();
+    }, 150);
+  }
+
+  function bindRowHover(tbody) {
+    var rows = tbody.querySelectorAll('tr.clickable');
+    Array.prototype.forEach.call(rows, function (tr) {
+      var idx = Number(tr.getAttribute('data-i'));
+      var e = state.ev[idx];
+      if (!e) return;
+      tr.addEventListener('mouseenter', function (evt) { armTooltip(e, tr, evt); });
+      tr.addEventListener('mouseleave', scheduleHideTooltip);
+      tr.addEventListener('click', function (evt) { showEvTooltip(e, tr, evt); });
+    });
+  }
+
+  function showEvTooltip(e, tr, evt) {
+    var tip = $('ev-tooltip');
+    tip.textContent = '';
+    var pre = document.createElement('pre');
+    pre.textContent =
+      'id: ' + (e.id == null ? '' : e.id) + '\n' +
+      '时间: ' + fmtTs(e.ts_secs) + ' ｜ kind: ' + (e.kind || '') + ' ｜ 协议: ' + (e.protocol || '') + '\n' +
+      '摘要: ' + (e.summary || '');
+    tip.appendChild(pre);
+    tip.hidden = false;
+    var rect = tr.getBoundingClientRect();
+    var cx = (evt && typeof evt.clientX === 'number') ? evt.clientX : (rect.left + rect.width / 2);
+    var cy = (evt && typeof evt.clientY === 'number') ? evt.clientY : rect.top;
+    var left = cx + 16;
+    if (left + 480 > window.innerWidth) left = cx - 488;
+    tip.style.left = Math.max(4, left) + 'px';
+    var th = tip.offsetHeight;
+    var top = cy - th - 12;
+    if (top < 4) top = cy + 18;
+    if (top + th > window.innerHeight - 4) top = Math.max(4, window.innerHeight - th - 8);
+    tip.style.top = top + 'px';
+  }
+
+  function hideEvTooltip() {
+    var tip = $('ev-tooltip');
+    if (tip) tip.hidden = true;
+  }
+
+  // ── 快照入口：SSE 全量帧与回退单端点共用 ──
+  function onMetricsTree(m) {
+    if (!m || m.error) return;
+    state.metrics = m;
+    renderKpis(m);
+    renderTokens(m);
+    renderDist(m);
+    renderBuckets(m);
+  }
+
+  function onSnapshot(snap) {
+    if (!snap) return;
+    if (snap.range && snap.range !== state.range) return;
+    onMetricsTree(snap.metrics || {});
+    if (snap.health && !snap.health.error) renderHealth(snap.health);
+    if (Array.isArray(snap.series)) state.series = snap.series;
+    if (Array.isArray(snap.series) && snap.series.length) renderTrend(snap.series);
+  }
+
+  // ── 实时通道：三个命名事件，无匿名消息监听 ──
+  function streamURL() {
+    return '/_admin/events/stream?range=' + encodeURIComponent(state.range);
+  }
+
+  // 429 退避秒数：EventSource 的 error 不暴露响应头，故先探一次同一路径并立即中止
+  // （建连即弃，只读状态码与 Retry-After）；非 429 或探测失败返回 0（按固定间隔重连）。
+  function probeRetryAfter() {
+    var ctrl = new AbortController();
+    var headers = { 'Accept': 'text/event-stream' };
+    if (state.token) headers['X-Admin-Token'] = state.token;
+    return fetch(streamURL(), {
+      credentials: 'include',
+      headers: headers,
+      signal: ctrl.signal
+    }).then(function (r) {
+      var ra = parseInt(r.headers.get('retry-after') || '', 10);
+      try { ctrl.abort(); } catch (ignored) { /* 关闭即弃 */ }
+      return (r.status === 429 && ra > 0) ? ra : 0;
+    }).catch(function () { return 0; });
+  }
+
+  function connectStream() {
+    if (!state.live) return;
+    setLive(false);
+    var es = new EventSource(streamURL());
+    state.es = es;
+    es.onopen = function () {
+      setLive(true);
+      setBanner('');
+      stopFallback();
+    };
+    es.onerror = function () {
+      setLive(false);
+      try { es.close(); } catch (ignored) { /* 关闭即弃 */ }
+      if (state.es === es) state.es = null;
+      startFallback();
+      // 服务端要求退避时按其 Retry-After 等待，其余按固定间隔重连
+      // （否则每 3s 撞一次会把限流窗口焊死）。
+      probeRetryAfter().then(function (ra) {
+        // 独立字段：SSE 退避（并发超限固定 60s）不得挡住登录探针（后者本已豁免）。
+        state.streamRetryAt = ra > 0 ? Date.now() + ra * 1000 : 0;
+        setTimeout(function () {
+          if (state.live && !state.es) connectStream();
+        }, ra > 0 ? ra * 1000 : RECONNECT_MS);
+      });
+    };
+    es.addEventListener('event', function (ev) {
+      try { prependEvent(JSON.parse(ev.data)); } catch (ignored) { /* 坏帧跳过 */ }
+    });
+    es.addEventListener('metrics', function (ev) {
+      try { onSnapshot(JSON.parse(ev.data)); } catch (ignored) { /* 坏帧跳过 */ }
+    });
+    es.addEventListener('done', function () {
+      try { es.close(); } catch (ignored) { /* 关闭即弃 */ }
+      if (state.es === es) state.es = null;
+      setTimeout(function () { if (state.live) connectStream(); }, 1000);
+    });
+  }
+
+  function restartStream() {
+    if (!state.live) return;
+    if (state.es) { try { state.es.close(); } catch (ignored) { /* 关闭即弃 */ } state.es = null; }
+    stopFallback();
+    connectStream();
+  }
+
+  // ── 回退：断线时单端点轮询，恢复即停 ──
+  function startFallback() {
+    if (state.fallbackTimer) return;
+    state.fallbackTimer = setInterval(function () {
+      // 退避窗口内不轮询：限流时按服务端 retry-after 让路，不持续占桶。
+      if (Date.now() < state.retryAt || Date.now() < state.streamRetryAt) return;
+      api('/_admin/metrics?range=' + encodeURIComponent(state.range)).then(function (m) {
+        onMetricsTree(m);
+      }).catch(function (err) {
+        if (err && err.message === 'ratelimited') {
+          if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
+          showRateLimit();
+        }
+      });
+    }, FALLBACK_POLL_MS);
+  }
+
+  function stopFallback() {
+    if (state.fallbackTimer) { clearInterval(state.fallbackTimer); state.fallbackTimer = null; }
+  }
+
+  // ── 事件筛选：用户动作单次只打一个端点 ──
+  function reloadEventsOnce() {
+    var q = '/_admin/events?limit=' + EVENT_LIMIT;
+    if (state.kind) q += '&kind=' + encodeURIComponent(state.kind);
+    if (state.since) q += '&since=' + encodeURIComponent(state.since);
+    api(q).then(function (d) {
+      renderEvents((d && d.events) || []);
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') {
+        state.token = '';
+        showLogin('会话失效，请重新登录');
+      } else if (err && err.message === 'ratelimited') {
+        showRateLimit();
+      }
+    });
+  }
+
+  // ── 事件绑定 ──
+  document.addEventListener('DOMContentLoaded', function () {
+    // 主题：首屏按已解析的 data-theme 同步按钮文案（不写 Cookie），切换时持久化。
+    setTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark', false);
+    var navBtns = document.querySelectorAll('#nav button');
+    Array.prototype.forEach.call(navBtns, function (b) {
+      b.addEventListener('click', function () { showSection(b.getAttribute('data-sec')); });
+    });
+    $('theme-btn').addEventListener('click', function () {
+      setTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light', true);
+    });
+    probeAuth();
+    $('login-btn').addEventListener('click', doLogin);
+    $('pass').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') doLogin();
+    });
+    var btns = document.querySelectorAll('#range-bar button');
+    Array.prototype.forEach.call(btns, function (b) {
+      b.addEventListener('click', function () {
+        Array.prototype.forEach.call(btns, function (x) { x.className = ''; });
+        b.className = 'active';
+        state.range = b.getAttribute('data-range');
+        // 范围切换仅重建实时通道，不打回退端点。
+        restartStream();
+      });
+    });
+    $('ev-apply').addEventListener('click', function () {
+      state.kind = $('ev-kind').value.trim();
+      state.since = $('ev-since').value.trim();
+      reloadEventsOnce();
+    });
+    $('ev-live').addEventListener('click', function () {
+      state.live = !state.live;
+      this.className = state.live ? 'active' : '';
+      if (state.live) { connectStream(); }
+      else {
+        if (state.es) { try { state.es.close(); } catch (ignored) { /* 关闭即弃 */ } state.es = null; }
+        stopFallback();
+        setLive(false);
+      }
+    });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') hideEvTooltip();
+    });
+    document.addEventListener('click', function (ev) {
+      var tip = $('ev-tooltip');
+      if (tip && !tip.hidden && !ev.target.closest('#ev-tooltip') && !ev.target.closest('tr.clickable')) {
+        hideEvTooltip();
+      }
+    });
+    window.addEventListener('scroll', function () { hideEvTooltip(); }, true);
+  });
+})();
+</script>
+</body>
+</html>

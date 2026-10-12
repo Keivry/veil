@@ -1,0 +1,237 @@
+# Tag 发布流水线：推送 `vX.Y.Z` 形态的 tag 时触发。
+#
+#   1) test       —— 全量 `cargo test --locked` 质量门禁；失败即中止全部发布（其余 job 均依赖它）；
+#   2) build-gnu  —— ubuntu-22.04 构建 x86_64-unknown-linux-gnu 二进制 → tar.gz → 上传 artifact；
+#   3) build-musl —— ubuntu-24.04 用 zig（cargo zigbuild）构建全静态 x86_64-unknown-linux-musl 二进制 → tar.gz → 上传 artifact；
+#   4) build-get  —— ubuntu-24.04 构建 Go 客户端 get-credential（CGO 关闭 → 全静态）→ tar.gz → 上传 artifact；
+#   5) publish    —— 下载全部 artifact，生成统一 SHA256SUMS，创建 GitHub Release（notes 由提交记录自动生成）；
+#   6) docker     —— 构建 Docker 镜像并推送到 GHCR：ghcr.io/<owner>/<repo>（linux/amd64）。
+#
+# 工具链约定：本仓库 `rust-toolchain.toml` 固定 nightly（仅本地 rustfmt 不稳定选项需要），
+# 发布构建必须对齐 Dockerfile builder（`rust:1.98.1-slim-bookworm`）的稳定版 1.98.1，
+# 故用 `RUSTUP_TOOLCHAIN` 环境变量覆盖工具链文件（优先级：env > rust-toolchain.toml > 默认）。
+#
+# runner 选择：
+#   - build-gnu 固定 ubuntu-22.04（glibc 2.35）：基线比 runtime 镜像 bookworm（glibc 2.36）更旧，
+#     产出的二进制可直接在 Debian 12+ / Ubuntu 22.04+ 运行；更换 runner 前需重新评估 glibc 基线
+#     （ubuntu-24.04 为 glibc 2.39，会抬高运行下限）。
+#   - 其余 job 用 ubuntu-24.04：ubuntu-22.04 镜像已于 2026-09-17 进入弃用期（2027-04-17 移除）；
+#     测试不产出二进制，musl 产物为全静态，均不受 runner glibc 影响。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# 最小权限：创建 Release 需 contents:write；推送 GHCR 需 packages:write。
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # 覆盖 rust-toolchain.toml 的 nightly，与 Dockerfile builder（rust:1.98.1-slim-bookworm）对齐。
+  RUSTUP_TOOLCHAIN: "1.98.1"
+
+jobs:
+  test:
+    name: cargo test（发布门禁）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust 1.98.1（与 Dockerfile builder 对齐）
+        run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装构建依赖（aws-lc-sys 编译 C/C++ 需要 g++ 与 cmake）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake make
+      - name: cargo test
+        run: cargo test --locked
+
+  build-gnu:
+    name: 构建 gnu 二进制（glibc 2.35 基线）
+    needs: [test]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust 1.98.1（与 Dockerfile builder 对齐）
+        run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装构建依赖（aws-lc-sys 编译 C/C++ 需要 g++ 与 cmake）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake make
+      - name: 构建 release 二进制
+        run: cargo build --release --locked
+      - name: 打包 tar.gz
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          pkg="veil-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p dist/stage/docs dist/stage/examples
+          cp target/release/veil dist/stage/veil
+          cp README.md dist/stage/README.md
+          cp docs/engineering-reference.md dist/stage/docs/
+          cp examples/veil.toml dist/stage/examples/
+          tar -C dist/stage -czf "dist/${pkg}" veil README.md docs/engineering-reference.md examples/veil.toml
+      - name: 上传 gnu 产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: veil-gnu
+          path: dist/veil-*.tar.gz
+          if-no-files-found: error
+
+  build-musl:
+    name: 构建 musl 全静态二进制（x86_64-unknown-linux-musl）
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust 1.98.1（与 Dockerfile builder 对齐）
+        run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - name: 添加 musl target（cargo zigbuild 仍需要该目标的 std）
+        run: rustup target add --toolchain 1.98.1 x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # zig 固定 0.15.2：与本仓库实测版本一致，且规避 zig 0.16 的 `ar` 回归（影响 cc-rs 归档）。
+      # mlugg/setup-zig 最新版（v2.2.1）仍为 node20（上游尚未发布 node24 版本），
+      # 故保留一条 Node20 弃用提示；功能不受影响（runner 会强制以 node24 运行）。
+      - name: 安装 zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
+      - name: 安装 cargo-zigbuild 0.23.4
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
+      # 切勿手动设置 CC_*/CXX_*：cargo-zigbuild 会自动生成 zigcc/zigcxx 包装器并注入正确的
+      # `-target x86_64-linux-musl`；手动指定 `zig cc` 会让 cc-rs 传入 4 段式 target 而被 zig 拒绝。
+      # aws-lc-sys 与 libsqlite3-sys 走 cc-builder 路径（本仓库实测无 CMake 产物），故无需 apt 装 g++/cmake/make。
+      - name: 构建 musl release 二进制（全静态）
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
+      - name: 校验产物为全静态（statically linked）
+        run: file target/x86_64-unknown-linux-musl/release/veil | grep -q "statically linked"
+      - name: 打包 tar.gz
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          pkg="veil-${ver}-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p dist/stage/docs dist/stage/examples
+          cp target/x86_64-unknown-linux-musl/release/veil dist/stage/veil
+          cp README.md dist/stage/README.md
+          cp docs/engineering-reference.md dist/stage/docs/
+          cp examples/veil.toml dist/stage/examples/
+          tar -C dist/stage -czf "dist/${pkg}" veil README.md docs/engineering-reference.md examples/veil.toml
+      - name: 上传 musl 产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: veil-musl
+          path: dist/veil-*.tar.gz
+          if-no-files-found: error
+
+  build-get:
+    name: 构建 get 客户端二进制（Go · linux/amd64 全静态）
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Go 版本由 get/go.mod（go 1.26）声明，setup-go 依此选型/下载；与 gate.sh 第 7 步口径一致。
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: get/go.mod
+          cache-dependency-path: get/go.mod
+      # CGO 关闭 → 全静态（无 libc 依赖）；-trimpath 去源码绝对路径、-s -w 去符号表，减小体积且可复现。
+      - name: 构建 get-credential（全静态）
+        working-directory: get
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o get-credential .
+      - name: 校验产物为全静态（statically linked）
+        run: file get/get-credential | grep -q "statically linked"
+      - name: 打包 tar.gz
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          pkg="get-credential-${ver}-linux-amd64.tar.gz"
+          mkdir -p dist/stage/docs
+          cp get/get-credential dist/stage/get-credential
+          cp README.md dist/stage/README.md
+          cp docs/engineering-reference.md dist/stage/docs/
+          tar -C dist/stage -czf "dist/${pkg}" get-credential README.md docs/engineering-reference.md
+      - name: 上传 get 产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: veil-get
+          path: dist/get-credential-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: 汇总产物并创建 Release
+    needs: [build-gnu, build-musl, build-get]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载构建产物（gnu + musl + get 合并到同一目录）
+        uses: actions/download-artifact@v8
+        with:
+          pattern: veil-*
+          merge-multiple: true
+          path: dist
+      - name: 生成统一 SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: 创建 GitHub Release（notes 由提交记录自动生成）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # publish 未 checkout，gh 无法从 git remote 推断仓库，故显式指定。
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
+
+  docker:
+    name: 构建并推送镜像（GHCR · linux/amd64）
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 启用 Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # GHCR 要求镜像名全小写，而 `github.repository` 保留用户/仓库名的显示大小写
+      # （GitHub 用户名可含大写字母），故在源头显式小写化，不依赖下游动作的隐式处理。
+      - name: 计算镜像名（GHCR 必须全小写）
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      # 标签规则：semver 版本号（vX.Y.Z → X.Y.Z）、次版本（X.Y）；
+      # metadata-action 默认 flavor `latest=auto` 会在非预发布版本上自动追加 latest。
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

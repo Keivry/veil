@@ -1,0 +1,2 @@
+# Python 脚本静态检查/格式化配置（行长与 rustfmt max_width=100 对齐）
+line-length = 100

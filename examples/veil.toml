@@ -1,0 +1,124 @@
+# veil 可选配置文件示例（TOML）
+#
+# 用法：把文件路径交给引导变量（该变量只从进程 env 读取，不能写进本文件）：
+#   export VEIL_CONFIG_FILE=/etc/veil/veil.toml
+# 优先级：白名单 env 显式 > 本文件 > 内建默认。
+# 白名单概念只要对应环境变量非空（trim 后），恒以 env 为准，本文件不覆盖；两处皆缺时取内建默认。
+# 白名单外的概念（脱敏/PII 作用域/审计/限额/入口/存储/LLM 上游等）只由本文件承载，恒为「本文件 > 内建默认」。
+# 未设置 VEIL_CONFIG_FILE 时不读盘，生效配置为「白名单 env + 内建默认」基线。
+#
+# fail-closed：文件缺失/不可读/超过 1MB/TOML 语法错误/未知键/类型错误/取值越界，
+# 一律拒绝启动；空文件合法（等价于无文件覆盖）。
+#
+# 密钥类键（matrix_access_token、observability_admin_token、get_binary_secret、
+# get_binary_hash、value_sample_hmac_key）一旦写入本文件，Unix 下文件权限必须收窄到
+# 0600（mode & 0o077 == 0），否则拒绝启动；env 覆盖不豁免该门禁（密钥文本已落盘）。
+# 本示例不声明任何密钥类键，保持入库权限 0644 也可直接加载；密钥建议继续走 env 注入。
+
+[auth]
+homeserver = "https://matrix.example.com"
+room_id = "!room:example.com"
+observability_disable = false
+# 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
+# matrix_access_token = "syt_..."
+# observability_admin_token = "至少 32 字符的随机串"
+
+[limits]
+audit_hold_max_bytes = 1048576
+nonstream_max_bytes = 8388608
+# SSE 单行/单事件硬上限（字节，默认 8388608 = 8MiB；超限 fail-closed）
+# sse_frame_hard_bytes = 8388608
+
+[audit]
+mode = "off"          # off | block | approve；approve 必须配 approval_whitelist
+timeout = 90          # 秒；禁止落在 110-130 竞态区间
+# approval_whitelist = ["@admin:example.com"]
+# policy_file = "/etc/veil/audit-policy.yaml"   # 其 mode 低于本文件 [audit].mode
+
+[storage]
+data_dir = "/data"                  # 派生 db_dir / tpm_dir / caller_registry_path
+# db_dir = "/data/db"
+# tpm_dir = "/data/tpm"
+# caller_registry_path = "/data/caller_registry.json"
+auto_approve = "pending"            # allow | deny | pending
+entry_mode = "credential-only"      # full | credential-only | llm-only
+credential_block_wait = false
+# 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
+# get_binary_secret = "..."
+# get_binary_hash = "..."
+
+[redaction]
+enabled = true
+fuzzy_restore = false
+detection_hardening = true
+# custom_rules_file = "/etc/veil/pii-rules.json"      # 缺文件/解析失败拒启动
+# custom_patterns_file = "/etc/veil/pii-patterns.json"
+# custom_dict_file = "/etc/veil/pii-dict.txt"
+value_sample_enabled = false
+value_sample_persist = true
+# value_sample_hmac_key = "..."        # 密钥类 - 写入本文件须 chmod 600
+placeholder_prompt = true
+# placeholder_prompt_text = "请原样保留 __PII_*__ 占位符"
+normalize_json_whitespace = false
+
+[pii_scope]
+mode = "request"                     # request | conversation
+ttl_secs = 3600
+max_conversations = 1024
+key_header = "x-veil-conversation-id"
+# prev_id_max_entries = 1024          # 缺省联动 max_conversations 生效值
+
+[llm]
+default_upstream = "http://127.0.0.1:11434"
+timeout_secs = 30
+pool_max_idle_per_host = 16
+pool_idle_timeout_secs = 90
+
+# 按宿主机入口端口选择上游（端口号 -> URL）
+[llm.upstreams]
+"8878" = "http://127.0.0.1:11434"
+"8879" = "http://127.0.0.1:11435"
+
+# 上游请求覆盖（文件专属，无 env 对应源）：目标键为入口端口（须有对应上游）或保留键 default（须有缺省上游）。
+# 目标级 override 布尔（缺省 true）：true = 配置恒胜客户端同名头/同键参数；false = 合并模式（headers 与
+# params 的 default/override 两段均仅补缺，客户端已有值保留；drop 不受开关影响）。
+# 出站头在保留头剔除/逐跳过滤之后注入；硬拒 host、content-length、content-encoding、accept-encoding、
+# transfer-encoding、逐跳头、x-veil-* 前缀、authorization、x-api-key、api-key、cookie；头值禁 CR/LF，归一重复头名拒启动。
+# params 仅对话协议生效，按 chat | anthropic | responses 分表，每协议三段：
+# default（缺则补）→ override（恒写）→ drop（删顶层键，缺失静默）；
+# 保留键 model/stream/messages/input/instructions/system/stream_options 任一段出现即拒启动。
+# NonDialog 字节透传与 count_tokens（redact-only）仅注入头、忽略 params（各记一次 warn）；参数值为配置原文。
+[llm.targets."8878".headers]
+anthropic-version = "2023-06-01"
+x-upstream-feature = "port-8878"
+
+[llm.targets."8878".params.chat]
+default = { temperature = 0.7 }
+override = { top_p = 0.9 }
+drop = ["presence_penalty"]
+
+[llm.targets."8878".params.anthropic]
+override = { max_tokens = 1024 }
+
+[llm.targets."8878".params.responses]
+drop = ["store"]
+
+# 合并模式示例：仅补缺，客户端显式给定的头/参数优先
+[llm.targets.default]
+override = false
+headers = { x-upstream-feature = "default" }
+params.chat.override = { temperature = 1.0 }
+
+# opencode zen/go 兼容示例（双场景共用一套配置）：
+# - opencode CLI 经 veil 接入：override = false 保留其动态身份头（x-opencode-session/request）；
+# - 缺 x-opencode-session 的客户端：以 veil 会话键头动态补齐——客户端携带会话键头（默认
+#   x-veil-conversation-id）时展开其首值为该头；未携带时该条跳过不注入（不伪造会话键）；
+# - 第三方客户端伪装 opencode：user_agent 恒胜替换客户端 UA，x-opencode-* 缺项补齐。
+# UA 版本串请取实际安装版本（如 opencode/1.18.33），与服务端指标口径一致。
+[llm.targets."8879"]
+override = false
+user_agent = "opencode/1.18.33"
+headers = { x-opencode-client = "cli", x-opencode-session = "$conversation" }
+
+[keepass]
+backend = "real"                     # real | mock（mock 仅 CI 逃生，生产禁用）

@@ -1,0 +1,12 @@
+# 工具链真源（开发与门禁）：`scripts/gate.sh` 的 `cargo fmt --check` / `clippy`
+# 依赖 nightly 的 rustfmt 不稳定选项（见仓库根 `rustfmt.toml` 的 `unstable_features`），
+# 故此处显式声明 nightly，避免"只有某台机器的全局 rustfmt 配置才过 fmt"这类
+# 只在特定环境暴露的问题。
+#
+# 与构建的关系：Docker/发布构建走 stable（`Dockerfile` 的 base tag），其下限由
+# `Cargo.toml` 的 `package.rust-version` 声明——任何更旧的工具链（含 Docker pin 落后）
+# 都会在 cargo 处以明确错误 fail-fast，不再等到晦涩的 E0658。
+[toolchain]
+channel = "nightly"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

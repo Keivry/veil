@@ -1,0 +1,65 @@
+# push / PR 常规 CI：两个 job 并行——
+#   - test：全量 `cargo test --locked`（Rust 网关）；
+#   - go：`get/` 内置 Go 客户端 `go vet ./...` + `go test ./...` + 全静态构建。
+# 发布流水线见 release.yml（tag 触发：测试门禁 → 二进制 Release + GHCR 镜像），两者共用同一测试口径。
+# 工具链与 runner 选择理由同 release.yml：稳定版 1.98.1 对齐 Dockerfile builder；
+# 测试不产出二进制、无 glibc 基线约束，故用 ubuntu-24.04（ubuntu-22.04 镜像已于 2026-09-17 进入弃用期）。
+
+name: CI
+
+on:
+  push:
+    # 仅分支推送触发；tag 推送留给 release.yml，避免重复跑（`branches` 过滤已排除 tag）。
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 覆盖 rust-toolchain.toml 的 nightly（仅供本地 rustfmt），CI 统一用与发布一致的稳定版 1.98.1。
+  RUSTUP_TOOLCHAIN: "1.98.1"
+
+# 同一分支的旧 run 自动取消：PR 连续推送时不浪费 runner。
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust 1.98.1（与 Dockerfile builder 对齐）
+        run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装构建依赖（aws-lc-sys 编译 C/C++ 需要 g++ 与 cmake）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake make
+      - name: cargo test
+        run: cargo test --locked
+
+  go:
+    name: go vet / test / build（get 客户端）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Go 版本由 get/go.mod（go 1.26）声明，setup-go 依此选型/下载；
+      # 与 gate.sh 第 7 步（get/ 内 go vet/go test）同一口径。
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: get/go.mod
+          cache-dependency-path: get/go.mod
+      - name: go vet
+        working-directory: get
+        run: go vet ./...
+      - name: go test
+        working-directory: get
+        run: go test ./...
+      # CGO 关闭 → 全静态；与 release.yml build-get 构建口径一致。
+      - name: go build（全静态）
+        working-directory: get
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/get-credential .

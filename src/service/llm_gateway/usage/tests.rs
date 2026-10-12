@@ -1,0 +1,386 @@
+use super::*;
+
+#[test]
+fn nonstream_usage_matches_stream_convention() {
+    let chat =
+        serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}});
+    assert_eq!(
+        extract_usage_nonstream(Protocol::Chat, &chat)
+            .unwrap()
+            .total_tokens,
+        3
+    );
+    let resp = serde_json::json!({"response":{"usage":{"prompt_tokens":4,"completion_tokens":5,"total_tokens":9}}});
+    assert_eq!(
+        extract_usage_nonstream(Protocol::Responses, &resp)
+            .unwrap()
+            .total_tokens,
+        9
+    );
+    let bad_resp = serde_json::json!({"usage":{"total_tokens":9}});
+    // F-P1a：顶层 `usage` 优先后该体命中顶层，不再回退嵌套。
+    assert_eq!(
+        extract_usage_nonstream(Protocol::Responses, &bad_resp)
+            .unwrap()
+            .total_tokens,
+        9
+    );
+    let anth =
+        serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}});
+    assert_eq!(
+        extract_usage_nonstream(Protocol::Anthropic, &anth)
+            .unwrap()
+            .total_tokens,
+        5
+    );
+    let anth_nested = serde_json::json!({"message":{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}});
+    assert_eq!(
+        extract_usage_nonstream(Protocol::Anthropic, &anth_nested)
+            .unwrap()
+            .total_tokens,
+        2
+    );
+    assert!(extract_usage_nonstream(Protocol::NonDialog, &chat).is_none());
+}
+
+#[test]
+fn responses_double_layer_fallback_with_alias_normalization() {
+    let double = serde_json::json!({"response":{"response":{"usage":{"prompt_tokens":7,"completion_tokens":8,"total_tokens":15}}}});
+    let u = extract_usage_nonstream(Protocol::Responses, &double).unwrap();
+    assert_eq!(
+        (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+        (7, 8, 15)
+    );
+    let single = serde_json::json!({"response":{"usage":{"input_tokens":4,"output_tokens":6}}});
+    let u = extract_usage_nonstream(Protocol::Responses, &single).unwrap();
+    assert_eq!(
+        (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+        (4, 6, 10)
+    );
+    let stream_double = serde_json::json!({"type":"response.completed","response":{"response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}});
+    let u = extract_usage_stream(Protocol::Responses, &stream_double).unwrap();
+    assert_eq!(u.total_tokens, 5);
+    let stream_single = serde_json::json!({"type":"response.completed","response":{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}});
+    let u = extract_usage_stream(Protocol::Responses, &stream_single).unwrap();
+    assert_eq!(u.total_tokens, 3);
+    let chat_ev =
+        serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+    assert!(extract_usage_stream(Protocol::Chat, &chat_ev).is_some());
+    assert!(extract_usage_stream(Protocol::Chat, &serde_json::json!({"delta":"hi"})).is_none());
+    let anth_delta = serde_json::json!({"delta":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}});
+    assert_eq!(
+        extract_usage_stream(Protocol::Anthropic, &anth_delta)
+            .unwrap()
+            .total_tokens,
+        30
+    );
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"message":{"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}),
+        ),
+    );
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(Protocol::Anthropic, &anth_delta),
+    );
+    let a = acc.unwrap();
+    assert_eq!(
+        (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+        (10, 20, 30),
+        "双段按字段单调 max，不求和双计"
+    );
+}
+
+#[test]
+fn responses_top_level_usage_preferred_over_nested() {
+    // F-P1a 真实体锁定：官方 Responses 非流顶层 `usage`（`resp_xxx` 体）。
+    let std = serde_json::json!({"id":"resp_abc","object":"response",
+        "output":[{"type":"message"}],
+        "usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57,
+            "input_tokens_details":{"cached_tokens":3}}});
+    let u = extract_usage_nonstream(Protocol::Responses, &std).unwrap();
+    assert_eq!(
+        (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+        (12, 45, 57)
+    );
+    assert_eq!(u.cached_read, 3, "顶层缓存列同口径命中");
+    // 顶层与嵌套并存时顶层优先。
+    let both = serde_json::json!({"usage":{"input_tokens":12,"output_tokens":45},
+        "response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}});
+    let u = extract_usage_nonstream(Protocol::Responses, &both).unwrap();
+    assert_eq!((u.prompt_tokens, u.completion_tokens), (12, 45));
+    // 流式顶层同口径（`response.completed` 官方事件形态为单层嵌套，不断链）。
+    let ev = serde_json::json!({"type":"response.completed",
+        "response":{"id":"resp_abc","usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57}}});
+    let u = extract_usage_stream(Protocol::Responses, &ev).unwrap();
+    assert_eq!(
+        (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+        (12, 45, 57)
+    );
+    let top_ev =
+        serde_json::json!({"usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57}});
+    let u = extract_usage_stream(Protocol::Responses, &top_ev).unwrap();
+    assert_eq!((u.prompt_tokens, u.completion_tokens), (12, 45));
+}
+
+#[test]
+fn stream_fast_path_borrowed_gate_matches_full_normalization() {
+    // F-P2b：无承载键分片零分配跳过，有用量分片结论不变。
+    assert!(extract_usage_stream(Protocol::Chat, &serde_json::json!({"type":"ping"})).is_none());
+    assert!(
+        extract_usage_stream(
+            Protocol::Chat,
+            &serde_json::json!({"delta":"input_tokens mention without keys"})
+        )
+        .is_none()
+    );
+    let chat_ev =
+        serde_json::json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+    assert!(extract_usage_stream(Protocol::Chat, &chat_ev).is_some());
+    let heartbeat = serde_json::json!({"delta":"hi"});
+    assert!(extract_usage_stream(Protocol::Anthropic, &heartbeat).is_none());
+}
+
+#[test]
+fn streaming_usage_two_segments_take_max_without_double_count() {
+    let start = serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5}}});
+    let delta = serde_json::json!({"type":"message_delta","usage":{"output_tokens":20}});
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &start));
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &delta));
+    let a = acc.unwrap();
+    assert_eq!((a.prompt_tokens, a.completion_tokens), (5, 20));
+    let bare = serde_json::json!({"delta":{"input_tokens":5}});
+    assert!(
+        extract_usage_stream(Protocol::Anthropic, &bare).is_none(),
+        "裸键分片过快路径门后仍按归一口径返回 None，不估算"
+    );
+    let heartbeat = serde_json::json!({"delta":"hi"});
+    assert!(extract_usage_stream(Protocol::Anthropic, &heartbeat).is_none());
+}
+
+#[test]
+fn responses_streaming_single_layer_preferred_over_double() {
+    let both = serde_json::json!({"response":{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"response":{"usage":{"prompt_tokens":9,"completion_tokens":9,"total_tokens":18}}}});
+    let u = extract_usage_stream(Protocol::Responses, &both).unwrap();
+    assert_eq!(
+        (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+        (1, 1, 2)
+    );
+}
+
+#[test]
+fn usage_accumulation_takes_max_without_double_count() {
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"message":{"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}),
+        ),
+    );
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"delta":{"usage":{"input_tokens":30,"output_tokens":0,"total_tokens":30}}}),
+        ),
+    );
+    let a = acc.as_ref().expect("须有累计值");
+    assert_eq!((a.prompt_tokens, a.total_tokens), (30, 30));
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"delta":{"usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10}}}),
+        ),
+    );
+    let a2 = acc.as_ref().expect("须保持累计值");
+    assert_eq!(
+        (a2.prompt_tokens, a2.completion_tokens, a2.total_tokens),
+        (30, 1, 30)
+    );
+}
+
+#[test]
+fn cached_columns_follow_normalize_usage() {
+    // Given：三协议各自口径的缓存键
+    // When：归一提取
+    // Then：cached_read/write 落位，缺失归零
+    let chat = serde_json::json!({"usage": {
+        "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        "prompt_tokens_details": {"cached_tokens": 4},
+    }});
+    let u = extract_usage_nonstream(Protocol::Chat, &chat).unwrap();
+    assert_eq!((u.cached_read, u.cached_write), (4, 0));
+
+    let chat_null = serde_json::json!({"usage": {
+        "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        "prompt_tokens_details": null,
+    }});
+    let u = extract_usage_nonstream(Protocol::Chat, &chat_null).unwrap();
+    assert_eq!((u.cached_read, u.cached_write), (0, 0));
+
+    let resp = serde_json::json!({"response": {"usage": {
+        "input_tokens": 8, "output_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 6},
+    }}});
+    let u = extract_usage_nonstream(Protocol::Responses, &resp).unwrap();
+    assert_eq!((u.cached_read, u.cached_write), (6, 0));
+
+    let anth = serde_json::json!({"usage": {
+        "input_tokens": 8, "output_tokens": 3,
+        "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2,
+    }});
+    let u = extract_usage_nonstream(Protocol::Anthropic, &anth).unwrap();
+    assert_eq!((u.cached_read, u.cached_write), (5, 2));
+
+    // 流式累计按列取 max，不双计。
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(
+        &mut acc,
+        extract_usage_nonstream(Protocol::Anthropic, &anth),
+    );
+    let anth_small = serde_json::json!({"usage": {
+        "input_tokens": 1, "output_tokens": 1,
+        "cache_read_input_tokens": 1, "cache_creation_input_tokens": 9,
+    }});
+    accumulate_usage(
+        &mut acc,
+        extract_usage_nonstream(Protocol::Anthropic, &anth_small),
+    );
+    let a = acc.unwrap();
+    assert_eq!((a.cached_read, a.cached_write), (5, 9));
+}
+
+#[test]
+fn usage_regression_keeps_historical_max_with_delta_coverage() {
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"type":"message_delta","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}),
+        ),
+    );
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"type":"message_delta","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}),
+        ),
+    );
+    let a = acc.as_ref().expect("须有累计值");
+    assert_eq!(
+        (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+        (100, 50, 150),
+        "递减输入不得回退"
+    );
+    accumulate_usage(
+        &mut acc,
+        extract_usage_stream(
+            Protocol::Anthropic,
+            &serde_json::json!({"type":"message_delta","usage":{"input_tokens":20,"output_tokens":200,"total_tokens":220}}),
+        ),
+    );
+    let b = acc.as_ref().expect("须保持累计值");
+    assert_eq!(
+        (b.prompt_tokens, b.completion_tokens, b.total_tokens),
+        (100, 200, 220),
+        "乱序输入按列取历史最大"
+    );
+    assert_ne!(b.total_tokens, 150 + 15 + 220, "禁止 sum 双计");
+}
+
+#[test]
+fn anthropic_usage_total_across_events() {
+    // start 给输入、delta 给输出，全部无显式 total → total 求和非取 max。
+    let start = serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}});
+    let delta = serde_json::json!({"type":"message_delta","usage":{"output_tokens":50}});
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &start));
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Anthropic, &delta));
+    let a = acc.expect("须有累计值");
+    assert_eq!(
+        (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+        (100, 50, 150),
+        "跨事件须 prompt_max + completion_max，不得单事件派生取 max"
+    );
+}
+
+#[test]
+fn usage_explicit_total_priority() {
+    // 任一事件显式 total 时取显式 max，忽略分列和。
+    let explicit =
+        serde_json::json!({"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":999}});
+    let derived = serde_json::json!({"usage":{"prompt_tokens":20,"completion_tokens":7}});
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Chat, &explicit));
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Chat, &derived));
+    let a = acc.expect("须有累计值");
+    assert_eq!(
+        (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+        (20, 7, 999),
+        "显式 total 优先，分列各自 max 不覆盖 total"
+    );
+    let mut acc2: Option<Usage> = None;
+    accumulate_usage(&mut acc2, extract_usage_stream(Protocol::Chat, &explicit));
+    accumulate_usage(
+        &mut acc2,
+        extract_usage_stream(
+            Protocol::Chat,
+            &serde_json::json!({"usage":{"total_tokens":1234}}),
+        ),
+    );
+    assert_eq!(
+        acc2.expect("须有累计值").total_tokens,
+        1234,
+        "多个显式 total 取 max"
+    );
+}
+
+#[test]
+fn usage_merge_regression() {
+    // 三协议回归，合并改动不得漂移既有取数。
+    let chat =
+        serde_json::json!({"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}});
+    let mut acc: Option<Usage> = None;
+    accumulate_usage(&mut acc, extract_usage_stream(Protocol::Chat, &chat));
+    let a = acc.expect("chat 单帧须取值");
+    assert_eq!(
+        (a.prompt_tokens, a.completion_tokens, a.total_tokens),
+        (3, 4, 7)
+    );
+    let multi = serde_json::json!({"choices":[{"delta":{"content":"x"}}],
+        "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}});
+    let mut acc2: Option<Usage> = None;
+    accumulate_usage(&mut acc2, extract_usage_stream(Protocol::Chat, &multi));
+    assert_eq!(acc2.expect("chat 多帧须取值").total_tokens, 7);
+    // Responses 三级回退数值不变：顶层 → response.usage → response.response.usage。
+    let cases = [
+        (
+            serde_json::json!({"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":45,"total_tokens":57}}}),
+            57,
+        ),
+        (
+            serde_json::json!({"type":"response.completed","response":{"response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}}),
+            5,
+        ),
+        (
+            serde_json::json!({"type":"response.completed","usage":{"input_tokens":7,"output_tokens":8,"total_tokens":15}}),
+            15,
+        ),
+    ];
+    for (ev, total) in cases {
+        let mut acc: Option<Usage> = None;
+        accumulate_usage(&mut acc, extract_usage_stream(Protocol::Responses, &ev));
+        assert_eq!(
+            acc.expect("responses 回退须取值").total_tokens,
+            total,
+            "Responses 三级回退数值不得漂移: {ev}"
+        );
+    }
+}

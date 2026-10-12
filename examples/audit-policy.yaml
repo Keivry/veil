@@ -1,0 +1,18 @@
+# veil 审计策略示例（§6.11）。
+# 用法：在配置文件中声明 [audit].policy_file = "examples/audit-policy.yaml" 后启动。
+# 热重载为 Non-Goal：改配置后重启生效。
+# 模式由配置文件 [audit].mode 决定（off/block/approve，默认 off，优先级高于本文件 mode）；
+# 本文件 mode 仅在配置文件未声明时生效，另追加危险子串与敏感路径。
+
+mode: block
+
+# 追加危险子串（小写归一后子串匹配，命中即 block/approve）。
+extra_block_substrings:
+  - "rm -rf /"
+  - "mkfs"
+  - ":(){:|:&};:"
+
+# 追加敏感路径前缀（词法 .. 归一后前缀匹配）。
+extra_sensitive_paths:
+  - "/etc/"
+  - "/root/.ssh/"

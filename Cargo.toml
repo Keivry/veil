@@ -1,0 +1,62 @@
+[package]
+name = "veil"
+version = "0.1.0"
+edition = "2024"
+# 构建工具链下限（MSRV）：源码使用 `str::floor_char_boundary`/`ceil_char_boundary`，
+# 旧工具链只会在编译期抛晦涩的 E0658；此处声明后，任何更旧工具链（含 Dockerfile
+# base tag 落后）在 cargo 处即 fail-fast。下限取值 = Docker builder 已验证的版本。
+rust-version = "1.98.1"
+
+# 脚手架依赖 pin（moka 留待后续，argon2/dashmap/tokio-rusqlite 均不引入）。
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "brotli",
+    "deflate",
+    "gzip",
+    "json",
+    "rustls",
+    "stream",
+] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# TOML 配置文件层（可选补充层，env 恒优先）：serde 原生强类型反序列化 +
+# fail-closed 严格语法；仅 `config::file_layer` 使用，pin 到当前稳定版。
+toml = "1.1.4"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+# 订阅者装配（stderr 人读格式）+ RUST_LOG per-target 过滤（env-filter）+ 时间戳（time）。
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+rand = "0.10"
+subtle = "2.6.1"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+regex = "1.13.1"
+fancy-regex = "0.19.1"
+moka = { version = "0.12.16", features = ["future"] }
+# 真实 kdbx 后端（KDBX3/4 + keyfile，纯 Rust 无系统依赖）+ 密钥零化。
+keepass = { version = "0.15", features = ["save_kdbx4"] }
+zeroize = "1"
+# 轻量流式构造（SSE 帧按需 yield），禁重型运行时依赖。
+async-stream = "0.3"
+bytes = "1"
+
+[lib]
+name = "veil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "veil"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+strip = true
+panic = "abort"
