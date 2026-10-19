@@ -727,6 +727,13 @@ auto_approve = [{ command = "deploy", hosts = ["fleet"] }]
     }
 
     #[test]
+    fn two_groups_may_share_a_host() {
+        let text = format!("{}\n[command.groups.mirror]\nhosts = [\"api\"]\n", base());
+        let cfg = parse(&text).expect("共享 host 的分组须合法");
+        assert!(cfg.is_group("mirror"));
+    }
+
+    #[test]
     fn non_absolute_caller_rejected() {
         let err = parse(&base().replace("/opt/ci/agent.sh", "agent.sh")).unwrap_err();
         assert!(err.to_string().contains("callers"), "{err}");
