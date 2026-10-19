@@ -26,8 +26,8 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn credential_headers(headers: &HeaderMap) -> CredentialHeaders {
     CredentialHeaders::new(
-        header_str(headers, "x-get-binary-hash"),
-        header_str(headers, "x-get-binary-secret"),
+        header_str(headers, "x-veilctl-binary-hash"),
+        header_str(headers, "x-veilctl-secret"),
     )
 }
 
@@ -65,7 +65,7 @@ pub async fn registrations_handler(
     let views = service::list_registrations(
         &state,
         header_str(&headers, "x-admin-token").as_deref(),
-        header_str(&headers, "x-get-binary-secret").as_deref(),
+        header_str(&headers, "x-veilctl-secret").as_deref(),
     )
     .await?;
     let items: Vec<Value> = views.iter().map(registration_list_item).collect();

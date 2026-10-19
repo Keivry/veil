@@ -10,12 +10,13 @@
 //! 集合内任一非空（trim 后）即 env 显式，跳过文件写入并记冲突 warn。
 //!
 //! 密钥门禁：文件声明 5 个密钥类键任一（`matrix_access_token`/
-//! `observability_admin_token`/`get_binary_secret`/`get_binary_hash`/
+//! `observability_admin_token`/`veilctl_secret`/`veilctl_binary_hash`/
 //! `value_sample_hmac_key`）时，Unix 下要求 `mode & 0o077 == 0`，否则拒启动；
 //! env 覆盖不豁免（密钥文本已落盘）。
 
 use {
     super::{
+        command::{CommandConfig, CommandSection, validate_command},
         custom_file::CUSTOM_FILE_MAX_BYTES,
         targets::{LlmTargets, RawTargets, validate_targets},
         validate::config_error,
@@ -38,7 +39,7 @@ const UPSTREAMS_KEY_PREFIX: &str = "llm.upstreams.";
 
 /// 文件专属结构键根（无 env 映射，不参与逐键合并）：内部结构由
 /// `config::targets` 校验与结构性键锁步测试覆盖；工程参考 §1 与锁步测试须保持同步。
-pub(crate) const FILE_ONLY_KEYS: &[&str] = &["llm.targets"];
+pub(crate) const FILE_ONLY_KEYS: &[&str] = &["llm.targets", "command"];
 
 /// 命中文件专属结构键根：`key == root` 或以 `root.` 开头时返回该根，否则 `None`。
 fn file_only_root(key: &str) -> Option<&'static str> {
@@ -113,6 +114,7 @@ pub struct FileConfig {
     pub pii_scope: Option<PiiScopeSection>,
     pub llm: Option<LlmSection>,
     pub keepass: Option<KeepassSection>,
+    pub command: Option<CommandSection>,
 }
 
 /// `[auth]`：认证/服务身份（目录键见 `MAPPINGS`）。
@@ -153,8 +155,8 @@ pub struct StorageSection {
     pub db_dir: Option<String>,
     pub tpm_dir: Option<String>,
     pub caller_registry_path: Option<String>,
-    pub get_binary_secret: Option<String>,
-    pub get_binary_hash: Option<String>,
+    pub veilctl_secret: Option<String>,
+    pub veilctl_binary_hash: Option<String>,
     pub auto_approve: Option<FileAutoApprove>,
     pub entry_mode: Option<FileEntryMode>,
     pub credential_block_wait: Option<bool>,
@@ -298,14 +300,14 @@ const MAPPINGS: &[MappingDef] = &[
         &["CALLER_REGISTRY_PATH"],
     ),
     env(
-        "storage.get_binary_secret",
-        "GET_BINARY_SECRET",
-        &["GET_BINARY_SECRET", "CREDENTIAL_SECRET"],
+        "storage.veilctl_secret",
+        "VEILCTL_SECRET",
+        &["VEILCTL_SECRET"],
     ),
     env(
-        "storage.get_binary_hash",
-        "GET_BINARY_HASH",
-        &["GET_BINARY_HASH"],
+        "storage.veilctl_binary_hash",
+        "VEILCTL_BINARY_HASH",
+        &["VEILCTL_BINARY_HASH"],
     ),
     MappingDef {
         key: "storage.auto_approve",
@@ -456,13 +458,20 @@ struct ResolvedEntry {
     value: String,
 }
 
+/// 文件层校验产物：文件专属结构分节（无 env 逐键映射）与逐键合并结果。
+#[derive(Debug, Default)]
+pub struct FileLayerOutcome {
+    pub llm_targets: LlmTargets,
+    pub command: CommandConfig,
+}
+
 /// 文件补充层入口：引导读取 → fail-closed 解析 → 密钥权限门禁 → 覆盖字段校验 →
-/// 逐键合并；返回校验后的 `[llm.targets]` 覆盖（供装载路径并入 `Config`）。
-/// 未设/空白 `VEIL_CONFIG_FILE` 时零副作用（不访问文件系统），返回空覆盖表；
-/// 任一失败拒绝启动。
-pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<LlmTargets> {
+/// 逐键合并；返回校验后的 `[llm.targets]` 覆盖与 `[command]` 配置（供装载路径
+/// 并入 `Config`）。未设/空白 `VEIL_CONFIG_FILE` 时零副作用（不访问文件系统），
+/// 返回缺省产物；任一失败拒绝启动。
+pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<FileLayerOutcome> {
     let Some(path) = bootstrap_path(env) else {
-        return Ok(LlmTargets::new());
+        return Ok(FileLayerOutcome::default());
     };
     let cfg = load_file_config(&path)?;
     enforce_secret_permissions(&path, &cfg)?;
@@ -471,8 +480,12 @@ pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<LlmTargets
             .as_ref()
             .and_then(|section| section.targets.as_ref()),
     )?;
+    let command = validate_command(cfg.command.as_ref())?;
     merge_entries(env, resolve_entries(&cfg)?);
-    Ok(llm_targets)
+    Ok(FileLayerOutcome {
+        llm_targets,
+        command,
+    })
 }
 
 /// 引导路径：`VEIL_CONFIG_FILE` trim 后非空才返回（空/缺失 = 不读盘）。
@@ -691,7 +704,7 @@ fn declares_secret_keys(cfg: &FileConfig) -> bool {
         section.matrix_access_token.is_some() || section.observability_admin_token.is_some()
     });
     let storage = cfg.storage.as_ref().is_some_and(|section| {
-        section.get_binary_secret.is_some() || section.get_binary_hash.is_some()
+        section.veilctl_secret.is_some() || section.veilctl_binary_hash.is_some()
     });
     let redaction = cfg
         .redaction

@@ -74,10 +74,6 @@ const D6_ALIAS_SETS: &[(&str, &[&str])] = &[
             "PII_CUSTOM_DICT",
         ],
     ),
-    (
-        "storage.get_binary_secret",
-        &["GET_BINARY_SECRET", "CREDENTIAL_SECRET"],
-    ),
     ("audit.mode", &["AUDIT_MODE"]),
 ];
 
@@ -256,7 +252,7 @@ fn migrated_list_equals_mapping_union_minus_whitelist() {
     );
 }
 
-/// 「环境变量表」须恰覆盖白名单 10 项，且不再声明 `LLM_<port>` 模式。
+/// 「环境变量表」须恰覆盖白名单 9 项，且不再声明 `LLM_<port>` 模式。
 #[test]
 fn env_var_table_equals_whitelist() {
     let whitelist: BTreeSet<String> = CONFIG_ENV_WHITELIST.iter().map(|s| s.to_string()).collect();
@@ -265,7 +261,7 @@ fn env_var_table_equals_whitelist() {
     assert_eq!(doc_names.len(), doc_set.len(), "环境变量表不得有重复行");
     assert_eq!(
         doc_set, whitelist,
-        "「环境变量表」须恰覆盖白名单 10 项（任一侧增删须同步）"
+        "「环境变量表」须恰覆盖白名单 9 项（任一侧增删须同步）"
     );
     assert!(
         !doc_env_vars_subsection().contains("`LLM_<port>`"),
@@ -426,7 +422,8 @@ fn example_file_covers_all_sections_and_declares_no_secret_keys() {
     for section in sections {
         let prefix = format!("{section}.");
         assert!(
-            keys.iter().any(|key| key.starts_with(&prefix)),
+            keys.iter()
+                .any(|key| key == section || key.starts_with(&prefix)),
             "示例文件分节 [{section}] 须至少一个代表键"
         );
     }
@@ -468,8 +465,9 @@ fn example_file_loads_and_applies_from_disk() {
         BOOTSTRAP_VAR.to_string(),
         file.path().to_string_lossy().into_owned(),
     );
-    let targets =
-        apply_config_file(&mut env).expect("示例文件须成功合并（不含密钥类键，0644 不触发门禁）");
+    let targets = apply_config_file(&mut env)
+        .expect("示例文件须成功合并（不含密钥类键，0644 不触发门禁）")
+        .llm_targets;
     let cfg = Config::load_from_with_targets(&env, targets).expect("示例文件须通过既有校验链");
     assert_eq!(cfg.pii_scope_ttl_secs, 3600);
     assert!(cfg.pii_detection_hardening);
@@ -578,9 +576,8 @@ fn example_file_loads_and_applies_from_disk() {
     );
 
     for secret_env in [
-        "GET_BINARY_SECRET",
-        "CREDENTIAL_SECRET",
-        "GET_BINARY_HASH",
+        "VEILCTL_SECRET",
+        "VEILCTL_BINARY_HASH",
         "PII_VALUE_SAMPLE_HMAC_KEY",
     ] {
         assert!(
@@ -588,7 +585,7 @@ fn example_file_loads_and_applies_from_disk() {
             "示例文件不得写入密钥类 env {secret_env}"
         );
     }
-    assert!(cfg.credential_secret.is_none());
-    assert!(cfg.get_binary_hash.is_none());
+    assert!(cfg.veilctl_secret.is_none());
+    assert!(cfg.veilctl_binary_hash.is_none());
     assert!(cfg.pii_value_sample_hmac_key.is_none());
 }

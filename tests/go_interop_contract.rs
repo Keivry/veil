@@ -1,4 +1,4 @@
-//! Go 互操作网关侧契约：镜像存量 Go `get`
+//! Go 互操作网关侧契约：镜像存量 Go `veilctl`
 //! 的请求形状（`FetchCredential` 纯 body、无三因子头），锁定网关侧行为。
 //! **真机 Go 闭环不在本仓复现（存量直连全链路 / 三因子齐全与缺失 /
 //! 阻断流终止三段）**；本文件只锁网关侧契约，不冒充该
@@ -11,8 +11,8 @@ use {
 
 mod common;
 
-const GET_HASH: &str = "gethash1";
-const GET_SECRET: &str = "s3cr3t";
+const VEILCTL_BINARY_HASH: &str = "gethash1";
+const VEILCTL_SECRET: &str = "s3cr3t";
 
 /// POST /credential：可选头 + 纯 JSON body，返回 (状态码, JSON 体)。
 async fn cred_post(
@@ -48,7 +48,7 @@ async fn go_shaped_credential_body_only_rejected() {
     // Go `FetchCredential` 纯 body、
     // 不发三因子头 → 403 且错误体为 `{"error":{"code","message"}}` **对象**
     //（`error` 非 string），锁定「Go 不可直接解析」根因契约；
-    // 同时锁定 `body.auth.get_binary_hash`/`get_binary_secret` 与 `body.secret`
+    // 同时锁定 `body.auth.veilctl_binary_hash`/`veilctl_secret` 与 `body.secret`
     // 被采纳为等价头（`auth.rs::effective_*`）的行为。
     let (app, state) = test_app(&[]);
     let (base, handle) = serve(app).await;
@@ -69,11 +69,11 @@ async fn go_shaped_credential_body_only_rejected() {
         body["error"]["message"]
             .as_str()
             .unwrap_or("")
-            .contains("get_binary_hash"),
+            .contains("veilctl_binary_hash"),
         "诊断须指向缺失的三因子字段: {body}"
     );
 
-    // body.auth.* 等价头被采纳：get_binary_hash + get_binary_secret → 放行。
+    // body.auth.* 等价头被采纳：veilctl_binary_hash + veilctl_secret → 放行。
     let (status, body) = cred_post(
         &client,
         &base,
@@ -82,8 +82,8 @@ async fn go_shaped_credential_body_only_rejected() {
             "auth": {
                 "caller_hash": "go-h2",
                 "caller_path": "/srv/go2.sh",
-                "get_binary_hash": GET_HASH,
-                "get_binary_secret": GET_SECRET
+                "veilctl_binary_hash": VEILCTL_BINARY_HASH,
+                "veilctl_secret": VEILCTL_SECRET
             },
             "entry": "网易", "field": "授权码"
         }),
@@ -92,17 +92,17 @@ async fn go_shaped_credential_body_only_rejected() {
     assert_eq!(status, 200, "body.auth 等价头须被采纳: {body}");
     assert_eq!(body["ok"], true, "{body}");
 
-    // body.secret 兼容 + body.auth.get_binary_hash：兼容路径同样放行。
+    // body.secret 兼容 + body.auth.veilctl_binary_hash：兼容路径同样放行。
     let (status, body) = cred_post(
         &client,
         &base,
         &[],
         serde_json::json!({
-            "secret": GET_SECRET,
+            "secret": VEILCTL_SECRET,
             "auth": {
                 "caller_hash": "go-h3",
                 "caller_path": "/srv/go3.sh",
-                "get_binary_hash": GET_HASH
+                "veilctl_binary_hash": VEILCTL_BINARY_HASH
             },
             "entry": "网易", "field": "授权码"
         }),
@@ -117,7 +117,7 @@ async fn go_shaped_credential_body_only_rejected() {
 #[tokio::test]
 async fn go_three_factor_matrix() {
     // 齐全（头体一致）→ 放行；
-    // 缺哈希头 / 缺密钥头 / 缺 `body.auth.*` / 冒用 caller_hash==GET_BINARY_HASH
+    // 缺哈希头 / 缺密钥头 / 缺 `body.auth.*` / 冒用 caller_hash==VEILCTL_BINARY_HASH
     // 各 → 403 明确诊断；冒用为 `token:false` 原始取用的拒止口径。
     let (app, state) = test_app(&[]);
     let (base, handle) = serve(app).await;
@@ -129,8 +129,8 @@ async fn go_three_factor_matrix() {
         &client,
         &base,
         &[
-            ("X-Get-Binary-Hash", GET_HASH),
-            ("X-Get-Binary-Secret", GET_SECRET),
+            ("X-Veilctl-Binary-Hash", VEILCTL_BINARY_HASH),
+            ("X-Veilctl-Secret", VEILCTL_SECRET),
         ],
         auth_body("go-m1", "/srv/go-m1.sh"),
     )
@@ -142,7 +142,7 @@ async fn go_three_factor_matrix() {
     let (status, body) = cred_post(
         &client,
         &base,
-        &[("X-Get-Binary-Secret", GET_SECRET)],
+        &[("X-Veilctl-Secret", VEILCTL_SECRET)],
         auth_body("go-m2", "/srv/go-m2.sh"),
     )
     .await;
@@ -153,7 +153,7 @@ async fn go_three_factor_matrix() {
     let (status, body) = cred_post(
         &client,
         &base,
-        &[("X-Get-Binary-Hash", GET_HASH)],
+        &[("X-Veilctl-Binary-Hash", VEILCTL_BINARY_HASH)],
         auth_body("go-m3", "/srv/go-m3.sh"),
     )
     .await;
@@ -165,8 +165,8 @@ async fn go_three_factor_matrix() {
         &client,
         &base,
         &[
-            ("X-Get-Binary-Hash", GET_HASH),
-            ("X-Get-Binary-Secret", GET_SECRET),
+            ("X-Veilctl-Binary-Hash", VEILCTL_BINARY_HASH),
+            ("X-Veilctl-Secret", VEILCTL_SECRET),
         ],
         serde_json::json!({"entry": "网易", "field": "授权码"}),
     )
@@ -174,16 +174,16 @@ async fn go_three_factor_matrix() {
     assert_eq!(status, 403, "缺 body.auth.* 须 403: {body}");
     assert_eq!(body["error"]["code"], "E_AUTH", "{body}");
 
-    // 冒用：caller_hash == GET_BINARY_HASH（终端直调/原始取用）→ 403。
+    // 冒用：caller_hash == VEILCTL_BINARY_HASH（终端直调/原始取用）→ 403。
     let (status, body) = cred_post(
         &client,
         &base,
         &[
-            ("X-Get-Binary-Hash", GET_HASH),
-            ("X-Get-Binary-Secret", GET_SECRET),
+            ("X-Veilctl-Binary-Hash", VEILCTL_BINARY_HASH),
+            ("X-Veilctl-Secret", VEILCTL_SECRET),
         ],
         serde_json::json!({
-            "auth": {"caller_hash": GET_HASH, "caller_path": "/srv/go-term.sh"},
+            "auth": {"caller_hash": VEILCTL_BINARY_HASH, "caller_path": "/srv/go-term.sh"},
             "entry": "网易", "field": "授权码", "token": false
         }),
     )

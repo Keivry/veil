@@ -173,8 +173,8 @@ async fn go_body_alias_without_headers_allows() {
         auth: Some(AuthBlock {
             caller_hash: Some("gohash1".to_string()),
             caller_path: Some("/s/go.sh".to_string()),
-            get_binary_hash: Some("gethash".to_string()),
-            get_binary_secret: Some("s3cr3t".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
         }),
         entry: Some("网易".to_string()),
         field: Some("授权码".to_string()),
@@ -196,8 +196,8 @@ async fn go_body_alias_wrong_secret_still_403() {
         auth: Some(AuthBlock {
             caller_hash: Some("gohash2".to_string()),
             caller_path: Some("/s/go2.sh".to_string()),
-            get_binary_hash: Some("gethash".to_string()),
-            get_binary_secret: Some("wrong".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("wrong".to_string()),
         }),
         entry: Some("网易".to_string()),
         field: Some("授权码".to_string()),
@@ -212,7 +212,7 @@ async fn go_body_alias_wrong_secret_still_403() {
 
 #[tokio::test]
 async fn three_factor_body_auth_fallback() {
-    // 头缺失时回退读取 `body.auth.get_binary_hash`/`get_binary_secret`
+    // 头缺失时回退读取 `body.auth.veilctl_binary_hash`/`veilctl_secret`
     //（Go 存量 `CredentialBody` 形态），按三因子语义放行；
     // 仅缺 caller 字段时返回 403「body.auth.caller_hash/caller_path 必填」。
     let env = cred_env(&[]);
@@ -223,8 +223,8 @@ async fn three_factor_body_auth_fallback() {
         auth: Some(AuthBlock {
             caller_hash: Some("gohash-fallback".to_string()),
             caller_path: Some("/s/go-fallback.sh".to_string()),
-            get_binary_hash: Some("gethash".to_string()),
-            get_binary_secret: Some("s3cr3t".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
         }),
         entry: Some("网易".to_string()),
         field: Some("授权码".to_string()),
@@ -240,8 +240,8 @@ async fn three_factor_body_auth_fallback() {
         auth: Some(AuthBlock {
             caller_hash: None,
             caller_path: None,
-            get_binary_hash: Some("gethash".to_string()),
-            get_binary_secret: Some("s3cr3t".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
         }),
         entry: Some("网易".to_string()),
         field: Some("授权码".to_string()),
@@ -441,8 +441,8 @@ async fn pure_body_without_headers_allows() {
         auth: Some(AuthBlock {
             caller_hash: Some("purehash".to_string()),
             caller_path: Some("/s/pure.sh".to_string()),
-            get_binary_hash: Some("gethash".to_string()),
-            get_binary_secret: Some("s3cr3t".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
         }),
         entry: Some("网易".to_string()),
         field: Some("授权码".to_string()),

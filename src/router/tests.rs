@@ -22,7 +22,7 @@ fn test_app_with_state(extra: &[(&str, &str)]) -> (Router, AppState) {
             "OBSERVABILITY_ADMIN_TOKEN".to_string(),
             "observability-admin-token-0123456789".to_string(),
         ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
+        ("VEILCTL_SECRET".to_string(), "s3cr3t".to_string()),
     ]);
     for (k, v) in extra {
         env.insert((*k).to_string(), (*v).to_string());
@@ -103,7 +103,7 @@ async fn seven_routes_paths_and_status_codes() {
     // `router_credential_write_endpoints_require_auth`）。
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/job.sh",
             "caller_hash": "routehash1",
@@ -117,8 +117,8 @@ async fn seven_routes_paths_and_status_codes() {
 
     let cred = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "routehashX")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "routehashX")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "routehashX", "caller_path": "/srv/other.sh"},
             "entry": "网易",
@@ -235,7 +235,7 @@ async fn admin_exact_routes_before_wildcard_unknown_404() {
         .unwrap();
     assert_eq!(index.status().as_u16(), 200);
     let body: serde_json::Value = index.json().await.unwrap();
-    assert_eq!(body["routes"].as_array().unwrap().len(), 6);
+    assert_eq!(body["routes"].as_array().unwrap().len(), 7);
 
     let health = client
         .get(format!("{base}/_admin/health"))
@@ -351,8 +351,8 @@ async fn credential_rate_limit_returns_429_with_retry_after() {
     });
     let first = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "rlhash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "rlhash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&payload)
         .send()
         .await
@@ -360,8 +360,8 @@ async fn credential_rate_limit_returns_429_with_retry_after() {
     assert_eq!(first.status().as_u16(), 202, "未注册转审批");
     let second = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "rlhash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "rlhash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&payload)
         .send()
         .await
@@ -382,8 +382,8 @@ async fn go_interop_mirror_and_entry_hint() {
             "auth": {
                 "caller_hash": "gohash9",
                 "caller_path": "/srv/go.sh",
-                "get_binary_hash": "gohash9",
-                "get_binary_secret": "s3cr3t"
+                "veilctl_binary_hash": "gohash9",
+                "veilctl_secret": "s3cr3t"
             },
             "entry": "网易",
             "field": "授权码"
@@ -395,8 +395,8 @@ async fn go_interop_mirror_and_entry_hint() {
 
     let no_entry = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gohash9")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gohash9")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "gohash9", "caller_path": "/srv/go.sh"}
         }))
@@ -575,7 +575,7 @@ async fn register_caller_go_shape_superset() {
     let request = tokio::spawn(async move {
         request_client
             .post(format!("{request_base}/register-caller"))
-            .header("X-Get-Binary-Secret", "s3cr3t")
+            .header("X-Veilctl-Secret", "s3cr3t")
             .json(&request_body)
             .send()
             .await
@@ -623,7 +623,7 @@ async fn register_caller_go_shape_superset() {
     assert_eq!(v["allow_mode"], "true");
     let dup = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&body)
         .send()
         .await

@@ -6,10 +6,10 @@ use {common::serve, veil::router::build_router};
 
 mod common;
 
-/// audit-approve 用例沿旧 env 不启用 `GET_BINARY_HASH` 门（空值经 config 过滤为 None），
+/// audit-approve 用例沿旧 env 不启用 `VEILCTL_BINARY_HASH` 门（空值经 config 过滤为 None），
 /// 其余走统一脚手架；避免为本文件的单点差异污染 `common::base_env`。
 fn audit_opts(extra: &[(&str, &str)]) -> common::TestOpts {
-    common::TestOpts::from(extra).set("GET_BINARY_HASH", "")
+    common::TestOpts::from(extra).set("VEILCTL_BINARY_HASH", "")
 }
 
 fn audit_app(extra: &[(&str, &str)]) -> axum::Router { common::test_app_router(audit_opts(extra)) }
@@ -249,8 +249,8 @@ async fn tampered_credential_turns_to_pending_202() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/e2e-approve.sh",
             "caller_hash": "hash-aaa-e2e",
@@ -263,8 +263,8 @@ async fn tampered_credential_turns_to_pending_202() {
     assert_eq!(reg.status().as_u16(), 202);
     let cred = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "hash-aaa-e2e")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "hash-aaa-e2e")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "hash-bbb-tampered", "caller_path": "/srv/e2e-approve.sh"},
             "entry": "网易",

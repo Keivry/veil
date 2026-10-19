@@ -271,7 +271,7 @@ fn legacy_var_names_not_read() {
     assert!(legacy_ignored_detected(&empty_hit).is_empty());
     // 行为仍为不读取：启动仅 warn，不断链、不生效。
     let cfg = Config::load_from(&env).unwrap();
-    assert!(cfg.credential_secret.is_none());
+    assert!(cfg.veilctl_secret.is_none());
     assert!(!cfg.llm_upstreams.contains_key(&9999));
     assert!(crate::service::llm_gateway::resolve_upstream(&cfg, Some(9999)).is_none());
 }

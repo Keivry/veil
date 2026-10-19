@@ -60,7 +60,7 @@ docker compose up -d
 
 ## 核心配置
 
-配置分两层：**环境变量表**（进程 env 白名单，共 10 个具名变量，见下）与 **TOML 配置文件**（其余设置的唯一来源）。优先级：白名单概念维持 `env 显式 > 文件 > 内建默认`；非白名单概念只由文件承载（同名 env 置位不生效、仅启动期告警）。
+配置分两层：**环境变量表**（进程 env 白名单，共 9 个具名变量，见下）与 **TOML 配置文件**（其余设置的唯一来源）。优先级：白名单概念维持 `env 显式 > 文件 > 内建默认`；非白名单概念只由文件承载（同名 env 置位不生效、仅启动期告警）。
 
 ### 环境变量表
 
@@ -72,8 +72,8 @@ docker compose up -d
 | `VEIL_ALLOW_MOCK_TPM` | 未设置 | 只认字面 `1`，放行 Mock TPM，仅开发机与 CI 使用；生产禁用 |
 | `MATRIX_ACCESS_TOKEN` | 空 | Matrix Bot access token；缺省时审批/凭据同步关闭 |
 | `OBSERVABILITY_ADMIN_TOKEN` | 空 | `/_admin` 鉴权 token，建议 ≥32 字符且不得与 Matrix token 相同 |
-| `GET_BINARY_SECRET` / `CREDENTIAL_SECRET` | 空（兼容模式） | 三因子部署密钥；前者优先 |
-| `GET_BINARY_HASH` | 空 | 直调哈希门禁 |
+| `VEILCTL_SECRET` | 空（兼容模式） | 三因子部署密钥 |
+| `VEILCTL_BINARY_HASH` | 空 | 直调哈希门禁 |
 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 值级采样 HMAC key（密钥类建议走 env 注入） |
 
 完整读取面与 compose 边界说明见 `docs/engineering-reference.md` §1。
@@ -96,6 +96,18 @@ docker compose up -d
 ### 配置文件（可选）
 
 `VEIL_CONFIG_FILE` 指向一份 TOML；不设置即零行为变化。文件缺失/语法错误/未知键/密钥文件权限不合规一律拒绝启动（fail-closed）。密钥类键建议继续走 env 注入。
+
+### 下游命令执行（可选）
+
+配置文件 `[command]` 分节可向经三因子认证的下游 agent 暴露受控命令：
+
+- `GET /commands` 返回该下游可见的命令目录与参数定义；
+- `POST /commands/{id}/invoke` 执行命令（argv 直传、禁止 shell），返回退出码与输出；
+- 需审批的命令经 Matrix `✅`/`❎`/`🔓` 落定（`🔓` 持久化 accept-always），默认 `202 + E_PENDING`，
+  `[command].block_wait = true` 时阻塞至终态；
+- 每次调用写入 `data_dir/commands.sqlite`，可在 `/_admin/commands` 与控制台「命令调用」分区查看。
+
+`[command].enabled = false`（缺省）时命令端点 404、其余行为不变。示例见 `examples/veil.toml`。
 
 ## 使用示例
 

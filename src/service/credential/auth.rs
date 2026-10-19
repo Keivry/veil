@@ -28,9 +28,28 @@ fn effective_secret(headers: &CredentialHeaders, body: &CredentialBody) -> Optio
         .or_else(|| {
             body.auth
                 .as_ref()
-                .and_then(|a| a.get_binary_secret.clone())
+                .and_then(|a| a.veilctl_secret.clone())
                 .filter(|v| !v.is_empty())
         })
+}
+
+/// 调用者身份：`body.auth` 优先，缺失/空时回退同名请求头（无 body 的 GET 端点）。
+pub(crate) fn effective_caller(
+    headers: &CredentialHeaders,
+    body: &CredentialBody,
+) -> (String, String) {
+    let auth = body.auth.clone().unwrap_or_default();
+    let hash = auth
+        .caller_hash
+        .filter(|v| !v.is_empty())
+        .or_else(|| headers.caller_hash.clone().filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    let path = auth
+        .caller_path
+        .filter(|v| !v.is_empty())
+        .or_else(|| headers.caller_path.clone().filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    (hash, path)
 }
 
 fn effective_binary_hash(headers: &CredentialHeaders, body: &CredentialBody) -> String {
@@ -40,7 +59,7 @@ fn effective_binary_hash(headers: &CredentialHeaders, body: &CredentialBody) -> 
     }
     body.auth
         .as_ref()
-        .and_then(|a| a.get_binary_hash.clone())
+        .and_then(|a| a.veilctl_binary_hash.clone())
         .unwrap_or_default()
 }
 
@@ -76,8 +95,8 @@ fn entry_selector(body: &CredentialBody) -> (Option<String>, Option<String>) {
 /// 三因子核验守卫：与 `/credential` 同源，供
 /// `/approve-hash-change`、`/register-caller`、`/revoke` 三处写端点复用。
 ///
-/// 校验：`X-Get-Binary-Hash`（或 `body.auth.get_binary_hash` 回退）、部署密钥
-/// （`X-Get-Binary-Secret` / `body.secret` / `body.auth.get_binary_secret`）、调用者身份
+/// 校验：`X-Veilctl-Binary-Hash`（或 `body.auth.veilctl_binary_hash` 回退）、部署密钥
+/// （`X-Veilctl-Secret` / `body.secret` / `body.auth.veilctl_secret`）、调用者身份
 /// （`body.auth.caller_hash` 与 `caller_path` 双必填）。任一因子缺失或不一致返回 403
 /// （`E_AUTH`）；守卫在业务动作前执行，失败即无副作用。
 pub async fn verify_three_factor(
@@ -85,9 +104,7 @@ pub async fn verify_three_factor(
     headers: &CredentialHeaders,
     body: &CredentialBody,
 ) -> Result<()> {
-    let auth = body.auth.clone().unwrap_or_default();
-    let caller_hash = auth.caller_hash.unwrap_or_default();
-    let caller_path = auth.caller_path.unwrap_or_default();
+    let (caller_hash, caller_path) = effective_caller(headers, body);
     if caller_hash.is_empty() || caller_path.is_empty() {
         return Err(VeilError::Auth {
             message: "三因子缺失：body.auth.caller_hash/caller_path 必填".to_string(),
@@ -96,17 +113,17 @@ pub async fn verify_three_factor(
     let header_hash = effective_binary_hash(headers, body);
     let server_get_hash = state
         .config()
-        .get_binary_hash
+        .veilctl_binary_hash
         .as_deref()
         .filter(|v| !v.is_empty());
     if let Some(expected_get) = server_get_hash
         && !ct_eq(&header_hash, expected_get)
     {
         return Err(VeilError::Auth {
-            message: "三因子缺失或不一致：get_binary_hash 不匹配".to_string(),
+            message: "三因子缺失或不一致：veilctl_binary_hash 不匹配".to_string(),
         });
     }
-    if let Some(expected_secret) = state.config().credential_secret.as_deref()
+    if let Some(expected_secret) = state.config().veilctl_secret.as_deref()
         && !expected_secret.is_empty()
     {
         match effective_secret(headers, body) {
@@ -123,7 +140,7 @@ pub async fn verify_three_factor(
 
 /// 写端点部署密钥强制守卫（fail-closed）：`/approve-hash-change`、
 /// `/register-caller`、`/revoke` 三处写端点 SHALL 在部署未配置部署密钥
-/// （`GET_BINARY_SECRET`/`CREDENTIAL_SECRET` 均空）时直接返回 403（`E_AUTH`）
+/// （`VEILCTL_SECRET` 为空）时直接返回 403（`E_AUTH`）
 /// 且在业务动作前失败（无副作用）；已配置时行为与 [`verify_three_factor`] 完全一致。
 ///
 /// `/credential` 读路径保持兼容语义（未配置即跳过 Secret 因子），
@@ -135,16 +152,90 @@ pub async fn verify_three_factor_write(
 ) -> Result<()> {
     let secret_configured = state
         .config()
-        .credential_secret
+        .veilctl_secret
         .as_deref()
         .is_some_and(|v| !v.is_empty());
     if !secret_configured {
         return Err(VeilError::Auth {
-            message: "写端点要求配置部署密钥（GET_BINARY_SECRET/CREDENTIAL_SECRET），未配置拒绝"
-                .to_string(),
+            message: "写端点要求配置部署密钥（VEILCTL_SECRET），未配置拒绝".to_string(),
         });
     }
     verify_three_factor(state, headers, body).await
+}
+
+/// 注册表身份判定结果（`/credential` 与命令 API 共用）。
+#[derive(Debug, Clone)]
+pub(crate) enum CallerLookup {
+    /// `caller_path` 命中且哈希匹配（含旧哈希宽限）。
+    Enrolled {
+        entry: crate::registry::CallerEntry,
+        hash_grace: bool,
+        grace_notify: Option<(String, String, u64)>,
+    },
+    /// `caller_path` 命中但哈希失配（未吊销）。
+    HashMismatch,
+    /// `caller_path` 未命中、但哈希命中另一注册条目。
+    ByHash { entry: crate::registry::CallerEntry },
+    /// 注册表无任何匹配。
+    Unknown,
+}
+
+/// 共享身份判定：registry lookup → revoked/enabled 门禁 → 哈希匹配分类。
+/// ACL 与 `allow_mode` 由调用方按各自语义处理（凭据取用 vs 命令授权）。
+pub(crate) async fn resolve_caller(
+    state: &impl AppStateParts,
+    caller_path: &str,
+    caller_hash: &str,
+) -> Result<CallerLookup> {
+    let registry = state.registry().read().await;
+    if let Some(caller) = registry.lookup_by_path(caller_path) {
+        if ct_eq(caller_hash, &caller.expected_hash) {
+            if caller.revoked || !caller.enabled {
+                return Err(VeilError::Auth {
+                    message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                });
+            }
+            return Ok(CallerLookup::Enrolled {
+                entry: caller.clone(),
+                hash_grace: false,
+                grace_notify: None,
+            });
+        }
+        if caller.matches_old_hash(caller_hash) {
+            if caller.revoked || !caller.enabled {
+                return Err(VeilError::Auth {
+                    message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                });
+            }
+            let grace_notify = caller
+                .old_hash
+                .clone()
+                .zip(caller.old_hash_expires_at)
+                .map(|(old, exp)| (caller.caller_path.clone(), old, exp));
+            return Ok(CallerLookup::Enrolled {
+                entry: caller.clone(),
+                hash_grace: true,
+                grace_notify,
+            });
+        }
+        if caller.revoked {
+            return Err(VeilError::Auth {
+                message: format!("调用方已吊销（{}），拒绝", caller.status_emoji()),
+            });
+        }
+        return Ok(CallerLookup::HashMismatch);
+    }
+    if let Some(caller) = registry.lookup_by_hash(caller_hash) {
+        if caller.revoked || !caller.enabled {
+            return Err(VeilError::Auth {
+                message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+            });
+        }
+        return Ok(CallerLookup::ByHash {
+            entry: caller.clone(),
+        });
+    }
+    Ok(CallerLookup::Unknown)
 }
 
 pub async fn handle_credential(
@@ -157,15 +248,13 @@ pub async fn handle_credential(
             message: "llm-only 纯代理入口，凭据接口不可用".to_string(),
         });
     }
-    let auth = body.auth.clone().unwrap_or_default();
-    let caller_hash = auth.caller_hash.unwrap_or_default();
-    let caller_path = auth.caller_path.unwrap_or_default();
+    let (caller_hash, caller_path) = effective_caller(headers, body);
     let use_token = body.token.unwrap_or(true);
     verify_three_factor(state, headers, body).await?;
-    // 终端直调拒绝：`token=false` 且调用者冒用 get 自身哈希（`--raw` 仅限脚本内调用）。
+    // 终端直调拒绝：`token=false` 且调用者冒用 veilctl 自身哈希（`--raw` 仅限脚本内调用）。
     let server_get_hash = state
         .config()
-        .get_binary_hash
+        .veilctl_binary_hash
         .as_deref()
         .filter(|v| !v.is_empty());
     if let Some(expected_get) = server_get_hash
@@ -187,63 +276,31 @@ pub async fn handle_credential(
     let mut grace_notify: Option<(String, String, u64)> = None;
     // 调用者身份未匹配任何注册条目时置位；自动放行仅对已注册条目生效。
     let mut unenrolled = false;
-    let decision = {
-        let registry = state.registry().read().await;
-        if let Some(caller) = registry.lookup_by_path(&caller_path) {
-            // 双模顺序（credential-approval-dual-mode）：先比 hash，
-            // 失配后再查吊销可达性——已吊销→403，其余转审批（默认 202 抛单）。
-            // 新注册（enabled=false 未启用）失配时同样转审批，不在此直接 403。
-            if ct_eq(&caller_hash, &caller.expected_hash) {
-                if caller.revoked || !caller.enabled {
-                    return Err(VeilError::Auth {
-                        message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
-                    });
-                }
-                if !caller.check_entry_allowed(&entry, field.as_deref()) {
-                    return Err(VeilError::Auth {
-                        message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
-                    });
-                }
-                Some(caller.effective_allow_mode(state.config().auto_approve))
-            } else if caller.matches_old_hash(&caller_hash) {
-                if caller.revoked || !caller.enabled {
-                    return Err(VeilError::Auth {
-                        message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
-                    });
-                }
-                if !caller.check_entry_allowed(&entry, field.as_deref()) {
-                    return Err(VeilError::Auth {
-                        message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
-                    });
-                }
-                hash_grace = true;
-                grace_notify = caller
-                    .old_hash
-                    .clone()
-                    .zip(caller.old_hash_expires_at)
-                    .map(|(old, exp)| (caller.caller_path.clone(), old, exp));
-                Some(caller.effective_allow_mode(state.config().auto_approve))
-            } else {
-                if caller.revoked {
-                    return Err(VeilError::Auth {
-                        message: format!("调用方已吊销（{}），拒绝", caller.status_emoji()),
-                    });
-                }
-                None
-            }
-        } else if let Some(caller) = registry.lookup_by_hash(&caller_hash) {
-            if caller.revoked || !caller.enabled {
+    let decision = match resolve_caller(state, &caller_path, &caller_hash).await? {
+        CallerLookup::Enrolled {
+            entry: caller,
+            hash_grace: grace,
+            grace_notify: notify,
+        } => {
+            if !caller.check_entry_allowed(&entry, field.as_deref()) {
                 return Err(VeilError::Auth {
-                    message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                    message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
                 });
             }
+            hash_grace = grace;
+            grace_notify = notify;
+            Some(caller.effective_allow_mode(state.config().auto_approve))
+        }
+        CallerLookup::HashMismatch => None,
+        CallerLookup::ByHash { entry: caller } => {
             if !caller.check_entry_allowed(&entry, field.as_deref()) {
                 return Err(VeilError::Auth {
                     message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
                 });
             }
             Some(caller.effective_allow_mode(state.config().auto_approve))
-        } else {
+        }
+        CallerLookup::Unknown => {
             unenrolled = true;
             Some(state.config().auto_approve)
         }

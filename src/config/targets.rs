@@ -414,13 +414,13 @@ fn parse_header_value_spec(key: TargetKey, name: &str, value: &str) -> Result<He
             return Err(invalid("结尾孤立 `$`（字面 `$` 须写作 `$$`）".to_string()));
         }
         if let Some(after) = strip_interpolation_keyword(after, "conversation") {
-            flush_literal(&mut literal, &mut segments).map_err(&invalid)?;
+            flush_literal(&mut literal, &mut segments).map_err(invalid)?;
             segments.push(HeaderValueSegment::Conversation);
             rest = after;
             continue;
         }
         if let Some(after) = strip_interpolation_keyword(after, "request-id") {
-            flush_literal(&mut literal, &mut segments).map_err(&invalid)?;
+            flush_literal(&mut literal, &mut segments).map_err(invalid)?;
             segments.push(HeaderValueSegment::RequestId);
             rest = after;
             continue;
@@ -429,8 +429,8 @@ fn parse_header_value_spec(key: TargetKey, name: &str, value: &str) -> Result<He
             let Some(close) = head.find(')') else {
                 return Err(invalid("`$header(` 未闭合（缺少 `)`）".to_string()));
             };
-            let mirror = parse_mirror_name(&head[..close]).map_err(&invalid)?;
-            flush_literal(&mut literal, &mut segments).map_err(&invalid)?;
+            let mirror = parse_mirror_name(&head[..close]).map_err(invalid)?;
+            flush_literal(&mut literal, &mut segments).map_err(invalid)?;
             segments.push(HeaderValueSegment::Mirror(mirror));
             rest = &head[close + 1..];
             continue;
@@ -438,7 +438,7 @@ fn parse_header_value_spec(key: TargetKey, name: &str, value: &str) -> Result<He
         return Err(invalid(unknown_interpolation_reason(after)));
     }
     literal.push_str(rest);
-    flush_literal(&mut literal, &mut segments).map_err(&invalid)?;
+    flush_literal(&mut literal, &mut segments).map_err(invalid)?;
     Ok(HeaderValueSpec::Template(segments))
 }
 

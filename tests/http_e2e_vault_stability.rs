@@ -17,8 +17,8 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/vault-flow.sh",
             "caller_hash": "h-vault-flow-1",
@@ -36,8 +36,8 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
     });
     let pre = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body)
         .send()
         .await
@@ -52,8 +52,8 @@ async fn t3_2_vault_backed_credential_flow_e2e() {
     wait_until_enabled(&state, "/srv/vault-flow.sh").await;
     let cred = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body)
         .send()
         .await

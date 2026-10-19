@@ -73,6 +73,8 @@ pub trait AppStateParts {
     fn admin_state(&self) -> &Arc<admin::AdminState>;
     /// 失败/审批通知统一有界 spool（应用层单例）。
     fn notify(&self) -> &Arc<matrix::NotificationSpool>;
+    /// 命令面运行时（配置、授权、执行后端、日志与幂等表）。
+    fn command(&self) -> &Arc<crate::service::command::CommandRuntime>;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,13 +102,13 @@ pub struct AuthBlock {
     pub caller_hash: Option<String>,
     #[serde(default)]
     pub caller_path: Option<String>,
-    /// Go 互操作别名：`body.auth.get_binary_hash` 等价 `X-Get-Binary-Hash` 头。
+    /// Go 互操作别名：`body.auth.veilctl_binary_hash` 等价 `X-Veilctl-Binary-Hash` 头。
     #[serde(default)]
-    pub get_binary_hash: Option<String>,
-    /// Go 互操作别名：`body.auth.get_binary_secret` 等价 `X-Get-Binary-Secret` 头（及
+    pub veilctl_binary_hash: Option<String>,
+    /// Go 互操作别名：`body.auth.veilctl_secret` 等价 `X-Veilctl-Secret` 头（及
     /// `body.secret`）。
     #[serde(default)]
-    pub get_binary_secret: Option<String>,
+    pub veilctl_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +135,9 @@ pub struct CredentialBody {
 pub struct CredentialHeaders {
     pub binary_hash: Option<String>,
     pub binary_secret: Option<String>,
+    /// 无 body 的 GET 端点（如 `GET /commands`）从头发送调用者身份。
+    pub caller_hash: Option<String>,
+    pub caller_path: Option<String>,
 }
 
 impl CredentialHeaders {
@@ -140,7 +145,15 @@ impl CredentialHeaders {
         Self {
             binary_hash,
             binary_secret,
+            caller_hash: None,
+            caller_path: None,
         }
+    }
+
+    pub fn with_caller(mut self, caller_hash: Option<String>, caller_path: Option<String>) -> Self {
+        self.caller_hash = caller_hash;
+        self.caller_path = caller_path;
+        self
     }
 }
 
@@ -250,8 +263,8 @@ pub(crate) mod test_support {
                 "OBSERVABILITY_ADMIN_TOKEN".to_string(),
                 "observability-admin-token-0123456789".to_string(),
             ),
-            ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
-            ("GET_BINARY_HASH".to_string(), "gethash".to_string()),
+            ("VEILCTL_SECRET".to_string(), "s3cr3t".to_string()),
+            ("VEILCTL_BINARY_HASH".to_string(), "gethash".to_string()),
         ]);
         for (k, v) in extra {
             env.insert((*k).to_string(), (*v).to_string());
@@ -368,8 +381,8 @@ pub(crate) mod test_support {
             auth: Some(AuthBlock {
                 caller_hash: Some(hash.to_string()),
                 caller_path: Some(path.to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             entry: Some("网易".to_string()),
             field: Some("授权码".to_string()),

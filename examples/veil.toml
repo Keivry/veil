@@ -10,8 +10,8 @@
 # fail-closed：文件缺失/不可读/超过 1MB/TOML 语法错误/未知键/类型错误/取值越界，
 # 一律拒绝启动；空文件合法（等价于无文件覆盖）。
 #
-# 密钥类键（matrix_access_token、observability_admin_token、get_binary_secret、
-# get_binary_hash、value_sample_hmac_key）一旦写入本文件，Unix 下文件权限必须收窄到
+# 密钥类键（matrix_access_token、observability_admin_token、veilctl_secret、
+# veilctl_binary_hash、value_sample_hmac_key）一旦写入本文件，Unix 下文件权限必须收窄到
 # 0600（mode & 0o077 == 0），否则拒绝启动；env 覆盖不豁免该门禁（密钥文本已落盘）。
 # 本示例不声明任何密钥类键，保持入库权限 0644 也可直接加载；密钥建议继续走 env 注入。
 
@@ -44,8 +44,8 @@ auto_approve = "pending"            # allow | deny | pending
 entry_mode = "credential-only"      # full | credential-only | llm-only
 credential_block_wait = false
 # 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
-# get_binary_secret = "..."
-# get_binary_hash = "..."
+# veilctl_secret = "..."
+# veilctl_binary_hash = "..."
 
 [redaction]
 enabled = true
@@ -122,3 +122,33 @@ headers = { x-opencode-client = "cli", x-opencode-session = "$conversation" }
 
 [keepass]
 backend = "real"                     # real | mock（mock 仅 CI 逃生，生产禁用）
+
+# ── 下游命令执行（文件专属；enabled = false 时端点 404、零行为差异）──
+[command]
+enabled = false
+block_wait = false            # true 时调用阻塞至审批终态
+
+# 命令定义示例（取消注释并按需修改）：
+# [command.hosts.api]
+# kind = "local"              # 本期仅 local；其他 kind 启动期拒绝
+# description = "api 主机"
+#
+# [command.groups.fleet]
+# hosts = ["api"]
+#
+# [command.commands.deploy]
+# program = "/usr/local/bin/deploy.sh"   # 绝对路径 + 可执行
+# args = ["--target", "{target}"]
+# usage = "deploy --target <name>"
+# hosts = ["fleet"]
+# timeout_secs = 60
+# requires_approval = true
+#
+# [command.commands.deploy.parameters.target]
+# kind = "enum"
+# values = ["api", "web"]
+#
+# [command.downstreams.ci]
+# callers = ["/opt/ci/agent.sh"]
+# allow_commands = ["deploy"]
+# auto_approve = [{ command = "deploy", hosts = ["fleet"] }]

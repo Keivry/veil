@@ -27,8 +27,8 @@ async fn t6_three_factor_missing_403() {
     let client = reqwest::Client::new();
     let no_auth = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({"entry": "网易", "field": "授权码"}))
         .send()
         .await
@@ -36,7 +36,7 @@ async fn t6_three_factor_missing_403() {
     assert_eq!(no_auth.status().as_u16(), 403);
     let no_secret = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-missing-1", "caller_path": "/srv/m1.sh"},
             "entry": "网易", "field": "授权码"
@@ -54,8 +54,8 @@ async fn t6_wrong_secret_403() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "wrong")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "wrong")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-wrong-1", "caller_path": "/srv/w1.sh"},
             "entry": "网易", "field": "授权码"
@@ -74,8 +74,8 @@ async fn t6_unenrolled_defaults_to_pending() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-fresh-1", "caller_path": "/srv/fresh1.sh"},
             "entry": "网易", "field": "授权码"
@@ -95,8 +95,8 @@ async fn t6_raw_terminal_call_rejected_403() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "gethash1", "caller_path": "/srv/term.sh"},
             "entry": "网易", "field": "授权码", "token": false
@@ -123,8 +123,8 @@ async fn t6_register_use_flow_200() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/flow.sh",
             "caller_hash": "h-flow-1",
@@ -138,8 +138,8 @@ async fn t6_register_use_flow_200() {
     assert_eq!(reg.status().as_u16(), 202, "注册默认转审批");
     let pre = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-flow-1", "caller_path": "/srv/flow.sh"},
             "entry": "网易", "field": "授权码"
@@ -157,8 +157,8 @@ async fn t6_register_use_flow_200() {
     wait_until_enabled(&state, "/srv/flow.sh").await;
     let use_resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-flow-1", "caller_path": "/srv/flow.sh"},
             "entry": "网易", "field": "授权码"
@@ -170,8 +170,8 @@ async fn t6_register_use_flow_200() {
     // 负例：审批仅对同一 caller 闭环生效——未注册 caller 不得借用他人审批放行。
     let other = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-flow-neg-1", "caller_path": "/srv/flow-neg.sh"},
             "entry": "网易", "field": "授权码"
@@ -201,8 +201,8 @@ async fn t6_duplicate_register_retry_same_pending() {
     });
     let first = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&payload)
         .send()
         .await
@@ -210,8 +210,8 @@ async fn t6_duplicate_register_retry_same_pending() {
     assert_eq!(first.status().as_u16(), 202);
     let second = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&payload)
         .send()
         .await
@@ -235,8 +235,8 @@ async fn t6_revoke_then_use_403() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/gone.sh",
             "caller_hash": "h-gone-1",
@@ -262,8 +262,8 @@ async fn t6_revoke_then_use_403() {
     let before = state.approval.pending_event_ids().await;
     let rev = client
         .post(format!("{base}/revoke"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/gone.sh",
             "auth": {"caller_hash": "h-gone-1", "caller_path": "/srv/gone.sh"}
@@ -274,8 +274,8 @@ async fn t6_revoke_then_use_403() {
     assert_eq!(rev.status().as_u16(), 202, "常规吊销须转审批");
     let use_before = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body)
         .send()
         .await
@@ -289,8 +289,8 @@ async fn t6_revoke_then_use_403() {
     wait_until_revoked(&state, "/srv/gone.sh").await;
     let use_resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body)
         .send()
         .await
@@ -360,8 +360,8 @@ async fn t6_locked_backend_health_and_credential() {
     assert_eq!(hbody["unlocked"], false);
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-lock-1", "caller_path": "/srv/lock1.sh"},
             "entry": "网易", "field": "授权码"
@@ -422,7 +422,7 @@ async fn registrations_deploy_key_auth() {
     let client = reqwest::Client::new();
     let matched = client
         .get(format!("{base}/registrations"))
-        .header("X-Get-Binary-Secret", common::GET_SECRET)
+        .header("X-Veilctl-Secret", common::VEILCTL_SECRET)
         .send()
         .await
         .unwrap();
@@ -435,7 +435,7 @@ async fn registrations_deploy_key_auth() {
     );
     let wrong = client
         .get(format!("{base}/registrations"))
-        .header("X-Get-Binary-Secret", "wrong-secret")
+        .header("X-Veilctl-Secret", "wrong-secret")
         .send()
         .await
         .unwrap();
@@ -460,8 +460,8 @@ async fn t6_register_duplicate_name_409() {
     let client = reqwest::Client::new();
     let first = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/name1.sh",
             "caller_hash": "h-name-1",
@@ -475,8 +475,8 @@ async fn t6_register_duplicate_name_409() {
     assert_eq!(first.status().as_u16(), 202);
     let second = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/name2.sh",
             "caller_hash": "h-name-2",
@@ -502,8 +502,8 @@ async fn t6_revoke_by_name_and_reuse() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-a.sh",
             "caller_hash": "h-byname-a",
@@ -518,8 +518,8 @@ async fn t6_revoke_by_name_and_reuse() {
     assert_eq!(reg.status().as_u16(), 202);
     let enable = client
         .post(format!("{base}/approve-hash-change"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-a.sh",
             "new_hash": "h-byname-a",
@@ -532,8 +532,8 @@ async fn t6_revoke_by_name_and_reuse() {
     let before = state.approval.pending_event_ids().await;
     let rev = client
         .post(format!("{base}/revoke"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "name": "check-mail",
             "auth": {"caller_hash": "h-byname-a", "caller_path": "/srv/byname-a.sh"}
@@ -550,8 +550,8 @@ async fn t6_revoke_by_name_and_reuse() {
     wait_until_revoked(&state, "/srv/byname-a.sh").await;
     let reuse = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-b.sh",
             "caller_hash": "h-byname-b",
@@ -576,8 +576,8 @@ async fn t6_credential_envelope_ok_credential() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-env-1", "caller_path": "/srv/env1.sh"},
             "entry": "网易", "field": "授权码"
@@ -606,8 +606,8 @@ async fn t6_caller_path_required_403() {
     let client = reqwest::Client::new();
     let no_path = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_hash": "h-nopath-1"},
             "entry": "网易", "field": "授权码"
@@ -618,8 +618,8 @@ async fn t6_caller_path_required_403() {
     assert_eq!(no_path.status().as_u16(), 403, "缺 caller_path 须 403");
     let no_hash = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "auth": {"caller_path": "/srv/nohash.sh"},
             "entry": "网易", "field": "授权码"

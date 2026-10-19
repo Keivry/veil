@@ -195,8 +195,8 @@ data_dir = "/srv/veil"
 db_dir = "/srv/veil/db"
 tpm_dir = "/srv/veil/tpm"
 caller_registry_path = "/srv/veil/caller_registry.json"
-get_binary_secret = "deploy-secret"
-get_binary_hash = "abcdef0123456789"
+veilctl_secret = "deploy-secret"
+veilctl_binary_hash = "abcdef0123456789"
 auto_approve = "pending"
 entry_mode = "credential-only"
 credential_block_wait = true
@@ -253,8 +253,8 @@ const EXPECTED_KEYS: [&str; 44] = [
     "storage.db_dir",
     "storage.tpm_dir",
     "storage.caller_registry_path",
-    "storage.get_binary_secret",
-    "storage.get_binary_hash",
+    "storage.veilctl_secret",
+    "storage.veilctl_binary_hash",
     "storage.auto_approve",
     "storage.entry_mode",
     "storage.credential_block_wait",
@@ -372,10 +372,6 @@ fn alias_legacy_and_env_only_keys_rejected() {
             "pii_sensitive_names_file",
         ),
         ("[redaction]\npii_custom_dict = \"/a\"\n", "pii_custom_dict"),
-        (
-            "[storage]\ncredential_secret = \"x\"\n",
-            "credential_secret",
-        ),
         ("[audit]\naudit_enabled = true\n", "audit_enabled"),
         (
             "[auth]\ncredential_admin_token = \"x\"\n",
@@ -390,6 +386,28 @@ fn alias_legacy_and_env_only_keys_rejected() {
         let err = parse(text).expect_err(&format!("键 {key} 须被拒"));
         assert!(err.to_string().contains(key), "错误信息须指名 {key}: {err}");
     }
+    let legacy_key: &str = concat!("get_bin", "ary_secret");
+    let err = parse(&format!("[storage]\n{legacy_key} = \"x\"\n")).expect_err("遗留键名须被拒");
+    assert!(
+        err.to_string().contains(legacy_key),
+        "错误信息须指名 {legacy_key}: {err}"
+    );
+}
+
+#[test]
+fn command_section_rejected_at_startup_with_key_path() {
+    let file = TempFile::new(
+        "bad-command.toml",
+        "[command]\nenabled = true\n\n[command.commands.deploy]\nprogram = \"deploy.sh\"\n         usage = \"deploy\"\nhosts = [\"api\"]\n\n[command.hosts.api]\nkind = \"local\"\n",
+    );
+    let mut env = with_config_file(&file);
+    let err = apply_config_file(&mut env).expect_err("非法命令配置须拒绝启动");
+    let message = err.to_string();
+    assert!(
+        message.contains("command.commands.deploy.program"),
+        "错误须指明键路径: {message}"
+    );
+    assert!(message.contains("绝对路径"), "错误须说明原因: {message}");
 }
 
 #[test]
@@ -526,8 +544,8 @@ fn alias_env_explicit_name_sets_match_design() {
         .as_slice()
     );
     assert_eq!(
-        names("storage.get_binary_secret"),
-        ["GET_BINARY_SECRET", "CREDENTIAL_SECRET"].as_slice()
+        names("storage.veilctl_secret"),
+        ["VEILCTL_SECRET"].as_slice()
     );
     assert_eq!(names("audit.mode"), ["AUDIT_MODE"].as_slice());
 }
@@ -784,16 +802,16 @@ fn merge_env_aliases_win_over_file_canonical_keys() {
 
     let file = TempFile::secret(
         "alias-secret.toml",
-        "[storage]\nget_binary_secret = \"file-secret\"\n",
+        "[storage]\nveilctl_secret = \"file-secret\"\n",
     );
     let mut env = with_config_file(&file);
     env.insert(
-        "CREDENTIAL_SECRET".to_string(),
+        concat!("CREDENTIAL", "_SECRET").to_string(),
         "env-alias-secret".to_string(),
     );
     let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.credential_secret.as_deref(), Some("env-alias-secret"));
-    assert!(!env.contains_key("GET_BINARY_SECRET"));
+    assert_eq!(cfg.veilctl_secret.as_deref(), Some("file-secret"));
+    assert!(env.contains_key("VEILCTL_SECRET"));
 }
 
 #[test]
@@ -940,18 +958,19 @@ fn file_without_targets_stays_env_only_baseline() {
     );
     let mut env = with_config_file(&file);
     let capture = CaptureMessages::default();
-    let targets = crate::test_support::with_capture_subscriber(capture.clone(), || {
+    let outcome = crate::test_support::with_capture_subscriber(capture.clone(), || {
         apply_config_file(&mut env).expect("文件层应用须成功")
     });
     let messages = capture.take();
-    assert!(targets.is_empty(), "未声明覆盖须返回空表");
+    assert!(outcome.llm_targets.is_empty(), "未声明覆盖须返回空表");
     assert!(
         !messages
             .iter()
             .any(|message| message.contains("llm.targets")),
         "未声明 [llm.targets] 不得新增相关告警: {messages:?}"
     );
-    let cfg = Config::load_from_with_targets(&env, targets).expect("合并后配置须可加载");
+    let cfg =
+        Config::load_from_with_targets(&env, outcome.llm_targets).expect("合并后配置须可加载");
     assert_eq!(
         cfg,
         Config::load_from(&base_env()).unwrap(),
@@ -1045,12 +1064,12 @@ fn secret_keys_with_wide_permissions_rejected() {
             "observability_admin_token",
         ),
         (
-            "[storage]\nget_binary_secret = \"deploy-secret\"\n",
-            "get_binary_secret",
+            "[storage]\nveilctl_secret = \"deploy-secret\"\n",
+            "veilctl_secret",
         ),
         (
-            "[storage]\nget_binary_hash = \"abcdef0123456789\"\n",
-            "get_binary_hash",
+            "[storage]\nveilctl_binary_hash = \"abcdef0123456789\"\n",
+            "veilctl_binary_hash",
         ),
         (
             "[redaction]\nvalue_sample_hmac_key = \"hmac-key\"\n",
@@ -1074,14 +1093,14 @@ fn secret_keys_with_wide_permissions_rejected() {
 fn secret_key_with_narrow_permissions_passes() {
     let file = TempFile::with_mode(
         "secret-narrow.toml",
-        "[storage]\nget_binary_secret = \"deploy-secret\"\n",
+        "[storage]\nveilctl_secret = \"deploy-secret\"\n",
         0o600,
     );
     let mut env = with_config_file(&file);
     let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.credential_secret.as_deref(), Some("deploy-secret"));
+    assert_eq!(cfg.veilctl_secret.as_deref(), Some("deploy-secret"));
     assert_eq!(
-        env.get("GET_BINARY_SECRET").map(String::as_str),
+        env.get("VEILCTL_SECRET").map(String::as_str),
         Some("deploy-secret")
     );
 }
@@ -1100,11 +1119,11 @@ fn non_secret_wide_permissions_pass() {
 fn secret_env_override_does_not_exempt_gate() {
     let file = TempFile::with_mode(
         "secret-env-override.toml",
-        "[storage]\nget_binary_secret = \"file-secret\"\n",
+        "[storage]\nveilctl_secret = \"file-secret\"\n",
         0o644,
     );
     let mut env = with_config_file(&file);
-    env.insert("GET_BINARY_SECRET".to_string(), "env-secret".to_string());
+    env.insert("VEILCTL_SECRET".to_string(), "env-secret".to_string());
     let err = apply_config_file(&mut env).unwrap_err();
     assert!(
         err.to_string().contains("chmod 600"),

@@ -76,12 +76,12 @@ fn auth_config_file(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 
 #[test]
 fn whitelist_and_migrated_counts_locked() {
-    assert_eq!(CONFIG_ENV_WHITELIST.len(), 10, "白名单须恰 10 个具名项");
+    assert_eq!(CONFIG_ENV_WHITELIST.len(), 9, "白名单须恰 9 个具名项");
     assert_eq!(MIGRATED_ENV_VARS.len(), 47, "迁移清单须恰 47 项");
 
     let whitelist: std::collections::BTreeSet<&str> =
         CONFIG_ENV_WHITELIST.iter().copied().collect();
-    assert_eq!(whitelist.len(), 10, "白名单不得有重复项");
+    assert_eq!(whitelist.len(), 9, "白名单不得有重复项");
     let migrated: std::collections::BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
     assert_eq!(migrated.len(), 47, "迁移清单不得有重复项");
     assert!(
@@ -329,7 +329,7 @@ fn from_env_map_keeps_whitelist_keys_effective_and_migrates_deploy_keys() {
         auth.to_string_lossy().into_owned(),
     );
     map.insert("DATA_DIR".to_string(), "/srv/veil".to_string());
-    map.insert("GET_BINARY_SECRET".to_string(), "deploy-secret".to_string());
+    map.insert("VEILCTL_SECRET".to_string(), "deploy-secret".to_string());
     map.insert(
         "LLM_UPSTREAM".to_string(),
         "http://127.0.0.1:11434".to_string(),
@@ -341,7 +341,7 @@ fn from_env_map_keeps_whitelist_keys_effective_and_migrates_deploy_keys() {
         "DATA_DIR 属迁移概念，env 置位不得生效（取内建默认）"
     );
     assert_eq!(
-        cfg.credential_secret.as_deref(),
+        cfg.veilctl_secret.as_deref(),
         Some("deploy-secret"),
         "白名单密钥键仍生效"
     );

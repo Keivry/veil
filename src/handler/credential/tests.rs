@@ -30,7 +30,7 @@ fn revoke_test_state() -> AppState {
             "APPROVAL_WHITELIST".to_string(),
             "@admin:example.com".to_string(),
         ),
-        ("GET_BINARY_SECRET".to_string(), "s3cr3t".to_string()),
+        ("VEILCTL_SECRET".to_string(), "s3cr3t".to_string()),
     ]);
     service::credential::test_support::inject_sink(
         AppState::new(
@@ -88,8 +88,8 @@ async fn register_caller_handler_response_carries_nonempty_reg_id_and_legacy_fie
         auth: Some(service::AuthBlock {
             caller_hash: Some("h-reg-id-1".to_string()),
             caller_path: Some("/srv/reg-id.sh".to_string()),
-            get_binary_hash: None,
-            get_binary_secret: None,
+            veilctl_binary_hash: None,
+            veilctl_secret: None,
         }),
         secret: Some("s3cr3t".to_string()),
     });
@@ -225,8 +225,8 @@ async fn approve_hash_change_handler_contract() {
             auth: Some(service::AuthBlock {
                 caller_hash: Some("c-old".to_string()),
                 caller_path: Some("/s/contract.sh".to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             secret: Some("s3cr3t".to_string()),
         }),
@@ -256,8 +256,8 @@ async fn approve_hash_change_handler_contract() {
             auth: Some(service::AuthBlock {
                 caller_hash: Some("c-old".to_string()),
                 caller_path: Some("/s/contract.sh".to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             secret: Some("s3cr3t".to_string()),
         }),
@@ -287,8 +287,8 @@ async fn approve_hash_change_handler_contract() {
             auth: Some(service::AuthBlock {
                 caller_hash: Some("c-old".to_string()),
                 caller_path: Some("/s/contract.sh".to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             secret: Some("s3cr3t".to_string()),
         }),
@@ -318,7 +318,7 @@ async fn registrations_response_has_type() {
         .await
         .unwrap();
     let mut headers = HeaderMap::new();
-    headers.insert("x-get-binary-secret", "s3cr3t".parse().unwrap());
+    headers.insert("x-veilctl-secret", "s3cr3t".parse().unwrap());
     let Json(body) = registrations_handler(State(state.clone()), headers)
         .await
         .unwrap();
@@ -354,7 +354,7 @@ async fn registrations_allow_mode_vocabulary() {
         }
     }
     let mut headers = HeaderMap::new();
-    headers.insert("x-get-binary-secret", "s3cr3t".parse().unwrap());
+    headers.insert("x-veilctl-secret", "s3cr3t".parse().unwrap());
     let Json(body) = registrations_handler(State(state.clone()), headers)
         .await
         .unwrap();
@@ -484,8 +484,8 @@ async fn revoke_requires_three_factor() {
 
 fn no_deployment_secret_state() -> AppState {
     service::credential::test_support::cred_state(&service::credential::test_support::cred_env(&[
-        ("GET_BINARY_SECRET", ""),
-        ("GET_BINARY_HASH", ""),
+        ("VEILCTL_SECRET", ""),
+        ("VEILCTL_BINARY_HASH", ""),
     ]))
 }
 
@@ -509,8 +509,8 @@ async fn write_endpoints_require_deployment_secret() {
             auth: Some(service::AuthBlock {
                 caller_hash: Some("fc-approve-old".to_string()),
                 caller_path: Some("/s/fc-approve.sh".to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             secret: None,
         }),
@@ -549,8 +549,8 @@ async fn write_endpoints_require_deployment_secret() {
             auth: Some(service::AuthBlock {
                 caller_hash: Some("fc-reg-h".to_string()),
                 caller_path: Some("/s/fc-reg.sh".to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             secret: None,
         }),
@@ -589,8 +589,8 @@ async fn write_endpoints_require_deployment_secret() {
             auth: Some(service::AuthBlock {
                 caller_hash: Some("fc-rev-h".to_string()),
                 caller_path: Some("/s/fc-rev.sh".to_string()),
-                get_binary_hash: None,
-                get_binary_secret: None,
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
             }),
             secret: None,
         }),
@@ -626,8 +626,8 @@ async fn register_handler_auto_mode_effective() {
         auth: Some(service::AuthBlock {
             caller_hash: Some("auto-h".to_string()),
             caller_path: Some("/s/auto-mode.sh".to_string()),
-            get_binary_hash: Some("gethash".to_string()),
-            get_binary_secret: Some("s3cr3t".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
         }),
         secret: None,
     });

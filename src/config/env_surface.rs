@@ -5,7 +5,7 @@
 //! 再经 [`filter_process_env`] 剔除白名单外的键，最后交文件层合并与既有校验链。
 //!
 //! 冻结接口（跨 agent 锁步测试依赖这些精确名字与语义）：
-//! - [`CONFIG_ENV_WHITELIST`]：10 个具名环境变量；
+//! - [`CONFIG_ENV_WHITELIST`]：9 个具名环境变量；
 //! - [`MIGRATED_ENV_VARS`]：47 个迁移清单变量（含全部兼容别名）；
 //! - [`parse_llm_port`]：`LLM_<port>` 解析唯一实现（`load_llm` 复用同一语义）；
 //! - [`filter_process_env`]：仅保留白名单名，其余（含 `LLM_<port>` 模式键）剔除；
@@ -16,13 +16,13 @@
 
 use {super::validate, std::collections::HashMap};
 
-/// 环境变量白名单（恰 10 个具名变量）。
+/// 环境变量白名单（恰 9 个具名变量）。
 ///
 /// 判定原则：① 引导悖论——配置文件路径本身不能来自文件（`VEIL_CONFIG_FILE`）；
 /// ② 进程上下文直读——配置加载之前/之外消费；③ 密钥注入——保留「不落盘」偏好。
 /// `LLM_<port>` 模式不在白名单内：其进程 env 面已关闭、置位仅告警（见
 /// [`warn_migrated_and_legacy`]）；[`parse_llm_port`] 仍供 `load_llm` 解析文件值使用。
-pub(crate) const CONFIG_ENV_WHITELIST: [&str; 10] = [
+pub(crate) const CONFIG_ENV_WHITELIST: [&str; 9] = [
     // ① 引导
     "VEIL_CONFIG_FILE",
     // ② Config 外直读
@@ -32,9 +32,8 @@ pub(crate) const CONFIG_ENV_WHITELIST: [&str; 10] = [
     // ③ 密钥注入
     "MATRIX_ACCESS_TOKEN",
     "OBSERVABILITY_ADMIN_TOKEN",
-    "GET_BINARY_SECRET",
-    "CREDENTIAL_SECRET",
-    "GET_BINARY_HASH",
+    "VEILCTL_SECRET",
+    "VEILCTL_BINARY_HASH",
     "PII_VALUE_SAMPLE_HMAC_KEY",
 ];
 

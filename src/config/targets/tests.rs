@@ -796,7 +796,9 @@ fn file_declared_targets_enter_config_with_file_upstream() {
         ),
     );
     let mut env = env_with_file(&file);
-    let targets = apply_config_file(&mut env).expect("文件层应用须成功");
+    let targets = apply_config_file(&mut env)
+        .expect("文件层应用须成功")
+        .llm_targets;
     let cfg = Config::load_from_with_targets(&env, targets).expect("文件上游可满足覆盖依赖");
     assert_eq!(
         cfg.llm_upstreams.get(&8878).map(String::as_str),
@@ -856,7 +858,9 @@ fn orphan_port_target_from_file_rejected_after_merge() {
         "[llm.targets.\"9000\".headers]\nx = \"1\"\n",
     );
     let mut env = env_with_file(&file);
-    let targets = apply_config_file(&mut env).expect("字段校验先通过");
+    let targets = apply_config_file(&mut env)
+        .expect("字段校验先通过")
+        .llm_targets;
     let err = Config::load_from_with_targets(&env, targets).expect_err("孤儿目标须拒启动");
     let msg = err.to_string();
     assert!(
@@ -872,7 +876,9 @@ fn default_target_from_file_without_upstream_rejected() {
         "[llm.targets.default.headers]\nx = \"1\"\n",
     );
     let mut env = env_with_file(&file);
-    let targets = apply_config_file(&mut env).expect("字段校验先通过");
+    let targets = apply_config_file(&mut env)
+        .expect("字段校验先通过")
+        .llm_targets;
     let err = Config::load_from_with_targets(&env, targets).expect_err("缺省上游未定义须拒启动");
     let msg = err.to_string();
     assert!(
@@ -893,7 +899,9 @@ fn file_default_upstream_and_file_port_upstreams_satisfy_targets() {
          [llm.targets.default.headers]\ny = \"2\"\n",
     );
     let mut env = env_with_file(&file);
-    let targets = apply_config_file(&mut env).expect("文件层应用须成功");
+    let targets = apply_config_file(&mut env)
+        .expect("文件层应用须成功")
+        .llm_targets;
     let cfg = Config::load_from_with_targets(&env, targets).expect("文件上游可满足覆盖依赖");
     assert_eq!(
         cfg.llm_upstreams.get(&8878).map(String::as_str),

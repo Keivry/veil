@@ -58,9 +58,9 @@ static APP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 管理面鉴权 token（与生产默认测试口径一致）。
 pub const ADMIN_TOKEN: &str = "observability-admin-token-0123456789";
 /// 三因子部署密钥。
-pub const GET_SECRET: &str = "s3cr3t";
+pub const VEILCTL_SECRET: &str = "s3cr3t";
 /// 三因子二进制哈希。
-pub const GET_HASH: &str = "gethash1";
+pub const VEILCTL_BINARY_HASH: &str = "gethash1";
 
 /// 统一基础环境（四必填 + 三因子常量）；各文件差异经 [`TestOpts::new`] 的 `extra` 覆盖。
 pub fn base_env() -> HashMap<String, String> {
@@ -75,8 +75,11 @@ pub fn base_env() -> HashMap<String, String> {
             "OBSERVABILITY_ADMIN_TOKEN".to_string(),
             ADMIN_TOKEN.to_string(),
         ),
-        ("GET_BINARY_SECRET".to_string(), GET_SECRET.to_string()),
-        ("GET_BINARY_HASH".to_string(), GET_HASH.to_string()),
+        ("VEILCTL_SECRET".to_string(), VEILCTL_SECRET.to_string()),
+        (
+            "VEILCTL_BINARY_HASH".to_string(),
+            VEILCTL_BINARY_HASH.to_string(),
+        ),
     ])
 }
 

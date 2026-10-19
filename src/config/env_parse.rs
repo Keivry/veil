@@ -10,6 +10,7 @@
 
 use {
     super::{
+        command::CommandConfig,
         custom_file::load_custom_file,
         targets::{LlmTargets, validate_target_upstreams},
         validate::{
@@ -190,8 +191,8 @@ pub struct Config {
     /// 解析器经 `service::sse` 常量消费（默认即 [`SSE_FRAME_HARD_BYTES`]）。
     pub sse_frame_hard_bytes: usize,
     pub data_dir: PathBuf,
-    pub credential_secret: Option<String>,
-    pub get_binary_hash: Option<String>,
+    pub veilctl_secret: Option<String>,
+    pub veilctl_binary_hash: Option<String>,
     pub auto_approve: AutoApprove,
     pub entry_mode: EntryMode,
     pub registry_path: PathBuf,
@@ -200,6 +201,8 @@ pub struct Config {
     pub llm_default_upstream: Option<String>,
     /// 文件专属 `[llm.targets]` 上游覆盖（无 env 对应源；未声明为空表，零行为变化）。
     pub llm_targets: LlmTargets,
+    /// 文件专属 `[command]`（未声明时 `enabled = false`）。
+    pub command: CommandConfig,
     pub redaction_enabled: bool,
     /// 宽松还原开关（`PII_FUZZY_RESTORE`，默认关闭；
     /// 开启时残缺/宽松形态 token 按序号回查请求表还原）。
@@ -276,9 +279,8 @@ impl std::str::FromStr for KeepassBackendKind {
 
 /// 遗留兼容声明：`CREDENTIAL_MASTER_PASSWORD`/`CREDENTIAL_PORT` 为遗留变量名，
 /// 本二进制不读取（`load_from` 只认下述新名）；主密码口令改走 TPM 解封
-/// （`service::tpm::startup_tpm_in`），部署密钥改用 `GET_BINARY_SECRET`/
-///
-/// `CREDENTIAL_SECRET`，宿主机端口改用 `PORT_8877/8878/8879`（仅改映射不改容器内
+/// （`service::tpm::startup_tpm_in`），部署密钥改用 `VEILCTL_SECRET`，
+/// 宿主机端口改用 `PORT_8877/8878/8879`（仅改映射不改容器内
 /// 监听）。沿用旧名部署不生效（置位仅启动期告警），须改用新名（见 工程参考 §7.4 兼容表）。
 impl Config {
     /// 从进程环境变量加载，缺必填或非法值返回 [`VeilError::Config`]。
@@ -290,8 +292,8 @@ impl Config {
     pub(crate) fn from_env_map(raw: HashMap<String, String>) -> Result<Self> {
         super::env_surface::warn_migrated_and_legacy(&raw);
         let mut map = super::env_surface::filter_process_env(raw);
-        let llm_targets = super::file_layer::apply_config_file(&mut map)?;
-        Self::load_from_with_targets(&map, llm_targets)
+        let outcome = super::file_layer::apply_config_file(&mut map)?;
+        Self::load_from_with_file(&map, outcome)
     }
 
     /// 公开兼容入口：无文件覆盖，逐字等价于扩展入口传空表。
@@ -299,15 +301,27 @@ impl Config {
         Self::load_from_with_targets(env, LlmTargets::new())
     }
 
-    /// 扩展入口：并入文件层已校验的 `[llm.targets]` 覆盖，复用同一校验链。
-    ///
-    /// 按域拆分后仍按原语句顺序编排：认证 → 限额（PII hold/审计 hold/
-    /// 非流上限）→ 审计（模式/超时/白名单）→ 存储/入口 → 脱敏（自定义
-    /// 文件）→ LLM（上游/HTTP）→ KeePass 后端，保证错误顺序与错误消息
-    /// 逐项不变。
+    /// 扩展入口（文件层产物）：并入 `[llm.targets]` 与 `[command]`。
+    pub(crate) fn load_from_with_file(
+        env: &HashMap<String, String>,
+        outcome: super::file_layer::FileLayerOutcome,
+    ) -> Result<Self> {
+        Self::load_from_parts(env, outcome.llm_targets, outcome.command)
+    }
+
+    /// 扩展入口：并入文件层已校验的 `[llm.targets]` 覆盖，复用同一校验链
+    /// （按域拆分后语句顺序不变，错误顺序与错误消息逐项保持）。
     pub(crate) fn load_from_with_targets(
         env: &HashMap<String, String>,
         llm_targets: LlmTargets,
+    ) -> Result<Self> {
+        Self::load_from_parts(env, llm_targets, CommandConfig::default())
+    }
+
+    fn load_from_parts(
+        env: &HashMap<String, String>,
+        llm_targets: LlmTargets,
+        command: CommandConfig,
     ) -> Result<Self> {
         let get = |name: &str| env.get(name).map(|v| v.trim().to_string());
         for name in super::validate::legacy_ignored_detected(env) {
@@ -346,8 +360,8 @@ impl Config {
         } = load_audit(&get)?;
         let StorageParts {
             data_dir,
-            credential_secret,
-            get_binary_hash,
+            veilctl_secret,
+            veilctl_binary_hash,
             auto_approve,
             entry_mode,
             registry_path,
@@ -401,8 +415,8 @@ impl Config {
             nonstream_max_bytes,
             sse_frame_hard_bytes,
             data_dir,
-            credential_secret,
-            get_binary_hash,
+            veilctl_secret,
+            veilctl_binary_hash,
             auto_approve,
             entry_mode,
             registry_path,
@@ -410,6 +424,7 @@ impl Config {
             llm_upstreams,
             llm_default_upstream,
             llm_targets,
+            command,
             redaction_enabled,
             pii_fuzzy_restore,
             pii_detection_hardening,
@@ -590,8 +605,8 @@ fn load_audit(get: &dyn Fn(&str) -> Option<String>) -> Result<AuditParts> {
 /// 存储/入口域：目录派生、三因子密钥、入口三态与审批双模开关。
 struct StorageParts {
     data_dir: PathBuf,
-    credential_secret: Option<String>,
-    get_binary_hash: Option<String>,
+    veilctl_secret: Option<String>,
+    veilctl_binary_hash: Option<String>,
     auto_approve: AutoApprove,
     entry_mode: EntryMode,
     registry_path: PathBuf,
@@ -604,10 +619,8 @@ fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
     let data_dir = get("DATA_DIR")
         .filter(|v| !v.is_empty())
         .map_or_else(|| PathBuf::from("/data"), PathBuf::from);
-    let credential_secret = get("GET_BINARY_SECRET")
-        .filter(|v| !v.is_empty())
-        .or_else(|| get("CREDENTIAL_SECRET").filter(|v| !v.is_empty()));
-    let get_binary_hash = get("GET_BINARY_HASH").filter(|v| !v.is_empty());
+    let veilctl_secret = get("VEILCTL_SECRET").filter(|v| !v.is_empty());
+    let veilctl_binary_hash = get("VEILCTL_BINARY_HASH").filter(|v| !v.is_empty());
     let auto_approve: AutoApprove = match get("AUTO_APPROVE") {
         Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
             var: "AUTO_APPROVE".to_string(),
@@ -634,8 +647,8 @@ fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
     let credential_block_wait = parse_bool_off(get, "CREDENTIAL_BLOCK_WAIT");
     Ok(StorageParts {
         data_dir,
-        credential_secret,
-        get_binary_hash,
+        veilctl_secret,
+        veilctl_binary_hash,
         auto_approve,
         entry_mode,
         registry_path,

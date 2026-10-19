@@ -22,10 +22,10 @@ services:
       - OBSERVABILITY_ADMIN_TOKEN=${OBSERVABILITY_ADMIN_TOKEN:-}
 
       # ── 三因子认证（强烈建议开启）──
-      # GET_BINARY_HASH 独立生效（置位时拒绝调用方冒用 get 自身哈希的直调；为空时该检查兼容跳过），
-      # 与 GET_BINARY_SECRET 无联动；两者均为空为兼容模式。
-      # - GET_BINARY_HASH=sha256:abc123...
-      # - GET_BINARY_SECRET=${GET_BINARY_SECRET}
+      # VEILCTL_BINARY_HASH 独立生效（置位时拒绝调用方冒用 veilctl 自身哈希的直调；为空时该检查兼容跳过），
+      # 与 VEILCTL_SECRET 无联动；两者均为空为兼容模式。
+      # - VEILCTL_BINARY_HASH=sha256:abc123...
+      # - VEILCTL_SECRET=${VEILCTL_SECRET}
 
       # ── 无 TPM 硬件的开发机：注释掉下方 devices 两行，并设置 VEIL_ALLOW_MOCK_TPM=1（仅开发）。──
       # - VEIL_ALLOW_MOCK_TPM=1

@@ -8,7 +8,7 @@
 
 ### 环境变量表
 
-进程 env 的允许读取面（配置过滤集合 ∪ Config 外直读）恰为下表 10 个具名变量。按端口选择上游的变量
+进程 env 的允许读取面（配置过滤集合 ∪ Config 外直读）恰为下表 9 个具名变量。按端口选择上游的变量
 （`LLM_` 前缀加端口，如 `LLM_8878`）不在读取面内：其进程 env 置位仅启动期 `warn`，请改用配置文件
 `[llm.upstreams]`。白名单之外的进程 env 不影响生效配置（生效配置即 `Config`）：其中属文件专属清单者置位仅启动期
 `warn` 并指引改用 `VEIL_CONFIG_FILE`，其余名一律不读取（例外仅下方三条）。白名单内的配置概念维持
@@ -23,9 +23,8 @@
 | `VEIL_ALLOW_MOCK_TPM` | 未设置（硬件强制） | TPM 层直读：仅 trim 后等于字面 `1` 放行 Mock TPM，其余值仍走硬件门禁 fail-closed；专供无硬件开发机与 CI，生产禁用（见下方指引） |
 | `MATRIX_ACCESS_TOKEN` | 空（可选） | Matrix Bot access token（密钥注入）；缺省即关闭 Matrix 通知/审批，不拒启动 |
 | `OBSERVABILITY_ADMIN_TOKEN` | 空（可选） | `/_admin` 鉴权 Token，须独立（不得复用 `MATRIX_ACCESS_TOKEN`），建议 ≥32 字符（不足仅 warn 告警）；缺省或置空即 `/_admin*` 全 404，不拒启动（密钥注入） |
-| `GET_BINARY_SECRET` | 空（兼容模式） | 三因子之部署密钥（密钥注入）；别名 `CREDENTIAL_SECRET`，前者优先 |
-| `CREDENTIAL_SECRET` | 空 | `GET_BINARY_SECRET` 的生存别名（密钥注入）；两者皆空为兼容模式 |
-| `GET_BINARY_HASH` | 空 | 直调哈希门禁（密钥注入）：置位时拒绝调用方冒用 get 自身哈希的直调（`caller_hash == GET_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `GET_BINARY_SECRET` 无联动 |
+| `VEILCTL_SECRET` | 空（兼容模式） | 三因子之部署密钥（密钥注入）；为空即兼容模式（写端点仍 fail-closed） |
+| `VEILCTL_BINARY_HASH` | 空 | 直调哈希门禁（密钥注入）：置位时拒绝调用方冒用 veilctl 自身哈希的直调（`caller_hash == VEILCTL_BINARY_HASH` → 403）；为空时该检查兼容跳过，与 `VEILCTL_SECRET` 无联动 |
 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 值级采样 HMAC key（密钥注入）；未设退化为 SHA256 |
 
 - compose 专用变量 `PORT_8877`/`PORT_8878`/`PORT_8879`/`TPM_HOST_PATH`/`DB_HOST_PATH` 不经二进制读取，属**容器编排层专用、非二进制读取面**（见 `docker-compose.yml`）。
@@ -44,15 +43,15 @@
   文件值并入后复用与 env 完全相同的 `Config::load_from` 校验链，不因来源为文件而放宽。
 - 合并优先级：每个**白名单**概念按 **env 显式名集合**（规范名 ∪ 存活别名）判定，集合内任一变量非空（trim 后）
   即 env 胜并记一条冲突 warn；否则取文件声明值；两处皆缺取内建默认。**文件专属**概念的进程 env 面恒空，文件恒胜。
-  文件不引入新概念：下表每个键都对应一个白名单 env 名或一个文件专属概念；例外仅两处声明式结构化分节
-  ——`[llm.upstreams]`（按端口展开为 `LLM_<port>`）与 `[llm.targets]`（文件专属上游目标覆盖，无 env 对应源，见下）。
+  文件不引入新概念：下表每个键都对应一个白名单 env 名或一个文件专属概念；例外仅三处声明式结构化分节
+  ——`[llm.upstreams]`（按端口展开为 `LLM_<port>`）、`[llm.targets]`（文件专属上游目标覆盖，无 env 对应源，见下）与 `[command]`（文件专属下游命令配置，见 command-api 规格）。
 - 过滤边界：白名单过滤只作用于 `Config::from_env` 收集到的**进程 env**；`Config::load_from(&HashMap)` 与文件层
   「映射为规范名后注入」的通道**保持不变**（文件值到达 `Config` 的唯一路径即该注入），故测试/脚本经 map
   注入的键不受过滤影响。
 - 审计 mode 层级：配置文件 `[audit].mode` > `[audit].policy_file` 所指策略文件的 `mode` > `off`
   ；配置文件 `mode` 视同显式，不得被策略文件的 `off` 静默降级为关闭审计。
-- 密钥类文件权限门禁：文件声明 `matrix_access_token`/`observability_admin_token`/`get_binary_secret`/
-  `get_binary_hash`/`value_sample_hmac_key` 任一键时，Unix 下要求 `mode & 0o077 == 0`（即 `chmod 600`），
+- 密钥类文件权限门禁：文件声明 `matrix_access_token`/`observability_admin_token`/`veilctl_secret`/
+  `veilctl_binary_hash`/`value_sample_hmac_key` 任一键时，Unix 下要求 `mode & 0o077 == 0`（即 `chmod 600`），
   否则拒绝启动并给出修正指引；env 覆盖不豁免该门禁（密钥文本已落盘）。非 Unix 平台该检查不适用。
   密钥类键建议继续走 env 注入。
 - env-only 例外（不参与文件层，写入即未知键拒启动）：`RUST_LOG`、`VEIL_ALLOW_MOCK_TPM`、`HOME`
@@ -61,7 +60,7 @@
 - 示例：`examples/veil.toml`（各分节代表键 + 中文注释；不含密钥类键，`0644` 权限即可加载）。
 
 文件 schema 键表（TOML 分节写法；键集由锁步测试与 `src/config/file_layer.rs` 的封闭映射表逐项绑定，
-`llm.targets` 为文件专属键根、无 env 对应源，增删须同步本表）：
+`llm.targets` 与 `command` 为文件专属键根、无 env 对应源，增删须同步本表）：
 
 | 文件键 | 规范 env 名 | TOML 类型 | 说明 |
 |:--|:--|:--|:--|
@@ -81,8 +80,8 @@
 | `storage.db_dir` | `DB_DIR` | string | kdbx 库目录（缺省 `<data_dir>/db`） |
 | `storage.tpm_dir` | `TPM_DIR` | string | TPM 密封目录（缺省 `<data_dir>/tpm`） |
 | `storage.caller_registry_path` | `CALLER_REGISTRY_PATH` | string | 调用方注册表路径（缺省 `<data_dir>/caller_registry.json`） |
-| `storage.get_binary_secret` | `GET_BINARY_SECRET` | string | 三因子之部署密钥；密钥类（须 0600）；env 别名 `CREDENTIAL_SECRET` 恒优先 |
-| `storage.get_binary_hash` | `GET_BINARY_HASH` | string | 直调哈希门禁；密钥类（保守纳入门禁，须 0600） |
+| `storage.veilctl_secret` | `VEILCTL_SECRET` | string | 三因子之部署密钥；密钥类（须 0600） |
+| `storage.veilctl_binary_hash` | `VEILCTL_BINARY_HASH` | string | 直调哈希门禁；密钥类（保守纳入门禁，须 0600） |
 | `storage.auto_approve` | `AUTO_APPROVE` | enum `allow`/`deny`/`pending` | `allow`→放行、`deny`→拒绝、`pending`→Matrix 审批 |
 | `storage.entry_mode` | `VEIL_ENTRY_MODE` | enum `full`/`credential-only`/`llm-only` | 入口语义模式 |
 | `storage.credential_block_wait` | `CREDENTIAL_BLOCK_WAIT` | bool | 凭据审批 300s 阻塞双模开关 |
@@ -109,6 +108,7 @@
 | `llm.pool_idle_timeout_secs` | `HTTP_POOL_IDLE_TIMEOUT_SECS` | integer | 空闲连接保活秒；≥1 |
 | `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16 |
 | `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标键、硬拒清单、保留键与三段语义见下 |
+| `command` | `（文件专属）` | table（命令配置分节） | 下游命令执行配置（文件专属，无 env 对应源）；schema 与行为见 command-api 规格 |
 | `keepass.backend` | `VEIL_KEEPASS_BACKEND` | enum `real`/`mock` | `mock` 仅 CI 逃生（生产禁用） |
 
 **[llm.targets] 上游覆盖（文件专属分节，无 env 对应源；未声明时零行为变化）**
@@ -187,9 +187,9 @@
 - 接入方式：浏览器直接访问 `/_admin/`（或 `/_admin`）即得控制台 HTML（入口按 `Accept` 协商；脚本/`curl` 仍得 JSON 索引）；控制台自身**未鉴权**（壳内无数据）。
 - 登录方式：页面向 `/_admin/health` 提交 `X-Admin-Token`，成功后由服务端 `Set-Cookie` 持久化（Cookie 模式后续免重复提交）；token 不落任何浏览器存储。
 - 缓存语义：管理面统一 `Cache-Control: no-store`；不返回 `ETag`，不参与 304 协商。
-- 数据来源：复用既有管理面六路由；实时大盘走 `/_admin/events/stream` 的 SSE 快照事件 `event: metrics`（15s 周期，与 `/_admin/metrics` 同字段集）；审计事件事件名为 `event`，并含 `done` 终止帧。
+- 数据来源：复用既有管理面七路由（含 `/_admin/commands`）；实时大盘走 `/_admin/events/stream` 的 SSE 快照事件 `event: metrics`（15s 周期，与 `/_admin/metrics` 同字段集）；审计事件事件名为 `event`，并含 `done` 终止帧。
 - 图表：仅内联 SVG 渲染，不加载 Chart.js，无任何外部资源。
-- 界面结构：单文件控制台采用左侧分区导航（概览 / 脱敏 / 性能 / 事件）与明暗双主题——首屏默认跟随系统 `prefers-color-scheme`，侧栏按钮手动切换并以 `veil_theme` Cookie 记忆（不写 `localStorage`/`sessionStorage`）；窄屏（<860px）下侧栏折叠为顶部横排。
+- 界面结构：单文件控制台采用左侧分区导航（概览 / 脱敏 / 性能 / 事件 / 命令调用）与明暗双主题——首屏默认跟随系统 `prefers-color-scheme`，侧栏按钮手动切换并以 `veil_theme` Cookie 记忆（不写 `localStorage`/`sessionStorage`）；窄屏（<860px）下侧栏折叠为顶部横排。
 - 事件过滤：按 `kind`（可附 `since`）与 `limit`（默认 50、上限 200）；不提供 `model`/`upstream` 过滤。
 - 范围切换：`?range=1h|24h|7d|30d`。
 - 数据绑定（时间轴与 KPI）：图表 X 轴与 tooltip 以 series 点的 `ts_start`（窗口起始 Unix 秒）按浏览器本地时间渲染，`window` 仅作内部键、不作可读标签；KPI 总量取自 `/_admin/metrics` 与 SSE `metrics` 快照的 `pii_hits`/`pii_miss`/`cred_hits` 三个 additive 字段（命中率 = `pii_hits/(pii_hits+pii_miss)`，分母为 0 显示 `—`）。
@@ -271,15 +271,15 @@ curl -fsS -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8877/_
 
 | 因子 | 字段 | 说明 |
 |:-----|:-----|:-----|
-| 因子 1：二进制完整性 | 请求头 `X-Get-Binary-Hash` | `get` 二进制的 SHA256 |
-| 因子 2：部署密钥 | 请求头 `X-Get-Binary-Secret`（兼容 `body.secret`） | Hermes 容器与网关共享的部署密钥 |
+| 因子 1：二进制完整性 | 请求头 `X-Veilctl-Binary-Hash` | `veilctl` 二进制的 SHA256 |
+| 因子 2：部署密钥 | 请求头 `X-Veilctl-Secret`（兼容 `body.secret`） | Hermes 容器与网关共享的部署密钥 |
 | 因子 3：调用者身份 | 请求体 `body.auth.caller_hash` / `caller_path` | 调用脚本文件的 SHA256 与路径 |
 
 ```bash
 curl -fsS http://127.0.0.1:8877/credential \
   -H 'Content-Type: application/json' \
-  -H "X-Get-Binary-Hash: $(sha256sum "$(which get)" | cut -d' ' -f1)" \
-  -H "X-Get-Binary-Secret: $GET_BINARY_SECRET" \
+  -H "X-Veilctl-Binary-Hash: $(sha256sum "$(which veilctl)" | cut -d' ' -f1)" \
+  -H "X-Veilctl-Secret: $VEILCTL_SECRET" \
   -d '{"auth":{"caller_hash":"<sha256(脚本)>","caller_path":"/srv/job.sh"}}'
 ```
 
@@ -288,15 +288,15 @@ curl -fsS http://127.0.0.1:8877/credential \
 - 服务端未配置对应调用方期望哈希（未 enrolled）时**默认转 Matrix 审批**
   （`202 + E_PENDING`；`[storage].auto_approve = "deny"` 时直接 `403`）——未注册调用方不直接取用凭据，
   自动放行仅对已注册调用方生效。
-- `caller_hash == GET_BINARY_HASH`（终端直调而非脚本调用）拒绝 403。
+- `caller_hash == VEILCTL_BINARY_HASH`（终端直调而非脚本调用）拒绝 403。
 - 自动放行三态（`[storage].auto_approve` 文件枚举）：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（哈希不一致走 `pending` 分支）；
   三态取值由配置文件承载，非法值拒启动（`src/config/env_parse.rs::AutoApprove`）。
 - 管理面鉴权优先级：`X-Admin-Token` 头 > `__Host-admin_token` Cookie > `?access_token`（仅 SSE 回退）；
   非 SSE 接口以 query 携带 token 恒 401。
 - 写端点部署密钥强制：`POST /approve-hash-change`、`POST /register-caller`、
-  `POST /revoke` 在部署未配置 `GET_BINARY_SECRET`/`CREDENTIAL_SECRET`（compat 默认）时 fail-closed——
+  `POST /revoke` 在部署未配置 `VEILCTL_SECRET`（compat 默认）为空时 fail-closed——
   一律 `403`（`E_AUTH`）且不执行任何注册/吊销/哈希变更动作；须配置非空部署密钥并与客户端
-  `X-Get-Binary-Secret`（或 `body.secret`）取值对齐。该约束**不适用于** `POST /credential` 读路径
+  `X-Veilctl-Secret`（或 `body.secret`）取值对齐。该约束**不适用于** `POST /credential` 读路径
   （compat 模式仍按既有语义跳过 Secret 因子），与三因子核验共用同一字段口径。
 
 ## 3. 限流规则
@@ -417,37 +417,40 @@ done
 
 ## 5. Go 客户端对接指引
 
-存量 Go `get` 客户端无需修改即可对接：网关保持其所用路径与方法不变。客户端源码
-内置本仓 `get/`（模块路径与二进制名不变），`202 + E_PENDING`
+存量 Go `veilctl` 客户端无需修改即可对接：网关保持其所用路径与方法不变。客户端源码
+内置本仓 `veilctl/`（模块路径与二进制名不变），`202 + E_PENDING`
 轮询语义与退出码约定见本节末条。
 
 | 用途 | 方法与路径 | 鉴权 |
 |:-----|:-----------|:-----|
-| 取用凭据 | `POST /credential` | 三因子（`X-Get-Binary-Hash` + `X-Get-Binary-Secret`/`body.secret` + `body.auth.caller_hash`/`caller_path`） |
-| 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` 或部署密钥 `X-Get-Binary-Secret`，两者皆缺/不匹配 401）；对接脚本须带凭据，Go `get list` 经部署密钥可用 |
+| 取用凭据 | `POST /credential` | 三因子（`X-Veilctl-Binary-Hash` + `X-Veilctl-Secret`/`body.secret` + `body.auth.caller_hash`/`caller_path`） |
+| 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` 或部署密钥 `X-Veilctl-Secret`，两者皆缺/不匹配 401）；对接脚本须带凭据，Go `veilctl list` 经部署密钥可用 |
 | 注册调用方 | `POST /register-caller` | 三因子（同取用；重名 409） |
 | 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销管理 token/内网两者任一（见 7.5） |
 | 批准哈希变更 | `POST /approve-hash-change` | 三因子 |
+| 命令目录 | `GET /commands` | 三因子写口径（头携带 `X-Veilctl-Binary-Hash`、`X-Veilctl-Secret`、`X-Caller-Hash`、`X-Caller-Path`） |
+| 命令调用 | `POST /commands/{id}/invoke` | 三因子写口径 + `downstreams.allow_commands` 授权 |
+| 命令调用日志 | `GET /_admin/commands` | 管理面鉴权（同其余 `/_admin` 路由） |
 | LLM 代理透传 | 任意 `/{tail}`（含 `GET`；未知 admin 子路径除外） | 无（上游透传） |
 | 存活探针 | `GET /health` | 无 |
 
 ```bash
 # 取用（脱敏值，默认）
-get credential 网易 授权码
+veilctl credential 网易 授权码
 # 取用原文（仅限脚本内调用，终端直调被 403 拒绝）
-get credential 网易 授权码 --raw
+veilctl credential 网易 授权码 --raw
 # 注册 / 吊销
-get register --name "check-mail" --entry "网易" --fields "授权码" --desc "检查邮件" --auto
-get revoke --name "check-mail"
+veilctl register --name "check-mail" --entry "网易" --fields "授权码" --desc "检查邮件" --auto
+veilctl revoke --name "check-mail"
 ```
 
 - `allow_mode` 契约：`POST /register-caller` 的 `allow_mode` 接受 `auto`（等价自动放行
-  `true`）与 `manual`（等价转审批 `none`），与 Go `get register --auto` 对齐；
+  `true`）与 `manual`（等价转审批 `none`），与 Go `veilctl register --auto` 对齐；
   未知非空值回退 `auto` 布尔并记 `warn` 日志。
 - 写端点部署密钥前置：`POST /register-caller`、`POST /revoke`、
-  `POST /approve-hash-change` 要求部署已配置 `GET_BINARY_SECRET`/`CREDENTIAL_SECRET`；compat 默认
-  （未配置）下三者恒 `403`（`E_AUTH`）不执行动作。Go `get` 实发
-  `X-Get-Binary-Secret`，配置后无需改客户端。`POST /credential` 取用路径不受影响。
+  `POST /approve-hash-change` 要求部署已配置 `VEILCTL_SECRET`；compat 默认
+  （未配置）下三者恒 `403`（`E_AUTH`）不执行动作。Go `veilctl` 实发
+  `X-Veilctl-Secret`，配置后无需改客户端。`POST /credential` 取用路径不受影响。
 
 - `POST /revoke` 异步 `202` 轮询契约：默认模式（`[storage].credential_block_wait` 未开启）下
   与 `POST /credential` 同口径——`202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示**已建单
@@ -456,7 +459,7 @@ get revoke --name "check-mail"
   时同请求阻塞返回终态、无需轮询。紧急吊销转常规审批路径同此契约。
 
 - `POST /revoke` 定位顺序 `key → caller_path → caller_hash → name`：
-  `get revoke --name "check-mail"` 命中未吊销同名条目；重名 409——未吊销条目重名注册直接拒绝，
+  `veilctl revoke --name "check-mail"` 命中未吊销同名条目；重名 409——未吊销条目重名注册直接拒绝，
   已吊销条目的名称释放可复用。
 
 - 注册表存储语义：加载 fail-closed——解析失败或完整性
@@ -465,13 +468,13 @@ get revoke --name "check-mail"
   diff 可复现，插入序不作承诺）；`[storage].db_dir` 所指目录扫描排序取末位 `.kdbx`，仅当存在同名 `.key` 才配对
   （不取首个 `.key`，避免配错库）。
 
-- 三因子字段：`X-Get-Binary-Hash` + `X-Get-Binary-Secret`（或 `body.secret`）+ `body.auth.caller_hash` /
+- 三因子字段：`X-Veilctl-Binary-Hash` + `X-Veilctl-Secret`（或 `body.secret`）+ `body.auth.caller_hash` /
   `caller_path`；齐全时按既有语义放行或进入审批，缺失时返回明确的鉴权失败（403），不会空响应或挂起。
 - 凭据审批 `202` 轮询语义：默认（`[storage].credential_block_wait` 未开启）待审请求返回
   `202 + E_PENDING` 即已建单，客户端应对同一请求轮询重试（建议指数退避），批准后重试返回凭据、
   拒绝后 `403`；`[storage].credential_block_wait = true` 时无需轮询（同请求阻塞等待，批准返回凭据、拒绝/超时 `403`）。
   超时码归并：阻塞超时按拒绝返回 `403`（`VeilError::Auth`），与拒绝同码，下游重试语义一律按拒绝处理（见 §6.7）。
-- Go `202` 处理（`get/`，本仓内置客户端）：`get revoke` / `get register` / `get credential` 在收到
+- Go `202` 处理（`veilctl/`，本仓内置客户端）：`veilctl revoke` / `veilctl register` / `veilctl credential` 在收到
   `202 + E_PENDING` 后按退避轮询**同一请求**（服务端经决策表幂等复用既有票，不重复建单）直至终态：
   批准 → 成功（吊销生效 / 注册生效 / 返回凭据），拒绝或超时 → `403` 报错；间隔与时限由
   `PROXY_APPROVAL_POLL`（默认 `2s`，逐次翻倍至 `10s`）与 `PROXY_APPROVAL_TIMEOUT`（默认 `300s`）控制。
@@ -479,11 +482,11 @@ get revoke --name "check-mail"
   （不再把 `202` 当成功）；`[storage].credential_block_wait = true` 时服务端阻塞返回终态，客户端单次调用即完成。
   错误体兼容（`ErrMessage`：网关对象取 `message`、兼容字符串形态错误体）与 `/credential`
   成功信封 `{"ok":true,"credential":{...}}` 不变；`202` 体不再报「解析响应失败」。
-- Go 客户端环境变量（`get/`，本仓内置）：`PROXY_URL`（网关基址，默认 `http://127.0.0.1:8877`）、
+- Go 客户端环境变量（`veilctl/`，本仓内置）：`PROXY_URL`（网关基址，默认 `http://127.0.0.1:8877`）、
   `PROXY_HTTP_TIMEOUT`（单次 HTTP 超时秒数，默认 `300`；非法值回退默认并向 stderr 告警，
   fail-closed 不回退 `30s`）、`PROXY_APPROVAL_WAIT`（默认 `1`；`0` 立即返回待审批）、
   `PROXY_APPROVAL_TIMEOUT`（审批终态总时限，默认 `300s`）、`PROXY_APPROVAL_POLL`（轮询起始间隔，
-  默认 `2s`，逐次翻倍至 `10s`）。审批真实网关 E2E（`get/internal/approval_e2e_test.go`）由
+  默认 `2s`，逐次翻倍至 `10s`）。审批真实网关 E2E（`veilctl/internal/approval_e2e_test.go`）由
   `VEIL_APPROVAL_E2E_URL`（网关基址）与 `VEIL_APPROVAL_E2E_CALLER`（一次性调用方名）共同启用，
   二者未同时设置即 `t.Skip`；该用例会向网关提交对 `VEIL_APPROVAL_E2E_CALLER` 的**真实吊销审批单**
   （破坏性，仅限可弃用调用方）。
@@ -492,6 +495,30 @@ get revoke --name "check-mail"
 ## 6. 行为语义与关键约束
 
 本章登记运行时语义与 fail-closed 约束；配置键见 §1，传输声明见 §7，遗留决策见 §8。
+
+### 5.1 下游命令执行（`[command]`）
+
+命令能力由配置文件 `[command]` 分节承载（无 env 对应源）；`enabled = false`（缺省）时
+`GET /commands` 与 `POST /commands/{id}/invoke` 均返回 404，其余面零行为差异。
+
+- 定义：`hosts`（本期仅 `kind = "local"`，其他 kind 启动期拒绝）、`groups`（host 集合）、
+  `commands`（绝对路径 `program` + `argv` 模板 `args`、`parameters`、`timeout_secs`、
+  `requires_approval`）与 `downstreams`（`callers` 绑定注册表 `caller_path`、`allow_commands`、
+  静态 `auto_approve` 规则）。未知键、悬空引用、非绝对路径、未声明参数占位与未实现 kind
+  一律拒绝启动并指明键路径。
+- 执行：argv 数组直传内核，SHALL NOT 经 shell；固定工作目录、最小环境变量、超时 kill、
+  stdout/stderr 有界截断（超限标记 `truncated`）。
+- 鉴权：复用三因子与调用者注册表，采用写口径（`VEILCTL_SECRET` 未配置即 403）。
+  自动放行（`requires_approval = false`、`auto_approve`、accept-always）仅在调用方已注册
+  且哈希匹配时生效；未注册/哈希失配仅当 `caller_path` 已绑定、命令在 `allow_commands` 内、
+  目标在 `hosts` 范围内时转审批，否则 403。
+- 审批：`MatrixBranch::Command`，`✅` 批准一次、`❎` 拒绝、`🔓` 批准并持久化 accept-always
+  （`data_dir/command_grants.json`，`0600` 原子写，损坏按空）；超时（默认 300s）按拒绝。
+  默认 `202 + E_PENDING`，`[command].block_wait = true` 时阻塞至终态。
+- 幂等：同一次审批至多执行一次；并发/重复重入返回同一终态（不会重复执行）。
+- 日志：`data_dir/commands.sqlite` 的 `command_invocations` 表记录审批状态、执行状态、
+  退出码、耗时与脱敏截断后的参数/输出摘要；`GET /_admin/commands` 提供分页与过滤
+  （`limit` 默认 50、上限 200），控制台「命令调用」分区消费同一数据源与 SSE `kind="command"`。
 
 ### 6.1 脱敏总开关默认开启
 
@@ -529,7 +556,7 @@ get revoke --name "check-mail"
 - 阻塞模式（`[storage].credential_block_wait = true`）：同请求阻塞至 `300`s，批准返回凭据、拒绝或超时按拒绝返回 `403`（`VeilError::Auth`，`src/service/credential/approval.rs`）。
 - 发送路由：审批建单走 `NotificationSink::send_text_tracked`（需真实回执——真实 `event_id` 是反应回调命中 pending 的唯一键；发送失败/取不到 id 即 fail-closed 返回 `403`，不建不可决单）；事件环/失败通知走 `notify_text` 有界 spool 的 best-effort 路径（可丢、不计回执）。二者共用同一 Bot。
 - 审批建单路径白名单：仅凭据、注册、吊销三类路径经 `send_text_tracked` 以真实 `event_id` 建单；`audit-hold` 仅内存 pending（见 §6.4）、`unlock` 无建单路径、哈希变更经 best-effort `notify_text` 通知（`src/service/credential/approval.rs::notify_hash_change`），三者不建 Matrix 审批票。
-- 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求（建议指数退避），批准后重试返回凭据、拒绝后 `403`。本仓内置 Go 客户端（`get/`）按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）。
+- 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求（建议指数退避），批准后重试返回凭据、拒绝后 `403`。本仓内置 Go 客户端（`veilctl/`）按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）。
 - 注册审批链：`POST /register-caller` 写入中立条目（`enabled=false`）后建 `MatrixBranch::Register` 审批单，复用同一双模口径（默认 `202 + E_PENDING` 抛单，阻塞模式至 `300s`）。三态落定：`🔓` 保持 `disabled`（不激活）、`✅` 置 `enabled=true`、`❎` 与等待超时置 `revoked=true`（fail-closed）；未获 `✅` 前条目不可用。同一未决注册请求的重试经决策表幂等：返回同一 `202 + E_PENDING`、不重复建单、不返回 `409`；终态后重试返回终态（`✅` 放行、`❎`/超时 `403`），与 §5 revoke `202` 轮询契约同口径。
 - 吊销类审批 `🔓`（`REACTION_AUTO_UNLOCK`）不执行吊销，同请求重试返回 `403` 且条目保持原状（`revoked=false`、`enabled` 不变）；`✅` 正常执行吊销。注册审批 `🔓` 维持 `disabled`、凭据/审计分支 `🔓` 不落定，自动放行语义不外溢。
 
@@ -915,7 +942,7 @@ PII 与凭据计数口径：
 
 - 写端点鉴权前置：常规吊销 `POST /revoke`、注册 `POST /register-caller`、
   哈希变更 `POST /approve-hash-change` 的三因子守卫在部署未配置部署密钥
-  （`GET_BINARY_SECRET`/`CREDENTIAL_SECRET` 均空）时 fail-closed，动作前返回 `403`（`E_AUTH`）；
+  （`VEILCTL_SECRET` 为空）时 fail-closed，动作前返回 `403`（`E_AUTH`）；
   须配置非空部署密钥。紧急吊销 `POST /revoke/emergency` 不受此条约束（只认管理 token/内网，见下）。
 - 紧急吊销 `POST /revoke/emergency`：仅认两类放行依据——有效管理 token
   （请求体 `admin_token` 或 `X-Admin-Token` 头）与内网来源；服务端
@@ -936,8 +963,8 @@ PII 与凭据计数口径：
   `❎` 与等待超时**保持条目原状**（不做破坏性动作）。默认 `202` 抛单，`[storage].credential_block_wait = true`
   阻塞至 `300s`。与紧急吊销旁路（上条两通道）分工：常态吊销走审批，止损走旁路且不建审批单。
 - `GET /registrations`：要求管理面鉴权（`X-Admin-Token` 或部署密钥
-  `X-Get-Binary-Secret`，见 `src/handler/credential.rs::registrations_handler`），两者皆缺/不匹配 401。
-  Go `get list` 携带部署密钥可用。
+  `X-Veilctl-Secret`，见 `src/handler/credential.rs::registrations_handler`），两者皆缺/不匹配 401。
+  Go `veilctl list` 携带部署密钥可用。
 - 哈希变更 `POST /approve-hash-change`：经 Matrix 三态落定——
   `🔓` 保持现有 `allow_mode`（自动放行延续）；`✅` 降级为人工审批模式（`allow_mode` 置 `none` 语义，
   后续取用进入审批）；`❎` 与等待超时置 `enabled=false`（取用被拒绝）。三态均写入旧哈希宽限
@@ -1084,7 +1111,7 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 
 ### 8.3 Go 对接验证
 
-- 存量 Go `get` 客户端对接指引见 §5；三项验证覆盖：`5.1` 存量 Go 直连全链路、`5.2` 三因子
+- 存量 Go `veilctl` 客户端对接指引见 §5；三项验证覆盖：`5.1` 存量 Go 直连全链路、`5.2` 三因子
   齐全/缺失两场景、`5.3` 阻断流终止（收到终止帧且无重试挂起）。端到端 runner：
   `scripts/go_interop_e2e.py`（共 14 项）。
 
@@ -1108,10 +1135,10 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 - 录制回放由 `tests/sentinel_check_tests.rs` + `tests/fixtures/` 覆盖。
 - 本仓真 SDK 一致性口径为脚本 `scripts/api_conformance.py` **24 项（脚本口径，live 实测）**（脚本侧覆盖三协议 SDK 与阻断相）。
   **已纳入 gate 步骤**：`bash scripts/gate.sh` 第 6 步执行真 SDK 一致性
-  （24 项 = 14 常规 + 4 阻断 + 5 取用 + 1 无库 503，由 gate 第 6 步 live 实测登记），第 7 步在 `get/` 内执行 Go 客户端 `go vet ./...`
+  （24 项 = 14 常规 + 4 阻断 + 5 取用 + 1 无库 503，由 gate 第 6 步 live 实测登记），第 7 步在 `veilctl/` 内执行 Go 客户端 `go vet ./...`
   与 `go test ./...`，与 fmt/clippy/test/文档路径/文件大小五步串联为七个步骤，任一失败整体非零退出。
   前置条件（第 6 步）：Python venv（默认 `<仓库根>/.venv/bin/python`，依赖 pin 见 `scripts/requirements-conformance.txt`；可用 `VEIL_CONFORMANCE_PYTHON` 覆盖）与 SDK pin `openai==3.5.0`/`anthropic==1.1.0` + `pykeepass`；无 TPM 硬件时脚本内建 `VEIL_ALLOW_MOCK_TPM=1` 回退（仅开发/CI，生产接 TPM 2.0 硬件）。
-  前置条件（第 7 步）：本机 Go 工具链，在 `get/` 目录内执行；**Go 版本由 `get/go.mod`（`go 1.26`）
+  前置条件（第 7 步）：本机 Go 工具链，在 `veilctl/` 目录内执行；**Go 版本由 `veilctl/go.mod`（`go 1.26`）
   在 `vet`/`test` 阶段强制**——Go ≥1.21 的 `GOTOOLCHAIN=auto` 会依 `go.mod` 自动选型/下载，
   Go <1.21 时版本指令在 `vet`/`test` 阶段明确报错并非零退出（fail-closed）。gate **SHALL NOT**
   增加版本字符串比较（会把本可成功的环境误判失败）。

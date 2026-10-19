@@ -22,8 +22,8 @@ async fn b8_auto_approve_true_unenrolled_still_pends() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("h-b8-true-1", "/srv/b8true.sh"))
         .send()
         .await
@@ -41,8 +41,8 @@ async fn b8_auto_approve_false_denies_unenrolled() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("h-b8-false-1", "/srv/b8false.sh"))
         .send()
         .await
@@ -58,8 +58,8 @@ async fn b8_auto_approve_none_pends_unenrolled() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("h-b8-none-1", "/srv/b8none.sh"))
         .send()
         .await
@@ -110,8 +110,8 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
         let client = reqwest::Client::new();
         let reg = client
             .post(format!("{base}/register-caller"))
-            .header("X-Get-Binary-Hash", "gethash1")
-            .header("X-Get-Binary-Secret", "s3cr3t")
+            .header("X-Veilctl-Binary-Hash", "gethash1")
+            .header("X-Veilctl-Secret", "s3cr3t")
             .json(&serde_json::json!({
                 "caller_path": "/srv/b8deg.sh",
                 "caller_hash": "h-b8-deg-A",
@@ -126,8 +126,8 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
         assert_eq!(reg.status().as_u16(), 202, "{mode}");
         let approve = client
             .post(format!("{base}/approve-hash-change"))
-            .header("X-Get-Binary-Hash", "gethash1")
-            .header("X-Get-Binary-Secret", "s3cr3t")
+            .header("X-Veilctl-Binary-Hash", "gethash1")
+            .header("X-Veilctl-Secret", "s3cr3t")
             .json(&serde_json::json!({
                 "caller_path": "/srv/b8deg.sh",
                 "new_hash": "h-b8-deg-B",
@@ -142,8 +142,8 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
         if mode == "credential-only" {
             let use_b = client
                 .post(format!("{base}/credential"))
-                .header("X-Get-Binary-Hash", "gethash1")
-                .header("X-Get-Binary-Secret", "s3cr3t")
+                .header("X-Veilctl-Binary-Hash", "gethash1")
+                .header("X-Veilctl-Secret", "s3cr3t")
                 .json(&cred_body("h-b8-deg-B", "/srv/b8deg.sh"))
                 .send()
                 .await
@@ -161,8 +161,8 @@ async fn b8_enrolled_tamper_turns_to_pending_202() {
     let client = reqwest::Client::new();
     let reg = client
         .post(format!("{base}/register-caller"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/b8tamper.sh",
             "caller_hash": "hash-aaa-b8",
@@ -177,8 +177,8 @@ async fn b8_enrolled_tamper_turns_to_pending_202() {
     assert_eq!(reg.status().as_u16(), 202);
     let cred = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("hash-bbb-tampered", "/srv/b8tamper.sh"))
         .send()
         .await
@@ -194,8 +194,8 @@ async fn b8_unenrolled_unknown_hash_pends_not_rejected() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("h-b8-unknown-tamper", "/srv/b8unknown.sh"))
         .send()
         .await

@@ -157,7 +157,7 @@ pub async fn list_registrations(
         (Some(got), expected) if !got.is_empty() => secret_eq(got, expected),
         _ => false,
     };
-    let secret_ok = match (secret, state.config().credential_secret.as_deref()) {
+    let secret_ok = match (secret, state.config().veilctl_secret.as_deref()) {
         (Some(got), Some(expected)) if !got.is_empty() && !expected.is_empty() => {
             secret_eq(got, expected)
         }

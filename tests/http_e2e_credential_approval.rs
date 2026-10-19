@@ -34,8 +34,8 @@ async fn default_202_pending_returns_immediately_with_ticket() {
     let start = Instant::now();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("h-t13-1", "/srv/t13.sh"))
         .send()
         .await
@@ -95,8 +95,8 @@ async fn block_wait_approve_returns_credential_same_request() {
     let req = tokio::spawn(async move {
         client
             .post(format!("{base_for_req}/credential"))
-            .header("X-Get-Binary-Hash", "gethash1")
-            .header("X-Get-Binary-Secret", "s3cr3t")
+            .header("X-Veilctl-Binary-Hash", "gethash1")
+            .header("X-Veilctl-Secret", "s3cr3t")
             .json(&cred_body("h-t14-a", "/srv/t14a.sh"))
             .send()
             .await
@@ -138,8 +138,8 @@ async fn block_wait_timeout_rejects_without_hanging() {
     let start = Instant::now();
     let resp = client
         .post(format!("{base}/credential"))
-        .header("X-Get-Binary-Hash", "gethash1")
-        .header("X-Get-Binary-Secret", "s3cr3t")
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
         .json(&cred_body("h-t14-t", "/srv/t14t.sh"))
         .send()
         .await
@@ -184,8 +184,8 @@ async fn early_disconnect_pending_cleanup_and_idempotent_resolve() {
     let req = tokio::spawn(async move {
         client
             .post(format!("{base_for_req}/credential"))
-            .header("X-Get-Binary-Hash", "gethash1")
-            .header("X-Get-Binary-Secret", "s3cr3t")
+            .header("X-Veilctl-Binary-Hash", "gethash1")
+            .header("X-Veilctl-Secret", "s3cr3t")
             .json(&cred_body("h-t53", "/srv/t53.sh"))
             .send()
             .await
