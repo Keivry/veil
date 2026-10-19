@@ -138,8 +138,8 @@ impl CommandBackend for LocalBackend {
         };
 
         // 先按宽限收尾；孙进程滞留管道时强杀进程组，避免无限等待。
-        let (stdout, stdout_truncated) = collect_reader(&out_rx, pid, timed_out)?;
-        let (stderr, stderr_truncated) = collect_reader(&err_rx, pid, timed_out)?;
+        let (stdout, stdout_truncated) = collect_reader(&out_rx, pid)?;
+        let (stderr, stderr_truncated) = collect_reader(&err_rx, pid)?;
         Ok(CommandOutput {
             exit_code: status.and_then(|s| s.code()),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -155,15 +155,13 @@ impl CommandBackend for LocalBackend {
 fn collect_reader(
     rx: &mpsc::Receiver<(Vec<u8>, bool)>,
     pid: i32,
-    already_killed: bool,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
     match rx.recv_timeout(READER_GRACE) {
         Ok(value) => Ok(value),
         Err(RecvTimeoutError::Disconnected) => Ok((Vec::new(), false)),
         Err(RecvTimeoutError::Timeout) => {
-            if !already_killed {
-                kill_process_group(pid);
-            }
+            // 无条件再杀一次：孙进程可能在首次 SIGKILL 之后才 fork 并持有管道。
+            kill_process_group(pid);
             match rx.recv_timeout(READER_GRACE) {
                 Ok(value) => Ok(value),
                 Err(_) => {
