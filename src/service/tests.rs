@@ -207,6 +207,14 @@ fn tpm_sync_markers() -> [String; 4] {
     ]
 }
 
+/// 命令执行（同步子进程）标记：生产文件仅限受约束作用域内出现。
+fn command_sync_markers() -> [String; 2] {
+    [
+        "std::process::Command".to_string(),
+        format!("{}::new(", "Command"),
+    ]
+}
+
 /// 剥离字符串字面量与行注释：避免字面量/注释中的括号与标记干扰结构化扫描。
 fn strip_literals(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
@@ -310,11 +318,15 @@ fn scrub_scopes(src: &str, needles: &[&str]) -> String {
 ///
 /// 受约束作用域（相对旧「整文件白名单 + `RealTpm`/`tpm2_` 标记探测」收窄）：
 /// - `service/tpm.rs` 及其外置用例 `service/tpm/tests.rs`：同步原语本体与用例， 本身即受约束边界；
+/// - `service/command/exec.rs`：命令执行原语本体（唯一调用方为 `spawn_blocking` 包装）；
 /// - `main.rs`：`#[tokio::main]` 启动链模块（启动期先于 serve，同步 TPM 按设计）；
 /// - 其余文件（含原被整文件放行的 `keepass.rs`）：仅 `spawn_blocking` 闭包内， 外加
 ///   `keepass.rs::tpm_password_provider`（惰性 provider 工厂，仅被阻塞闭包调用）。
 fn tpm_sync_subprocess_violations(rel: &str, src: &str) -> Vec<String> {
-    if matches!(rel, "service/tpm.rs" | "service/tpm/tests.rs" | "main.rs") {
+    if matches!(
+        rel,
+        "service/tpm.rs" | "service/tpm/tests.rs" | "service/command/exec.rs" | "main.rs"
+    ) {
         return Vec::new();
     }
     let stripped = strip_literals(src);
@@ -323,7 +335,10 @@ fn tpm_sync_subprocess_violations(rel: &str, src: &str) -> Vec<String> {
         needles.push("pub fn tpm_password_provider");
     }
     let scoped = scrub_scopes(&stripped, &needles);
-    let markers = tpm_sync_markers();
+    let mut markers = tpm_sync_markers().to_vec();
+    if !rel.contains("test") {
+        markers.extend(command_sync_markers());
+    }
     let mut out = Vec::new();
     for (i, line) in scoped.lines().enumerate() {
         for m in &markers {

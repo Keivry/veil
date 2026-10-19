@@ -75,6 +75,8 @@ pub struct AppState {
     /// 失败/审批通知统一有界 spool（单 Bot + 有界队列 + 常驻消费者）。
     /// 消费者由 `main` 启动期 `start()` 拉起；未启动时 `notify_text` 按满队列丢弃。
     pub notify: Arc<crate::service::matrix::NotificationSpool>,
+    /// 命令面运行时（`[command].enabled = false` 时为零行为差异的禁用态）。
+    pub command: Arc<crate::service::command::CommandRuntime>,
 }
 
 /// 手工 `Debug`：`conversation_secret`（会话 HMAC 密钥）派生 `Debug`
@@ -108,6 +110,7 @@ impl std::fmt::Debug for AppState {
             .field("previous_response_map", &self.previous_response_map)
             .field("conversation_secret", &"[redacted]")
             .field("notify", &self.notify)
+            .field("command", &self.command)
             .finish()
     }
 }
@@ -204,6 +207,10 @@ impl AppState {
             crate::service::redaction::PreviousResponseMap::new(config.pii_prev_id_max_entries)
                 .with_metrics(gateway_metrics.clone()),
         );
+        let command = Arc::new(crate::service::command::CommandRuntime::new(
+            config.command.clone(),
+            &config.data_dir,
+        )?);
         Ok(Self {
             config: Arc::new(config),
             sqlite_ok: Arc::new(AtomicBool::new(outcome.sqlite_ok)),
@@ -233,6 +240,7 @@ impl AppState {
             previous_response_map,
             conversation_secret,
             notify,
+            command,
         })
     }
 
@@ -299,6 +307,8 @@ impl crate::service::credential::AppStateParts for AppState {
     fn admin_state(&self) -> &Arc<crate::service::admin::AdminState> { &self.admin }
 
     fn notify(&self) -> &Arc<crate::service::matrix::NotificationSpool> { &self.notify }
+
+    fn command(&self) -> &Arc<crate::service::command::CommandRuntime> { &self.command }
 }
 
 /// 网关侧清理接线——Matrix 文本指令经此读写真实口令缓存、

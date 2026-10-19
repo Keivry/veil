@@ -8,6 +8,7 @@ pub mod admin;
 pub mod audit;
 pub mod audit_hold;
 pub mod block_inject;
+pub mod command;
 pub mod credential;
 /// 脱敏子模块（单向依赖：只读 `state` 经调用方注入，不触网络与路由）。
 pub mod credential_vault;
