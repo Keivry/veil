@@ -993,6 +993,38 @@ async fn admin_commands_disabled_returns_empty_page() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["total"], 0);
     assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert!(
+        !dir.join("commands.sqlite").exists(),
+        "未启用的命令面不得创建日志库"
+    );
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn exec_error_returns_503_without_leaking_the_program_path() {
+    let dir = temp_dir("exec-error");
+    let cfg = command_config(&dir, COUNTER_SCRIPT, false);
+    let program = cfg.commands["run"].program.clone();
+    let (app, state) = app(&dir, cfg);
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    // 启动校验通过后程序被移除：执行期 spawn 失败按不可用（503）返回。
+    std::fs::remove_file(&program).unwrap();
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains(&program.display().to_string()),
+        "错误消息不得泄漏 program 路径: {body}"
+    );
     handle.abort();
     std::fs::remove_dir_all(&dir).ok();
 }
