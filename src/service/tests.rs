@@ -208,10 +208,11 @@ fn tpm_sync_markers() -> [String; 4] {
 }
 
 /// 命令执行（同步子进程）标记：生产文件仅限受约束作用域内出现。
-fn command_sync_markers() -> [String; 2] {
+fn command_sync_markers() -> [String; 3] {
     [
         "std::process::Command".to_string(),
         format!("{}::new(", "Command"),
+        "run_blocking".to_string(),
     ]
 }
 

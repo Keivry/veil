@@ -8,8 +8,15 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc::{self, RecvTimeoutError},
     time::{Duration, Instant},
 };
+
+/// 子进程退出后等待 reader 收尾的宽限：孙进程可能继承管道并阻止 EOF。
+#[cfg(target_os = "linux")]
+const READER_GRACE: Duration = Duration::from_millis(500);
+#[cfg(not(target_os = "linux"))]
+const READER_GRACE: Duration = Duration::from_millis(2000);
 
 /// 单路输出默认上限（字节）。
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -35,8 +42,10 @@ impl CommandOutput {
 
 /// 可插拔执行后端边界；本期仅本机实现。
 pub trait CommandBackend: Send + Sync {
+    /// `host` 为逻辑执行目标；本机后端忽略，远程后端据此选路。
     fn run_blocking(
         &self,
+        host: &str,
         program: &Path,
         args: &[String],
         timeout: Duration,
@@ -67,6 +76,7 @@ impl LocalBackend {
 impl CommandBackend for LocalBackend {
     fn run_blocking(
         &self,
+        _host: &str,
         program: &Path,
         args: &[String],
         timeout: Duration,
@@ -75,7 +85,8 @@ impl CommandBackend for LocalBackend {
             anyhow::bail!("program 须为绝对路径: {}", program.display());
         }
         std::fs::create_dir_all(&self.work_dir)?;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .current_dir(&self.work_dir)
             .env_clear()
@@ -83,8 +94,15 @@ impl CommandBackend for LocalBackend {
             .env("LANG", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        // 独立进程组：超时可连同孙进程一并终止，避免其继承管道后 reader 永久阻塞。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command.spawn()?;
+        let pid = child.id() as i32;
         let stdout = child
             .stdout
             .take()
@@ -95,8 +113,14 @@ impl CommandBackend for LocalBackend {
             .ok_or_else(|| anyhow::anyhow!("stderr 管道缺失"))?;
         let limit = self.max_output_bytes;
         let start = Instant::now();
-        let out_reader = std::thread::spawn(move || read_capped(stdout, limit));
-        let err_reader = std::thread::spawn(move || read_capped(stderr, limit));
+        let (out_tx, out_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = out_tx.send(read_capped(stdout, limit));
+        });
+        std::thread::spawn(move || {
+            let _ = err_tx.send(read_capped(stderr, limit));
+        });
 
         let deadline = start + timeout;
         let mut timed_out = false;
@@ -106,18 +130,16 @@ impl CommandBackend for LocalBackend {
             }
             if Instant::now() >= deadline {
                 timed_out = true;
+                kill_process_group(pid);
                 let _ = child.kill();
                 break child.wait().ok();
             }
             std::thread::sleep(WAIT_POLL);
         };
 
-        let (stdout, stdout_truncated) = out_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("stdout 读取线程异常"))?;
-        let (stderr, stderr_truncated) = err_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("stderr 读取线程异常"))?;
+        // 先按宽限收尾；孙进程滞留管道时强杀进程组，避免无限等待。
+        let (stdout, stdout_truncated) = collect_reader(&out_rx, pid, timed_out)?;
+        let (stderr, stderr_truncated) = collect_reader(&err_rx, pid, timed_out)?;
         Ok(CommandOutput {
             exit_code: status.and_then(|s| s.code()),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -126,6 +148,47 @@ impl CommandBackend for LocalBackend {
             timed_out,
             truncated: stdout_truncated || stderr_truncated,
         })
+    }
+}
+
+/// 收 reader 结果：超时则先杀进程组再等；仍无结果按空输出处理（不阻塞调用）。
+fn collect_reader(
+    rx: &mpsc::Receiver<(Vec<u8>, bool)>,
+    pid: i32,
+    already_killed: bool,
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    match rx.recv_timeout(READER_GRACE) {
+        Ok(value) => Ok(value),
+        Err(RecvTimeoutError::Disconnected) => Ok((Vec::new(), false)),
+        Err(RecvTimeoutError::Timeout) => {
+            if !already_killed {
+                kill_process_group(pid);
+            }
+            match rx.recv_timeout(READER_GRACE) {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    tracing::warn!("命令子进程管道未关闭，按空输出收尾（pid {pid}）");
+                    Ok((Vec::new(), true))
+                }
+            }
+        }
+    }
+}
+
+/// 终止整个进程组（Unix）；非 Unix 退化为无操作，由 `child.kill()` 兜底。
+fn kill_process_group(pid: i32) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
+        }
+        const SIGKILL: std::os::raw::c_int = 9;
+        // SAFETY：`kill` 为纯系统调用包装；负 pid 表示进程组，无指针解引用。
+        let _ = unsafe { kill(-pid, SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
     }
 }
 
@@ -163,6 +226,7 @@ mod tests {
     fn argv_passed_without_shell_interpretation() {
         let out = local()
             .run_blocking(
+                "local",
                 Path::new("/bin/echo"),
                 &args(&["a;b", "$(id)", "x y"]),
                 Duration::from_secs(5),
@@ -177,6 +241,7 @@ mod tests {
     fn timeout_kills_child() {
         let out = local()
             .run_blocking(
+                "local",
                 Path::new("/bin/sleep"),
                 &args(&["5"]),
                 Duration::from_millis(150),
@@ -191,6 +256,7 @@ mod tests {
         let out = LocalBackend::new(std::env::temp_dir())
             .with_max_output_bytes(1024)
             .run_blocking(
+                "local",
                 Path::new("/usr/bin/yes"),
                 &args(&["y"]),
                 Duration::from_millis(150),
@@ -201,9 +267,39 @@ mod tests {
     }
 
     #[test]
+    fn timeout_kills_grandchildren_holding_pipes() {
+        // 后台孙进程继承 stdout：若只 kill 直接子进程，reader 会永久阻塞。
+        let start = Instant::now();
+        let out = local()
+            .run_blocking(
+                "local",
+                Path::new("/bin/sh"),
+                &args(&["-c", "sleep 30 & echo started"]),
+                Duration::from_millis(150),
+            )
+            .unwrap();
+        // 直接子进程已退出，但孙进程仍持有管道：调用须在宽限内收尾而非永久阻塞。
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "孙进程持有管道时不得阻塞调用: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            out.stdout.contains("started") || out.stdout.is_empty(),
+            "输出须为已读内容或空: {:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
     fn nonzero_exit_is_reported() {
         let out = local()
-            .run_blocking(Path::new("/bin/false"), &[], Duration::from_secs(5))
+            .run_blocking(
+                "local",
+                Path::new("/bin/false"),
+                &[],
+                Duration::from_secs(5),
+            )
             .unwrap();
         assert_eq!(out.exit_code, Some(1));
         assert!(!out.success());
