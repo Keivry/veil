@@ -1473,6 +1473,7 @@
         state.token = '';
         showLogin('会话失效，请重新登录');
       } else if (err && err.message === 'ratelimited') {
+        if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
         showRateLimit();
       }
     });
@@ -1490,6 +1491,7 @@
         state.token = '';
         showLogin('会话失效，请重新登录');
       } else if (err && err.message === 'ratelimited') {
+        if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
         showRateLimit();
       }
     });
