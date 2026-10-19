@@ -61,9 +61,9 @@ async fn c2_json_accept_without_credentials_401() {
     handle.abort();
 }
 
-// 有效头凭证 + 通配 Accept → 200 JSON 索引，六路由齐备。
+// 有效头凭证 + 通配 Accept → 200 JSON 索引，七路由齐备。
 #[tokio::test]
-async fn c3_valid_token_serves_json_index_six_routes() {
+async fn c3_valid_token_serves_json_index_seven_routes() {
     let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let resp = client
@@ -76,7 +76,7 @@ async fn c3_valid_token_serves_json_index_six_routes() {
     assert_eq!(resp.status().as_u16(), 200);
     let v: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(v["ok"], true, "{v}");
-    assert_eq!(v["routes"].as_array().unwrap().len(), 6, "{v}");
+    assert_eq!(v["routes"].as_array().unwrap().len(), 7, "{v}");
     handle.abort();
 }
 

@@ -1,8 +1,8 @@
-//! 六 admin 路由：鉴权 + 限流 + SSE + 事件查询。
+//! 七 admin 路由：鉴权 + 限流 + SSE + 事件查询 + 命令调用日志。
 //!
 //! 唯一表（精确注册先于通配，MUST NOT 被 `/{*tail}` 吞没）：
 //! `/_admin/`、`/_admin/health`、`/_admin/metrics`、`/_admin/series`、
-//! `/_admin/events`、`/_admin/events/stream`；未知子路径 404。
+//! `/_admin/events`、`/_admin/events/stream`、`/_admin/commands`；未知子路径 404。
 //! 鉴权优先级 `X-Admin-Token` > `__Host-admin_token` Cookie >
 //! `?access_token`（仅 SSE）；非 SSE 带 query 恒 401；HMAC 等长比较；
 //! `OBSERVABILITY_ADMIN_TOKEN` 必填独立性沿用 `Config`。

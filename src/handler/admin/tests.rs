@@ -180,11 +180,11 @@ fn unknown_subpath_returns_404() {
 }
 
 #[test]
-fn admin_index_lists_six_routes() {
+fn admin_index_lists_seven_routes() {
     let body = json!({
-        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream"],
+        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream", "/_admin/commands"],
     });
-    assert_eq!(body["routes"].as_array().unwrap().len(), 6);
+    assert_eq!(body["routes"].as_array().unwrap().len(), 7);
 }
 
 #[tokio::test]

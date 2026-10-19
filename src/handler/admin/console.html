@@ -333,6 +333,7 @@
         <button data-sec="redaction"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.4-3 8.2-7 10-4-1.8-7-5.6-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>脱敏</button>
         <button data-sec="performance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>性能</button>
         <button data-sec="events"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>事件</button>
+        <button data-sec="commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>命令调用</button>
       </nav>
       <div class="side-foot">
         <span class="live-ind"><span class="dot off" id="live-dot"></span><span id="live-txt">连接中</span></span>
@@ -414,6 +415,29 @@
           </div>
         </div>
       </section>
+
+      <section class="sec" id="sec-commands" hidden>
+        <div class="panel">
+          <h2>命令调用日志 <span class="h2-sub">每次调用的审批与执行状态</span></h2>
+          <div class="toolbar" style="margin-bottom:12px">
+            <input id="cmd-command" placeholder="命令 id 过滤（空=全部）">
+            <input id="cmd-status" placeholder="审批状态（approved/denied/timeout/not_required）">
+            <button id="cmd-apply">筛选</button>
+            <button id="cmd-prev">上一页</button>
+            <button id="cmd-next">下一页</button>
+            <span class="hintline" id="cmd-page-info">—</span>
+          </div>
+          <div style="overflow:auto">
+            <table id="cmd-table">
+              <thead><tr>
+                <th>时间</th><th>下游</th><th>命令</th><th>host</th>
+                <th>审批</th><th>执行</th><th>退出码</th><th>耗时(ms)</th>
+              </tr></thead>
+              <tbody><tr><td colspan="8"><div class="empty">暂无命令调用记录（[command].enabled = false 时不产生日志）</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 </div>
@@ -423,7 +447,7 @@
 <script>
 (function () {
   'use strict';
-  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null };
+  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null, cmdLimit: 50, cmdOffset: 0, cmdTotal: 0, cmdCommand: '', cmdStatus: '' };
 
   // 回退轮询间隔：管理面通用桶 10 次/分钟，断线后单端点每 15 秒轮询一次，
   // 仅占约 4 次/分钟；剩余预算留给登录探针与手动操作，恢复后立即停轮询。
@@ -516,7 +540,7 @@
   }
 
   // ── 分区导航与明暗主题（新增，不动既有数据逻辑）──
-  var SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件' };
+  var SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用' };
 
   function showSection(sec) {
     var i;
@@ -529,6 +553,7 @@
     // 分区可见后按真实宽度重绘依赖 clientWidth 的图表（横向条形 / 趋势）。
     if (sec === 'redaction' && state.metrics) renderDist(state.metrics);
     if (sec === 'overview' && state.series) renderTrend(state.series);
+    if (sec === 'commands') reloadCommands();
   }
 
   // 主题：persist 为真时写 veil_theme Cookie（仅用户手动切换），否则只更新 UI。
@@ -1330,7 +1355,11 @@
       });
     };
     es.addEventListener('event', function (ev) {
-      try { prependEvent(JSON.parse(ev.data)); } catch (ignored) { /* 坏帧跳过 */ }
+      try {
+        var parsed = JSON.parse(ev.data);
+        prependEvent(parsed);
+        if (parsed && parsed.kind === 'command' && !$('sec-commands').hidden) reloadCommands();
+      } catch (ignored) { /* 坏帧跳过 */ }
     });
     es.addEventListener('metrics', function (ev) {
       try { onSnapshot(JSON.parse(ev.data)); } catch (ignored) { /* 坏帧跳过 */ }
@@ -1368,6 +1397,73 @@
 
   function stopFallback() {
     if (state.fallbackTimer) { clearInterval(state.fallbackTimer); state.fallbackTimer = null; }
+  }
+
+  // ── 命令调用日志：分页/过滤查询（管理面通用限流，单次只打一个端点）──
+  /* @veil-testable:start */
+  function commandRowModel(item) {
+    var it = item || {};
+    return {
+      ts: fmtTs(it.ts_secs),
+      downstream: it.downstream || '',
+      command: it.command || '',
+      host: it.host || '',
+      approval: it.approval_status || '',
+      exec: it.exec_status || '',
+      exit: (it.exit_code == null) ? '-' : String(it.exit_code),
+      duration: (it.duration_ms == null) ? '-' : String(it.duration_ms)
+    };
+  }
+  /* @veil-testable:end */
+
+  function renderCommands(items) {
+    var tbody = document.querySelector('#cmd-table tbody');
+    var rows = (items || []).map(commandRowModel);
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8"><div class="empty">暂无命令调用记录（[command].enabled = false 时不产生日志）</div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+      return '<tr>' +
+        '<td>' + esc(r.ts) + '</td>' +
+        '<td>' + esc(r.downstream) + '</td>' +
+        '<td>' + esc(r.command) + '</td>' +
+        '<td>' + esc(r.host) + '</td>' +
+        '<td>' + esc(r.approval) + '</td>' +
+        '<td>' + esc(r.exec) + '</td>' +
+        '<td>' + esc(r.exit) + '</td>' +
+        '<td>' + esc(r.duration) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function updateCmdPager() {
+    var info = $('cmd-page-info');
+    if (!info) return;
+    var from = state.cmdTotal ? state.cmdOffset + 1 : 0;
+    var to = Math.min(state.cmdOffset + state.cmdLimit, state.cmdTotal);
+    info.textContent = '第 ' + from + '–' + to + ' 条 / 共 ' + state.cmdTotal + ' 条';
+    $('cmd-prev').disabled = state.cmdOffset <= 0;
+    $('cmd-next').disabled = state.cmdOffset + state.cmdLimit >= state.cmdTotal;
+  }
+
+  function reloadCommands() {
+    var q = '/_admin/commands?limit=' + state.cmdLimit + '&offset=' + state.cmdOffset;
+    if (state.cmdCommand) q += '&command=' + encodeURIComponent(state.cmdCommand);
+    if (state.cmdStatus) q += '&approval_status=' + encodeURIComponent(state.cmdStatus);
+    api(q).then(function (d) {
+      state.cmdTotal = (d && d.total) || 0;
+      if (d && d.limit) state.cmdLimit = d.limit;
+      renderCommands((d && d.items) || []);
+      updateCmdPager();
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') {
+        state.token = '';
+        showLogin('会话失效，请重新登录');
+      } else if (err && err.message === 'ratelimited') {
+        showRateLimit();
+      }
+    });
   }
 
   // ── 事件筛选：用户动作单次只打一个端点 ──
@@ -1412,6 +1508,20 @@
         // 范围切换仅重建实时通道，不打回退端点。
         restartStream();
       });
+    });
+    $('cmd-apply').addEventListener('click', function () {
+      state.cmdCommand = $('cmd-command').value.trim();
+      state.cmdStatus = $('cmd-status').value.trim();
+      state.cmdOffset = 0;
+      reloadCommands();
+    });
+    $('cmd-prev').addEventListener('click', function () {
+      state.cmdOffset = Math.max(0, state.cmdOffset - state.cmdLimit);
+      reloadCommands();
+    });
+    $('cmd-next').addEventListener('click', function () {
+      state.cmdOffset += state.cmdLimit;
+      reloadCommands();
     });
     $('ev-apply').addEventListener('click', function () {
       state.kind = $('ev-kind').value.trim();

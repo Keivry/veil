@@ -363,8 +363,8 @@ pub async fn admin_index(
     let body = Json(json!({
         "ok": true,
         "admin": "veil observability",
-        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream"],
-        "note": "JSON 索引占位：六路由 API + SSE 流已就绪；浏览器访问同路径可获控制台 HTML（Accept 协商）",
+        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream", "/_admin/commands"],
+        "note": "JSON 索引占位：七路由 API + SSE 流已就绪；浏览器访问同路径可获控制台 HTML（Accept 协商）",
     }))
     .into_response();
     with_vary_accept(with_admin_cookie(body, &headers, expected))
@@ -529,6 +529,64 @@ pub async fn admin_series(
             with_admin_cookie(resp, &headers, &state.config().observability_admin_token)
         }
         Err(e) => with_security_headers(VeilError::internal(e).into_response()),
+    }
+}
+
+/// `GET /_admin/commands`：命令调用日志分页/过滤查询（`?limit=&offset=&command=`
+/// `&caller_path=&approval_status=`）；`limit` 默认 50、上限 200 收敛。
+pub async fn admin_commands(
+    State(state): State<AppState>,
+    addr: PeerIp,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let ip = peer_ip(&addr);
+    if let Some(retry) = admin::check_admin_rate(&state, ip) {
+        return rate_limited(retry);
+    }
+    let has_q = query.contains_key("access_token");
+    if let Some(r) = authorize(
+        &state.config().observability_admin_token,
+        &headers,
+        None,
+        has_q,
+        false,
+    ) {
+        return r;
+    }
+    let filter = crate::service::command::LogFilter {
+        limit: query.get("limit").and_then(|s| s.parse().ok()),
+        offset: query.get("offset").and_then(|s| s.parse().ok()),
+        command: query.get("command").cloned(),
+        caller_path: query.get("caller_path").cloned(),
+        approval_status: query.get("approval_status").cloned(),
+    };
+    let limit = filter.limit();
+    let offset = filter.offset();
+    match state.command().log.query(filter).await {
+        Ok(page) => {
+            let body = Json(json!({
+                "ok": true,
+                "items": page.items,
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+            }))
+            .into_response();
+            with_admin_cookie(body, &headers, &state.config().observability_admin_token)
+        }
+        Err(err) => with_security_headers(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "code": "E_STORAGE",
+                        "message": format!("命令日志查询失败（limit={limit} offset={offset}）: {err}"),
+                    }
+                })),
+            )
+                .into_response(),
+        ),
     }
 }
 

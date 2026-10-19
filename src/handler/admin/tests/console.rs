@@ -96,6 +96,89 @@ async fn console_response_headers_and_body() {
 }
 
 #[test]
+fn console_html_command_section_wired() {
+    for needle in [
+        "data-sec=\"commands\"",
+        "id=\"sec-commands\"",
+        "id=\"cmd-table\"",
+        "SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用' }",
+        "'/_admin/commands?limit='",
+        "approval_status=",
+        "parsed.kind === 'command'",
+        "function commandRowModel",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_command_row_model_executes_in_node() {
+    const START: &str = "/* @veil-testable:start */";
+    const END: &str = "/* @veil-testable:end */";
+    let fn_pos = CONSOLE_HTML
+        .find("function commandRowModel")
+        .expect("壳须含 commandRowModel");
+    let start = CONSOLE_HTML[..fn_pos]
+        .rfind(START)
+        .expect("commandRowModel 须位于 @veil-testable 块内")
+        + START.len();
+    let rest = &CONSOLE_HTML[start..];
+    let end = rest.find(END).expect("壳须含 @veil-testable:end 标记");
+    let helpers = &rest[..end];
+
+    let node_ready = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !node_ready {
+        return;
+    }
+
+    let harness = r#"
+function fmtTs(ts) {
+    if (ts == null || ts === '') return '';
+    var d = new Date(Number(ts) * 1000);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+var out = {};
+var r = commandRowModel({ ts_secs: 1700000000, downstream: 'ci', command: 'deploy', host: 'api', approval_status: 'approved', exec_status: 'failed', exit_code: 3, duration_ms: 12 });
+out.command = r.command;
+out.exit = r.exit;
+out.duration = r.duration;
+out.approval = r.approval;
+var empty = commandRowModel(null);
+out.empty_exit = empty.exit;
+out.empty_command = empty.command;
+console.log(JSON.stringify(out));
+"#;
+    let script = format!("{helpers}\n{harness}\n");
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .expect("spawn `node -e` 失败");
+    assert!(
+        output.status.success(),
+        "node 执行失败（status={}）：{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verdict: serde_json::Value = serde_json::from_str(
+        String::from_utf8(output.stdout)
+            .expect("node stdout 须为 UTF-8")
+            .trim(),
+    )
+    .expect("node 须输出 JSON");
+    assert_eq!(verdict["command"], "deploy");
+    assert_eq!(verdict["exit"], "3");
+    assert_eq!(verdict["duration"], "12");
+    assert_eq!(verdict["approval"], "approved");
+    assert_eq!(verdict["empty_exit"], "-");
+    assert_eq!(verdict["empty_command"], "");
+}
+
+#[test]
 fn console_html_honors_retry_after_backoff() {
     // C 语义接线：SSE 错误后先探 `Retry-After` 再决定重连间隔（EventSource 错误
     // 不暴露响应头），回退轮询亦在退避窗口内让路——否则每 3s 撞一次焊死限流窗口。
