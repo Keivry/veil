@@ -290,6 +290,12 @@ pub fn validate_command(section: Option<&CommandSection>) -> Result<CommandConfi
                 &format!("command.groups.{name}.hosts 不得为空，拒绝启动"),
             ));
         }
+        if cfg.hosts.contains_key(name) {
+            return Err(config_error(
+                BOOTSTRAP_VAR,
+                &format!("command.groups.{name} 与同名 host 冲突（名称须唯一），拒绝启动"),
+            ));
+        }
         for host in hosts {
             if !cfg.hosts.contains_key(host) {
                 return Err(config_error(
@@ -471,6 +477,20 @@ pub fn validate_command(section: Option<&CommandSection>) -> Result<CommandConfi
                 command,
                 hosts: hosts.to_vec(),
             });
+        }
+        for caller in callers {
+            if let Some((other, _)) = cfg
+                .downstreams
+                .iter()
+                .find(|(_, existing)| existing.callers.iter().any(|bound| bound == caller))
+            {
+                return Err(config_error(
+                    BOOTSTRAP_VAR,
+                    &format!(
+                        "command.downstreams.{name}.callers 中 {caller:?} 已绑定到 downstream {other:?}（须唯一），拒绝启动"
+                    ),
+                ));
+            }
         }
         cfg.downstreams.insert(
             name.clone(),
@@ -690,6 +710,20 @@ auto_approve = [{ command = "deploy", hosts = ["fleet"] }]
         ))
         .unwrap_err();
         assert!(err.to_string().contains("auto_approve"), "{err}");
+    }
+
+    #[test]
+    fn ambiguous_group_host_and_caller_binding_rejected() {
+        let text = base().replace("[command.groups.fleet]", "[command.groups.api]");
+        let err = parse(&text).unwrap_err();
+        assert!(err.to_string().contains("同名 host"), "{err}");
+
+        let duplicated = format!(
+            "{}\n[command.downstreams.other]\ncallers = [\"/opt/ci/agent.sh\"]\nallow_commands = [\"deploy\"]\n",
+            base()
+        );
+        let err = parse(&duplicated).unwrap_err();
+        assert!(err.to_string().contains("已绑定"), "{err}");
     }
 
     #[test]

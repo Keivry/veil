@@ -38,6 +38,10 @@ struct GrantsFile {
 pub struct CommandGrants {
     path: PathBuf,
     grants: tokio::sync::RwLock<BTreeSet<GrantKey>>,
+    /// 落盘串行化：并发 insert 不得互相截断临时文件或丢失授权。
+    write_lock: tokio::sync::Mutex<()>,
+    /// 临时文件名唯一后缀（进程内单调）。
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl CommandGrants {
@@ -67,6 +71,8 @@ impl CommandGrants {
         Self {
             path,
             grants: tokio::sync::RwLock::new(grants),
+            write_lock: tokio::sync::Mutex::new(()),
+            seq: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -87,6 +93,8 @@ impl CommandGrants {
             command: command.to_string(),
             host: host.to_string(),
         };
+        // 先持写锁再取快照，保证「快照 + 落盘」整体串行。
+        let _write = self.write_lock.lock().await;
         let mut guard = self.grants.write().await;
         if !guard.insert(key) {
             return;
@@ -96,7 +104,12 @@ impl CommandGrants {
             grants: guard.iter().cloned().collect(),
         };
         drop(guard);
-        if let Err(err) = write_atomic(&self.path, &file) {
+        let tmp = self.path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if let Err(err) = write_atomic(&self.path, &tmp, &file) {
             tracing::warn!(
                 "命令授权文件写入失败（本次放行仍生效，重启后可能失效）{}: {err}",
                 self.path.display()
@@ -108,23 +121,22 @@ impl CommandGrants {
     pub(crate) async fn len(&self) -> usize { self.grants.read().await.len() }
 }
 
-fn write_atomic(path: &Path, file: &GrantsFile) -> std::io::Result<()> {
+fn write_atomic(path: &Path, tmp: &Path, file: &GrantsFile) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(file)
         .map_err(|err| std::io::Error::other(format!("序列化失败: {err}")))?;
     {
-        let mut handle = std::fs::File::create(&tmp)?;
+        let mut handle = std::fs::File::create(tmp)?;
         handle.write_all(&bytes)?;
         handle.sync_all()?;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(tmp, path)
 }
 
 #[cfg(test)]
@@ -167,6 +179,28 @@ mod tests {
         grants.insert("/opt/ci/a.sh", "deploy", "api").await;
         grants.insert("/opt/ci/a.sh", "deploy", "api").await;
         assert_eq!(grants.len().await, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_inserts_keep_all_grants() {
+        let dir = temp_dir("concurrent");
+        let grants = std::sync::Arc::new(CommandGrants::load(&dir));
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let grants = grants.clone();
+            tasks.push(tokio::spawn(async move {
+                grants
+                    .insert("/opt/ci/a.sh", &format!("cmd-{i}"), "api")
+                    .await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(grants.len().await, 8, "并发写入不得丢授权");
+        let reloaded = CommandGrants::load(&dir);
+        assert_eq!(reloaded.len().await, 8, "落盘后重启须读回全部授权");
         std::fs::remove_dir_all(&dir).ok();
     }
 
