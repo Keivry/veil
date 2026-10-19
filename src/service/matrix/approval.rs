@@ -46,9 +46,10 @@ impl std::fmt::Debug for PendingEntry {
 /// 审计/解锁类 60s；已决票按落定时刻、未决票按建单时刻施加同一族 TTL。
 fn orphan_ttl_secs(branch: MatrixBranch) -> u64 {
     match branch {
-        MatrixBranch::Register | MatrixBranch::HashChange | MatrixBranch::Credential => {
-            CREDENTIAL_TIMEOUT_SECS
-        }
+        MatrixBranch::Register
+        | MatrixBranch::HashChange
+        | MatrixBranch::Credential
+        | MatrixBranch::Command => CREDENTIAL_TIMEOUT_SECS,
         MatrixBranch::Unlock | MatrixBranch::Audit | MatrixBranch::Unknown => ORPHAN_SWEEP_SECS,
     }
 }
@@ -156,6 +157,11 @@ impl MatrixApproval {
     }
 
     /// 已落定票的 `auto` 标志（未落定/无票返回 None）；三态落定消费。
+    /// 非阻塞读取已落定决议：`None` = 仍待审；`Some(Some(bool))` = 已决。
+    pub async fn decision(&self, event_id: &str) -> Option<Option<bool>> {
+        self.pending.lock().await.get(event_id).map(|e| e.decided)
+    }
+
     pub async fn applied_auto(&self, event_id: &str) -> Option<bool> {
         self.pending
             .lock()

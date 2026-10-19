@@ -107,7 +107,8 @@ fn pending_ttl_secs(branch: matrix::MatrixBranch) -> u64 {
     match branch {
         matrix::MatrixBranch::Register
         | matrix::MatrixBranch::HashChange
-        | matrix::MatrixBranch::Credential => matrix::CREDENTIAL_TIMEOUT_SECS,
+        | matrix::MatrixBranch::Credential
+        | matrix::MatrixBranch::Command => matrix::CREDENTIAL_TIMEOUT_SECS,
         _ => PENDING_TTL_SECS,
     }
 }
@@ -126,11 +127,23 @@ pub(crate) async fn submit_pending_with_branch(
     entry: &str,
     field: Option<&str>,
 ) -> Result<String> {
+    let summary = approval_summary(reason, key, entry, field);
+    submit_pending_with_summary(state, key, reason, branch, &summary).await
+}
+
+/// 显式正文建单：调用方自备摘要（命令审批需含 argv/超时），建单链路与
+/// [`submit_pending_with_branch`] 完全一致（tracked 发送、pending、presets）。
+pub(crate) async fn submit_pending_with_summary(
+    state: &impl AppStateParts,
+    key: &str,
+    reason: &str,
+    branch: matrix::MatrixBranch,
+    summary: &str,
+) -> Result<String> {
     if !state.config().matrix_enabled() {
         return Err(matrix_disabled_error(state));
     }
-    let summary = approval_summary(reason, key, entry, field);
-    let text = state.notify().format_approval(branch, None, &summary);
+    let text = state.notify().format_approval(branch, None, summary);
     let Some(event_id) = state.notify().send_tracked(text).await else {
         tracing::warn!("审批发送失败，按拒绝 fail-closed（不建单）: 原因 {reason}");
         return Err(VeilError::Auth {

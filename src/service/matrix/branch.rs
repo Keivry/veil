@@ -17,6 +17,7 @@ pub enum MatrixBranch {
     Register,
     HashChange,
     Credential,
+    Command,
     Audit,
     Unknown,
 }
@@ -36,6 +37,8 @@ impl MatrixBranch {
             Self::HashChange
         } else if r.contains("credential") || r.contains("凭据") {
             Self::Credential
+        } else if r.contains("command") || r.contains("命令") {
+            Self::Command
         } else if r.contains("audit") || r.contains("审计") {
             Self::Audit
         } else {
@@ -55,7 +58,7 @@ impl MatrixBranch {
     /// 含注册/哈希变更分支的 `🔓`），供建单后预置、使审批人可点选。
     pub fn reaction_presets(&self) -> &'static [&'static str] {
         match self {
-            Self::Register | Self::HashChange => {
+            Self::Register | Self::HashChange | Self::Command => {
                 &[REACTION_AUTO_UNLOCK, REACTION_APPROVE, REACTION_REJECT]
             }
             Self::Unlock | Self::Credential | Self::Audit => &[REACTION_APPROVE, REACTION_REJECT],
@@ -178,7 +181,7 @@ pub fn reaction_to_decision(branch: MatrixBranch, key: &str) -> Option<(bool, bo
             k if k == REACTION_REJECT => Some((false, false)),
             _ => None,
         },
-        MatrixBranch::Register | MatrixBranch::HashChange => match key {
+        MatrixBranch::Register | MatrixBranch::HashChange | MatrixBranch::Command => match key {
             k if k == REACTION_AUTO_UNLOCK => Some((true, true)),
             k if k == REACTION_APPROVE => Some((true, false)),
             k if k == REACTION_REJECT => Some((false, false)),

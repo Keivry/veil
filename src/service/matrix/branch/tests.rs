@@ -123,6 +123,35 @@ fn unknown_emoji_and_branch_map_to_noop() {
 }
 
 #[test]
+fn command_branch_three_state_reactions() {
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Command, REACTION_APPROVE),
+        Some((true, false)),
+        "✅ 批准一次"
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Command, REACTION_REJECT),
+        Some((false, false)),
+        "❎ 拒绝"
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Command, REACTION_AUTO_UNLOCK),
+        Some((true, true)),
+        "🔓 批准并持久化 accept-always"
+    );
+    assert_eq!(reaction_to_decision(MatrixBranch::Command, "👍"), None);
+    assert_eq!(
+        MatrixBranch::Command.reaction_presets(),
+        &[REACTION_AUTO_UNLOCK, REACTION_APPROVE, REACTION_REJECT]
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("command_invoke"),
+        MatrixBranch::Command
+    );
+    assert_eq!(MatrixBranch::from_reason("命令审批"), MatrixBranch::Command);
+}
+
+#[test]
 fn text_commands_parse_three_instructions() {
     assert_eq!(parse_text_command("lock proxy"), TextCommand::Lock);
     assert_eq!(parse_text_command("  LOCK  "), TextCommand::Lock);

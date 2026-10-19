@@ -100,6 +100,7 @@ impl MatrixBot {
             MatrixBranch::Register => "注册",
             MatrixBranch::HashChange => "哈希变更",
             MatrixBranch::Credential => "凭据",
+            MatrixBranch::Command => "命令",
             MatrixBranch::Audit => "审计",
             MatrixBranch::Unknown => "未知分支（已忽略）",
         };
