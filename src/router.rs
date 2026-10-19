@@ -56,6 +56,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/_admin/series", get(admin::admin_series))
         .route("/_admin/events", get(admin::admin_events))
         .route("/_admin/events/stream", get(admin::admin_events_stream))
+        .route("/_admin/commands", get(admin::admin_commands))
         .route("/_admin/{*rest}", any(admin::admin_not_found))
         .route("/health", get(handler::health_handler))
         .route("/credential", post(handler::credential_handler))
@@ -66,6 +67,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/approve-hash-change",
             post(handler::approve_hash_change_handler),
+        )
+        .route("/commands", get(handler::commands_handler))
+        .route(
+            "/commands/{id}/invoke",
+            post(handler::command_invoke_handler),
         )
         .route("/{*tail}", any(handler::llm_proxy_handler))
         .fallback(handler::llm_proxy_handler)

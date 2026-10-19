@@ -2,6 +2,7 @@
 //! 路由（`router.rs`）只经本模块访问两面，对外路径保持 `handler::*` 不变。
 
 pub mod admin;
+pub mod command;
 pub mod credential;
 pub mod llm;
 pub mod peer_ip;
@@ -11,7 +12,7 @@ use {
     axum::{Json, extract::State},
     serde_json::{Value, json},
 };
-pub use {credential::*, llm::*, peer_ip::PeerIp};
+pub use {command::*, credential::*, llm::*, peer_ip::PeerIp};
 
 pub async fn health_handler(State(state): State<AppState>) -> Json<Value> {
     let health = service::health_status(&state);
