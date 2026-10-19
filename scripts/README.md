@@ -6,24 +6,24 @@
 - mock 上游监听 `:0` 随机端口；veil 二进制固定 `127.0.0.1:8877`。
 - `go_interop_e2e.py` — 5.1–5.3「Go 对接验证」端到端 runner，共 14 项
   （5.1 Go 直连取用全链路 4 项、5.2 三因子齐全/缺失 6 项、5.3 Go 消费阻断流终止 3 项、
-  5.2 `caller_hash` 冒用 `GET_BINARY_HASH` 1 项）；失败非零退出，前置不可得显式报错不静默跳过。
+  5.2 `caller_hash` 冒用 `VEILCTL_BINARY_HASH` 1 项）；失败非零退出，前置不可得显式报错不静默跳过。
   用法（仓库根目录，复用 `api_conformance.py` 设施，须含 `pykeepass`）：
   `.venv/bin/python scripts/go_interop_e2e.py`。
-  Go 客户端内置本仓 `get/`：
-  脚本按自身位置解析 `get/` 绝对路径（不依赖 cwd）并打印所用目录，执行 `make -C get build`
-  产出 `get/get-credential-linux-amd64`，缺失时显式报错不静默跳过；本仓 `.venv` 仅作 Python 解释器。
+  Go 客户端内置本仓 `veilctl/`：
+  脚本按自身位置解析 `veilctl/` 绝对路径（不依赖 cwd）并打印所用目录，执行 `make -C veilctl build`
+  产出 `veilctl/veilctl-linux-amd64`，缺失时显式报错不静默跳过；本仓 `.venv` 仅作 Python 解释器。
   前置：上述 venv、Go 工具链、`cargo build --bin veil`；无 TPM 硬件时脚本内建 Mock TPM 回退
   （`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
 - `gate.sh` — 发布/CI 统一门禁：串联
   `cargo fmt --check`、`cargo clippy --tests --all-targets -- -D warnings`、`cargo test`、
-  `check_doc_paths.py`、`check_file_sizes.py`、`api_conformance.py` 与 `get/` 内
+  `check_doc_paths.py`、`check_file_sizes.py`、`api_conformance.py` 与 `veilctl/` 内
   `go vet ./...`/`go test ./...` 共七步；任一子步骤失败整体非零退出。
   用法：`bash scripts/gate.sh`（仓库根目录执行）。
   前置条件（第 6 步）：Python venv（默认 `<仓库根>/.venv`，依赖 pin 见
   `scripts/requirements-conformance.txt`，可用 `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖）内含
   SDK pin `openai==3.5.0`/`anthropic==1.1.0`
   与 `pykeepass`；Mock TPM 回退由 `api_conformance.py` 内建（`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
-  前置条件（第 7 步）：本机 Go 工具链，在 `get/` 目录内执行；Go 版本由 `get/go.mod`（`go 1.26`）
+  前置条件（第 7 步）：本机 Go 工具链，在 `veilctl/` 目录内执行；Go 版本由 `veilctl/go.mod`（`go 1.26`）
   在 `vet`/`test` 阶段强制（Go ≥1.21 的 `GOTOOLCHAIN=auto` 依 `go.mod` 自动选型/下载；<1.21 时
   版本指令明确报错并非零退出，fail-closed），脚本 **SHALL NOT** 增加版本字符串比较。
   跳过语义：缺 venv/SDK/Go 默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与

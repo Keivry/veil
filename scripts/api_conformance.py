@@ -544,8 +544,8 @@ def cred_post(payload, tag="conformance"):
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "X-Get-Binary-Hash": "conformance-caller-%s" % tag,
-            "X-Get-Binary-Secret": "veil-conformance-secret",
+            "X-Veilctl-Binary-Hash": "conformance-caller-%s" % tag,
+            "X-Veilctl-Secret": "veil-conformance-secret",
         },
         method="POST",
     )
@@ -753,7 +753,7 @@ _MIGRATED_TOML_KEYS = {
     "LLM_UPSTREAM": ("llm", "default_upstream", "str"),
 }
 
-# 进程 env 白名单（恰 10 个具名变量）：仅这些键允许经 `env_extra` 进入子进程 env；
+# 进程 env 白名单（恰 9 个具名变量）：仅这些键允许经 `env_extra` 进入子进程 env；
 # 部署/迁移键必须走 TOML，未知键 fail-closed。`LLM_<port>` 端口键亦不再 env 可读，
 # 由 `[llm.upstreams]` 承载（见 `_toml_document`）。
 _ENV_WHITELIST = frozenset(
@@ -764,9 +764,8 @@ _ENV_WHITELIST = frozenset(
         "VEIL_ALLOW_MOCK_TPM",
         "MATRIX_ACCESS_TOKEN",
         "OBSERVABILITY_ADMIN_TOKEN",
-        "GET_BINARY_SECRET",
-        "CREDENTIAL_SECRET",
-        "GET_BINARY_HASH",
+        "VEILCTL_SECRET",
+        "VEILCTL_BINARY_HASH",
         "PII_VALUE_SAMPLE_HMAC_KEY",
     }
 )
@@ -893,7 +892,7 @@ def start_veil(env_extra):
     # 白名单密钥/开关经进程 env；部署参数经临时 TOML（`VEIL_CONFIG_FILE`）。
     env["MATRIX_ACCESS_TOKEN"] = "syt_dummy_veil_conformance"
     env["OBSERVABILITY_ADMIN_TOKEN"] = "veil-conformance-admin-token-0123456789"
-    env["GET_BINARY_SECRET"] = "veil-conformance-secret"
+    env["VEILCTL_SECRET"] = "veil-conformance-secret"
     if "VEIL_ALLOW_MOCK_TPM" not in env and "VEIL_ALLOW_MOCK_TPM" not in env_surface:
         env_surface["VEIL_ALLOW_MOCK_TPM"] = "1"
     env.update(env_surface)

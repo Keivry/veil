@@ -10,8 +10,8 @@
 
 __pycache__/
 
-# Go 客户端构建产物（含无后缀的 get-credential 与带平台后缀的 get-credential-<os>-<arch>）
-/get/get-credential*
+# Go 客户端构建产物（含无后缀的 veilctl 与带平台后缀的 veilctl-<os>-<arch>）
+/veilctl/veilctl*
 
 # Python 一致性 venv（gate 第 6 步）
 /.venv

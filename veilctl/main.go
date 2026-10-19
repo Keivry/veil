@@ -1,11 +1,11 @@
-// Package main — CLI 入口：get credential <entry> [field]
+// Package main — CLI 入口：veilctl credential <entry> [field]
 package main
 
 import (
 	"fmt"
 	"os"
 
-	"get/cmd"
+	"veilctl/cmd"
 )
 
 func main() {
@@ -36,11 +36,11 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `用法:
-  get credential <条目> [字段] [--raw] [--no-wait]    获取凭据
-  get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段,字段>] [--script-path <路径>] [--no-wait]  注册脚本
-  get revoke --name <名称> [--no-wait]      吊销注册
-  get list                                  列出注册
-  get status                                Proxy 状态
+  veilctl credential <条目> [字段] [--raw] [--no-wait]    获取凭据
+  veilctl register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段,字段>] [--script-path <路径>] [--no-wait]  注册脚本
+  veilctl revoke --name <名称> [--no-wait]      吊销注册
+  veilctl list                                  列出注册
+  veilctl status                                Proxy 状态
 
 环境变量:
   PROXY_URL                Proxy 地址（默认 http://127.0.0.1:8877）

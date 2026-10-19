@@ -1,6 +1,6 @@
 # push / PR 常规 CI：两个 job 并行——
 #   - test：全量 `cargo test --locked`（Rust 网关）；
-#   - go：`get/` 内置 Go 客户端 `go vet ./...` + `go test ./...` + 全静态构建。
+#   - go：`veilctl/` 内置 Go 客户端 `go vet ./...` + `go test ./...` + 全静态构建。
 # 发布流水线见 release.yml（tag 触发：测试门禁 → 二进制 Release + GHCR 镜像），两者共用同一测试口径。
 # 工具链与 runner 选择理由同 release.yml：稳定版 1.98.1 对齐 Dockerfile builder；
 # 测试不产出二进制、无 glibc 基线约束，故用 ubuntu-24.04（ubuntu-22.04 镜像已于 2026-09-17 进入弃用期）。
@@ -47,19 +47,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      # Go 版本由 get/go.mod（go 1.26）声明，setup-go 依此选型/下载；
-      # 与 gate.sh 第 7 步（get/ 内 go vet/go test）同一口径。
+      # Go 版本由 veilctl/go.mod（go 1.26）声明，setup-go 依此选型/下载；
+      # 与 gate.sh 第 7 步（veilctl/ 内 go vet/go test）同一口径。
       - uses: actions/setup-go@v7
         with:
-          go-version-file: get/go.mod
-          cache-dependency-path: get/go.mod
+          go-version-file: veilctl/go.mod
+          cache-dependency-path: veilctl/go.mod
       - name: go vet
-        working-directory: get
+        working-directory: veilctl
         run: go vet ./...
       - name: go test
-        working-directory: get
+        working-directory: veilctl
         run: go test ./...
-      # CGO 关闭 → 全静态；与 release.yml build-get 构建口径一致。
+      # CGO 关闭 → 全静态；与 release.yml build-veilctl 构建口径一致。
       - name: go build（全静态）
-        working-directory: get
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/get-credential .
+        working-directory: veilctl
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/veilctl .

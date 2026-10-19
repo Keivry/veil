@@ -13,7 +13,7 @@ import (
 // TestApprovalRevokeAgainstGatewayE2E 校验默认 `202 + E_PENDING` 审批语义对真实网关的判别力。
 //
 // 破坏性声明：本用例会向网关提交对 `VEIL_APPROVAL_E2E_CALLER` 的**真实吊销审批单**
-// （等价 `get revoke --name <caller>`），只可指向一次性/预发注册；请勿指向生产条目。
+// （等价 `veilctl revoke --name <caller>`），只可指向一次性/预发注册；请勿指向生产条目。
 //
 // 判别方式：先以客户端相同的请求体与 `Content-Type: application/json` 裸发一次
 // `POST /revoke` 取得原始状态码，再关闭等待（`ApprovalWait=false`）调用公开的

@@ -1,4 +1,4 @@
-// Package cmd — get register 子命令
+// Package cmd — veilctl register 子命令
 package cmd
 
 import (
@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"get/internal"
+	"veilctl/internal"
 )
 
 // Register 注册当前脚本到 Proxy
-// Usage: get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]
+// Usage: veilctl register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]
 func Register(args []string) {
-	fs := newFlagSet("register", "用法: get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]")
+	fs := newFlagSet("register", "用法: veilctl register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>] [--script-path <路径>] [--no-wait]")
 	name := fs.String("name", "", "注册名称（必填）")
 	entry := fs.String("entry", "", "允许访问的条目（必填，逗号分隔）")
 	desc := fs.String("desc", "", "程序用途描述")

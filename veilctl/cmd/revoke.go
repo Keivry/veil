@@ -1,17 +1,17 @@
-// Package cmd — get revoke / list / status 子命令
+// Package cmd — veilctl revoke / list / status 子命令
 package cmd
 
 import (
 	"errors"
 	"fmt"
-	"get/internal"
+	"veilctl/internal"
 	"os"
 )
 
 // Revoke 吊销注册
-// Usage: get revoke --name <名称> [--no-wait]
+// Usage: veilctl revoke --name <名称> [--no-wait]
 func Revoke(args []string) {
-	fs := newFlagSet("revoke", "用法: get revoke --name <名称> [--no-wait]")
+	fs := newFlagSet("revoke", "用法: veilctl revoke --name <名称> [--no-wait]")
 	name := fs.String("name", "", "注册名称（必填）")
 	noWait := fs.Bool("no-wait", false, "仅提交审批单，不等待终态（待审批时退出码 2）")
 	parseFlags(fs, args)
@@ -37,7 +37,7 @@ func Revoke(args []string) {
 }
 
 // ListRegistrations 列出所有注册
-// Usage: get list
+// Usage: veilctl list
 func ListRegistrations(args []string) {
 	regs, err := internal.ListRegistrations()
 	if err != nil {
@@ -85,7 +85,7 @@ func joinStrings(items []string, sep string) string {
 }
 
 // Status 查询 Proxy 状态
-// Usage: get status
+// Usage: veilctl status
 func Status(args []string) {
 	st, err := internal.FetchStatus()
 	if err != nil {

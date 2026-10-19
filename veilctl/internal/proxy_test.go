@@ -231,7 +231,7 @@ func TestErrMessageUnmarshal(t *testing.T) {
 		want ErrMessage
 	}{
 		{"字符串形态（Python 基线）", `"鉴权失败"`, "鉴权失败"},
-		{"对象形态取 message", `{"code":"E_AUTH","message":"调用方冒用 get 自身哈希直调，拒绝"}`, "调用方冒用 get 自身哈希直调，拒绝"},
+		{"对象形态取 message", `{"code":"E_AUTH","message":"调用方冒用 veilctl 自身哈希直调，拒绝"}`, "调用方冒用 veilctl 自身哈希直调，拒绝"},
 		{"对象缺 message 回退 code", `{"code":"E_AUTH"}`, "E_AUTH"},
 		{"null 保持空", `null`, ""},
 		{"空对象留空待结构级兜底", `{}`, ""},
@@ -268,7 +268,7 @@ func errorField(v any) ErrMessage {
 }
 
 func TestResponseErrorBodyTolerance(t *testing.T) {
-	gatewayBody := `{"error":{"code":"E_AUTH","message":"调用方冒用 get 自身哈希直调，拒绝"},"error_detail":"调用方冒用 get 自身哈希直调，拒绝"}`
+	gatewayBody := `{"error":{"code":"E_AUTH","message":"调用方冒用 veilctl 自身哈希直调，拒绝"},"error_detail":"调用方冒用 veilctl 自身哈希直调，拒绝"}`
 	pythonBody := `{"error":"旧版字符串错误"}`
 
 	targets := []struct {
@@ -286,7 +286,7 @@ func TestResponseErrorBodyTolerance(t *testing.T) {
 			if err := json.Unmarshal([]byte(gatewayBody), tc.target); err != nil {
 				t.Fatalf("unmarshal failed: %v", err)
 			}
-			if got := errorField(tc.target); got != "调用方冒用 get 自身哈希直调，拒绝" {
+			if got := errorField(tc.target); got != "调用方冒用 veilctl 自身哈希直调，拒绝" {
 				t.Fatalf("got %q, want gateway message", got)
 			}
 		})
@@ -338,8 +338,8 @@ func TestFetchCredentialErrorBodyCompat(t *testing.T) {
 	}{
 		{
 			name: "网关对象错误体",
-			body: `{"error":{"code":"E_AUTH","message":"调用方冒用 get 自身哈希直调，拒绝"},"error_detail":"调用方冒用 get 自身哈希直调，拒绝"}`,
-			want: "调用方冒用 get 自身哈希直调，拒绝",
+			body: `{"error":{"code":"E_AUTH","message":"调用方冒用 veilctl 自身哈希直调，拒绝"},"error_detail":"调用方冒用 veilctl 自身哈希直调，拒绝"}`,
+			want: "调用方冒用 veilctl 自身哈希直调，拒绝",
 		},
 		{
 			name: "Python 字符串错误体",

@@ -3,7 +3,7 @@
 #   1) test       —— 全量 `cargo test --locked` 质量门禁；失败即中止全部发布（其余 job 均依赖它）；
 #   2) build-gnu  —— ubuntu-22.04 构建 x86_64-unknown-linux-gnu 二进制 → tar.gz → 上传 artifact；
 #   3) build-musl —— ubuntu-24.04 用 zig（cargo zigbuild）构建全静态 x86_64-unknown-linux-musl 二进制 → tar.gz → 上传 artifact；
-#   4) build-get  —— ubuntu-24.04 构建 Go 客户端 get-credential（CGO 关闭 → 全静态）→ tar.gz → 上传 artifact；
+#   4) build-veilctl  —— ubuntu-24.04 构建 Go 客户端 veilctl（CGO 关闭 → 全静态）→ tar.gz → 上传 artifact；
 #   5) publish    —— 下载全部 artifact，生成统一 SHA256SUMS，创建 GitHub Release（notes 由提交记录自动生成）；
 #   6) docker     —— 构建 Docker 镜像并推送到 GHCR：ghcr.io/<owner>/<repo>（linux/amd64）。
 #
@@ -131,45 +131,45 @@ jobs:
           path: dist/veil-*.tar.gz
           if-no-files-found: error
 
-  build-get:
+  build-veilctl:
     name: 构建 get 客户端二进制（Go · linux/amd64 全静态）
     needs: [test]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      # Go 版本由 get/go.mod（go 1.26）声明，setup-go 依此选型/下载；与 gate.sh 第 7 步口径一致。
+      # Go 版本由 veilctl/go.mod（go 1.26）声明，setup-go 依此选型/下载；与 gate.sh 第 7 步口径一致。
       - uses: actions/setup-go@v7
         with:
-          go-version-file: get/go.mod
-          cache-dependency-path: get/go.mod
+          go-version-file: veilctl/go.mod
+          cache-dependency-path: veilctl/go.mod
       # CGO 关闭 → 全静态（无 libc 依赖）；-trimpath 去源码绝对路径、-s -w 去符号表，减小体积且可复现。
-      - name: 构建 get-credential（全静态）
-        working-directory: get
+      - name: 构建 veilctl（全静态）
+        working-directory: veilctl
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o get-credential .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o veilctl .
       - name: 校验产物为全静态（statically linked）
-        run: file get/get-credential | grep -q "statically linked"
+        run: file veilctl/veilctl | grep -q "statically linked"
       - name: 打包 tar.gz
         run: |
           set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"
-          pkg="get-credential-${ver}-linux-amd64.tar.gz"
+          pkg="veilctl-${ver}-linux-amd64.tar.gz"
           mkdir -p dist/stage/docs
-          cp get/get-credential dist/stage/get-credential
+          cp veilctl/veilctl dist/stage/veilctl
           cp README.md dist/stage/README.md
           cp docs/engineering-reference.md dist/stage/docs/
-          tar -C dist/stage -czf "dist/${pkg}" get-credential README.md docs/engineering-reference.md
+          tar -C dist/stage -czf "dist/${pkg}" veilctl README.md docs/engineering-reference.md
       - name: 上传 get 产物
         uses: actions/upload-artifact@v7
         with:
           name: veil-get
-          path: dist/get-credential-*.tar.gz
+          path: dist/veilctl-*.tar.gz
           if-no-files-found: error
 
   publish:
     name: 汇总产物并创建 Release
-    needs: [build-gnu, build-musl, build-get]
+    needs: [build-gnu, build-musl, build-veilctl]
     runs-on: ubuntu-24.04
     steps:
       - name: 下载构建产物（gnu + musl + get 合并到同一目录）

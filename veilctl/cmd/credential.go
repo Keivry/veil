@@ -1,4 +1,4 @@
-// Package cmd — get credential 子命令
+// Package cmd — veilctl credential 子命令
 package cmd
 
 import (
@@ -7,14 +7,14 @@ import (
 	"os"
 	"sort"
 
-	"get/internal"
+	"veilctl/internal"
 )
 
 // Credential 获取凭据
-// Usage: get credential <条目> [字段] [--raw] [--no-wait]
+// Usage: veilctl credential <条目> [字段] [--raw] [--no-wait]
 func Credential(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "用法: get credential <条目> [字段] [--raw] [--no-wait]")
+		fmt.Fprintln(os.Stderr, "用法: veilctl credential <条目> [字段] [--raw] [--no-wait]")
 		os.Exit(1)
 	}
 
@@ -39,12 +39,12 @@ func Credential(args []string) {
 	auth := internal.BuildAuth()
 
 	// ── 安全：禁止终端直接调用 --raw ──
-	// 当 caller_hash == get_binary_hash 时，表示 get 被终端/bash 直接调用
+	// 当 caller_hash == veilctl_binary_hash 时，表示 get 被终端/bash 直接调用
 	// （而不是从脚本中通过 subprocess.run 调用）。此时 --raw 应被拒绝，
 	// 强制用户通过脚本文件获取原始凭据，防止 LLM 上下文直接接触明文。
 	if raw {
 		callerHash := auth["caller_hash"]
-		binaryHash := auth["get_binary_hash"]
+		binaryHash := auth["veilctl_binary_hash"]
 		if callerHash != "" && callerHash == binaryHash {
 			fmt.Fprintln(os.Stderr, "错误: --raw 只允许在脚本文件中使用。")
 			fmt.Fprintln(os.Stderr, "请在脚本内通过 subprocess.run 调用 get，而不是直接在终端输入。")

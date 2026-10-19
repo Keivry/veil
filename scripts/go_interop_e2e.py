@@ -6,7 +6,7 @@
 # 复用 api_conformance.py 的 MockUpstream / start_veil / raw_post / 临时 kdbx 设施，
 # 覆盖：5.1 Go 直连取用全链路（整条目/单字段原文/status/转发以 HTTP 代表）+
 # 5.2 三因子齐全放行与缺失/错误明确拒绝（含 403 与转审 202）+ 5.3 Go 消费阻断流终止。
-# Go 二进制经 make build 产出 get-credential-linux-amd64；veil 经 cargo build --bin veil。
+# Go 二进制经 make build 产出 veilctl-linux-amd64；veil 经 cargo build --bin veil。
 # 打印 PASS/FAIL <name> 与耗时，汇总「共 N 项，失败 M 项」，失败非零退出。
 # 前置不可得（TPM/pykeepass/go 工具链/网络）时显式报错并非零退出，不静默跳过。
 
@@ -29,10 +29,10 @@ VEIL_ROOT = ac.VEIL_ROOT
 GATEWAY = ac.GATEWAY
 SECRET = "veil-conformance-secret"
 
-# Go 客户端内置本仓 get/：
+# Go 客户端内置本仓 veilctl/：
 # 按脚本所在位置解析绝对路径，不依赖当前工作目录（cwd）。
-GET_DIR = os.path.join(VEIL_ROOT, "get")
-GO_BIN = os.path.join(GET_DIR, "get-credential-linux-amd64")
+GET_DIR = os.path.join(VEIL_ROOT, "veilctl")
+GO_BIN = os.path.join(GET_DIR, "veilctl-linux-amd64")
 
 RESULTS = []
 WRAP_DIR = None
@@ -71,7 +71,7 @@ def build_all():
     if make.returncode != 0:
         print(make.stdout[-3000:])
         print(make.stderr[-3000:])
-        raise SystemExit("make -C get build 失败")
+        raise SystemExit("make -C veilctl build 失败")
     if not os.path.exists(GO_BIN):
         raise SystemExit("Go 二进制缺失: %s" % GO_BIN)
 
@@ -106,7 +106,7 @@ def make_wrapper(tag):
 def run_go(tag, args, secret=SECRET, timeout=60):
     wrapper = make_wrapper(tag)
     env = dict(os.environ)
-    env["GET_BINARY_SECRET"] = secret
+    env["VEILCTL_SECRET"] = secret
     env["PROXY_URL"] = GATEWAY
     env["PROXY_HTTP_TIMEOUT"] = "30"
     return subprocess.run(
@@ -206,9 +206,9 @@ def s52_http_missing_caller():
         {
             "entry": "网易",
             "token": True,
-            "auth": {"get_binary_hash": "sha256:x", "get_binary_secret": SECRET},
+            "auth": {"veilctl_binary_hash": "sha256:x", "veilctl_secret": SECRET},
         },
-        {"X-Get-Binary-Secret": SECRET},
+        {"X-Veilctl-Secret": SECRET},
     )
     assert status == 403, (status, body)
     text = json.dumps(body, ensure_ascii=False)
@@ -218,7 +218,7 @@ def s52_http_missing_caller():
 
 def s52_http_missing_auth():
     status, body = http_post(
-        "/credential", {"entry": "网易", "token": True}, {"X-Get-Binary-Secret": SECRET}
+        "/credential", {"entry": "网易", "token": True}, {"X-Veilctl-Secret": SECRET}
     )
     assert status == 403, (status, body)
     code = (body.get("error") or {}).get("code")
@@ -235,11 +235,11 @@ def s52_http_wrong_secret():
             "auth": {
                 "caller_hash": "sha256:caller-x",
                 "caller_path": "/srv/x.sh",
-                "get_binary_hash": "sha256:x",
-                "get_binary_secret": "wrong",
+                "veilctl_binary_hash": "sha256:x",
+                "veilctl_secret": "wrong",
             },
         },
-        {"X-Get-Binary-Secret": "wrong-secret"},
+        {"X-Veilctl-Secret": "wrong-secret"},
     )
     assert status == 403, (status, body)
     text = json.dumps(body, ensure_ascii=False)
@@ -271,11 +271,11 @@ def s52_http_transfer_202():
             "auth": {
                 "caller_hash": "sha256:deadbeef",
                 "caller_path": path,
-                "get_binary_hash": "sha256:x",
-                "get_binary_secret": SECRET,
+                "veilctl_binary_hash": "sha256:x",
+                "veilctl_secret": SECRET,
             },
         },
-        {"X-Get-Binary-Secret": SECRET},
+        {"X-Veilctl-Secret": SECRET},
     )
     assert status == 202, (status, body)
     code = (body.get("error") or {}).get("code")
@@ -288,7 +288,7 @@ def run_abuse_case(mock_port, work):
     veil = ac.start_veil(
         {
             "DB_DIR": work,
-            "GET_BINARY_HASH": get_hash,
+            "VEILCTL_BINARY_HASH": get_hash,
             "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port,
         }
     )
@@ -301,11 +301,11 @@ def run_abuse_case(mock_port, work):
                 "auth": {
                     "caller_hash": get_hash,
                     "caller_path": "/srv/direct.sh",
-                    "get_binary_hash": get_hash,
-                    "get_binary_secret": SECRET,
+                    "veilctl_binary_hash": get_hash,
+                    "veilctl_secret": SECRET,
                 },
             },
-            {"X-Get-Binary-Hash": get_hash, "X-Get-Binary-Secret": SECRET},
+            {"X-Veilctl-Binary-Hash": get_hash, "X-Veilctl-Secret": SECRET},
         )
         assert status == 403, (status, body)
         text = json.dumps(body, ensure_ascii=False)
@@ -313,7 +313,7 @@ def run_abuse_case(mock_port, work):
     finally:
         veil.terminate()
         veil.wait(timeout=15)
-    return "caller_hash == GET_BINARY_HASH（token=false）403 拒绝"
+    return "caller_hash == VEILCTL_BINARY_HASH（token=false）403 拒绝"
 
 
 def build_sse_e2e_binary(tmpdir):
@@ -378,7 +378,7 @@ def main():
         veil.wait(timeout=15)
 
     check(
-        "5.2 caller_hash 冒用 GET_BINARY_HASH 403",
+        "5.2 caller_hash 冒用 VEILCTL_BINARY_HASH 403",
         lambda: run_abuse_case(mock_port, work),
     )
 

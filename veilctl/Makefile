@@ -1,6 +1,6 @@
 .PHONY: build clean install test vet check
 
-BINARY ?= ./get-credential-linux-amd64
+BINARY ?= ./veilctl-linux-amd64
 
 build:
 	go build -o $(BINARY) .

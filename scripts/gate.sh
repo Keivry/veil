@@ -10,7 +10,7 @@
 #      保证，脚本不校验
 #   5) python3 scripts/check_file_sizes.py
 #   6) scripts/api_conformance.py（真 SDK 一致性，24 项）
-#   7) get/ 内 go vet ./... + go test ./...（内置 Go 客户端静态检查与单测）
+#   7) veilctl/ 内 go vet ./... + go test ./...（内置 Go 客户端静态检查与单测）
 #
 # 前置条件（第 6 步）：
 #   - Python venv：默认 `<veil 仓库>/.venv/bin/python`（依赖 pin 见
@@ -21,9 +21,9 @@
 #     生产必须接 TPM 2.0 硬件）。
 #
 # 前置条件（第 7 步）：
-#   - Go 工具链：`go vet`/`go test` 需本机 Go 可执行文件，在 `get/` 目录内执行；
+#   - Go 工具链：`go vet`/`go test` 需本机 Go 可执行文件，在 `veilctl/` 目录内执行；
 #     缺失且未显式跳过时 fail-fast 非零退出。
-#   - Go 版本由 `get/go.mod`（`go 1.26`）在 `vet`/`test` 阶段强制：Go ≥1.21 的
+#   - Go 版本由 `veilctl/go.mod`（`go 1.26`）在 `vet`/`test` 阶段强制：Go ≥1.21 的
 #     `GOTOOLCHAIN=auto` 会依 `go.mod` 自动选型/下载；<1.21 时版本指令在 `vet`/`test`
 #     阶段明确报错并非零退出（fail-closed）。本脚本 SHALL NOT 增加版本字符串比较
 #     （会把本可成功的环境误判失败）。
@@ -42,7 +42,7 @@ cd "$VEIL_ROOT" || exit 1
 
 CONFORMANCE_PY="${VEIL_CONFORMANCE_PYTHON:-$VEIL_ROOT/.venv/bin/python}"
 SKIP_CONFORMANCE="${GATE_SKIP_CONFORMANCE:-0}"
-GO_DIR="$VEIL_ROOT/get"
+GO_DIR="$VEIL_ROOT/veilctl"
 SKIP_GO="${GATE_SKIP_GO:-0}"
 
 run_step() {
@@ -78,7 +78,7 @@ run_conformance_precheck() {
 run_go_precheck() {
   if ! command -v go >/dev/null 2>&1; then
     echo "!! 前置条件缺失（第 7 步 go）：未找到 Go 工具链（go 可执行文件不在 PATH）" >&2
-    echo "   安装 Go 1.26+（版本要求见 get/go.mod）后重试；详见 工程参考 §8.5 与 scripts/README.md。" >&2
+    echo "   安装 Go 1.26+（版本要求见 veilctl/go.mod）后重试；详见 工程参考 §8.5 与 scripts/README.md。" >&2
     echo "   若为有意跳过，请显式设置 GATE_SKIP_GO=1（会打印跳过理由）。" >&2
     exit 1
   fi
@@ -98,7 +98,7 @@ else
 fi
 if [ "$SKIP_GO" = "1" ]; then
   echo "==> [7/7 go] 显式跳过（GATE_SKIP_GO=1）"
-  echo "    跳过理由：Go 客户端 vet/test 需本机 Go 工具链（get/go.mod 要求 go 1.26），"
+  echo "    跳过理由：Go 客户端 vet/test 需本机 Go 工具链（veilctl/go.mod 要求 go 1.26），"
   echo "    本环境未声明具备或有意跳过；口径与前置条件见 工程参考 §8.5 与 scripts/README.md。"
 else
   run_go_precheck
