@@ -554,6 +554,18 @@ pub async fn admin_commands(
     ) {
         return r;
     }
+    if !state.config().command.enabled {
+        let body = Json(json!({
+            "ok": true,
+            "items": [],
+            "total": 0,
+            "limit": crate::service::command::log_store::LOG_DEFAULT_LIMIT,
+            "offset": 0,
+            "note": "命令能力未启用（[command].enabled = false），无调用日志",
+        }))
+        .into_response();
+        return with_admin_cookie(body, &headers, &state.config().observability_admin_token);
+    }
     let filter = crate::service::command::LogFilter {
         limit: query.get("limit").and_then(|s| s.parse().ok()),
         offset: query.get("offset").and_then(|s| s.parse().ok()),

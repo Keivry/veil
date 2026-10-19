@@ -447,11 +447,13 @@
 <script>
 (function () {
   'use strict';
-  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null, cmdLimit: 50, cmdOffset: 0, cmdTotal: 0, cmdCommand: '', cmdStatus: '' };
+  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null, cmdLimit: 50, cmdOffset: 0, cmdTotal: 0, cmdCommand: '', cmdStatus: '', lastCmdReload: 0 };
 
   // 回退轮询间隔：管理面通用桶 10 次/分钟，断线后单端点每 15 秒轮询一次，
   // 仅占约 4 次/分钟；剩余预算留给登录探针与手动操作，恢复后立即停轮询。
   var FALLBACK_POLL_MS = 15000;
+  // 命令分区刷新去抖：SSE 事件密集时避免自撞 10/min 管理限流。
+  var CMD_RELOAD_MIN_MS = 15000;
   var RECONNECT_MS = 3000;
   var EVENT_LIMIT = 100;
   // SVG 命名空间：拆写避免字面量，取值仍为标准 SVG 命名空间。
@@ -553,7 +555,7 @@
     // 分区可见后按真实宽度重绘依赖 clientWidth 的图表（横向条形 / 趋势）。
     if (sec === 'redaction' && state.metrics) renderDist(state.metrics);
     if (sec === 'overview' && state.series) renderTrend(state.series);
-    if (sec === 'commands') reloadCommands();
+    if (sec === 'commands') reloadCommands(true);
   }
 
   // 主题：persist 为真时写 veil_theme Cookie（仅用户手动切换），否则只更新 UI。
@@ -1358,7 +1360,7 @@
       try {
         var parsed = JSON.parse(ev.data);
         prependEvent(parsed);
-        if (parsed && parsed.kind === 'command' && !$('sec-commands').hidden) reloadCommands();
+        if (parsed && parsed.kind === 'command' && !$('sec-commands').hidden) reloadCommands(false);
       } catch (ignored) { /* 坏帧跳过 */ }
     });
     es.addEventListener('metrics', function (ev) {
@@ -1381,9 +1383,16 @@
   // ── 回退：断线时单端点轮询，恢复即停 ──
   function startFallback() {
     if (state.fallbackTimer) return;
+    var tick = 0;
     state.fallbackTimer = setInterval(function () {
       // 退避窗口内不轮询：限流时按服务端 retry-after 让路，不持续占桶。
       if (Date.now() < state.retryAt || Date.now() < state.streamRetryAt) return;
+      // 每次只打一个端点：偶数拍拉指标，奇数拍拉当前可见的命令分区。
+      var commandsVisible = !$('sec-commands').hidden;
+      if (commandsVisible && (tick++ % 2 === 1)) {
+        reloadCommands(true);
+        return;
+      }
       api('/_admin/metrics?range=' + encodeURIComponent(state.range)).then(function (m) {
         onMetricsTree(m);
       }).catch(function (err) {
@@ -1447,7 +1456,10 @@
     $('cmd-next').disabled = state.cmdOffset + state.cmdLimit >= state.cmdTotal;
   }
 
-  function reloadCommands() {
+  function reloadCommands(force) {
+    var now = Date.now();
+    if (!force && now - state.lastCmdReload < CMD_RELOAD_MIN_MS) return;
+    state.lastCmdReload = now;
     var q = '/_admin/commands?limit=' + state.cmdLimit + '&offset=' + state.cmdOffset;
     if (state.cmdCommand) q += '&command=' + encodeURIComponent(state.cmdCommand);
     if (state.cmdStatus) q += '&approval_status=' + encodeURIComponent(state.cmdStatus);
@@ -1513,15 +1525,15 @@
       state.cmdCommand = $('cmd-command').value.trim();
       state.cmdStatus = $('cmd-status').value.trim();
       state.cmdOffset = 0;
-      reloadCommands();
+      reloadCommands(true);
     });
     $('cmd-prev').addEventListener('click', function () {
       state.cmdOffset = Math.max(0, state.cmdOffset - state.cmdLimit);
-      reloadCommands();
+      reloadCommands(true);
     });
     $('cmd-next').addEventListener('click', function () {
       state.cmdOffset += state.cmdLimit;
-      reloadCommands();
+      reloadCommands(true);
     });
     $('ev-apply').addEventListener('click', function () {
       state.kind = $('ev-kind').value.trim();
