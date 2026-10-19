@@ -62,7 +62,10 @@ pub struct TargetSpec {
 /// 调用结果：待审批或终态。
 #[derive(Debug, Clone)]
 pub enum InvokeResult {
-    Pending { message: String },
+    Pending {
+        message: String,
+        approval_event_id: String,
+    },
     Terminal(Terminal),
 }
 
@@ -72,6 +75,7 @@ pub enum Terminal {
     Executed {
         approval_status: String,
         approval_event_id: Option<String>,
+        host: String,
         output: CommandOutput,
     },
     Denied {
@@ -312,6 +316,7 @@ pub async fn invoke(
             }
             return Ok(InvokeResult::Pending {
                 message: "命令调用待审批".to_string(),
+                approval_event_id: pending.event_id.clone(),
             });
         }
         None => {}
@@ -319,7 +324,10 @@ pub async fn invoke(
 
     check_rate(
         &runtime.hits,
-        &format!("command:{}:{command_id}:{host}", caller.caller_path),
+        &format!(
+            "command:{}:{}:{command_id}:{host}",
+            caller.caller_path, caller.caller_hash
+        ),
         crate::config::CREDENTIAL_RATE_WINDOW_SECS,
     )
     .await?;
@@ -332,8 +340,8 @@ pub async fn invoke(
     let auto_allowed =
         caller.registered && (!def.requires_approval || static_auto || runtime_grant);
     if auto_allowed {
-        let output = run_command(state, &def.program, &argv, def.timeout_secs).await;
-        let terminal = terminal_from_output(None, "not_required", output);
+        let output = run_command(state, &host, &def.program, &argv, def.timeout_secs).await;
+        let terminal = terminal_from_output(None, "not_required", &host, output);
         log_terminal(
             state,
             &caller,
@@ -397,6 +405,7 @@ pub async fn invoke(
     });
     Ok(InvokeResult::Pending {
         message: "命令调用待审批".to_string(),
+        approval_event_id: event_id,
     })
 }
 
@@ -443,16 +452,21 @@ fn validate_params(
             ParameterKind::Integer => match value {
                 Value::Number(number) => {
                     number
-                        .as_i64()
+                        .as_u64()
                         .map(|n| n.to_string())
                         .ok_or_else(|| VeilError::BadRequest {
-                            message: format!("参数 {name} 须为整数"),
+                            message: format!("参数 {name} 须为非负整数"),
                         })?
                 }
                 Value::String(text) => {
-                    text.parse::<i64>().map(|n| n.to_string()).map_err(|_| {
+                    if text.starts_with('-') {
+                        return Err(VeilError::BadRequest {
+                            message: format!("参数 {name} 不得以 `-` 开头（防选项注入）"),
+                        });
+                    }
+                    text.parse::<u64>().map(|n| n.to_string()).map_err(|_| {
                         VeilError::BadRequest {
-                            message: format!("参数 {name} 须为整数"),
+                            message: format!("参数 {name} 须为非负整数"),
                         }
                     })?
                 }
@@ -469,6 +483,11 @@ fn validate_params(
                 if text.chars().count() > PARAM_STRING_MAX_CHARS {
                     return Err(VeilError::BadRequest {
                         message: format!("参数 {name} 超过 {PARAM_STRING_MAX_CHARS} 字符上限"),
+                    });
+                }
+                if text.starts_with('-') {
+                    return Err(VeilError::BadRequest {
+                        message: format!("参数 {name} 不得以 `-` 开头（防选项注入）"),
                     });
                 }
                 text.to_string()
@@ -496,11 +515,14 @@ async fn drive_pending(
     if let Some(ExecutionEntry::Done(terminal)) = state.command().entry(key) {
         return Some((*terminal).clone());
     }
-    let decision = state.approval().decision(&pending.event_id).await;
-    if let Some(decision) = decision {
-        return Some(complete(state, key, pending, decision).await);
+    match state.approval().decision(&pending.event_id).await {
+        // 已落定（批准/拒绝）。
+        Some(Some(decision)) => return Some(complete(state, key, pending, Some(decision)).await),
+        // 票仍在待审：重入必须继续返回 202，不得当作超时。
+        Some(None) => return None,
+        // 票已消失：可能是并发 complete 正在执行（持 key 锁）或审批票被回收。
+        None => {}
     }
-    // 票已消失：可能是并发 complete 正在执行（持 key 锁）或审批票被回收。
     let lock = state.command().key_lock(key).await;
     let _guard = lock.lock().await;
     match state.command().entry(key) {
@@ -538,9 +560,20 @@ async fn complete(
                     .insert(&pending.caller_path, &pending.command_id, &pending.host)
                     .await;
             }
-            let output =
-                run_command(state, &pending.program, &pending.argv, pending.timeout_secs).await;
-            terminal_from_output(Some(pending.event_id.clone()), "approved", output)
+            let output = run_command(
+                state,
+                &pending.host,
+                &pending.program,
+                &pending.argv,
+                pending.timeout_secs,
+            )
+            .await;
+            terminal_from_output(
+                Some(pending.event_id.clone()),
+                "approved",
+                &pending.host,
+                output,
+            )
         }
         Some(false) => Terminal::Denied {
             approval_status: "denied".to_string(),
@@ -573,15 +606,17 @@ async fn complete(
 
 async fn run_command(
     state: &impl crate::service::credential::AppStateParts,
+    host: &str,
     program: &std::path::Path,
     argv: &[String],
     timeout_secs: u64,
 ) -> std::result::Result<CommandOutput, String> {
     let backend = state.command().backend.clone();
+    let host = host.to_string();
     let program = program.to_path_buf();
     let argv = argv.to_vec();
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    tokio::task::spawn_blocking(move || backend.run_blocking(&program, &argv, timeout))
+    tokio::task::spawn_blocking(move || backend.run_blocking(&host, &program, &argv, timeout))
         .await
         .map_err(|err| format!("执行任务异常: {err}"))?
         .map_err(|err| format!("命令启动失败: {err:#}"))
@@ -590,12 +625,14 @@ async fn run_command(
 fn terminal_from_output(
     event_id: Option<String>,
     approval_status: &str,
+    host: &str,
     output: std::result::Result<CommandOutput, String>,
 ) -> Terminal {
     match output {
         Ok(output) => Terminal::Executed {
             approval_status: approval_status.to_string(),
             approval_event_id: event_id,
+            host: host.to_string(),
             output,
         },
         Err(message) => Terminal::ExecError {
@@ -658,10 +695,7 @@ async fn log_terminal(
         tracing::warn!("命令调用日志写入失败: {err:#}");
     }
     let summary = format!(
-        "{} {}@{} by {} -> {}",
-        command_id,
-        command_id,
-        host,
+        "{command_id}@{host} by {} -> {}",
         caller.caller_path,
         terminal.exec_status()
     );

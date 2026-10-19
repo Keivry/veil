@@ -34,7 +34,7 @@ fn script(dir: &std::path::Path, body: &str) -> PathBuf {
     path
 }
 
-const COUNTER_SCRIPT: &str = "#!/bin/sh\necho ran >> counter.log\necho ok\nexit 0\n";
+const COUNTER_SCRIPT: &str = "#!/bin/sh\nsleep 0.2\necho ran >> counter.log\necho ok\nexit 0\n";
 const FAIL_SCRIPT: &str = "#!/bin/sh\necho boom >&2\nexit 3\n";
 
 fn command_config(dir: &std::path::Path, body: &str, requires_approval: bool) -> CommandConfig {
@@ -76,6 +76,54 @@ allow_commands = ["run"]
 }
 
 fn disabled_config() -> CommandConfig { CommandConfig::default() }
+
+fn config_with_auto_approve(dir: &std::path::Path, body: &str) -> CommandConfig {
+    let mut cfg = command_config(dir, body, true);
+    if let Some(downstream) = cfg.downstreams.get_mut("ci") {
+        downstream.auto_approve = vec![veil::config::command::AutoApproveRule {
+            command: "run".to_string(),
+            hosts: vec!["fleet".to_string()],
+        }];
+    }
+    cfg
+}
+
+/// 从 TOML 解析：`run` 不声明 `requires_approval`，验证缺省为 true。
+fn config_without_requires_approval(dir: &std::path::Path, body: &str) -> CommandConfig {
+    let program = script(dir, body);
+    let text = format!(
+        r#"
+[command]
+enabled = true
+
+[command.hosts.api]
+kind = "local"
+
+[command.commands.run]
+program = "{program}"
+args = ["--target", "{{target}}"]
+usage = "run --target <host>"
+hosts = ["api"]
+timeout_secs = 10
+
+[command.commands.run.parameters.target]
+kind = "enum"
+values = ["api"]
+
+[command.downstreams.ci]
+callers = ["/opt/ci/agent.sh"]
+allow_commands = ["run"]
+"#,
+        program = program.display(),
+    );
+    let parsed: FileConfig = toml::from_str(&text).expect("命令配置须可解析");
+    let cfg = validate_command(parsed.command.as_ref()).expect("命令配置须通过校验");
+    assert!(
+        cfg.commands["run"].requires_approval,
+        "未声明 requires_approval 须缺省为 true"
+    );
+    cfg
+}
 
 fn app(dir: &std::path::Path, cfg: CommandConfig) -> (axum::Router, AppState) {
     let data_dir = dir.to_path_buf();
@@ -228,7 +276,7 @@ async fn auto_approved_invoke_executes_and_logs() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["exit_code"], 0);
     assert_eq!(body["stdout"].as_str().unwrap().trim_end(), "ok");
-    assert!(dir.join("counter.log").exists());
+    assert!(dir.join("command-work").join("counter.log").exists());
 
     let page = state.command().log.query(Default::default()).await.unwrap();
     assert_eq!(page.total, 1);
@@ -330,7 +378,6 @@ async fn undeclared_param_rejected_400() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
-    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     let resp = client
         .post(format!("{base}/commands/run/invoke"))
         .headers(auth_headers("hash-ci"))
@@ -357,7 +404,7 @@ async fn unregistered_caller_not_auto_approved() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 202);
-    assert!(!dir.join("counter.log").exists());
+    assert!(!dir.join("command-work").join("counter.log").exists());
     handle.abort();
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -408,7 +455,7 @@ async fn approval_then_reentry_executes_exactly_once() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "重复重入返回同一终态");
 
-    let runs = std::fs::read_to_string(dir.join("counter.log")).unwrap();
+    let runs = std::fs::read_to_string(dir.join("command-work").join("counter.log")).unwrap();
     assert_eq!(runs.lines().count(), 1, "同一次审批至多执行一次");
     handle.abort();
     std::fs::remove_dir_all(&dir).ok();
@@ -458,7 +505,7 @@ async fn concurrent_reentry_executes_exactly_once() {
     for task in tasks {
         assert_eq!(task.await.unwrap(), 200);
     }
-    let runs = std::fs::read_to_string(dir.join("counter.log")).unwrap();
+    let runs = std::fs::read_to_string(dir.join("command-work").join("counter.log")).unwrap();
     assert_eq!(runs.lines().count(), 1, "并发重入仅执行一次");
     handle.abort();
     std::fs::remove_dir_all(&dir).ok();
@@ -495,7 +542,7 @@ async fn denied_approval_returns_403_and_logs_denied() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
-    assert!(!dir.join("counter.log").exists());
+    assert!(!dir.join("command-work").join("counter.log").exists());
 
     let page = state.command().log.query(Default::default()).await.unwrap();
     assert_eq!(page.items[0]["approval_status"], "denied");
@@ -679,11 +726,322 @@ async fn ticket_removed_reentry_records_timeout() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
-    assert!(!dir.join("counter.log").exists());
+    assert!(!dir.join("command-work").join("counter.log").exists());
 
     let page = state.command().log.query(Default::default()).await.unwrap();
     assert_eq!(page.items[0]["approval_status"], "timeout");
     assert_eq!(page.items[0]["exec_status"], "not_run");
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn pending_reentry_keeps_returning_202() {
+    let dir = temp_dir("pending-reentry");
+    let (app, state) = app(&dir, command_config(&dir, COUNTER_SCRIPT, true));
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status().as_u16(), 202);
+    let first_body: Value = first.json().await.unwrap();
+    let event_id = first_body["approval_event_id"]
+        .as_str()
+        .expect("202 须返回审批 event id")
+        .to_string();
+
+    // 审批尚未落定：重入必须继续 202，不得被当作超时。
+    for _ in 0..3 {
+        let resp = client
+            .post(format!("{base}/commands/run/invoke"))
+            .headers(auth_headers("hash-ci"))
+            .json(&invoke_body("api"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 202, "待审重入须保持 202");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["approval_event_id"], event_id, "同一审批复用同一单");
+    }
+    assert_eq!(
+        state.approval.pending_event_ids().await.len(),
+        1,
+        "不得重复建单"
+    );
+    assert!(!dir.join("command-work").join("counter.log").exists());
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn static_auto_approve_rule_skips_approval() {
+    let dir = temp_dir("static-auto");
+    let (app, state) = app(&dir, config_with_auto_approve(&dir, COUNTER_SCRIPT));
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "静态 auto_approve 须直接执行");
+    assert!(state.approval.pending_event_ids().await.is_empty());
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn approved_then_failed_is_recorded_separately() {
+    let dir = temp_dir("approved-failed");
+    let (app, state) = app(&dir, command_config(&dir, FAIL_SCRIPT, true));
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let event_id = state
+        .approval
+        .pending_event_ids()
+        .await
+        .into_iter()
+        .next()
+        .expect("须建审批单");
+    state.approval.resolve(&event_id, "", true).await;
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["host"], "api");
+    let page = state.command().log.query(Default::default()).await.unwrap();
+    assert_eq!(page.items[0]["approval_status"], "approved");
+    assert_eq!(page.items[0]["exec_status"], "failed");
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn invoke_without_deploy_secret_returns_403() {
+    let dir = temp_dir("post-nosecret");
+    let (app, state) = app(&dir, command_config(&dir, COUNTER_SCRIPT, false));
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .header("x-caller-hash", "hash-ci")
+        .header("x-caller-path", "/opt/ci/agent.sh")
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn unbound_caller_invoke_returns_403() {
+    let dir = temp_dir("post-unbound");
+    let (app, state) = app(&dir, command_config(&dir, COUNTER_SCRIPT, false));
+    enroll(&state, "/opt/other/agent.sh", "hash-other").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let mut headers = auth_headers("hash-other");
+    headers.insert("x-caller-path", "/opt/other/agent.sh".parse().unwrap());
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(headers)
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn catalog_excludes_commands_outside_allow_list() {
+    let dir = temp_dir("catalog-exclude");
+    let mut cfg = command_config(&dir, COUNTER_SCRIPT, false);
+    let program = cfg.commands.get("run").unwrap().program.clone();
+    cfg.commands.insert(
+        "hidden".to_string(),
+        veil::config::CommandDef {
+            program,
+            args: Vec::new(),
+            usage: "hidden".to_string(),
+            description: String::new(),
+            hosts: vec!["api".to_string()],
+            timeout_secs: 10,
+            requires_approval: false,
+            parameters: Default::default(),
+        },
+    );
+    let (app, state) = app(&dir, cfg);
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let body: Value = client
+        .get(format!("{base}/commands"))
+        .headers(auth_headers("hash-ci"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = body["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["run"], "目录不得包含 allow_commands 之外的命令");
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn accept_always_survives_restart() {
+    let dir = temp_dir("always-restart");
+    let cfg = command_config(&dir, COUNTER_SCRIPT, true);
+    let (router, state) = app(&dir, cfg.clone());
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(router).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let event_id = state
+        .approval
+        .pending_event_ids()
+        .await
+        .into_iter()
+        .next()
+        .expect("须建审批单");
+    state
+        .approval
+        .resolve_with_auto(&event_id, "", true, true)
+        .await;
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    handle.abort();
+
+    // 同一数据目录重建状态：运行时授权须从磁盘加载。
+    let (router2, state2) = app(&dir, cfg);
+    enroll(&state2, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base2, handle2) = serve(router2).await;
+    let resp = client
+        .post(format!("{base2}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "重启后 accept-always 须仍生效");
+    assert!(state2.approval.pending_event_ids().await.is_empty());
+    handle2.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_commands_disabled_returns_empty_page() {
+    let dir = temp_dir("admin-disabled");
+    let (app, _state) = app(&dir, disabled_config());
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/_admin/commands"))
+        .header("X-Admin-Token", ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn string_param_cannot_start_with_dash() {
+    let dir = temp_dir("dash-param");
+    let mut cfg = command_config(&dir, COUNTER_SCRIPT, false);
+    if let Some(def) = cfg.commands.get_mut("run") {
+        def.parameters.insert(
+            "target".to_string(),
+            veil::config::ParameterDef {
+                kind: veil::config::ParameterKind::String,
+            },
+        );
+        def.args = vec!["--target".to_string(), "{target}".to_string()];
+    }
+    let (app, state) = app(&dir, cfg);
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(app).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&json!({"target": {"host": "api"}, "params": {"target": "--evil"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn requires_approval_defaults_to_true() {
+    let dir = temp_dir("default-approval");
+    let (router, state) = app(&dir, config_without_requires_approval(&dir, COUNTER_SCRIPT));
+    enroll(&state, "/opt/ci/agent.sh", "hash-ci").await;
+    let (base, handle) = serve(router).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/commands/run/invoke"))
+        .headers(auth_headers("hash-ci"))
+        .json(&invoke_body("api"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202, "缺省须进入审批");
+    assert!(!dir.join("command-work").join("counter.log").exists());
     handle.abort();
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -57,9 +57,16 @@ pub async fn command_invoke_handler(
 ) -> Result<Response> {
     let result = service::command::invoke(&state, &command_headers(&headers), &id, request).await?;
     Ok(match result {
-        InvokeResult::Pending { message } => (
+        InvokeResult::Pending {
+            message,
+            approval_event_id,
+        } => (
             StatusCode::ACCEPTED,
-            Json(json!({"ok": false, "error": {"code": "E_PENDING", "message": message}})),
+            Json(json!({
+                "ok": false,
+                "approval_event_id": approval_event_id,
+                "error": {"code": "E_PENDING", "message": message},
+            })),
         )
             .into_response(),
         InvokeResult::Terminal(terminal) => terminal_response(&id, terminal),
@@ -68,11 +75,12 @@ pub async fn command_invoke_handler(
 
 fn terminal_response(command_id: &str, terminal: Terminal) -> Response {
     match terminal {
-        Terminal::Executed { output, .. } => (
+        Terminal::Executed { host, output, .. } => (
             StatusCode::OK,
             Json(json!({
                 "ok": output.exit_code == Some(0) && !output.timed_out,
                 "command": command_id,
+                "host": host,
                 "exit_code": output.exit_code,
                 "stdout": output.stdout,
                 "stderr": output.stderr,
@@ -82,10 +90,11 @@ fn terminal_response(command_id: &str, terminal: Terminal) -> Response {
             })),
         )
             .into_response(),
-        Terminal::Denied { message, .. } | Terminal::ExecError { message, .. } => {
-            let err = VeilError::Auth { message };
-            err.into_response()
+        Terminal::Denied { message, .. } => VeilError::Auth { message }.into_response(),
+        Terminal::ExecError { message, .. } => VeilError::Unavailable {
+            message: format!("命令执行失败（{message}）"),
         }
+        .into_response(),
         Terminal::ApprovalTimeout { message, .. } => {
             let err = VeilError::Auth { message };
             err.into_response()
@@ -119,6 +128,7 @@ mod tests {
             Terminal::Executed {
                 approval_status: "not_required".to_string(),
                 approval_event_id: None,
+                host: "api".to_string(),
                 output: CommandOutput {
                     exit_code: Some(0),
                     stdout: "ok".to_string(),
