@@ -47,7 +47,7 @@ func Credential(args []string) {
 		binaryHash := auth["veilctl_binary_hash"]
 		if callerHash != "" && callerHash == binaryHash {
 			fmt.Fprintln(os.Stderr, "错误: --raw 只允许在脚本文件中使用。")
-			fmt.Fprintln(os.Stderr, "请在脚本内通过 subprocess.run 调用 get，而不是直接在终端输入。")
+			fmt.Fprintln(os.Stderr, "请在脚本内通过 subprocess.run 调用 veilctl，而不是直接在终端输入。")
 			os.Exit(1)
 		}
 	}

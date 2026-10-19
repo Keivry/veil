@@ -172,7 +172,7 @@ jobs:
     needs: [build-gnu, build-musl, build-veilctl]
     runs-on: ubuntu-24.04
     steps:
-      - name: 下载构建产物（gnu + musl + get 合并到同一目录）
+      - name: 下载构建产物（gnu + musl + veilctl 合并到同一目录）
         uses: actions/download-artifact@v8
         with:
           pattern: veil*
