@@ -38,10 +38,25 @@ pub(crate) struct PendingInvocation {
     pub params_json: String,
 }
 
-/// 在途记录保留窗口：审批最长 300s，留余量。
+/// 在途记录等待审批的保留窗口：审批最长 300s，留余量。
+///
+/// 实际保留时间还要叠加该次调用的 `timeout_secs`——审批通过后的执行期同样
+/// 属于在途期，若在此期间过期，轮询会误建第二个审批。
 const PENDING_RECORD_TTL: Duration = Duration::from_secs(600);
 /// 终态记录保留窗口：窗口内重入返回同一结果，过期后视为新的独立调用。
 const DONE_RECORD_TTL: Duration = Duration::from_secs(300);
+/// 执行期在审批窗口之外的额外余量。
+const EXECUTION_RECORD_MARGIN: Duration = Duration::from_secs(60);
+
+fn pending_record_ttl(pending: &PendingInvocation) -> Duration {
+    PENDING_RECORD_TTL
+        .saturating_add(Duration::from_secs(pending.timeout_secs.max(1)))
+        .saturating_add(EXECUTION_RECORD_MARGIN)
+}
+
+pub(crate) fn execution_record_ttl(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.max(1)).saturating_add(EXECUTION_RECORD_MARGIN)
+}
 
 /// 幂等键槽位：在途或已决终态。
 #[derive(Clone, Debug)]
@@ -55,15 +70,16 @@ pub(crate) enum ExecutionEntry {
 struct ExecutionRecord {
     entry: ExecutionEntry,
     created: Instant,
+    /// 逐条记录的保留窗口：在途记录需覆盖“审批 + 执行”全生命周期。
+    ttl: Duration,
 }
 
 impl ExecutionRecord {
-    fn is_expired(&self, now: Instant) -> bool {
-        let ttl = match self.entry {
-            ExecutionEntry::Pending(_) => PENDING_RECORD_TTL,
-            ExecutionEntry::Done(_) => DONE_RECORD_TTL,
-        };
-        now.duration_since(self.created) >= ttl
+    fn is_expired(&self, now: Instant) -> bool { now.duration_since(self.created) >= self.ttl }
+
+    fn hold(&mut self, ttl: Duration) {
+        self.created = Instant::now();
+        self.ttl = ttl;
     }
 }
 
@@ -122,14 +138,43 @@ impl CommandRuntime {
     }
 
     pub(crate) fn set_pending(&self, key: &str, pending: Arc<PendingInvocation>) {
+        let ttl = pending_record_ttl(&pending);
+        self.insert_pending(key, pending, ttl);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_with_ttl(
+        &self,
+        key: &str,
+        pending: Arc<PendingInvocation>,
+        ttl: Duration,
+    ) {
+        self.insert_pending(key, pending, ttl);
+    }
+
+    fn insert_pending(&self, key: &str, pending: Arc<PendingInvocation>, ttl: Duration) {
         if let Ok(mut guard) = self.executions.lock() {
             guard.insert(
                 key.to_string(),
                 ExecutionRecord {
                     entry: ExecutionEntry::Pending(pending),
                     created: Instant::now(),
+                    ttl,
                 },
             );
+        }
+    }
+
+    /// 开始执行时重置在途记录的存活窗口：执行期不得因审批等待窗口到期而被清扫。
+    ///
+    /// 仅在槽位仍是同一张审批票时生效，避免覆盖并发建立的新审批。
+    pub(crate) fn hold_pending(&self, key: &str, event_id: &str, ttl: Duration) {
+        if let Ok(mut guard) = self.executions.lock()
+            && let Some(record) = guard.get_mut(key)
+            && let ExecutionEntry::Pending(pending) = &record.entry
+            && pending.event_id == event_id
+        {
+            record.hold(ttl);
         }
     }
 
@@ -140,6 +185,7 @@ impl CommandRuntime {
                 ExecutionRecord {
                     entry: ExecutionEntry::Done(Arc::new(terminal)),
                     created: Instant::now(),
+                    ttl: DONE_RECORD_TTL,
                 },
             );
         }
@@ -226,5 +272,49 @@ mod tests {
             record.created = Instant::now() - DONE_RECORD_TTL - Duration::from_secs(1);
         }
         assert!(rt.entry("k").is_some(), "在途记录须活过审批窗口（300s）");
+    }
+
+    #[test]
+    fn pending_record_ttl_covers_the_whole_execution_window() {
+        let rt = runtime("pending-exec");
+        let long = Arc::new(PendingInvocation {
+            timeout_secs: 600,
+            ..(*pending("k")).clone()
+        });
+        rt.set_pending("k", long);
+        if let Ok(mut guard) = rt.executions.lock()
+            && let Some(record) = guard.get_mut("k")
+        {
+            // 审批等待 600s 后开始执行、执行又耗时 600s 的极端情形。
+            record.created = Instant::now() - Duration::from_secs(1_100);
+        }
+        assert!(
+            rt.entry("k").is_some(),
+            "执行中的调用不得因审批窗口到期而丢失在途槽位"
+        );
+    }
+
+    #[test]
+    fn hold_pending_extends_the_record_for_the_execution() {
+        let rt = runtime("hold");
+        rt.set_pending_with_ttl("k", pending("k"), Duration::from_millis(20));
+        rt.hold_pending("k", "$e", Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(40));
+        let Some(ExecutionEntry::Pending(entry)) = rt.entry("k") else {
+            panic!("续期后的在途记录不得被清扫");
+        };
+        assert_eq!(entry.event_id, "$e");
+    }
+
+    #[test]
+    fn hold_pending_does_not_touch_a_different_approval() {
+        let rt = runtime("hold-other");
+        rt.set_pending_with_ttl("k", pending("k"), Duration::from_millis(20));
+        rt.hold_pending("k", "$other", Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            rt.entry("k").is_none(),
+            "旧执行的续期不得覆盖并发建立的新审批"
+        );
     }
 }

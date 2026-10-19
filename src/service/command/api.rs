@@ -5,7 +5,7 @@
 //! 且审批不绕过 `allow_commands` 与目标范围校验。
 
 use {
-    super::{ExecutionEntry, PendingInvocation},
+    super::{ExecutionEntry, PendingInvocation, execution_record_ttl},
     crate::{
         config::{CommandDef, ParameterKind, command::placeholders},
         error::{Result, VeilError},
@@ -545,6 +545,12 @@ async fn complete(
     if let Some(ExecutionEntry::Done(terminal)) = state.command().entry(key) {
         return (*terminal).clone();
     }
+    // 审批已落定：后续执行期也必须保留在途槽位，否则轮询会误判超时并新建审批。
+    state.command().hold_pending(
+        key,
+        &pending.event_id,
+        execution_record_ttl(pending.timeout_secs),
+    );
     let auto = state
         .approval()
         .applied_auto(&pending.event_id)
