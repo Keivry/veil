@@ -122,7 +122,7 @@ pub fn parse_register_allow_mode(
         if let Ok(mode) = crate::config::AutoApprove::from_str(raw) {
             return Some(mode);
         }
-        // 与 Go `get register --auto` 契约对齐（缺省 `manual`）。
+        // 与 Go `veilctl register --auto` 契约对齐（缺省 `manual`）。
         match raw.to_lowercase().as_str() {
             "auto" => return Some(crate::config::AutoApprove::Allow),
             "manual" => return Some(crate::config::AutoApprove::Pending),

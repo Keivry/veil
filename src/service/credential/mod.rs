@@ -117,7 +117,7 @@ pub struct CredentialBody {
     pub secret: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthBlock>,
-    /// 取用选择器：条目名（Go `get credential <entry> <field>` 的 entry）。
+    /// 取用选择器：条目名（Go `veilctl credential <entry> <field>` 的 entry）。
     #[serde(default)]
     pub entry: Option<String>,
     /// 取用选择器：字段名单数形态。

@@ -68,7 +68,7 @@ async fn health_superset_fields() {
 
 #[tokio::test]
 async fn health_go_client_fields_present_and_numeric() {
-    // GO/D8.2：补齐 Go `get status` 所需 `pending`（待审批数）与
+    // GO/D8.2：补齐 Go `veilctl status` 所需 `pending`（待审批数）与
     // `llm_secrets`（已注册凭据数），存在、数值正确，既有字段不删。
     let env = HashMap::from([
         (

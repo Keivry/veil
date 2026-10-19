@@ -43,7 +43,7 @@ jobs:
         run: cargo test --locked
 
   go:
-    name: go vet / test / build（get 客户端）
+    name: go vet / test / build（veilctl 客户端）
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

@@ -39,7 +39,7 @@ func Credential(args []string) {
 	auth := internal.BuildAuth()
 
 	// ── 安全：禁止终端直接调用 --raw ──
-	// 当 caller_hash == veilctl_binary_hash 时，表示 get 被终端/bash 直接调用
+	// 当 caller_hash == veilctl_binary_hash 时，表示 veilctl 被终端/bash 直接调用
 	// （而不是从脚本中通过 subprocess.run 调用）。此时 --raw 应被拒绝，
 	// 强制用户通过脚本文件获取原始凭据，防止 LLM 上下文直接接触明文。
 	if raw {

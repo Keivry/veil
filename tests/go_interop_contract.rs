@@ -188,7 +188,7 @@ async fn go_three_factor_matrix() {
         }),
     )
     .await;
-    assert_eq!(status, 403, "冒用 get 哈希须 403: {body}");
+    assert_eq!(status, 403, "冒用 veilctl 哈希须 403: {body}");
     assert_eq!(body["error"]["code"], "E_AUTH", "{body}");
 
     handle.abort();

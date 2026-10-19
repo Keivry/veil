@@ -132,7 +132,7 @@ jobs:
           if-no-files-found: error
 
   build-veilctl:
-    name: 构建 get 客户端二进制（Go · linux/amd64 全静态）
+    name: 构建 veilctl 客户端二进制（Go · linux/amd64 全静态）
     needs: [test]
     runs-on: ubuntu-24.04
     steps:
@@ -160,10 +160,10 @@ jobs:
           cp README.md dist/stage/README.md
           cp docs/engineering-reference.md dist/stage/docs/
           tar -C dist/stage -czf "dist/${pkg}" veilctl README.md docs/engineering-reference.md
-      - name: 上传 get 产物
+      - name: 上传 veilctl 产物
         uses: actions/upload-artifact@v7
         with:
-          name: veil-get
+          name: veilctl
           path: dist/veilctl-*.tar.gz
           if-no-files-found: error
 
@@ -175,7 +175,7 @@ jobs:
       - name: 下载构建产物（gnu + musl + get 合并到同一目录）
         uses: actions/download-artifact@v8
         with:
-          pattern: veil-*
+          pattern: veil*
           merge-multiple: true
           path: dist
       - name: 生成统一 SHA256SUMS

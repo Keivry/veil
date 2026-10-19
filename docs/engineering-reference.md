@@ -492,10 +492,6 @@ veilctl revoke --name "check-mail"
   （破坏性，仅限可弃用调用方）。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
 
-## 6. 行为语义与关键约束
-
-本章登记运行时语义与 fail-closed 约束；配置键见 §1，传输声明见 §7，遗留决策见 §8。
-
 ### 5.1 下游命令执行（`[command]`）
 
 命令能力由配置文件 `[command]` 分节承载（无 env 对应源）；`enabled = false`（缺省）时
@@ -519,6 +515,10 @@ veilctl revoke --name "check-mail"
 - 日志：`data_dir/commands.sqlite` 的 `command_invocations` 表记录审批状态、执行状态、
   退出码、耗时与脱敏截断后的参数/输出摘要；`GET /_admin/commands` 提供分页与过滤
   （`limit` 默认 50、上限 200），控制台「命令调用」分区消费同一数据源与 SSE `kind="command"`。
+
+## 6. 行为语义与关键约束
+
+本章登记运行时语义与 fail-closed 约束；配置键见 §1，传输声明见 §7，遗留决策见 §8。
 
 ### 6.1 脱敏总开关默认开启
 
