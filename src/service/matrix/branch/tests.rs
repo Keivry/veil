@@ -228,6 +228,34 @@ fn from_reason_routes_revoke_and_rejects_unlock() {
 }
 
 #[test]
+fn from_reason_prioritizes_hash_mismatch_over_register() {
+    assert_eq!(
+        MatrixBranch::from_reason("hash_mismatch :: /s/register-foo.sh").unwrap(),
+        MatrixBranch::Credential,
+        "含 register 字样的凭据类原因串须先命中 hash_mismatch"
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("hash mismatch register").unwrap(),
+        MatrixBranch::Credential,
+        "hash mismatch 变体同样优先于 register"
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("register caller").unwrap(),
+        MatrixBranch::Register
+    );
+    assert!(MatrixBranch::from_reason("unlock credential").is_err());
+    assert!(MatrixBranch::from_reason("解锁 凭据").is_err());
+    assert_eq!(
+        MatrixBranch::from_reason("revoke caller").unwrap(),
+        MatrixBranch::Revoke
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("吊销 x").unwrap(),
+        MatrixBranch::Revoke
+    );
+}
+
+#[test]
 fn command_branch_three_state_reactions() {
     assert_eq!(
         reaction_to_decision(MatrixBranch::Command, REACTION_APPROVE),

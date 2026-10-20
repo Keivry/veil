@@ -294,6 +294,34 @@ async fn approve_hash_change_handler_contract() {
             "✅ 须降级人工"
         );
     }
+    // `❎` 禁用与注册同构：同时置 revoked，徽标为 ❎。
+    let Json(resp_reject) = approve_hash_change_handler(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(ApproveHashChangeBody {
+            caller_path: "/s/contract.sh".to_string(),
+            reg_id: String::new(),
+            reaction: Some("❎".to_string()),
+            new_hash: "c-reject".to_string(),
+            auth: Some(service::AuthBlock {
+                caller_hash: Some("c-old".to_string()),
+                caller_path: Some("/s/contract.sh".to_string()),
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
+            }),
+            secret: Some("s3cr3t".to_string()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp_reject["ok"], true);
+    {
+        let registry = state.registry.read().await;
+        let e = registry.lookup_by_path("/s/contract.sh").unwrap();
+        assert!(!e.enabled && e.revoked, "❎ 须禁用且吊销: {e:?}");
+        assert_eq!(e.expected_hash, "c-reject");
+        assert_eq!(e.status_emoji(), "❎");
+    }
     // 未知 reaction 仍 400（不弱化显式校验）。
     let err = approve_hash_change_handler(
         State(state),

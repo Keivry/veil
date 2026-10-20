@@ -245,6 +245,7 @@ fn approval_timeout(state: &impl AppStateParts) -> Duration {
 
 /// 三态落定：`♾️ (true, true)` 启用并置持久放行；`✅ (true, false)` 启用并保留
 /// 注册声明的 `allow_mode`；`❎ (false, _)` 与 `None`（超时）置 `revoked=true`。
+/// 例外：批准分支命中已 `revoked` 条目时拒绝复活（吊销为终态）。
 async fn apply_register_approval(
     state: &impl AppStateParts,
     caller_path: &str,
@@ -255,14 +256,24 @@ async fn apply_register_approval(
         let mut registry = state.registry().write().await;
         match decision {
             Some((true, always)) => {
-                if let Err(e) = registry.set_enabled(caller_path, true) {
-                    tracing::warn!("注册审批启用失败 {caller_path}: {e}");
-                }
-                if always
-                    && let Err(e) = registry
-                        .set_allow_mode(caller_path, Some(crate::config::AutoApprove::Allow))
-                {
-                    tracing::warn!("注册审批置持久放行失败 {caller_path}: {e}");
+                // 吊销为终态：注册批准命中已吊销条目时拒绝复活（判断与写入同锁，无并发窗口）。
+                let revoked = registry
+                    .lookup_by_path(caller_path)
+                    .is_some_and(|entry| entry.revoked);
+                if revoked {
+                    tracing::warn!(
+                        "注册批准命中已吊销条目，拒绝复活: caller_path={caller_path}（吊销为终态）"
+                    );
+                } else {
+                    if let Err(e) = registry.set_enabled(caller_path, true) {
+                        tracing::warn!("注册审批启用失败 {caller_path}: {e}");
+                    }
+                    if always
+                        && let Err(e) = registry
+                            .set_allow_mode(caller_path, Some(crate::config::AutoApprove::Allow))
+                    {
+                        tracing::warn!("注册审批置持久放行失败 {caller_path}: {e}");
+                    }
                 }
             }
             _ => {
@@ -297,6 +308,10 @@ async fn rollback_registered_entry(state: &impl AppStateParts, caller_path: &str
 }
 
 /// 终态重试回读注册视图（已批准条目）。
+///
+/// 已吊销条目不得作为批准结果返回：吊销为终态，`✅`/阻塞批准命中它时
+/// 条目保持 `revoked=true`，此处返回 `403` 语义的 [`VeilError::Auth`]，
+/// 与「`❎`/超时 `403`」口径一致，避免调用方误判注册已生效。
 async fn read_registration_view(
     state: &impl AppStateParts,
     caller_path: &str,
@@ -307,6 +322,11 @@ async fn read_registration_view(
         .ok_or_else(|| VeilError::Storage {
             message: "注册审批后回读失败".to_string(),
         })?;
+    if entry.revoked {
+        return Err(VeilError::Auth {
+            message: "注册批准命中已吊销条目，条目保持吊销".to_string(),
+        });
+    }
     Ok(registration_view(entry))
 }
 
@@ -601,8 +621,11 @@ pub async fn approve_hash_change(
         crate::registry::bind_script_sha256_async(caller_path.clone(), new_hash.trim().to_string())
             .await;
     let save_guard = state.registry_save_lock().lock().await;
-    let (view, bytes) = {
+    let (view, bytes, detail) = {
         let mut registry = state.registry().write().await;
+        let hash_changed = registry
+            .lookup_by_path(&caller_path)
+            .is_some_and(|entry| entry.expected_hash != new_hash.trim());
         let entry = registry.approve_hash_change_with_script_sha256(
             &caller_path,
             new_hash,
@@ -610,14 +633,20 @@ pub async fn approve_hash_change(
             outcome,
         )?;
         let view = registration_view(entry);
-        (view, registry.to_file_bytes())
+        let detail = match outcome {
+            HashChangeOutcome::Disable => "approve_hash_change 已禁用并吊销，旧哈希宽限不适用",
+            _ if hash_changed => "approve_hash_change 已生效，旧哈希进入3600s宽限",
+            _ => "approve_hash_change 已生效，哈希未变，无新增宽限",
+        };
+        (view, registry.to_file_bytes(), detail)
     };
     persist_registry_bytes(state.registry_path(), bytes).await;
     drop(save_guard);
     notify_hash_change(
         state,
         &caller_path,
-        "approve_hash_change 已生效，旧哈希进入3600s宽限",
+        detail,
+        Some(!matches!(outcome, HashChangeOutcome::Disable)),
     );
     Ok(view)
 }

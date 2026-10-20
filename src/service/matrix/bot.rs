@@ -94,27 +94,31 @@ impl MatrixBot {
         }
     }
 
+    /// 建单分支的 reaction 图例；`HashChange`/`Audit` 仅为原因分类标签，
+    /// 不建票也无图例（空串由 `format_ticket` 省略整行）。
     fn reaction_legend(branch: MatrixBranch) -> &'static str {
         match branch {
             MatrixBranch::Register => "✅ 激活（保留注册声明）/ ♾️ 激活并持久放行 / ❎ 吊销",
-            MatrixBranch::HashChange => "✅ 批准并降级人工审批 / ♾️ 批准并置自动放行 / ❎ 禁用",
             MatrixBranch::Command => "✅ 批准本次 / ♾️ 批准并持久放行 / ❎ 拒绝",
             MatrixBranch::Revoke => "✅ 执行吊销 / ❎ 不吊销",
-            MatrixBranch::Credential | MatrixBranch::Audit => "✅ 批准本次 / ❎ 拒绝",
-            MatrixBranch::Unknown => "",
+            MatrixBranch::Credential => "✅ 批准本次 / ❎ 拒绝",
+            MatrixBranch::HashChange | MatrixBranch::Audit | MatrixBranch::Unknown => "",
         }
     }
 
     /// 建单消息正文：分支 + 待审标识 + 脱敏摘要 + 该分支 reaction 图例。
+    /// 无图例的原因标签分支不追加空的"可选反应"行。
     pub fn format_ticket(&self, branch: MatrixBranch, summary: &str) -> String {
         let clean = crate::service::audit::sanitize_for_log(summary);
-        let name = Self::branch_name(branch);
-        format!(
-            "{mark} [{name}] {room} :: {clean}\n可选反应：{legend}",
-            mark = branch.status_emoji_pending(),
-            room = self.room_id,
-            legend = Self::reaction_legend(branch)
-        )
+        let head = format!(
+            "{} [{}] {} :: {clean}",
+            branch.status_emoji_pending(),
+            Self::branch_name(branch),
+            self.room_id
+        );
+        let legend = Self::reaction_legend(branch);
+        let tail = (!legend.is_empty()).then(|| format!("\n可选反应：{legend}"));
+        format!("{head}{}", tail.unwrap_or_default())
     }
 
     /// 无票通知正文（哈希变更/失败 spool）：分支 + 状态标识 + 脱敏摘要，不含图例。
@@ -313,7 +317,10 @@ impl MatrixBot {
     }
 
     /// 单个文本事件门控 + 执行：`whoami` 为空时丢弃全部文本指令
-    /// （fail-closed，与自反应过滤同口径），返回 `None` 表示不产生回执。
+    /// （fail-closed，与自反应过滤同口径）。发送者须经与 reaction 同口径的
+    /// 白名单判定（空白名单＝不过滤）：非成员丢弃且不回执；该判定在
+    /// `parse_text_command` 之前完成，未知文本对成员与非成员一律无回执，
+    /// 不提供指令词表探测通道。返回 `None` 表示不产生回执。
     pub(crate) async fn handle_text_event(
         approval: &MatrixApproval,
         cleanup: &dyn GatewayCleanup,
@@ -327,6 +334,10 @@ impl MatrixBot {
             || text.server_ts_ms < start_ts_ms
             || text.sender == own_user_id
         {
+            return None;
+        }
+        if !approval.is_sender_allowed(&text.sender) {
+            tracing::debug!("文本指令被忽略: 发送者 {} 不在白名单", text.sender);
             return None;
         }
         Self::handle_text_command_full(approval, parse_text_command(&text.body), cleanup).await
@@ -666,6 +677,22 @@ mod bot_tests {
             }
         });
         (url, handle)
+    }
+
+    #[test]
+    fn hash_change_has_no_ticket_legend_but_keeps_notice_branch_name() {
+        let bot = MatrixBot::new(
+            "https://m.example.com".into(),
+            "!r:example.com".into(),
+            "tok".into(),
+        );
+        let ticket = bot.format_ticket(MatrixBranch::HashChange, "摘要");
+        assert!(
+            !ticket.contains('♾') && !ticket.contains("可选反应"),
+            "{ticket}"
+        );
+        let notice = bot.format_notice(MatrixBranch::HashChange, None, "摘要");
+        assert!(notice.contains("哈希变更"), "{notice}");
     }
 
     #[test]

@@ -163,8 +163,8 @@ impl AppState {
                 crate::service::matrix::NOTIFICATION_QUEUE_CAPACITY,
             ))
         } else {
-            // Matrix 三要素缺失：保留 MatrixBot 构造（`format_approval` 仍需），
-            // 但注入 no-op sink，不触网、不排队。
+            // Matrix 三要素缺失：保留 MatrixBot 构造（建单/通知正文格式化
+            // （`format_ticket`/`format_notice`）仍需），但注入 no-op sink，不触网、不排队。
             Arc::new(crate::service::matrix::NotificationSpool::with_sink(
                 notify_bot,
                 Arc::new(crate::service::matrix::NoopSink),

@@ -35,10 +35,10 @@ impl MatrixBranch {
             return Ok(Self::Revoke);
         }
         Ok(
-            if lowered.contains("register") || lowered.contains("注册") {
-                Self::Register
-            } else if lowered.contains("hash_mismatch") || lowered.contains("hash mismatch") {
+            if lowered.contains("hash_mismatch") || lowered.contains("hash mismatch") {
                 Self::Credential
+            } else if lowered.contains("register") || lowered.contains("注册") {
+                Self::Register
             } else if lowered.contains("hash") || lowered.contains("哈希") {
                 Self::HashChange
             } else if lowered.contains("credential") || lowered.contains("凭据") {
@@ -223,8 +223,9 @@ pub fn reaction_to_decision(branch: MatrixBranch, key: &str) -> ReactionAction {
         ReactionAction::Reject
     } else if key == always {
         match branch {
-            // 仅三类建单分支受理 `♾️`（HashChange/Audit 已在函数开头按非建单分支返回，
-            // 不可能抵达此处——故 SHALL NOT 出现在本臂，避免读成"哈希变更受理持久放行"）。
+            // 仅 Register/Command 两类受理 `♾️`（Credential/Revoke 不受理；HashChange/Audit
+            // 已在函数开头按非建单分支返回，不可能抵达此处——故 SHALL NOT 出现在本臂，
+            // 避免读成"哈希变更受理持久放行"）。
             MatrixBranch::Register | MatrixBranch::Command => ReactionAction::ApproveAlways,
             _ => ReactionAction::NotAccepted,
         }

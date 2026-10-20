@@ -7,9 +7,9 @@
 //! - 本文件：`PendingApprovals` 待审单据存储（`Mutex<HashMap>`，`PENDING_TTL_SECS` 60s 孤儿上限）。
 //! - `service::credential::approval`：`approval_dual_mode` 双模（默认 202 抛单建单即返；
 //!   `CREDENTIAL_BLOCK_WAIT=1` 时 300s 阻塞等 reaction；审计问询走 `AUDIT_TIMEOUT` 90s 口径）。
-//! - `service::matrix`：`MatrixBranch` 五业务分支（Unlock/Register/HashChange/Credential/Audit
-//!     + Unknown 兜底）流转，凭据 300s / 审计 90s 分表超时，`ORPHAN_SWEEP_SECS` 60s 孤儿清扫，
-//!       `spawn_sync_loop` 常驻同步。
+//! - `service::matrix`：`MatrixBranch` 建单分支（Register/Credential/Command/Revoke）
+//!   与原因标签（HashChange/Audit/Unknown）流转，凭据 300s / 审计 90s 分表超时，`ORPHAN_SWEEP_SECS`
+//!   60s 孤儿清扫， `spawn_sync_loop` 常驻同步。
 //!
 //! 保活二选一锁定：流内保活唯一实现为 `service::audit::RequestKeepalive`
 //! （`service::audit::RequestKeepalive::spawn_gated` 接线于 `src/handler/llm/pump/spawn/setup.rs`，
@@ -27,8 +27,8 @@ pub struct PendingRecord {
     pub key: String,
     pub reason: String,
     pub created_ms: u128,
-    /// 本记录的清扫 TTL（秒）：缺省 `PENDING_TTL_SECS`（60s，空闲/审计/解锁类）；
-    /// 凭据/注册/哈希变更类阻塞票由建单侧以 300s 覆盖，使其不被 60s 空闲清扫误收。
+    /// 本记录的清扫 TTL（秒）：缺省 `PENDING_TTL_SECS`（60s，空闲/审计类）；
+    /// 凭据/注册类阻塞票由建单侧以 300s 覆盖，使其不被 60s 空闲清扫误收。
     ttl_secs: u64,
 }
 
@@ -88,7 +88,7 @@ impl PendingApprovals {
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
-    /// 按记录自身 `ttl_secs` 清扫——凭据类阻塞票 300s，空闲/审计/解锁类 60s。
+    /// 按记录自身 `ttl_secs` 清扫——凭据类阻塞票 300s，空闲/审计类 60s。
     pub fn sweep_expired(&self) -> usize {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -189,7 +189,7 @@ mod tests {
     fn idle_orphan_swept_at_60s() {
         // 无等待者孤儿票按 60s 上限回收，内存有界。
         let table = PendingApprovals::default();
-        let mut orphan = PendingRecord::new("idle-key", "unlock");
+        let mut orphan = PendingRecord::new("idle-key", "audit");
         orphan.created_ms = orphan
             .created_ms
             .saturating_sub(u128::from(PENDING_TTL_SECS) * 1000 + 1);
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_unlock_same_key_single_record_without_deadlock() {
+    fn concurrent_insert_same_key_single_record_without_deadlock() {
         use std::sync::Arc;
         let table = Arc::new(PendingApprovals::default());
         let mut handles = Vec::new();
@@ -254,13 +254,13 @@ mod tests {
             let t = Arc::clone(&table);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..50 {
-                    t.insert(PendingRecord::new("unlock-k", "hash_mismatch"));
+                    t.insert(PendingRecord::new("dup-k", "hash_mismatch"));
                 }
             }));
         }
         for h in handles {
             h.join().expect("并发插入不得死锁");
         }
-        assert_eq!(table.len(), 1, "并发双解锁仅一次 Matrix ask 建单");
+        assert_eq!(table.len(), 1, "同 key 并发插入仅保留一条记录，不得翻倍");
     }
 }

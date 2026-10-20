@@ -604,7 +604,7 @@ async fn approval_message_context() {
 }
 
 #[tokio::test]
-async fn unlock_timeout_single_ask() {
+async fn credential_timeout_single_ask() {
     // 超时按拒绝（Auth）；并发同键仅一次问询且结果复用。
     use std::time::Duration;
     let state = cred_state(&cred_env(&[
@@ -613,8 +613,8 @@ async fn unlock_timeout_single_ask() {
     ]));
     let err = settle_approval(
         &state,
-        "/s/unlock-to:h",
-        "$unlock-to",
+        "/s/cred-timeout:h",
+        "$cred-timeout",
         None,
         "网易",
         Some("授权码"),
@@ -630,24 +630,28 @@ async fn unlock_timeout_single_ask() {
     assert!(
         state
             .approval
-            .submit_branch("$unlock-one", MatrixBranch::Credential)
+            .submit_branch("$cred-concurrent", MatrixBranch::Credential)
             .await
     );
     assert!(
         !state
             .approval
-            .submit_branch("$unlock-one", MatrixBranch::Credential)
+            .submit_branch("$cred-concurrent", MatrixBranch::Credential)
             .await,
         "并发二次登记不得再问询"
     );
     assert_eq!(state.approval.pending_len().await, 1, "并发须恰一问询");
     state
         .approval
-        .resolve("$unlock-one", "@admin:example.com", true)
+        .resolve("$cred-concurrent", "@admin:example.com", true)
         .await;
     let (a, b) = tokio::join!(
-        state.approval.ask("$unlock-one", Duration::from_secs(1)),
-        state.approval.ask("$unlock-one", Duration::from_secs(1))
+        state
+            .approval
+            .ask("$cred-concurrent", Duration::from_secs(1)),
+        state
+            .approval
+            .ask("$cred-concurrent", Duration::from_secs(1))
     );
     assert_eq!((a, b), (Some(true), Some(true)), "并发问询须复用同一结果");
 }

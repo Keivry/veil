@@ -22,6 +22,9 @@
   `cargo fmt --check`、`cargo clippy --tests --all-targets -- -D warnings`、`cargo test`、
   `check_doc_paths.py`、`check_file_sizes.py`、`api_conformance.py` 与 `veilctl/` 内
   `go vet ./...`/`go test ./...` 共七步；任一子步骤失败整体非零退出。
+  可选步骤：`GATE_GO_INTEROP=1` 时在上述七步之后追加执行 `go_interop_e2e.py`
+  （不编号，需 Go wrapper 与本地 Matrix stub，约 20s+）；默认未设置即打印跳过理由并继续，
+  默认门禁仍为七步、耗时与结果不变。
   用法：`bash scripts/gate.sh`（仓库根目录执行）。
   前置条件（第 6 步）：Python venv（默认 `<仓库根>/.venv`，依赖 pin 见
   `scripts/requirements-conformance.txt`，可用 `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖）内含

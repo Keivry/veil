@@ -17,10 +17,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # 先拷贝清单文件，利用构建缓存加速依赖编译。
+# `--locked` 强制沿用 Cargo.lock：清单与锁文件不一致时构建期失败，不静默改写锁文件。
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # ---- runtime：运行阶段（无工具链，仅运行必需品）----
 FROM docker.io/library/debian:bookworm-slim AS runtime

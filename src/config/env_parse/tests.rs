@@ -112,6 +112,46 @@ fn approve_with_whitelist_allows() {
 }
 
 #[test]
+fn empty_whitelist_warns_when_matrix_enabled() {
+    let cfg = Config::load_from(&base_env()).unwrap();
+    let msg = cfg
+        .empty_whitelist_warning()
+        .expect("Matrix 启用 + 空白名单须返回告警文本");
+    assert!(msg.contains("任意成员"), "告警须说明空白名单的后果: {msg}");
+    assert!(
+        msg.contains("[audit].approval_whitelist"),
+        "告警须指名真实配置键: {msg}"
+    );
+}
+
+#[test]
+fn non_empty_whitelist_suppresses_warning() {
+    let mut env = base_env();
+    env.insert(
+        "APPROVAL_WHITELIST".to_string(),
+        "@admin:example.com".to_string(),
+    );
+    let cfg = Config::load_from(&env).unwrap();
+    assert_eq!(cfg.approval_whitelist.len(), 1);
+    assert!(
+        cfg.empty_whitelist_warning().is_none(),
+        "非空白名单不得告警"
+    );
+}
+
+#[test]
+fn empty_whitelist_without_matrix_is_silent() {
+    let mut env = base_env();
+    env.remove("HOMESERVER");
+    let cfg = Config::load_from(&env).unwrap();
+    assert!(!cfg.matrix_enabled());
+    assert!(
+        cfg.empty_whitelist_warning().is_none(),
+        "Matrix 面未启用时空白名单无意义，不得告警"
+    );
+}
+
+#[test]
 fn http_client_defaults_and_overrides_ok() {
     let cfg = Config::load_from(&base_env()).unwrap();
     assert_eq!(cfg.http_timeout_secs, HTTP_TIMEOUT_SECS_DEFAULT);

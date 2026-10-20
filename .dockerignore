@@ -1,0 +1,12 @@
+# 构建上下文裁剪：只排除编译不需要的目录与产物。
+# 不得排除 Cargo.toml、Cargo.lock、src/。
+target/
+.git/
+openspec/
+veilctl/veilctl*
+.venv/
+data/
+# 本地密钥与工具状态：绝不能进入构建上下文（Git 忽略对 Docker 无效）。
+.keys/
+.omo/
+.ruff_cache/

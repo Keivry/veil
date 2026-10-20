@@ -335,10 +335,10 @@ def s52_http_transfer_202():
         },
         {"X-Veilctl-Secret": SECRET},
     )
-    # 注册默认转 Matrix 人工审批（202 + E_PENDING）；同步 200 仅出现在审批已落定时。
-    assert status in (200, 202), (status, body)
-    if status == 202:
-        assert (body.get("error") or {}).get("code") == "E_PENDING", body
+    # 注册默认转 Matrix 人工审批：本 harness 无人审批，落定只可能是 202 + E_PENDING；
+    # 同步 200 只可能来自「审批被绕过」的回归，故不得接受。
+    assert status == 202, (status, body)
+    assert (body.get("error") or {}).get("code") == "E_PENDING", body
     status, body = http_post(
         "/credential",
         {

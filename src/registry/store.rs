@@ -370,12 +370,12 @@ impl CallerRegistry {
 
     /// 预计算脚本哈希入口：生产写路径在取写锁前异步读取后传入。
     /// `outcome` 三态：`ApproveAlways` 置 `allow_mode=Allow`、`DemoteManual`
-    /// 降级 `Pending`、`Disable` 置 `enabled=false`；三态均写旧哈希宽限与
+    /// 降级 `Pending`、`Disable` 置 `enabled=false` 且 `revoked=true`；三态均写旧哈希宽限与
     /// `script_sha256`。
     ///
     /// `ApproveAlways`/`DemoteManual` SHALL NOT 写 `revoked=false`/`enabled=true`
     /// ——落定仅更新 `script_sha256`、`allow_mode` 与旧哈希宽限字段，不复活/解吊销既有条目。
-    /// `Disable` 仍 fail-closed 置 `enabled=false`。
+    /// `Disable` 与注册 `❎` 同构：否决即吊销，使 `status_emoji()` 显示 `❎` 而非待审 `⏳`。
     pub fn approve_hash_change_with_script_sha256(
         &mut self,
         caller_path: &str,
@@ -403,7 +403,9 @@ impl CallerRegistry {
                 entry.allow_mode = Some(crate::config::AutoApprove::Pending);
             }
             HashChangeOutcome::Disable => {
+                // 与注册 ❎ 同构：否决即吊销，使 status_emoji() 显示 ❎ 而非待审 ⏳。
                 entry.enabled = false;
+                entry.revoked = true;
             }
         }
         Ok(entry)

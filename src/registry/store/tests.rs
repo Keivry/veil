@@ -334,6 +334,8 @@ fn hash_change_three_state() {
     .unwrap();
     let e = reg.lookup_by_path("/s/disable.sh").unwrap();
     assert!(!e.enabled, "❎ 须禁用条目");
+    assert!(e.revoked, "❎ 须置 revoked（徽标 ❎ 而非 ⏳）");
+    assert_eq!(e.status_emoji(), "❎");
     assert_eq!(e.expected_hash, "disable-new");
     assert_eq!(e.old_hash.as_deref(), Some("disable-old"));
     assert!(e.old_hash_expires_at.is_some());

@@ -12,6 +12,10 @@
 #   6) scripts/api_conformance.py（真 SDK 一致性，24 项）
 #   7) veilctl/ 内 go vet ./... + go test ./...（内置 Go 客户端静态检查与单测）
 #
+# 可选的第八段（不编号、默认跳过）：`GATE_GO_INTEROP=1` 时执行
+#   scripts/go_interop_e2e.py（Go 对接端到端，需 Go wrapper 与本地 Matrix stub，约 20s+）；
+#   未设置时打印跳过理由并继续，默认门禁仍是上述七步。
+#
 # 前置条件（第 6 步）：
 #   - Python venv：默认 `<veil 仓库>/.venv/bin/python`（依赖 pin 见
 #     `scripts/requirements-conformance.txt`），可用 `VEIL_CONFORMANCE_PYTHON=<python>` 覆盖。
@@ -44,6 +48,7 @@ CONFORMANCE_PY="${VEIL_CONFORMANCE_PYTHON:-$VEIL_ROOT/.venv/bin/python}"
 SKIP_CONFORMANCE="${GATE_SKIP_CONFORMANCE:-0}"
 GO_DIR="$VEIL_ROOT/veilctl"
 SKIP_GO="${GATE_SKIP_GO:-0}"
+GATE_GO_INTEROP="${GATE_GO_INTEROP:-0}"
 
 run_step() {
   local name="$1"
@@ -120,6 +125,14 @@ if [ "$SKIP_GO" = "1" ]; then
   echo "==> [7/7 go] 已按 GATE_SKIP_GO=1 跳过（见上方理由）"
 else
   run_step "7/7 go" run_go_checks
+fi
+
+if [ "$GATE_GO_INTEROP" = "1" ]; then
+  run_step "interop" "$CONFORMANCE_PY" scripts/go_interop_e2e.py
+else
+  echo "==> [interop] 跳过（未设置 GATE_GO_INTEROP=1）"
+  echo "    跳过理由：go_interop_e2e.py 需 Go wrapper 与本地 Matrix stub（约 20s+），属发布前检查；"
+  echo "    显式设置 GATE_GO_INTEROP=1 可纳入门禁；前置条件见 scripts/README.md。"
 fi
 
 echo "== gate 全绿（exit 0）=="

@@ -185,6 +185,9 @@ async fn main() -> ExitCode {
             );
         }
     }
+    if let Some(warning) = config.empty_whitelist_warning() {
+        eprintln!("{warning}");
+    }
     if !config.admin_surface_enabled() && !config.observability_disabled {
         eprintln!("警告: 管理面未启用：缺少 OBSERVABILITY_ADMIN_TOKEN");
     }

@@ -140,7 +140,7 @@ impl NotificationSpool {
         Self::with_sink(bot, sink, capacity)
     }
 
-    /// 可注入 sink（测试用）：`bot` 仅承担 `format_approval`，发送走 `sink`。
+    /// 可注入 sink（测试用）：`bot` 仅承担 `format_ticket`，发送走 `sink`。
     pub fn with_sink(
         bot: Arc<MatrixBot>,
         sink: Arc<dyn NotificationSink>,

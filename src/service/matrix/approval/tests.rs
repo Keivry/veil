@@ -315,6 +315,143 @@ async fn status_reports_loaded_master_password_without_unlock_wording() {
 }
 
 #[tokio::test]
+async fn non_member_lock_text_dropped_without_receipt_or_settling() {
+    let gw = approval();
+    let cleanup = FixedCleanup {
+        unlocked: true,
+        secrets: 0,
+    };
+    assert!(gw.submit("$pending-x").await);
+    let intruder = TextInput {
+        body: "lock".to_string(),
+        sender: "@intruder:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 2000,
+    };
+    assert_eq!(
+        MatrixBot::handle_text_event(
+            &gw,
+            &cleanup,
+            "@bot:example.com",
+            "!r:example.com",
+            1000,
+            &intruder
+        )
+        .await,
+        None,
+        "非白名单成员的 lock 须无回执"
+    );
+    assert_eq!(
+        gw.decision("$pending-x").await,
+        Some(None),
+        "非成员 lock 不得把 pending 按拒绝落定"
+    );
+    let member = TextInput {
+        sender: "@admin:example.com".to_string(),
+        ..intruder
+    };
+    assert!(
+        MatrixBot::handle_text_event(
+            &gw,
+            &cleanup,
+            "@bot:example.com",
+            "!r:example.com",
+            1000,
+            &member
+        )
+        .await
+        .is_some(),
+        "白名单成员同一 lock 指令须照常回执"
+    );
+}
+
+#[tokio::test]
+async fn non_member_status_text_dropped_without_receipt() {
+    let gw = approval();
+    let cleanup = FixedCleanup {
+        unlocked: true,
+        secrets: 0,
+    };
+    let intruder = TextInput {
+        body: "status".to_string(),
+        sender: "@intruder:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 2000,
+    };
+    assert_eq!(
+        MatrixBot::handle_text_event(
+            &gw,
+            &cleanup,
+            "@bot:example.com",
+            "!r:example.com",
+            1000,
+            &intruder
+        )
+        .await,
+        None,
+        "非白名单成员的 status 须无回执"
+    );
+    let member = TextInput {
+        sender: "@admin:example.com".to_string(),
+        ..intruder
+    };
+    let reply = MatrixBot::handle_text_event(
+        &gw,
+        &cleanup,
+        "@bot:example.com",
+        "!r:example.com",
+        1000,
+        &member,
+    )
+    .await
+    .expect("白名单成员 status 须照常回执");
+    assert!(reply.contains("主密码缓存"), "{reply}");
+}
+
+#[tokio::test]
+async fn non_member_forget_text_dropped_without_receipt() {
+    let gw = approval();
+    let cleanup = FixedCleanup {
+        unlocked: true,
+        secrets: 0,
+    };
+    let intruder = TextInput {
+        body: "forget secrets".to_string(),
+        sender: "@intruder:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 2000,
+    };
+    assert_eq!(
+        MatrixBot::handle_text_event(
+            &gw,
+            &cleanup,
+            "@bot:example.com",
+            "!r:example.com",
+            1000,
+            &intruder
+        )
+        .await,
+        None,
+        "非白名单成员的 forget secrets 须无回执"
+    );
+    let member = TextInput {
+        sender: "@admin:example.com".to_string(),
+        ..intruder
+    };
+    let reply = MatrixBot::handle_text_event(
+        &gw,
+        &cleanup,
+        "@bot:example.com",
+        "!r:example.com",
+        1000,
+        &member,
+    )
+    .await
+    .expect("白名单成员 forget secrets 须照常回执");
+    assert!(reply.contains("已清除"), "{reply}");
+}
+
+#[tokio::test]
 async fn whoami_empty_drops_text_commands_without_reply() {
     let gw = approval();
     let cleanup = FixedCleanup {

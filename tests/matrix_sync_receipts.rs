@@ -22,11 +22,16 @@ use {
     },
     serde_json::{Value, json},
     std::{
-        sync::{Arc, Mutex},
+        sync::{
+            Arc,
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     },
     veil::service::matrix::{
         FixedCleanup,
+        GatewayCleanup,
         MatrixApproval,
         MatrixBot,
         MatrixBranch,
@@ -75,6 +80,39 @@ fn reaction(target: &str, key: &str, sender: &str, ts: u64) -> Value {
             "m.relates_to": {"event_id": target, "key": key, "rel_type": "m.annotation"}
         }
     })
+}
+
+fn text_event(body: &str, sender: &str, ts: u64) -> Value {
+    json!({
+        "type": "m.room.message",
+        "sender": sender,
+        "origin_server_ts": ts,
+        "content": {"msgtype": "m.text", "body": body}
+    })
+}
+
+/// 记录指令清理调用的网关桩：非成员指令若被执行，计数与 secret 数会变化。
+#[derive(Default)]
+struct RecordingCleanup {
+    lock_cleanup_calls: AtomicUsize,
+    forget_cleanup_calls: AtomicUsize,
+    secrets: AtomicUsize,
+}
+
+impl GatewayCleanup for RecordingCleanup {
+    fn keepass_unlocked(&self) -> bool { true }
+
+    fn vault_len(&self) -> usize { self.secrets.load(Ordering::SeqCst) }
+
+    fn lock_cleanup(&self) -> usize {
+        self.lock_cleanup_calls.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    fn forget_cleanup(&self) -> usize {
+        self.forget_cleanup_calls.fetch_add(1, Ordering::SeqCst);
+        0
+    }
 }
 
 async fn whoami(State(mock): State<MockMatrix>) -> impl IntoResponse {
@@ -257,6 +295,79 @@ async fn four_ticket_kinds_receipts_and_settlement() {
         approval.decision("$t-legacy").await,
         Some(None),
         "🔓 不得改变任何票状态"
+    );
+
+    handle.abort();
+    server.abort();
+    std::fs::remove_file(&token_file).ok();
+}
+
+/// 非白名单成员的文本指令整批丢弃：无任何回执、pending 与 secret 映射不变。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_member_text_commands_dropped_without_any_receipt() {
+    let events = vec![
+        text_event("lock", "@intruder:example.com", 2000),
+        text_event("status", "@intruder:example.com", 2001),
+        text_event("forget secrets", "@intruder:example.com", 2002),
+        text_event("Lock", "@intruder:example.com", 2003),
+        text_event("status", "@admin:example.com", 2004),
+        // 成员发送未知文本同样无回执：指令词表不构成探测通道。
+        text_event("hello", "@admin:example.com", 2005),
+    ];
+    let (homeserver, mock, server) = serve_mock(events).await;
+    let approval = Arc::new(MatrixApproval::new(
+        vec!["@admin:example.com".to_string()],
+        90,
+    ));
+    assert!(
+        approval
+            .submit_branch("$t-pending", MatrixBranch::Register)
+            .await,
+        "建单须成功"
+    );
+
+    let cleanup = Arc::new(RecordingCleanup {
+        secrets: AtomicUsize::new(3),
+        ..RecordingCleanup::default()
+    });
+    let cleanup_handle: Arc<dyn GatewayCleanup> = cleanup.clone();
+    let token_file = temp_token_file("whitelist-text");
+    let bot = MatrixBot::new(
+        homeserver,
+        "!r:example.com".to_string(),
+        "syt_test".to_string(),
+    );
+    let handle = bot.spawn_sync_loop(Arc::clone(&approval), cleanup_handle, token_file.clone(), 0);
+
+    let receipt = mock.wait_for("主密码缓存").await;
+    assert!(receipt.contains("待审批: 1"), "{receipt}");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        mock.sent_texts().len(),
+        1,
+        "仅白名单成员 status 有回执，非成员文本一律无回执: {:?}",
+        mock.sent_texts()
+    );
+    assert_eq!(
+        approval.decision("$t-pending").await,
+        Some(None),
+        "非成员 lock 不得把 pending 按拒绝落定"
+    );
+    assert_eq!(
+        cleanup.lock_cleanup_calls.load(Ordering::SeqCst),
+        0,
+        "非成员 lock 不得触发清理"
+    );
+    assert_eq!(
+        cleanup.forget_cleanup_calls.load(Ordering::SeqCst),
+        0,
+        "非成员 forget 不得触发清理"
+    );
+    assert_eq!(
+        cleanup.secrets.load(Ordering::SeqCst),
+        3,
+        "非成员 forget 不得清空 secret 映射"
     );
 
     handle.abort();

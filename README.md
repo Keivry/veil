@@ -47,7 +47,7 @@ docker compose up -d
   podman unshare chown -R 999:999 ./data
   ```
   rootless 下改完后宿主 `ls -ln ./data` 显示的是高位 subuid（如 `100998`）而非 `999`，这是 uid 映射的正常表现，不影响容器内读写。换用命名卷（`volumes: veil_data:/data`）时由引擎自动继承镜像内属主，可跳过此步。
-- **从旧版本升级**：两处默认值变了，都表现为"容器是绿的但不可用"。① `[server]` 段是本版新增：若实际挂载的 TOML（例如升级前自己维护的 `veil.toml`）没有 `[server].bind`，容器会回退到缺省 `127.0.0.1:8877`——容器内 `/health` 仍然 `ok:true`（健康检查在容器内跑），但宿主机发布端口一律被 reset。② `docker-compose.yml` 的默认挂载已从 `./veil.toml` 改为只读的 `examples/veil.container.toml`；旧部署里自己维护的 `./veil.toml` 不再被挂载，私有的 homeserver/room_id/data_dir 会被示例占位值取代（审批相关请求转 403）。升级后须确认实际挂载的 TOML 是你自己的配置且含 `[server].bind = "0.0.0.0:8877"`。
+- **从旧版本升级**：两处默认值变了，都表现为"容器是绿的但不可用"。① `[server]` 段是本版新增：若实际挂载的 TOML（例如升级前自己维护的 `veil.toml`）没有 `[server].bind`，容器会回退到缺省 `127.0.0.1:8877`——容器内 `/health` 仍然 `ok:true`（健康检查在容器内跑），但宿主机发布端口一律被 reset。② `docker-compose.yml` 的默认挂载已从 `./veil.toml` 改为只读的 `examples/veil.container.toml`；旧部署里自己维护的 `./veil.toml` 不再被挂载，私有的 homeserver/room_id/data_dir 会被示例占位值取代（审批相关请求转 403）。升级后须确认实际挂载的 TOML 是你自己的配置且含 `[server].bind = "0.0.0.0:8877"`。③ 文本指令现已受 `[audit].approval_whitelist` 约束：非白名单成员发送 `lock`/`status`/`forget` 会被静默丢弃（无回执）。若此前依赖「房间里任何成员都能发运维指令」，升级后须把运维 MXID 显式加入白名单，否则运维指令全部失效。
 - compose 把配置文件只读挂到 `/etc/veil/veil.toml` 并设 `VEIL_CONFIG_FILE`；数据卷父卷 `${DATA_DIR:-./data}` 是**宿主机侧**的卷路径（仅 compose 变量），与配置文件的 `[storage].data_dir`（默认 `/data`）相互独立。
 - 监听地址分两层：容器内必须 `[server].bind = "0.0.0.0:8877"`（bridge 网络的 DNAT 目标不是回环，写回环收不到），宿主机侧仍只发布到 `127.0.0.1`（见 `ports`）——对外不暴露到局域网。
 - `cap_add: IPC_LOCK` 与 `ulimits.memlock: -1` 让 `mlockall` 成功；若受限 daemon 拒绝 `ulimits`，删除该段只保留 `cap_add` 即可（`mlockall` 检查的是 `CAP_IPC_LOCK`）。
@@ -107,7 +107,8 @@ docker compose up -d
 | `[redaction].enabled` | `true` | 脱敏总开关 |
 | `[pii_scope].mode` | `"request"` | 逐请求隔离；`"conversation"` 启用有界的会话级关联 |
 | `[limits].sse_frame_hard_bytes` | `8388608`（8MiB） | SSE 单帧/单行硬上限（字节，≥1）；超限 fail-closed 并按协议合成终止帧 |
-| `[audit].mode` | `"off"` | `"off"` / `"block"` / `"approve"`；`"approve"` 必须配 `[audit].approval_whitelist` |
+| `[audit].mode` | `"off"` | `"off"` / `"block"` / `"approve"`；`"approve"` 必须配 `[audit].approval_whitelist`；生产部署必须显式配置 `[audit].approval_whitelist` |
+| `[audit].approval_whitelist` | 空（不过滤） | 审批人 MXID 列表（精确匹配）；空白名单＝房间内任意成员可审批，Matrix 面启用时启动期打印不可被 `RUST_LOG` 抑制的告警；生产部署必须显式配置；同时约束 `lock`/`status`/`forget` 文本指令（非成员静默丢弃） |
 
 紧急吊销 `POST /revoke/emergency` 必须携带 `X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN`（或 body `admin_token`）；无有效 token 时须通过三因子（body `auth` + `secret`），不成立返回 `401`/`403` 且不建审批单。
 

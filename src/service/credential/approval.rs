@@ -657,11 +657,16 @@ pub(crate) async fn approval_dual_mode(
     settle_approval(state, key, &event_id, decision, entry, field, use_token).await
 }
 
-pub(crate) fn notify_hash_change(state: &impl AppStateParts, key: &str, detail: &str) {
+pub(crate) fn notify_hash_change(
+    state: &impl AppStateParts,
+    key: &str,
+    detail: &str,
+    approved: Option<bool>,
+) {
     let summary = format!("哈希变更 :: {key} :: {detail}");
     let text = state
         .notify()
-        .format_notice(matrix::MatrixBranch::Credential, None, &summary);
+        .format_notice(matrix::MatrixBranch::HashChange, approved, &summary);
     state.notify().notify_text(text);
     tracing::warn!("调用方哈希变更通知: {summary}");
 }
@@ -681,7 +686,7 @@ pub(crate) fn notify_hash_grace_once(
     if !first_grace_notification(&dedup_key, expires_at, now_secs) {
         return;
     }
-    notify_hash_change(state, entry, "old_hash宽限内放行");
+    notify_hash_change(state, entry, "old_hash宽限内放行", Some(true));
 }
 
 /// 凭据审批问询（`credential_approval_timeout_secs` 超时口径，默认 300s；与阻塞模式同源）：

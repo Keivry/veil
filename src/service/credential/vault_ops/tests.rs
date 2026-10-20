@@ -24,7 +24,7 @@ use {
     },
     crate::{
         config::Config,
-        error::Result,
+        error::{Result, VeilError},
         registry::RegisterParams,
         service::{
             credential::{
@@ -34,7 +34,7 @@ use {
                 handle_credential,
                 test_support::*,
             },
-            matrix::{ReactionInput, ReactionOutcome},
+            matrix::{MatrixBranch, ReactionInput, ReactionOutcome},
         },
         state::{AppState, SqliteOutcome},
     },
@@ -127,6 +127,35 @@ async fn wait_until_revoked(state: &AppState, path: &str) {
         assert!(std::time::Instant::now() < deadline, "吊销落定超时: {path}");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_registration_view_rejects_revoked_entry() {
+    let state = cred_state(&cred_env(&[]));
+    let path = "/s/view-revoked.sh";
+    register_caller_extended(&state, &params(path, "view-h1"), "view-src")
+        .await
+        .unwrap();
+    let ok = super::read_registration_view(&state, path)
+        .await
+        .expect("未吊销条目须可回读");
+    assert_eq!(ok.caller_path, path);
+    assert!(!ok.revoked, "未吊销条目视图须保持非吊销");
+
+    state.registry.write().await.revoke(path).unwrap();
+    let err = super::read_registration_view(&state, path)
+        .await
+        .expect_err("已吊销条目不得作为批准结果返回");
+    match &err {
+        VeilError::Auth { message } => {
+            assert!(
+                message.contains("保持吊销"),
+                "错误须说明条目保持吊销: {message}"
+            );
+        }
+        other => panic!("已吊销条目须返回 Auth(403 语义)，实得: {other:?}"),
+    }
+    assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -432,6 +461,161 @@ async fn register_approval_three_state() {
         err.status_code().is_client_error(),
         "超时吊销后取用须被拒: {err:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn register_approval_does_not_revive_revoked_entry_with_check() {
+    let state = cred_state(&cred_env(&[]));
+    register_caller_extended(
+        &state,
+        &params("/s/revive-ok.sh", "revive-h1"),
+        "revive-src",
+    )
+    .await
+    .unwrap();
+    {
+        let mut registry = state.registry.write().await;
+        registry.revoke("/s/revive-ok.sh").unwrap();
+        registry
+            .set_allow_mode("/s/revive-ok.sh", Some(crate::config::AutoApprove::Pending))
+            .unwrap();
+    }
+    apply_register_approval(&state, "/s/revive-ok.sh", Some((true, false))).await;
+    let registry = state.registry.read().await;
+    let entry = registry
+        .lookup_by_path("/s/revive-ok.sh")
+        .expect("条目须在");
+    assert!(entry.revoked, "✅ 不得复活已吊销条目");
+    assert!(!entry.enabled, "已吊销条目须保持未启用");
+    assert_eq!(
+        entry.allow_mode,
+        Some(crate::config::AutoApprove::Pending),
+        "✅ 不得改写已吊销条目的 allow_mode"
+    );
+    assert_eq!(entry.status_emoji(), "❎", "已吊销条目徽标须为 ❎");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn register_approval_always_does_not_revive_revoked_entry() {
+    let state = cred_state(&cred_env(&[]));
+    register_caller_extended(
+        &state,
+        &params("/s/revive-always.sh", "revive-h2"),
+        "revive-src",
+    )
+    .await
+    .unwrap();
+    {
+        let mut registry = state.registry.write().await;
+        registry.revoke("/s/revive-always.sh").unwrap();
+    }
+    apply_register_approval(&state, "/s/revive-always.sh", Some((true, true))).await;
+    let registry = state.registry.read().await;
+    let entry = registry
+        .lookup_by_path("/s/revive-always.sh")
+        .expect("条目须在");
+    assert!(entry.revoked, "♾️ 不得复活已吊销条目");
+    assert!(!entry.enabled, "已吊销条目须保持未启用");
+    assert_ne!(
+        entry.allow_mode,
+        Some(crate::config::AutoApprove::Allow),
+        "♾️ 不得把已吊销条目的 allow_mode 改写为 Allow"
+    );
+    assert_eq!(entry.status_emoji(), "❎", "已吊销条目徽标须为 ❎");
+}
+
+/// 迟到 `✅` 的闭环回归：批准命中已吊销条目时须返回 `403`，不得伪造注册成功。
+///
+/// 走查结论：真实 re-register 在 `register_caller_extended` 判重处即早退
+/// `VeilError::Conflict { message: "调用方已注册: <path>" }`（`lookup_by_path`
+/// 命中含已吊销条目，早于 `submit_pending_with_branch` 建 Register 票），
+/// 因此 `react_blocking_register` 无法驱动已注册路径；此处按生产阻塞链原序
+/// 重放「Register 票 → `✅` → ask → apply_register_approval → 回读」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_register_approval_after_revoke_returns_forbidden() {
+    let state = cred_state(&cred_env(&[("APPROVAL_WHITELIST", "@admin:example.com")]));
+    let path = "/s/late-revive.sh";
+    let enrolled = register_caller_extended(&state, &params(path, "late-h1"), "late-src")
+        .await
+        .expect("中立条目须先落盘");
+    assert!(!enrolled.enabled && !enrolled.revoked, "注册须先落中立态");
+    state.registry.write().await.revoke(path).unwrap();
+
+    // 已吊销路径不可重新建 Register 票：真实早退为判重 Conflict（HTTP 409）。
+    let conflict = register_caller_with_approval(&state, &params(path, "late-h2"), "late-src")
+        .await
+        .expect_err("已注册路径不得再建 Register 票");
+    assert_eq!(conflict.status_code(), axum::http::StatusCode::CONFLICT);
+    assert!(
+        conflict.to_string().contains("调用方已注册"),
+        "早退原因须为判重 Conflict: {conflict:?}"
+    );
+    assert!(
+        state.approval.pending_event_ids().await.is_empty(),
+        "判重早退前不得建单"
+    );
+
+    // 按生产顺序重放同一张票：Register 建票 → ✅ 落定 → 阻塞问询 → 落定回写。
+    let event_id = "$late-register-approval";
+    assert!(
+        state
+            .approval
+            .submit_branch(event_id, MatrixBranch::Register)
+            .await,
+        "Register 票须可登记"
+    );
+    let input = ReactionInput {
+        target_event_id: event_id.to_string(),
+        key: "✅".to_string(),
+        sender: "@admin:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 1,
+    };
+    let outcome = state
+        .approval
+        .on_reaction(&input, "@bot:example.com", "!r:example.com", 0)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            ReactionOutcome::Applied {
+                approved: true,
+                always: false
+            }
+        ),
+        "✅ 须落定为批准: {outcome:?}"
+    );
+    let decision = state
+        .approval
+        .ask(event_id, std::time::Duration::from_secs(1))
+        .await;
+    assert_eq!(decision, Some(true), "阻塞问询须读到 ✅ 决议");
+    let auto = state
+        .approval
+        .applied_always(event_id)
+        .await
+        .unwrap_or(false);
+    apply_register_approval(&state, path, decision.map(|ok| (ok, auto))).await;
+
+    let err = super::read_registration_view(&state, path)
+        .await
+        .expect_err("迟到 ✅ 命中已吊销条目须返回 403，不得伪造成功");
+    match &err {
+        VeilError::Auth { message } => {
+            assert!(
+                message.contains("保持吊销"),
+                "错误须说明条目保持吊销: {message}"
+            );
+        }
+        other => panic!("已吊销条目批准后须返回 Auth(403 语义)，实得: {other:?}"),
+    }
+    assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+
+    let registry = state.registry.read().await;
+    let entry = registry.lookup_by_path(path).expect("条目须在");
+    assert!(entry.revoked, "迟到 ✅ 不得复活已吊销条目");
+    assert!(!entry.enabled, "已吊销条目须保持未启用");
+    assert_eq!(entry.status_emoji(), "❎", "已吊销条目徽标须为 ❎");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

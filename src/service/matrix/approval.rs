@@ -84,6 +84,9 @@ impl MatrixApproval {
 
     pub fn credential_timeout(&self) -> Duration { self.credential_timeout }
 
+    /// 文本指令发送者白名单判定（与 reaction 同口径；空白名单＝不过滤）。
+    pub fn is_sender_allowed(&self, mxid: &str) -> bool { is_mxid_allowed(mxid, &self.whitelist) }
+
     /// 登记一个待审批 event；已存在返回 false（幂等建单）。
     #[cfg(test)]
     pub(crate) async fn submit(&self, event_id: &str) -> bool {
@@ -360,9 +363,10 @@ impl MatrixApproval {
     /// 在 `ask` 返回后与内存侧 `PendingApprovals` 同批清理，保证 health `pending` 即时一致。
     pub async fn remove(&self, event_id: &str) { self.pending.lock().await.remove(event_id); }
 
-    /// 清扫孤儿 pending（按分支 TTL）；返回清理条数。凭据类分支
-    /// （`Register`/`HashChange`/`Credential`）取 `CREDENTIAL_TIMEOUT_SECS`（300s），
-    /// 保证 `ask` 阻塞等待者（自身 300s 超时）在阻塞期内不被清扫；审计/解锁维持 60s。
+    /// 清扫孤儿 pending（按分支 TTL）；返回清理条数。有阻塞等待者的分支
+    /// （`Register`/`HashChange`/`Credential`/`Command`/`Revoke`）取
+    /// `CREDENTIAL_TIMEOUT_SECS`（300s），保证 `ask` 阻塞等待者（自身 300s 超时）
+    /// 在阻塞期内不被清扫；`Audit`/`Unknown` 维持 `ORPHAN_SWEEP_SECS`（60s）。
     /// 已决票不再恒保留——无 waiter 的已决票按**落定时刻**施加同族有界 TTL，
     /// 超时回收使矩阵侧票数与 `pending` 有界；已决有 waiter 者在其轮询窗口内不被误收。
     pub async fn sweep_orphans(&self) -> usize {

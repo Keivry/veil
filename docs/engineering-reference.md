@@ -74,7 +74,7 @@
 | `limits.sse_frame_hard_bytes` | `SSE_FRAME_HARD_BYTES` | integer | SSE 单行/单事件硬上限；≥1（默认 8MiB，超限 fail-closed） |
 | `audit.mode` | `AUDIT_MODE` | enum `off`/`block`/`approve` | 见上方审计 mode 层级；`approve` 须配 `approval_whitelist` |
 | `audit.timeout` | `AUDIT_TIMEOUT` | integer | 审批超时秒数；禁止落在 110-130 竞态区间 |
-| `audit.approval_whitelist` | `APPROVAL_WHITELIST` | array of string | 审批人 MXID 列表，数组按逗号连接为 env 值 |
+| `audit.approval_whitelist` | `APPROVAL_WHITELIST` | array of string | 审批人 MXID 列表，数组按逗号连接为 env 值；空白名单＝不过滤；Matrix 面启用时启动期以裸 stderr 告警（`RUST_LOG=off` 也输出）；生产部署必须显式配置 |
 | `audit.policy_file` | `AUDIT_POLICY_FILE` | string | 审计策略文件路径；其 `mode` 低于配置文件 `mode` |
 | `storage.data_dir` | `DATA_DIR` | string | sqlite/审计日志父目录；派生 `db_dir`/`tpm_dir`/`caller_registry_path` |
 | `storage.db_dir` | `DB_DIR` | string | kdbx 库目录（缺省 `<data_dir>/db`） |
@@ -385,9 +385,9 @@ done
 
 审批票回收两口径并存、不可混用：**空闲票 60s 回收上限**——
 无阻塞等待者的孤儿票按分支 TTL（审计类 `60s`）清扫；**有阻塞等待者凭据类票 300s 阻塞 TTL**——
-凭据/注册/哈希变更类存在阻塞等待者的未决票在其自身 `300s` 阻塞超时前不被回收。前者是清扫延迟上限，
+凭据/注册/命令/吊销类存在阻塞等待者的未决票在其自身 `300s` 阻塞超时前不被回收（`HashChange` 仅作原因标签、不建票）。前者是清扫延迟上限，
 后者是阻塞等待保留时长，维度不同（详见 §8.4）。内存侧 `PendingApprovals` 清扫与矩阵侧同口径按记录 TTL
-执行（凭据/注册/吊销/哈希变更类阻塞票 `300s`、空闲/审计类 `60s`），不再对全部记录一律 `60s`。
+执行（凭据/注册/吊销/命令类票 `300s`、空闲/审计类 `60s`），不再对全部记录一律 `60s`。
 
 `GET /health` 与 `/_admin/health` 的 `pii_custom_disabled`（只增字段）为已停用自定义规则计数
 （`disabled_snapshot()` 口径）：ReDoS 守卫连续 3 次超时停用的
@@ -590,14 +590,14 @@ veilctl revoke --name "check-mail"
 - 审计策略文件（`[audit].policy_file` 所指路径）在启动期 fail-fast 加载并注入共享运行时状态（请求路径零读盘、零 env 快照）；不可读、含未知键、孤立列表项、非法 `mode`、无法解析行或列表段形态错误时拒启动，不降级为「无审计」空策略。加载早于 TPM 门禁、sqlite 初始化与后台任务。
 - 策略 `mode` 参与运行模式判定并注入运行时配置（`state.config.audit_mode`）；优先级为配置文件 `[audit].mode` > 策略文件 `mode` > 默认 `off`。`dangerous:` 段兼容对象形 `{pattern, reason, network}`（YAML mapping 与 JSON 对象，`network` 缺省 `false`）与字符串形。
 - 最终生效模式为 `approve`（无论来源）且 `[audit].approval_whitelist` 为空时，启动以配置错误拒绝。
-- `[audit].approval_whitelist` 为空或未声明时审批白名单层不过滤；非空时非成员 reaction 被忽略（审计 `approve` 空名单由上述启动门禁兜底）。
+- `[audit].approval_whitelist` 为空或未声明时审批白名单层不过滤；非空时非成员 reaction 与文本指令（`lock`/`status`/`forget`）均被忽略，且文本指令不产生回执（审计 `approve` 空名单由上述启动门禁兜底）。Matrix 面启用（homeserver/room/token 三要素齐备）且名单为空时，启动期以裸 stderr 输出不可被 `RUST_LOG` 抑制的告警（`RUST_LOG=off` 也输出）；生产部署必须显式配置。
 - `[redaction].custom_rules_file`/`custom_patterns_file`/`custom_dict_file` 读取前施加 1MB（`1_048_576` 字节）上限，超限具名拒绝启动，恰 1MB 放行。
 - 审计日志（`[storage].data_dir/audit.log`）创建即 `0600`（`OpenOptionsExt::mode`），轮转产物同样 `0600`。
 
 ### 6.12 日志层默认可见
 
 - 进程启动第一步即安装 tracing 订阅者，默认向 stderr 输出 `warn` 及以上人类可读日志（无 ANSI），stdout 保持零输出。`RUST_LOG` 自此生效（`EnvFilter` 指令，支持 per-target 过滤；非法指令不拒启动，回退默认级别并在 stderr 说明一行）。
-- 降级类告警（`mlockall` 失败、sqlite 降级 memory-only、凭据 alternation 回退）走日志层，默认 `warn` 级别可见且可被 `RUST_LOG` 抑制；进程终止类诊断（fail-fast 启动失败、TPM 门禁、端口绑定失败、`serve` 异常退出）与缺 HMAC 安全配置告警（`[redaction].value_sample_enabled = true` 且未设 `PII_VALUE_SAMPLE_HMAC_KEY`）保留裸 stderr，不受 `RUST_LOG` 影响（含 `RUST_LOG=off`）。
+- 降级类告警（`mlockall` 失败、sqlite 降级 memory-only、凭据 alternation 回退）走日志层，默认 `warn` 级别可见且可被 `RUST_LOG` 抑制；进程终止类诊断（fail-fast 启动失败、TPM 门禁、端口绑定失败、`serve` 异常退出）与缺 HMAC 安全配置告警（`[redaction].value_sample_enabled = true` 且未设 `PII_VALUE_SAMPLE_HMAC_KEY`）以及空白名单弱授权告警（Matrix 面启用且 `[audit].approval_whitelist` 为空，见 §6.11）保留裸 stderr，不受 `RUST_LOG` 影响（含 `RUST_LOG=off`）。`[storage].entry_mode != full` 的降级告警不在此列：它是可被 `RUST_LOG` 抑制的日志层 `warn`。
 - 更多细节设 `RUST_LOG=info`/`RUST_LOG=debug`；噪声大用 per-target 指令（如 `RUST_LOG=warn,veil::handler::llm=error`）。`RUST_LOG` 登记见 §1「环境变量表」。
 
 ### 6.13 出口透传、响应侧 PII 分类计数下线与凭据前缀
@@ -1137,12 +1137,12 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 - 非 `full` 入口下 `approve_hash_change` 降级为阻断（返回鉴权失败，不执行哈希变更，
   见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
 - Matrix 审批返回 `None` 即 rejected 并清理；审批票回收两口径并存、不得混用：
-  **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（审计类）按分支 TTL `60s` 清扫；
-  **有阻塞等待者凭据类票 300s 阻塞 TTL**——凭据/注册/哈希变更类存在阻塞等待者的未决票，
-  在其自身 `300s` 阻塞超时前不被回收；
+  **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（`Audit`/`Unknown`）按分支 TTL `60s` 清扫；
+  **有阻塞等待者凭据类票 300s 阻塞 TTL**——凭据/注册/命令/吊销类存在阻塞等待者的未决票，
+  在其自身 `300s` 阻塞超时前不被回收（`HashChange` 仅作原因标签、不建票）；
   两口径对矩阵侧票与内存侧 `PendingApprovals` 一致适用。
 - 文本指令 `lock`/`forget` 经网关侧清理接线：
-  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，**不阻止下次取用**——再次取用仍经 TPM 解封）+ 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。
+  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，**不阻止下次取用**——再次取用仍经 TPM 解封）+ 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。发送者须经与 reaction 相同的白名单判定（`[audit].approval_whitelist`）；非成员发送的 `lock`/`status`/`forget` 在指令解析前被丢弃（`debug` 日志），不产生回执。
 - `MatrixBranch::Unlock` 已删除：`unlock`/`解锁` 前缀原因在 `from_reason` 直接返回错误，
   `record_pending` fail-closed（不建一张永远不可决的票）。
 - `[storage].auto_approve` 三态：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（见 §2）。

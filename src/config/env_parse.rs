@@ -455,35 +455,36 @@ impl Config {
 
 impl Config {
     /// Matrix 通知/审批是否可用：`homeserver`、`room_id`、`matrix_access_token`
-    /// 三要素均非空（文件 + env 合并后）。任一缺失即关闭 Matrix 通知/审批功能，
-    /// 不再拒绝启动。
+    /// 三要素均非空（文件 + env 合并后）；任一缺失即关闭功能，不拒启动。
     pub fn matrix_enabled(&self) -> bool {
         !self.homeserver.is_empty()
             && !self.room_id.is_empty()
             && !self.matrix_access_token.is_empty()
     }
 
-    /// 管理面是否可用：未显式禁用（`OBSERVABILITY_DISABLE` 精确 `1`）且 admin
-    /// token 非空。任一不满足即 `/_admin*` 全 404（与 token 有效性无关），
-    /// 不影响 LLM 代理。
+    /// 空白名单告警：Matrix 面启用且审批白名单为空时返回；调用方走裸 stderr。
+    pub fn empty_whitelist_warning(&self) -> Option<&'static str> {
+        (self.matrix_enabled() && self.approval_whitelist.is_empty()).then_some(
+            "警告: [audit].approval_whitelist 为空（空白名单＝不过滤）：审批房间内任意成员可审批注册/命令/吊销/凭据/审计票，并可发送 lock/forget 清理指令；生产部署必须显式配置 [audit].approval_whitelist",
+        )
+    }
+
+    /// 管理面是否可用：未显式禁用（`OBSERVABILITY_DISABLE` 精确 `1`）且 admin token
+    /// 非空；任一不满足即 `/_admin*` 全 404，不影响 LLM 代理。
     pub fn admin_surface_enabled(&self) -> bool {
         !self.observability_disabled && !self.observability_admin_token.is_empty()
     }
 
-    /// Matrix 三要素中的缺失键清单（顺序固定为 `HOMESERVER`、`ROOM_ID`、
-    /// `MATRIX_ACCESS_TOKEN`），供启动告警与审批 fail-closed 早退指名缺失项。
+    /// Matrix 三要素缺失键清单（顺序固定），供启动告警与审批 fail-closed 早退指名缺失项。
     pub fn missing_matrix_keys(&self) -> Vec<&'static str> {
-        let mut missing = Vec::new();
-        if self.homeserver.is_empty() {
-            missing.push("HOMESERVER");
-        }
-        if self.room_id.is_empty() {
-            missing.push("ROOM_ID");
-        }
-        if self.matrix_access_token.is_empty() {
-            missing.push("MATRIX_ACCESS_TOKEN");
-        }
-        missing
+        [
+            (self.homeserver.is_empty(), "HOMESERVER"),
+            (self.room_id.is_empty(), "ROOM_ID"),
+            (self.matrix_access_token.is_empty(), "MATRIX_ACCESS_TOKEN"),
+        ]
+        .into_iter()
+        .filter_map(|(missing, key)| missing.then_some(key))
+        .collect()
     }
 }
 

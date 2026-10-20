@@ -65,6 +65,77 @@ async fn grace_notification_dedup() {
     state.notify.shutdown();
 }
 
+/// 轮询 sink 直至出现含 `needle` 的通知文本（约 2s 上限）。
+async fn wait_notice(sink: &CountingSink, needle: &str) -> String {
+    for _ in 0..200 {
+        if let Some(text) = sink.texts().into_iter().find(|text| text.contains(needle)) {
+            return text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("未在 2s 内收到含 {needle:?} 的通知: {:?}", sink.texts());
+}
+
+#[tokio::test]
+async fn hash_change_reject_notifies_hash_branch_as_rejected() {
+    let sink = CountingSink::new();
+    let state = cred_state_with_sink(&cred_env(&[]), sink.clone());
+    state.notify.start();
+    enrolled_with_entries(
+        &state,
+        "/s/hc-reject-notify.sh",
+        "h1",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    approve_hash_change(
+        &state,
+        "/s/hc-reject-notify.sh",
+        "h2",
+        HashChangeOutcome::Disable,
+    )
+    .await
+    .unwrap();
+
+    let note = wait_notice(&sink, "禁用并吊销").await;
+    assert!(note.contains("哈希变更"), "须走 HashChange 分支: {note}");
+    assert!(note.contains("❎"), "❎ 落定须渲染拒绝徽标: {note}");
+    assert!(!note.contains("凭据"), "不得再渲染为凭据分支: {note}");
+    assert!(
+        !note.contains("3600s宽限"),
+        "禁用并吊销已不可宽限，通知不得声称宽限: {note}"
+    );
+    state.notify.shutdown();
+}
+
+#[tokio::test]
+async fn hash_change_approve_notifies_hash_branch_as_approved() {
+    let sink = CountingSink::new();
+    let state = cred_state_with_sink(&cred_env(&[]), sink.clone());
+    state.notify.start();
+    enrolled_with_entries(
+        &state,
+        "/s/hc-approve-notify.sh",
+        "h1",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    approve_hash_change(
+        &state,
+        "/s/hc-approve-notify.sh",
+        "h2",
+        HashChangeOutcome::DemoteManual,
+    )
+    .await
+    .unwrap();
+
+    let note = wait_notice(&sink, "3600s宽限").await;
+    assert!(note.contains("哈希变更"), "须走 HashChange 分支: {note}");
+    assert!(note.contains("✅"), "批准落定须渲染通过徽标: {note}");
+    assert!(!note.contains("凭据"), "不得再渲染为凭据分支: {note}");
+    state.notify.shutdown();
+}
+
 #[test]
 fn grace_dedup_ttl_eviction() {
     // 满表先清扫过期、仍满逐出 `expires_at` 最小者、SHALL NOT 整表清空。
