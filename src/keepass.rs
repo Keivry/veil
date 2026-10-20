@@ -49,6 +49,9 @@ pub trait KeePassBackend: Send + Sync + std::fmt::Debug {
     fn clear_cache(&self) {}
     /// 清除并零化 TPM 派生主密码缓存；无该缓存的实现默认 no-op。
     fn clear_master_password(&self) -> bool { false }
+    /// TPM 派生主密码缓存是否已载入（真实载入状态，非库文件在位）；
+    /// 无该缓存的实现默认 `false`。
+    fn master_password_cached(&self) -> bool { false }
 }
 
 #[derive(Debug, Default)]
@@ -307,6 +310,12 @@ impl KeePassBackend for RealKeePass {
         self.password_cache
             .as_ref()
             .is_some_and(MasterPasswordCache::clear)
+    }
+
+    fn master_password_cached(&self) -> bool {
+        self.password_cache
+            .as_ref()
+            .is_some_and(MasterPasswordCache::has_cached)
     }
 }
 

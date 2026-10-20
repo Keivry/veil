@@ -29,6 +29,15 @@ services:
 
       # ── 无 TPM 硬件的开发机：注释掉下方 devices 两行，并设置 VEIL_ALLOW_MOCK_TPM=1（仅开发）。──
       # - VEIL_ALLOW_MOCK_TPM=1
+    cap_add:
+      # mlockall 检查 CAP_IPC_LOCK（与 ulimits 冗余保险；受限 daemon 可只保留本节）。
+      - IPC_LOCK
+    ulimits:
+      # 明文密钥内存锁定上限；被 daemon 拒绝时可删除本段，cap_add 单独亦可使 mlockall 成功。
+      memlock: -1
+    group_add:
+      # 必填：TPM 设备属组 GID。取值：stat -c '%g' /dev/tpmrm0；无 TPM 开发机用 TPM_GID=$(id -g)。
+      - "${TPM_GID:?未设置 TPM_GID：请执行 stat -c '%g' /dev/tpmrm0 取值，无 TPM 开发机用 TPM_GID=$(id -g)}"
     ports:
       # 回环三端口（默认仅回环；宿主机端口可经环境变量覆盖，回环绑定语义保持）。
       # Rust 服务在容器内固定监听 8877，三条映射均指向该端口（Host 端口区分调用入口）。
@@ -42,8 +51,8 @@ services:
       - ${TPM_HOST_PATH:-./data/tpm}:/data/tpm:ro
       # KeePass 数据库（.kdbx + .key）。
       - ${DB_HOST_PATH:-./data/db}:/data/db:ro
-      # TOML 配置文件（只读）；配合上方 VEIL_CONFIG_FILE 使用，宿主机 ./veil.toml 须先存在。
-      - ./veil.toml:/etc/veil/veil.toml:ro
+      # 容器版示例（只读）：bind = 0.0.0.0:8877；需要私有配置时改挂自己的 TOML。
+      - ./examples/veil.container.toml:/etc/veil/veil.toml:ro
     devices:
       - /dev/tpm0:/dev/tpm0
       - /dev/tpmrm0:/dev/tpmrm0

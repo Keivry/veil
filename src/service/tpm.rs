@@ -45,6 +45,15 @@ impl Drop for TempWorkdir {
 pub trait TpmUnlock: Send + Sync + Debug {
     fn unseal(&self) -> anyhow::Result<Vec<u8>>;
     fn is_available(&self) -> bool;
+
+    /// 带因由的可用性探测：默认由 `is_available` 降级（Mock 走此路径）。
+    fn probe(&self) -> std::result::Result<(), String> {
+        if self.is_available() {
+            Ok(())
+        } else {
+            Err("TPM 不可用".to_string())
+        }
+    }
 }
 
 /// CI / 单测用 Mock TPM（无硬件依赖）。
@@ -233,13 +242,40 @@ impl TpmUnlock for RealTpm {
     /// 与 `unseal` 路径（`createprimary → load → unseal` 全回放）的差异有意为之：
     /// 探测只回答“TPM 硬件/守护进程是否在位”，密封模板回放正确性由 `unseal`
     /// 首次调用的真实错误透出，不在探测阶段预演（避免启动期双倍耗时与临时目录残留）。
-    fn is_available(&self) -> bool {
-        retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
-            std::process::Command::new("tpm2_pcrread")
+    fn is_available(&self) -> bool { self.probe().is_ok() }
+
+    /// 探测 `tpm2_pcrread` 并保留 stderr：缺失/非零退出/设备权限不足给出可区分的启动原因。
+    fn probe(&self) -> std::result::Result<(), String> {
+        let executable = match &self.bin_dir {
+            Some(dir) => dir.join("tpm2_pcrread"),
+            None => PathBuf::from("tpm2_pcrread"),
+        };
+        let output = match retry_on_exec_busy(EXEC_MAX_ATTEMPTS, || {
+            std::process::Command::new(&executable)
                 .arg("sha256:0")
                 .output()
-        })
-        .is_ok_and(|o| o.status.success())
+        }) {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err("tpm2_pcrread 不存在（runtime 镜像需安装 tpm2-tools）".to_string());
+            }
+            Err(err) => return Err(format!("tpm2_pcrread 执行失败: {err}")),
+        };
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let reason = if stderr.is_empty() {
+            format!("tpm2_pcrread 退出码 {:?}", output.status.code())
+        } else {
+            stderr
+        };
+        if reason.contains("Permission denied") || reason.contains("EACCES") {
+            return Err(format!(
+                "{reason}（设备权限不足：容器内需 group_add TPM_GID 或调整设备属组）"
+            ));
+        }
+        Err(reason)
     }
 
     fn unseal(&self) -> anyhow::Result<Vec<u8>> {
@@ -292,8 +328,8 @@ fn sealed_ctx_arg(workdir: &Path) -> String {
 
 /// 启动门禁：TPM 不可用 SHALL 报错退出，MUST NOT 软件回退。
 pub fn require_hardware_tpm(tpm: &dyn TpmUnlock) -> anyhow::Result<Vec<u8>> {
-    if !tpm.is_available() {
-        anyhow::bail!("TPM 不可用，拒绝启动（禁止软件回退）");
+    if let Err(reason) = tpm.probe() {
+        anyhow::bail!("TPM 不可用，拒绝启动（禁止软件回退）: {reason}");
     }
     tpm.unseal()
 }

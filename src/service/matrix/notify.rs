@@ -161,14 +161,19 @@ impl NotificationSpool {
 
     pub fn capacity(&self) -> usize { self.capacity }
 
-    /// 审批正文格式化（复用单一 Bot，无新建实例）。
-    pub fn format_approval(
+    /// 建单正文（含该分支 reaction 图例）。
+    pub fn format_ticket(&self, branch: MatrixBranch, summary: &str) -> String {
+        self.bot.format_ticket(branch, summary)
+    }
+
+    /// 无票通知正文（不含图例）。
+    pub fn format_notice(
         &self,
         branch: MatrixBranch,
         approved: Option<bool>,
         summary: &str,
     ) -> String {
-        self.bot.format_approval(branch, approved, summary)
+        self.bot.format_notice(branch, approved, summary)
     }
 
     /// 审批建单专用 tracked 发送：直接 `await` sink 取真实 event id，`None` 即发送失败。

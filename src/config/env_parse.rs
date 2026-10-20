@@ -27,11 +27,18 @@ use {
         },
     },
     crate::error::{Result, VeilError},
-    std::{collections::HashMap, path::PathBuf, time::Duration},
+    std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration},
 };
 
+mod keepass;
 pub(crate) mod pii_scope;
-pub use pii_scope::PiiScopeMode;
+pub use {keepass::KeepassBackendKind, pii_scope::PiiScopeMode};
+
+/// 默认监听地址：本机回环（容器部署在 `[server].bind` 显式写 `0.0.0.0:8877`）。
+pub const DEFAULT_SERVER_BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::new(127, 0, 0, 1),
+    8877,
+));
 
 /// 审计审批默认超时（秒）。
 pub const AUDIT_TIMEOUT_DEFAULT: i64 = 90;
@@ -177,6 +184,8 @@ pub struct Config {
     /// 可观测性总开关（`OBSERVABILITY_DISABLE`，仅精确 `1` 生效）：
     /// 置位时网关入口拒绝管理面（`/_admin` 全 404，与 token 有效性无关）。
     pub observability_disabled: bool,
+    /// 监听地址（文件专属 `[server].bind`；缺省 `127.0.0.1:8877`）。
+    pub server_bind: SocketAddr,
     pub audit_mode: AuditMode,
     /// 审计模式是否由环境来源显式给出（`AUDIT_MODE` 非空）。
     /// 用于区分「显式 `AUDIT_MODE=off`」与「未设置」，决定策略文件 `mode`
@@ -255,28 +264,6 @@ pub struct Config {
     pub credential_block_wait: bool,
 }
 
-/// KeePass 后端选型：默认 real，显式 `VEIL_KEEPASS_BACKEND=mock` 仅 CI 逃生。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KeepassBackendKind {
-    #[default]
-    Real,
-    Mock,
-}
-
-impl std::str::FromStr for KeepassBackendKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "real" => Ok(Self::Real),
-            "mock" => Ok(Self::Mock),
-            other => Err(format!(
-                "VEIL_KEEPASS_BACKEND 非法: {other:?}（取值 real/mock）"
-            )),
-        }
-    }
-}
-
 /// 遗留兼容声明：`CREDENTIAL_MASTER_PASSWORD`/`CREDENTIAL_PORT` 为遗留变量名，
 /// 本二进制不读取（`load_from` 只认下述新名）；主密码口令改走 TPM 解封
 /// （`service::tpm::startup_tpm_in`），部署密钥改用 `VEILCTL_SECRET`，
@@ -306,7 +293,12 @@ impl Config {
         env: &HashMap<String, String>,
         outcome: super::file_layer::FileLayerOutcome,
     ) -> Result<Self> {
-        Self::load_from_parts(env, outcome.llm_targets, outcome.command)
+        Self::load_from_parts(
+            env,
+            outcome.llm_targets,
+            outcome.command,
+            outcome.server_bind,
+        )
     }
 
     /// 扩展入口：并入文件层已校验的 `[llm.targets]` 覆盖，复用同一校验链
@@ -315,13 +307,14 @@ impl Config {
         env: &HashMap<String, String>,
         llm_targets: LlmTargets,
     ) -> Result<Self> {
-        Self::load_from_parts(env, llm_targets, CommandConfig::default())
+        Self::load_from_parts(env, llm_targets, CommandConfig::default(), None)
     }
 
     fn load_from_parts(
         env: &HashMap<String, String>,
         llm_targets: LlmTargets,
         command: CommandConfig,
+        server_bind: Option<SocketAddr>,
     ) -> Result<Self> {
         let get = |name: &str| env.get(name).map(|v| v.trim().to_string());
         for name in super::validate::legacy_ignored_detected(env) {
@@ -400,6 +393,11 @@ impl Config {
         let default_upstream = llm_default_upstream.as_deref();
         validate_target_upstreams(&llm_targets, &llm_upstreams, default_upstream)?;
         let keepass_backend = load_keepass_backend(&get)?;
+        if entry_mode != EntryMode::Full {
+            tracing::warn!(
+                "[storage].entry_mode = {entry_mode:?}（非 full）：Pending 条目在 credential-only 下会跳过审批直接放行；llm-only 使凭据面不可用"
+            );
+        }
 
         Ok(Self {
             homeserver,
@@ -407,6 +405,7 @@ impl Config {
             matrix_access_token,
             observability_admin_token,
             observability_disabled,
+            server_bind: server_bind.unwrap_or(DEFAULT_SERVER_BIND),
             audit_mode,
             audit_mode_explicit,
             audit_timeout_secs,

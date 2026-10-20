@@ -10,59 +10,72 @@ pub const CREDENTIAL_TIMEOUT_SECS: u64 = 300;
 /// 孤儿 pending 清扫阈值（秒）。
 pub const ORPHAN_SWEEP_SECS: u64 = 60;
 
-/// Matrix 五分支业务（未知分支忽略并记审计）。
+/// Matrix 分支业务（未知分支忽略并记审计）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixBranch {
-    Unlock,
     Register,
     HashChange,
     Credential,
     Command,
     Audit,
+    Revoke,
     Unknown,
 }
 
 impl MatrixBranch {
-    pub fn from_reason(reason: &str) -> Self {
-        let r = reason.to_lowercase();
-        if r.contains("unlock") || r.contains("解锁") {
-            Self::Unlock
-        } else if r.contains("register")
-            || r.contains("注册")
-            || r.contains("revoke")
-            || r.contains("吊销")
-        {
-            Self::Register
-        } else if r.contains("hash") || r.contains("哈希") {
-            Self::HashChange
-        } else if r.contains("credential") || r.contains("凭据") {
-            Self::Credential
-        } else if r.contains("command") || r.contains("命令") {
-            Self::Command
-        } else if r.contains("audit") || r.contains("审计") {
-            Self::Audit
-        } else {
-            Self::Unknown
+    pub fn from_reason(reason: &str) -> std::result::Result<Self, String> {
+        let lowered = reason.to_lowercase();
+        let head = lowered.trim_start();
+        if head.starts_with("unlock") || head.starts_with("解锁") {
+            return Err(format!(
+                "unlock 审批链已移除，不允许建单: {reason:?}（若需重新取用，请走 TPM 解封）"
+            ));
         }
+        if head.starts_with("revoke") || head.starts_with("吊销") {
+            return Ok(Self::Revoke);
+        }
+        Ok(
+            if lowered.contains("register") || lowered.contains("注册") {
+                Self::Register
+            } else if lowered.contains("hash_mismatch") || lowered.contains("hash mismatch") {
+                Self::Credential
+            } else if lowered.contains("hash") || lowered.contains("哈希") {
+                Self::HashChange
+            } else if lowered.contains("credential") || lowered.contains("凭据") {
+                Self::Credential
+            } else if lowered.contains("command") || lowered.contains("命令") {
+                Self::Command
+            } else if lowered.contains("audit") || lowered.contains("审计") {
+                Self::Audit
+            } else {
+                Self::Unknown
+            },
+        )
     }
 
     pub fn status_emoji_approved(&self) -> &'static str { "✅" }
 
     pub fn status_emoji_rejected(&self) -> &'static str { "❎" }
 
-    pub fn status_emoji_pending(&self) -> &'static str { "🔓" }
+    pub fn status_emoji_pending(&self) -> &'static str { "⏳" }
 
     pub fn is_known(&self) -> bool { !matches!(self, Self::Unknown) }
 
-    /// 该分支预置提示的 reaction 表情集（与 [`reaction_to_decision`] 受理集一致，
-    /// 含注册/哈希变更分支的 `🔓`），供建单后预置、使审批人可点选。
+    /// 该分支是否有 Matrix 建单路径（`HashChange`/`Audit` 仅为原因分类标签）。
+    pub fn is_matrix_order_branch(&self) -> bool {
+        matches!(
+            self,
+            Self::Register | Self::Credential | Self::Command | Self::Revoke
+        )
+    }
+
     pub fn reaction_presets(&self) -> &'static [&'static str] {
         match self {
-            Self::Register | Self::HashChange | Self::Command => {
-                &[REACTION_AUTO_UNLOCK, REACTION_APPROVE, REACTION_REJECT]
+            Self::Register | Self::Command => {
+                &[REACTION_APPROVE, REACTION_APPROVE_ALWAYS, REACTION_REJECT]
             }
-            Self::Unlock | Self::Credential | Self::Audit => &[REACTION_APPROVE, REACTION_REJECT],
-            Self::Unknown => &[],
+            Self::Credential | Self::Revoke => &[REACTION_APPROVE, REACTION_REJECT],
+            Self::HashChange | Self::Audit | Self::Unknown => &[],
         }
     }
 }
@@ -87,12 +100,12 @@ pub fn validate_whitelist_mxids(whitelist: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// reaction 批准表情常量。
+/// reaction 批准本次。
 pub const REACTION_APPROVE: &str = "✅";
-/// reaction 拒绝表情常量。
+/// reaction 拒绝本次。
 pub const REACTION_REJECT: &str = "❎";
-/// reaction 表情常量（注册场景自动放行）。
-pub const REACTION_AUTO_UNLOCK: &str = "🔓";
+/// reaction 批准并建立持久自动放行（仅注册/哈希变更/命令受理）。
+pub const REACTION_APPROVE_ALWAYS: &str = "♾️";
 /// 文本指令：锁定。
 pub const CMD_LOCK: &str = "lock proxy";
 /// 文本指令：状态。
@@ -123,12 +136,23 @@ pub enum ResolveOutcome {
     Duplicate,
 }
 
-/// reaction 五分支落定（含自动放行语义）：`🔓` 仅注册分支视为批准。
+/// reaction 落定结果：动作全局唯一，静默与回执分开。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReactionOutcome {
-    Applied { approved: bool, auto: bool },
-    Ignored(&'static str),
+    Applied { approved: bool, always: bool },
+    Silent(&'static str),
+    Notify(&'static str),
     Duplicate,
+}
+
+/// 常量 → 动作（全局函数；分支只决定受不受理）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionAction {
+    Approve,
+    Reject,
+    ApproveAlways,
+    NotAccepted,
+    NotAnOrderBranch,
 }
 
 /// 文本指令三元组。
@@ -173,26 +197,39 @@ pub fn parse_text_command(body: &str) -> TextCommand {
     }
 }
 
-/// reaction 表情到决议的分支映射：未知表情返回 None（调用方 no-op）。
-pub fn reaction_to_decision(branch: MatrixBranch, key: &str) -> Option<(bool, bool)> {
-    match branch {
-        MatrixBranch::Unlock => match key {
-            k if k == REACTION_APPROVE => Some((true, false)),
-            k if k == REACTION_REJECT => Some((false, false)),
-            _ => None,
-        },
-        MatrixBranch::Register | MatrixBranch::HashChange | MatrixBranch::Command => match key {
-            k if k == REACTION_AUTO_UNLOCK => Some((true, true)),
-            k if k == REACTION_APPROVE => Some((true, false)),
-            k if k == REACTION_REJECT => Some((false, false)),
-            _ => None,
-        },
-        MatrixBranch::Credential | MatrixBranch::Audit => match key {
-            k if k == REACTION_APPROVE => Some((true, false)),
-            k if k == REACTION_REJECT => Some((false, false)),
-            _ => None,
-        },
-        MatrixBranch::Unknown => None,
+/// 归一表情键：客户端可能带/不带 U+FE0F 变体选择符。
+pub fn normalize_reaction(key: &str) -> String { key.replace('\u{FE0F}', "") }
+
+/// 是否为受理集内的已知表情（旧解锁表情已退役，视为未知）。
+pub fn is_known_reaction(key: &str) -> bool {
+    let key = normalize_reaction(key);
+    [REACTION_APPROVE, REACTION_APPROVE_ALWAYS, REACTION_REJECT]
+        .iter()
+        .any(|known| normalize_reaction(known) == key)
+}
+
+/// 表情键 → 全局动作；分支只决定受不受理。
+pub fn reaction_to_decision(branch: MatrixBranch, key: &str) -> ReactionAction {
+    let key = normalize_reaction(key);
+    let approve = normalize_reaction(REACTION_APPROVE);
+    let reject = normalize_reaction(REACTION_REJECT);
+    let always = normalize_reaction(REACTION_APPROVE_ALWAYS);
+    if !branch.is_matrix_order_branch() {
+        return ReactionAction::NotAnOrderBranch;
+    }
+    if key == approve {
+        ReactionAction::Approve
+    } else if key == reject {
+        ReactionAction::Reject
+    } else if key == always {
+        match branch {
+            // 仅三类建单分支受理 `♾️`（HashChange/Audit 已在函数开头按非建单分支返回，
+            // 不可能抵达此处——故 SHALL NOT 出现在本臂，避免读成"哈希变更受理持久放行"）。
+            MatrixBranch::Register | MatrixBranch::Command => ReactionAction::ApproveAlways,
+            _ => ReactionAction::NotAccepted,
+        }
+    } else {
+        ReactionAction::NotAccepted
     }
 }
 

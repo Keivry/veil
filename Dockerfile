@@ -26,7 +26,7 @@ RUN cargo build --release
 FROM docker.io/library/debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --no-log-init --create-home --home-dir /home/veil veil \

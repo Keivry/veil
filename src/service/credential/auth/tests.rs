@@ -507,3 +507,20 @@ async fn same_secret_cross_requests_same_token() {
     assert!(credential_value(&first).starts_with("__CRED_"));
     assert_eq!(credential_value(&first), credential_value(&second));
 }
+
+#[test]
+fn pending_entry_only_skips_approval_in_credential_only_mode() {
+    use crate::config::EntryMode;
+    assert!(
+        pending_entry_needs_approval(EntryMode::Full),
+        "full 须进审批"
+    );
+    assert!(
+        pending_entry_needs_approval(EntryMode::LlmOnly),
+        "llm-only 亦须进审批（凭据面不可用属另一约束）"
+    );
+    assert!(
+        !pending_entry_needs_approval(EntryMode::CredentialOnly),
+        "credential-only 下 Pending 直接放行（示例不得用该模式配 pending）"
+    );
+}

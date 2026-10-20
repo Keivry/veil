@@ -2,12 +2,11 @@
 //! 纯透传层，业务语义归 `service`（`handle_credential/register/revoke/approve`）；
 //! 注册 DTO→域映射（条目/字段/放行模式）归 `service::credential::register_map`
 //! 本层仅提取原始字段并委派，不承载业务解析。
-//! 紧急吊销只认 TCP 远端 `ConnectInfo`，禁采信代理头。
+//! 紧急吊销只认管理 token；无 token 时须先过三因子，不成立即 401/403 且不建单。
 
 use {
     crate::{
         error::{Result, VeilError},
-        handler::peer_ip::PeerIp,
         service::{self, CredentialBody, CredentialHeaders},
         state::AppState,
     },
@@ -239,11 +238,14 @@ pub struct EmergencyRevokeBody {
     pub caller_hash: Option<String>,
     #[serde(default)]
     pub admin_token: Option<String>,
+    #[serde(default)]
+    pub auth: Option<service::AuthBlock>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 pub async fn emergency_revoke_handler(
     State(state): State<AppState>,
-    peer: PeerIp,
     headers: HeaderMap,
     Json(body): Json<EmergencyRevokeBody>,
 ) -> Result<Json<Value>> {
@@ -255,15 +257,21 @@ pub async fn emergency_revoke_handler(
         auth: None,
         secret: None,
     })?;
-    let admin_token = body
-        .admin_token
-        .clone()
-        .or_else(|| header_str(&headers, "x-admin-token"));
-    // 安全契约：紧急吊销只认 TCP 远端 `ConnectInfo`，
-    // MUST NOT 回退 `X-Forwarded-For` 等代理头（伪造头可绕过内网豁免）。
-    let peer_ip = peer.0.map(|ip| ip.to_string());
-    let view =
-        service::emergency_revoke(&state, &key, admin_token.as_deref(), peer_ip.as_deref()).await?;
+    // 头与 body 任一有效即算携带管理 token；任一无效值不得遮蔽另一处的有效值
+    // （否则同一请求会因一个可忽略的自证字段被判为无 token）。
+    let expected_admin = state.config.observability_admin_token.as_str();
+    let valid_admin = |got: &str| !got.is_empty() && crate::auth::secret_eq(got, expected_admin);
+    let header_token = header_str(&headers, "x-admin-token");
+    let body_token = body.admin_token.clone();
+    let admin_token = [header_token.as_deref(), body_token.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|got| valid_admin(got))
+        .map(str::to_string);
+    if admin_token.is_none() {
+        require_three_factor(&state, &headers, body.auth.as_ref(), body.secret.as_deref()).await?;
+    }
+    let view = service::emergency_revoke(&state, &key, admin_token.as_deref()).await?;
     Ok(Json(json!({ "ok": true, "registration": view })))
 }
 
@@ -289,8 +297,8 @@ pub async fn approve_hash_change_handler(
     Json(body): Json<ApproveHashChangeBody>,
 ) -> Result<Json<Value>> {
     require_three_factor(&state, &headers, body.auth.as_ref(), body.secret.as_deref()).await?;
-    // `reg_id` 优先，缺省回退 `caller_path`；`reaction` 缺省按保持自动，
-    // 未知非空值返回 400（显式校验）。
+    // `reg_id` 优先，缺省回退 `caller_path`（定位信息，非安全决策）；
+    // `reaction` 为必填安全决策：缺省、空串、已退役 `🔓` 与集合外取值一律 400。
     let key = if body.reg_id.trim().is_empty() {
         body.caller_path.trim()
     } else {
@@ -301,7 +309,7 @@ pub async fn approve_hash_change_handler(
     // DTO 字段 trim 与 `RegisterParams` 构造（已下沉 `service::register_map`）。
     let outcome = crate::registry::HashChangeOutcome::from_reaction(body.reaction.as_deref())
         .ok_or_else(|| VeilError::BadRequest {
-            message: "reaction 必须为 🔓/✅/❎".to_string(),
+            message: "reaction 必须为 ♾️/✅/❎（缺省不合法；旧解锁表情已退役）".to_string(),
         })?;
     let view = service::approve_hash_change(&state, key, &body.new_hash, outcome).await?;
     Ok(Json(json!({ "ok": true, "registration": view })))

@@ -368,27 +368,13 @@ impl CallerRegistry {
         Ok(entry)
     }
 
-    pub fn approve_hash_change(
-        &mut self,
-        caller_path: &str,
-        new_hash: &str,
-    ) -> Result<&CallerEntry> {
-        let script_sha256 = bind_script_sha256(caller_path, new_hash);
-        self.approve_hash_change_with_script_sha256(
-            caller_path,
-            new_hash,
-            script_sha256,
-            HashChangeOutcome::KeepAuto,
-        )
-    }
-
     /// 预计算脚本哈希入口：生产写路径在取写锁前异步读取后传入。
-    /// `outcome` 三态：`KeepAuto` 保持 `allow_mode`、`DemoteManual`
+    /// `outcome` 三态：`ApproveAlways` 置 `allow_mode=Allow`、`DemoteManual`
     /// 降级 `Pending`、`Disable` 置 `enabled=false`；三态均写旧哈希宽限与
     /// `script_sha256`。
     ///
-    /// `KeepAuto`/`DemoteManual` SHALL NOT 写 `revoked=false`/`enabled=true`
-    /// ——落定仅更新 `script_sha256` 与旧哈希宽限字段，不复活/解吊销既有条目。
+    /// `ApproveAlways`/`DemoteManual` SHALL NOT 写 `revoked=false`/`enabled=true`
+    /// ——落定仅更新 `script_sha256`、`allow_mode` 与旧哈希宽限字段，不复活/解吊销既有条目。
     /// `Disable` 仍 fail-closed 置 `enabled=false`。
     pub fn approve_hash_change_with_script_sha256(
         &mut self,
@@ -410,8 +396,9 @@ impl CallerRegistry {
         entry.expected_hash = new_hash.to_string();
         entry.script_sha256 = script_sha256;
         match outcome {
-            // 保持既有 `allow_mode`/`enabled`/`revoked` 原状，仅哈希与宽限已更新。
-            HashChangeOutcome::KeepAuto => {}
+            HashChangeOutcome::ApproveAlways => {
+                entry.allow_mode = Some(crate::config::AutoApprove::Allow);
+            }
             HashChangeOutcome::DemoteManual => {
                 entry.allow_mode = Some(crate::config::AutoApprove::Pending);
             }
@@ -420,6 +407,18 @@ impl CallerRegistry {
             }
         }
         Ok(entry)
+    }
+
+    pub fn set_allow_mode(
+        &mut self,
+        key: &str,
+        mode: Option<crate::config::AutoApprove>,
+    ) -> Result<()> {
+        let entry = self.find_mut(key).ok_or_else(|| VeilError::BadRequest {
+            message: format!("调用方不存在: {key}"),
+        })?;
+        entry.allow_mode = mode;
+        Ok(())
     }
 
     pub fn set_enabled(&mut self, key: &str, enabled: bool) -> Result<()> {

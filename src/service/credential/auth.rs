@@ -192,7 +192,7 @@ pub(crate) async fn resolve_caller(
         if ct_eq(caller_hash, &caller.expected_hash) {
             if caller.revoked || !caller.enabled {
                 return Err(VeilError::Auth {
-                    message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                    message: "调用方已禁用，拒绝".to_string(),
                 });
             }
             return Ok(CallerLookup::Enrolled {
@@ -204,7 +204,7 @@ pub(crate) async fn resolve_caller(
         if caller.matches_old_hash(caller_hash) {
             if caller.revoked || !caller.enabled {
                 return Err(VeilError::Auth {
-                    message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                    message: "调用方已禁用，拒绝".to_string(),
                 });
             }
             let grace_notify = caller
@@ -220,7 +220,7 @@ pub(crate) async fn resolve_caller(
         }
         if caller.revoked {
             return Err(VeilError::Auth {
-                message: format!("调用方已吊销（{}），拒绝", caller.status_emoji()),
+                message: "调用方已吊销，拒绝".to_string(),
             });
         }
         return Ok(CallerLookup::HashMismatch);
@@ -228,7 +228,7 @@ pub(crate) async fn resolve_caller(
     if let Some(caller) = registry.lookup_by_hash(caller_hash) {
         if caller.revoked || !caller.enabled {
             return Err(VeilError::Auth {
-                message: format!("调用方已禁用（{}），拒绝", caller.status_emoji()),
+                message: "调用方已禁用，拒绝".to_string(),
             });
         }
         return Ok(CallerLookup::ByHash {
@@ -353,7 +353,7 @@ pub async fn handle_credential(
                 message: "自动放行=False，拒绝".to_string(),
             });
         }
-        Some(AutoApprove::Pending) if state.config().entry_mode != EntryMode::CredentialOnly => {
+        Some(AutoApprove::Pending) if pending_entry_needs_approval(state.config().entry_mode) => {
             return approval_dual_mode(
                 state,
                 &pending_key,
@@ -368,6 +368,11 @@ pub async fn handle_credential(
     }
 
     query_keepass(state, &entry, field.as_deref(), use_token).await
+}
+
+/// `Pending` 条目是否进审批：`credential-only` 显式跳过（直接放行）。
+fn pending_entry_needs_approval(entry_mode: EntryMode) -> bool {
+    entry_mode != EntryMode::CredentialOnly
 }
 
 #[cfg(test)]

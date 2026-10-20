@@ -1172,3 +1172,4 @@ fn file_len_redline() {
 
 mod docs_lockstep;
 mod env_read_surface;
+mod server_bind;

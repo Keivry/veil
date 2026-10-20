@@ -106,47 +106,35 @@ async fn approval_pending_uses_real_event_id() {
 }
 
 #[tokio::test]
-async fn audit_branch_pending_uses_real_event_id() {
-    // 本测试覆盖「通用 `MatrixBranch::Audit` 经 tracked 发送取真实 id 建单」的能力，
-    // 非生产 `audit-hold` 路径——生产 audit-hold（`src/handler/llm/pump/spawn.rs`）仅写内存
-    // `audit_pending`，不建 Matrix 审批票（工程参考 §6.4）。
+async fn audit_and_hash_labels_never_create_tickets() {
     let env = cred_env(&[("APPROVAL_WHITELIST", "@admin:example.com")]);
     let state = cred_state(&env);
-    let event_id = submit_pending_with_branch(
-        &state,
-        "audit-hold-0-shell",
-        "audit-hold: rm -rf /",
-        MatrixBranch::Audit,
-        "",
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        event_id.starts_with("$test-event-"),
-        "Audit 分支建单须用真实 id，实得 {event_id}"
-    );
-    assert_eq!(
-        state.approval.pending_event_ids().await,
-        vec![event_id.clone()]
-    );
-    let reaction = ReactionInput {
-        target_event_id: event_id,
-        key: "✅".to_string(),
-        sender: "@admin:example.com".to_string(),
-        room_id: "!r:example.com".to_string(),
-        server_ts_ms: 2000,
-    };
-    assert_eq!(
-        state
-            .approval
-            .on_reaction(&reaction, "@bot:example.com", "!r:example.com", 1000)
-            .await,
-        ReactionOutcome::Applied {
-            approved: true,
-            auto: false
-        }
-    );
+    for (key, reason, branch) in [
+        (
+            "audit-hold-0-shell",
+            "audit-hold: rm -rf /",
+            MatrixBranch::Audit,
+        ),
+        (
+            "hash-change-0-shell",
+            "hash-change",
+            MatrixBranch::HashChange,
+        ),
+    ] {
+        let err = submit_pending_with_branch(&state, key, reason, branch, "", None)
+            .await
+            .expect_err("分类标签不得建票");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert!(
+            state.approval.pending_event_ids().await.is_empty(),
+            "{branch:?} 不得产生 Matrix 票"
+        );
+        let err = submit_pending(&state, key, reason, "", None)
+            .await
+            .expect_err("原因串分类得到的标签不得建票");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert!(state.approval.pending_event_ids().await.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -206,7 +194,7 @@ async fn approval_reaction_three_state_and_timeout() {
             .await,
         ReactionOutcome::Applied {
             approved: true,
-            auto: false
+            always: false
         }
     );
     assert_eq!(
@@ -221,14 +209,14 @@ async fn approval_reaction_three_state_and_timeout() {
             .await,
         ReactionOutcome::Applied {
             approved: false,
-            auto: false
+            always: false
         }
     );
     assert_eq!(
         state
             .approval
             .on_reaction(
-                &reaction(&auto_id, "🔓"),
+                &reaction(&auto_id, "♾️"),
                 "@bot:example.com",
                 "!r:example.com",
                 1000
@@ -236,7 +224,7 @@ async fn approval_reaction_three_state_and_timeout() {
             .await,
         ReactionOutcome::Applied {
             approved: true,
-            auto: true
+            always: true
         }
     );
     let timeout_id = submit_pending_with_branch(
@@ -267,7 +255,7 @@ async fn approval_reaction_three_state_and_timeout() {
                 1000
             )
             .await,
-        ReactionOutcome::Ignored("event id 无精确匹配"),
+        ReactionOutcome::Silent("event id 无精确匹配"),
         "未知 id 不得落定"
     );
 }

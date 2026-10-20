@@ -22,10 +22,11 @@ use {
         validate::config_error,
     },
     crate::error::Result,
-    serde::{Deserialize, Serialize},
+    serde::{Deserialize, Deserializer, Serialize, de},
     serde_json::Value,
     std::{
         collections::{BTreeMap, HashMap},
+        net::SocketAddr,
         path::{Path, PathBuf},
     },
 };
@@ -39,7 +40,10 @@ const UPSTREAMS_KEY_PREFIX: &str = "llm.upstreams.";
 
 /// 文件专属结构键根（无 env 映射，不参与逐键合并）：内部结构由
 /// `config::targets` 校验与结构性键锁步测试覆盖；工程参考 §1 与锁步测试须保持同步。
-pub(crate) const FILE_ONLY_KEYS: &[&str] = &["llm.targets", "command"];
+///
+/// `server` 是键根级文件专属概念：`[server].bind` 属部署参数，不进 env 白名单
+/// （design D1），故以根名登记、由 `FileLayerOutcome.server_bind` 单值进 `Config`。
+pub(crate) const FILE_ONLY_KEYS: &[&str] = &["llm.targets", "command", "server"];
 
 /// 命中文件专属结构键根：`key == root` 或以 `root.` 开头时返回该根，否则 `None`。
 fn file_only_root(key: &str) -> Option<&'static str> {
@@ -115,6 +119,33 @@ pub struct FileConfig {
     pub llm: Option<LlmSection>,
     pub keepass: Option<KeepassSection>,
     pub command: Option<CommandSection>,
+    pub server: Option<ServerSection>,
+}
+
+/// `[server]`：监听地址（文件专属；`bind` 必须是 `IP:PORT` 字面量）。
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSection {
+    #[serde(default, deserialize_with = "deserialize_bind")]
+    pub bind: Option<SocketAddr>,
+}
+
+/// `bind` 专属反序列化：把类型/语法错误统一改写为指名 `server.bind` 的 fail-closed
+/// 消息（`SocketAddr` 不接受主机名；缺端口/越界/非 IP 字面量一律拒启动）。
+fn deserialize_bind<'de, D>(deserializer: D) -> std::result::Result<Option<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)
+        .map_err(|e| de::Error::custom(format!("server.bind 取值非法: {e}")))?;
+    raw.map(|text| {
+        text.trim().parse::<SocketAddr>().map_err(|e| {
+            de::Error::custom(format!(
+                "server.bind 取值非法: {text:?}（{e}）；须为 IP:PORT 字面量，如 \"127.0.0.1:8877\""
+            ))
+        })
+    })
+    .transpose()
 }
 
 /// `[auth]`：认证/服务身份（目录键见 `MAPPINGS`）。
@@ -463,6 +494,7 @@ struct ResolvedEntry {
 pub struct FileLayerOutcome {
     pub llm_targets: LlmTargets,
     pub command: CommandConfig,
+    pub server_bind: Option<SocketAddr>,
 }
 
 /// 文件补充层入口：引导读取 → fail-closed 解析 → 密钥权限门禁 → 覆盖字段校验 →
@@ -481,10 +513,12 @@ pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<FileLayerO
             .and_then(|section| section.targets.as_ref()),
     )?;
     let command = validate_command(cfg.command.as_ref())?;
+    let server_bind = cfg.server.as_ref().and_then(|section| section.bind);
     merge_entries(env, resolve_entries(&cfg)?);
     Ok(FileLayerOutcome {
         llm_targets,
         command,
+        server_bind,
     })
 }
 

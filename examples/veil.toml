@@ -23,6 +23,11 @@ observability_disable = false
 # matrix_access_token = "syt_..."
 # observability_admin_token = "至少 32 字符的随机串"
 
+[server]
+# 监听地址（文件专属部署参数；必须为 IP:PORT 字面量，不接受主机名）
+# 本机直跑保持回环；容器内需改为 0.0.0.0（见 examples/veil.container.toml）
+bind = "127.0.0.1:8877"
+
 [limits]
 audit_hold_max_bytes = 1048576
 nonstream_max_bytes = 8388608
@@ -41,7 +46,9 @@ data_dir = "/data"                  # 派生 db_dir / tpm_dir / caller_registry_
 # tpm_dir = "/data/tpm"
 # caller_registry_path = "/data/caller_registry.json"
 auto_approve = "pending"            # allow | deny | pending
-entry_mode = "credential-only"      # full | credential-only | llm-only
+entry_mode = "full"                 # full | credential-only | llm-only
+# 注意：credential-only 会让 auto_approve = "pending" 的条目跳过审批直接放行；
+#       llm-only 使凭据面不可用。示例给最不意外的 full。
 credential_block_wait = false
 # 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
 # veilctl_secret = "..."

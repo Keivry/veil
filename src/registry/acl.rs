@@ -9,7 +9,7 @@ impl CallerEntry {
         } else if self.enabled {
             "✅"
         } else {
-            "🔓"
+            "⏳"
         }
     }
 
@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn status_emoji_maps_three_states() {
         let mut e = entry("/s/a.sh", "h1");
-        assert_eq!(e.status_emoji(), "🔓");
+        assert_eq!(e.status_emoji(), "⏳");
         e.enabled = true;
         assert_eq!(e.status_emoji(), "✅");
         e.revoked = true;

@@ -79,6 +79,8 @@ struct CleanupHandles {
 impl veil::service::matrix::GatewayCleanup for CleanupHandles {
     fn keepass_unlocked(&self) -> bool { self.keepass.is_unlocked() }
 
+    fn master_password_cached(&self) -> bool { self.keepass.master_password_cached() }
+
     fn vault_len(&self) -> usize { self.vault.len() }
 
     fn lock_cleanup(&self) -> usize {
@@ -122,6 +124,13 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+}
+
+/// 判定是否运行在容器内（Docker 与 Podman/CRI-O 各写一个标记文件）。
+/// 只用于启动告警口径，不参与任何安全判定。
+fn running_in_container() -> bool {
+    std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
 }
 
 #[tokio::main]
@@ -284,7 +293,22 @@ async fn main() -> ExitCode {
         )
     });
     let app = build_router(state.clone());
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:8877").await {
+    let bind_addr = state.config.server_bind;
+    if !bind_addr.ip().is_loopback() {
+        tracing::warn!(
+            "监听地址 {bind_addr} 非回环：该网卡上所有可达方均可访问本服务；\
+             容器内需 0.0.0.0:8877，宿主机侧请仅发布到 127.0.0.1"
+        );
+    } else if running_in_container() {
+        // 容器内监听回环时，bridge 网络的 DNAT 目标不是 lo，宿主发布端口会被 reset；
+        // 而 HEALTHCHECK 在容器内跑，仍报 healthy —— 这是"绿但不可达"的经典假象。
+        tracing::warn!(
+            "检测到容器环境但监听地址为回环 {bind_addr}：端口发布（DNAT）无法投递到回环，\
+             宿主机侧将无法访问（容器内 /health 仍为 ok）。请在挂载的 TOML 中设置 \
+             [server].bind = \"0.0.0.0:8877\""
+        );
+    }
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(err) => {
             eprintln!("启动失败: 端口绑定失败: {err}");

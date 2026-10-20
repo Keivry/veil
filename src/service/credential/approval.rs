@@ -97,23 +97,37 @@ pub(crate) async fn submit_pending(
     entry: &str,
     field: Option<&str>,
 ) -> Result<String> {
-    let branch = matrix::MatrixBranch::from_reason(reason);
+    let branch = matrix::MatrixBranch::from_reason(reason)
+        .map_err(|message| VeilError::BadRequest { message })?;
+    if !branch.is_known() {
+        return Err(VeilError::BadRequest {
+            message: format!("审批原因无法分类，按拒绝 fail-closed: {reason}"),
+        });
+    }
+    if !branch.is_matrix_order_branch() {
+        return Err(VeilError::BadRequest {
+            message: format!(
+                "审批原因被分类为 HashChange/Audit 标签，该标签不建 Matrix 票（仅用于原因串分类与文案），按拒绝 fail-closed: {reason}"
+            ),
+        });
+    }
     submit_pending_with_branch(state, key, reason, branch, entry, field).await
 }
 
-/// 按分支取内存 pending 清扫 TTL（秒）——凭据/注册/哈希变更类阻塞票
-/// 保留至 300s 阻塞超时，空闲/审计/解锁类维持 60s 上限。
+/// 按分支取内存 pending 清扫 TTL（秒）——凭据/注册/命令/吊销四类建单票
+/// 保留至 300s 阻塞超时；`HashChange`/`Audit`/`Unknown` 等非建单分类标签
+/// 与空闲类一样维持 60s 上限（`HashChange` 已改为同步 `reaction` 落定、不建票）。
 fn pending_ttl_secs(branch: matrix::MatrixBranch) -> u64 {
     match branch {
         matrix::MatrixBranch::Register
-        | matrix::MatrixBranch::HashChange
+        | matrix::MatrixBranch::Revoke
         | matrix::MatrixBranch::Credential
         | matrix::MatrixBranch::Command => matrix::CREDENTIAL_TIMEOUT_SECS,
         _ => PENDING_TTL_SECS,
     }
 }
 
-/// 显式分支建单：注册/吊销复用 `Register` 分支，避免调用方路径内的
+/// 显式分支建单：调用方直接指定分支，避免调用方路径内的
 /// 关键词（如 `unlock`/`credential`）经 `from_reason` 误判分支。
 ///
 /// 审批建单走 tracked 发送——先 `await` 取 Bot 返回的真实 Matrix event id，
@@ -140,10 +154,17 @@ pub(crate) async fn submit_pending_with_summary(
     branch: matrix::MatrixBranch,
     summary: &str,
 ) -> Result<String> {
+    if !branch.is_matrix_order_branch() {
+        return Err(VeilError::BadRequest {
+            message: format!(
+                "分支 {branch:?} 不是 Matrix 建单分支（HashChange/Audit 仅为原因分类标签），按拒绝 fail-closed"
+            ),
+        });
+    }
     if !state.config().matrix_enabled() {
         return Err(matrix_disabled_error(state));
     }
-    let text = state.notify().format_approval(branch, None, summary);
+    let text = state.notify().format_ticket(branch, summary);
     let Some(event_id) = state.notify().send_tracked(text).await else {
         tracing::warn!("审批发送失败，按拒绝 fail-closed（不建单）: 原因 {reason}");
         return Err(VeilError::Auth {
@@ -191,16 +212,16 @@ pub(crate) enum CredentialDecision {
     TimedOut,
 }
 
-/// 闭环批准动作对「自动放行」表情（`🔓` → `auto=true`）的策略。
-/// 吊销 lane 传 [`AutoPolicy::Reject`]——`decision == Some(true) && auto` 落定为拒绝，
-/// 使其与常规吊销路径的 `!auto` 守卫一致；凭据 lane 传 [`AutoPolicy::Accept`]（行为不变）。
+/// 闭环批准动作对「持久放行」表情（`♾️` → `always=true`）的策略。
+/// 吊销 lane 传 [`AutoPolicy::Reject`]（纵深防御：吊销票本就不受理 `♾️`）；
+/// 凭据 lane 传 [`AutoPolicy::Accept`]（行为不变）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutoPolicy {
     Accept,
     Reject,
 }
 
-/// 闭环 lane 声明——终态文案与「自动放行」策略成对传入。
+/// 闭环 lane 声明——终态文案与「持久放行」策略成对传入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClosureLane {
     pub label: &'static str,
@@ -534,16 +555,15 @@ where
             let key_owned = key.to_string();
             tokio::spawn(async move {
                 let decision = await_credential_approval(&owned, &event_id).await;
-                // `applied_auto` 必须早于 `clear_terminal_pending` 读取——
-                // 后者移除矩阵侧票后回读恒 `None`。吊销 lane（`Reject`）把 `🔓`
-                // （`Some(true) && auto`）落定的批准改写为拒绝。
-                let auto = owned
+                // `applied_always` 必须早于 `clear_terminal_pending` 读取——
+                // 后者移除矩阵侧票后回读恒 `None`。
+                let always = owned
                     .approval()
-                    .applied_auto(&event_id)
+                    .applied_always(&event_id)
                     .await
                     .unwrap_or(false);
                 let decision =
-                    if lane.auto_policy == AutoPolicy::Reject && decision == Some(true) && auto {
+                    if lane.auto_policy == AutoPolicy::Reject && decision == Some(true) && always {
                         Some(false)
                     } else {
                         decision
@@ -641,7 +661,7 @@ pub(crate) fn notify_hash_change(state: &impl AppStateParts, key: &str, detail: 
     let summary = format!("哈希变更 :: {key} :: {detail}");
     let text = state
         .notify()
-        .format_approval(matrix::MatrixBranch::Credential, None, &summary);
+        .format_notice(matrix::MatrixBranch::Credential, None, &summary);
     state.notify().notify_text(text);
     tracing::warn!("调用方哈希变更通知: {summary}");
 }

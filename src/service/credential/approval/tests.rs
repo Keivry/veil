@@ -167,7 +167,7 @@ async fn credential_only_entry_approve_blocked_forbidden() {
         &state,
         "/s/a.sh",
         "h2",
-        crate::registry::HashChangeOutcome::KeepAuto,
+        crate::registry::HashChangeOutcome::ApproveAlways,
     )
     .await
     .unwrap_err();
@@ -191,7 +191,6 @@ async fn emergency_revoke_exemptions_and_approval_flow() {
         &state,
         "/s/a.sh",
         Some("observability-admin-token-0123456789"),
-        None,
     )
     .await
     .unwrap();
@@ -199,9 +198,7 @@ async fn emergency_revoke_exemptions_and_approval_flow() {
     register_caller(&state, "/s/b.sh", "h2", "src-b")
         .await
         .unwrap();
-    let err = emergency_revoke(&state, "/s/b.sh", None, Some("203.0.113.9"))
-        .await
-        .unwrap_err();
+    let err = emergency_revoke(&state, "/s/b.sh", None).await.unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
 }
 
@@ -309,7 +306,12 @@ async fn old_hash_within_grace_allows() {
         .registry
         .write()
         .await
-        .approve_hash_change("/s/grace.sh", "h2")
+        .approve_hash_change_with_script_sha256(
+            "/s/grace.sh",
+            "h2",
+            "sha-h2".to_string(),
+            crate::registry::HashChangeOutcome::ApproveAlways,
+        )
         .unwrap();
     let out = handle_credential(
         &state,
@@ -582,7 +584,7 @@ async fn approval_message_context() {
         state.http_client().as_ref().clone(),
     );
     let summary = approval_summary("hash_mismatch", "/s/job.sh:abc123", "网易", Some("授权码"));
-    let text = bot.format_approval(MatrixBranch::Credential, None, &summary);
+    let text = bot.format_notice(MatrixBranch::Credential, None, &summary);
     assert!(text.contains("hash_mismatch"), "{text}");
     assert!(text.contains("/s/job.sh"), "{text}");
     assert!(text.contains("网易"), "{text}");
@@ -748,22 +750,20 @@ async fn pending_both_tables_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn emergency_revoke_auto_reaction_rejected() {
-    // 紧急吊销转常规审批的 `🔓` 不得执行吊销——重试 403、条目原状。
+async fn emergency_revoke_always_reaction_not_settled() {
+    // 紧急吊销转常规审批的 `♾️` 不受理——票保持未决、重试仍 202、条目原状。
     let state = cred_state(&cred_env(&[("APPROVAL_WHITELIST", "@admin:example.com")]));
     let key = "/s/em-auto.sh";
     register_caller(&state, key, "em-auto-h", "em-auto-src")
         .await
         .unwrap();
     state.registry.write().await.set_enabled(key, true).unwrap();
-    let err = emergency_revoke(&state, key, None, Some("203.0.113.9"))
-        .await
-        .unwrap_err();
+    let err = emergency_revoke(&state, key, None).await.unwrap_err();
     assert_eq!(err.status_code(), StatusCode::ACCEPTED);
     let event_id = wait_event_id(&state).await;
     let input = crate::service::matrix::ReactionInput {
         target_event_id: event_id,
-        key: "🔓".to_string(),
+        key: "♾️".to_string(),
         sender: "@admin:example.com".to_string(),
         room_id: "!r:example.com".to_string(),
         server_ts_ms: 1,
@@ -773,32 +773,24 @@ async fn emergency_revoke_auto_reaction_rejected() {
         .on_reaction(&input, "@bot:example.com", "!r:example.com", 0)
         .await;
     assert!(
-        matches!(
-            outcome,
-            crate::service::matrix::ReactionOutcome::Applied {
-                approved: true,
-                auto: true
-            }
-        ),
-        "🔓 须按自动放行落定: {outcome:?}"
+        matches!(outcome, crate::service::matrix::ReactionOutcome::Notify(_)),
+        "♾️ 在吊销分支须回执而不落定: {outcome:?}"
     );
     let pending_key = format!("revoke:{key}");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while credential_decision_slot(&state, &pending_key) != Some(DecisionSlot::Denied) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "🔓 落定后决策表须为拒绝，实得 {:?}",
-            credential_decision_slot(&state, &pending_key)
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let denied = emergency_revoke(&state, key, None, Some("203.0.113.9"))
-        .await
-        .unwrap_err();
-    assert_eq!(denied.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        credential_decision_slot(&state, &pending_key),
+        Some(DecisionSlot::Pending),
+        "不受理后票须保持未决"
+    );
+    let retried = emergency_revoke(&state, key, None).await.unwrap_err();
+    assert_eq!(
+        retried.status_code(),
+        StatusCode::ACCEPTED,
+        "重试仍为 202 + E_PENDING"
+    );
     let registry = state.registry.read().await;
     let entry = registry.lookup_by_path(key).unwrap();
-    assert!(entry.enabled && !entry.revoked, "🔓 不得吊销，条目须原状");
+    assert!(entry.enabled && !entry.revoked, "♾️ 不得吊销，条目须原状");
 }
 
 #[tokio::test]

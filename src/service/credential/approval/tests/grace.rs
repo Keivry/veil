@@ -21,7 +21,7 @@ async fn grace_notification_dedup() {
         &state,
         "/s/grace-dedup.sh",
         "h2",
-        HashChangeOutcome::KeepAuto,
+        HashChangeOutcome::ApproveAlways,
     )
     .await
     .unwrap();

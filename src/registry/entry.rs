@@ -43,27 +43,27 @@ pub struct CallerEntry {
 /// 旧哈希宽限窗口（秒，3600s）。
 pub const OLD_HASH_GRACE_SECS: u64 = 3600;
 
-/// 哈希变更落定三态：对应 Matrix reaction 表情与等待超时。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 哈希变更落定三态：对应 Matrix reaction 表情；缺省不再是合法输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashChangeOutcome {
-    /// `🔓`：批准但保持现有 `allow_mode`（自动放行延续），兼容既有二元批准。
-    #[default]
-    KeepAuto,
+    /// `♾️`：批准新哈希并置为自动放行（`allow_mode = Some(AutoApprove::Allow)`）。
+    ApproveAlways,
     /// `✅`：批准并降级为人工审批模式（`allow_mode = Some(AutoApprove::Pending)`）。
     DemoteManual,
-    /// `❎` 或等待超时：未获批准，禁用条目（fail-closed）。
+    /// `❎`：未获批准，禁用条目（fail-closed）。
     Disable,
 }
 
 impl HashChangeOutcome {
-    /// 从 `reaction` 入参解析：缺省/空串按保持自动；`✅` 降级；`❎` 禁用；
-    /// 其它非空值返回 `None`（调用方按 `400` 处理，显式校验）。
+    /// 从 `reaction` 入参解析：`♾️`/`♾` 持久放行、`✅` 降级、`❎` 禁用；
+    /// 缺省/空串/旧解锁表情/集合外取值返回 `None`（调用方按 `400` 处理）。
     pub fn from_reaction(reaction: Option<&str>) -> Option<Self> {
-        match reaction.map(str::trim) {
-            None | Some("") | Some("🔓") => Some(Self::KeepAuto),
-            Some("✅") => Some(Self::DemoteManual),
-            Some("❎") => Some(Self::Disable),
-            Some(_) => None,
+        let key = reaction?.trim().replace('\u{FE0F}', "");
+        match key.as_str() {
+            "♾" => Some(Self::ApproveAlways),
+            "✅" => Some(Self::DemoteManual),
+            "❎" => Some(Self::Disable),
+            _ => None,
         }
     }
 }
@@ -152,7 +152,13 @@ mod tests {
     fn old_hash_grace_accepts_old_rejects_other() {
         let mut reg = CallerRegistry::empty();
         reg.register("/s/g.sh", "h1").unwrap();
-        reg.approve_hash_change("/s/g.sh", "h2").unwrap();
+        reg.approve_hash_change_with_script_sha256(
+            "/s/g.sh",
+            "h2",
+            "sha-h2".to_string(),
+            super::HashChangeOutcome::ApproveAlways,
+        )
+        .unwrap();
         let e = reg.lookup_by_path("/s/g.sh").unwrap();
         assert_eq!(e.old_hash.as_deref(), Some("h1"));
         assert!(e.matches_old_hash("h1"));

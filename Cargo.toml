@@ -1,6 +1,6 @@
 [package]
 name = "veil"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # 构建工具链下限（MSRV）：源码使用 `str::floor_char_boundary`/`ceil_char_boundary`，
 # 旧工具链只会在编译期抛晦涩的 E0658；此处声明后，任何更旧工具链（含 Dockerfile

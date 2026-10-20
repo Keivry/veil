@@ -1,6 +1,6 @@
 use {
     super::{
-        super::{FixedCleanup, MatrixBot, TextCommand},
+        super::{FixedCleanup, GatewayCleanup, MatrixBot, TextCommand, TextInput},
         *,
     },
     crate::{
@@ -95,16 +95,17 @@ async fn blocking_ticket_survives_60s_sweep() {
 }
 
 #[tokio::test]
-async fn audit_orphan_still_swept_after_60s() {
+async fn unknown_orphan_still_swept_after_60s() {
     let gw = approval();
-    gw.submit_branch("$audit-orphan", MatrixBranch::Audit).await;
+    gw.submit_branch("$unknown-orphan", MatrixBranch::Unknown)
+        .await;
     {
         let mut guard = gw.pending.lock().await;
-        if let Some(e) = guard.get_mut("$audit-orphan") {
+        if let Some(e) = guard.get_mut("$unknown-orphan") {
             e.created = Instant::now() - Duration::from_secs(ORPHAN_SWEEP_SECS + 1);
         }
     }
-    assert_eq!(gw.sweep_orphans().await, 1, "审计类存量票维持 60s 回收");
+    assert_eq!(gw.sweep_orphans().await, 1, "未知分支存量票维持 60s 回收");
     assert_eq!(gw.pending_len().await, 0);
 }
 
@@ -130,7 +131,7 @@ async fn unknown_event_and_branch_mismatch_noop_preserves_state() {
     assert_eq!(
         gw.on_reaction(&unknown, "@bot:example.com", "!r:example.com", 1000)
             .await,
-        ReactionOutcome::Ignored("event id 无精确匹配")
+        ReactionOutcome::Silent("event id 无精确匹配")
     );
     let wrong_room = ReactionInput {
         room_id: "!other:example.com".to_string(),
@@ -139,7 +140,7 @@ async fn unknown_event_and_branch_mismatch_noop_preserves_state() {
     assert_eq!(
         gw.on_reaction(&wrong_room, "@bot:example.com", "!r:example.com", 1000)
             .await,
-        ReactionOutcome::Ignored("非目标房间")
+        ReactionOutcome::Silent("非目标房间")
     );
     let historic = ReactionInput {
         server_ts_ms: 500,
@@ -148,7 +149,7 @@ async fn unknown_event_and_branch_mismatch_noop_preserves_state() {
     assert_eq!(
         gw.on_reaction(&historic, "@bot:example.com", "!r:example.com", 1000)
             .await,
-        ReactionOutcome::Ignored("历史事件")
+        ReactionOutcome::Silent("历史事件")
     );
     let not_member = ReactionInput {
         target_event_id: "$known".to_string(),
@@ -159,7 +160,7 @@ async fn unknown_event_and_branch_mismatch_noop_preserves_state() {
     assert_eq!(
         gw.on_reaction(&not_member, "@bot:example.com", "!r:example.com", 1000)
             .await,
-        ReactionOutcome::Ignored("发送者不在白名单")
+        ReactionOutcome::Silent("发送者不在白名单")
     );
     assert_eq!(gw.pending_len().await, 1);
 }
@@ -180,7 +181,7 @@ async fn five_branch_reactions_settle_with_text_command_echo() {
             .await,
         ReactionOutcome::Applied {
             approved: true,
-            auto: false
+            always: false
         }
     );
     assert_eq!(
@@ -191,7 +192,7 @@ async fn five_branch_reactions_settle_with_text_command_echo() {
     gw.submit_branch("$reg", MatrixBranch::Register).await;
     let auto = ReactionInput {
         target_event_id: "$reg".to_string(),
-        key: "🔓".to_string(),
+        key: "♾️".to_string(),
         ..approve.clone()
     };
     assert_eq!(
@@ -199,12 +200,12 @@ async fn five_branch_reactions_settle_with_text_command_echo() {
             .await,
         ReactionOutcome::Applied {
             approved: true,
-            auto: true
+            always: true
         }
     );
-    assert_eq!(gw.applied_auto("$reg").await, Some(true));
-    assert_eq!(gw.applied_auto("$cred").await, Some(false));
-    assert_eq!(gw.applied_auto("$missing").await, None);
+    assert_eq!(gw.applied_always("$reg").await, Some(true));
+    assert_eq!(gw.applied_always("$cred").await, Some(false));
+    assert_eq!(gw.applied_always("$missing").await, None);
     let self_echo = ReactionInput {
         sender: "@bot:example.com".to_string(),
         ..approve.clone()
@@ -212,11 +213,11 @@ async fn five_branch_reactions_settle_with_text_command_echo() {
     assert_eq!(
         gw.on_reaction(&self_echo, "@bot:example.com", "!r:example.com", 1000)
             .await,
-        ReactionOutcome::Ignored("自反应")
+        ReactionOutcome::Silent("自反应")
     );
     let locked = gw.lock_reject_all().await;
     assert_eq!(locked, 0);
-    gw.submit_branch("$open", MatrixBranch::Audit).await;
+    gw.submit_branch("$open", MatrixBranch::Unknown).await;
     assert_eq!(gw.lock_reject_all().await, 1);
     assert_eq!(
         gw.ask("$open", Duration::from_millis(10)).await,
@@ -230,10 +231,10 @@ async fn five_branch_reactions_settle_with_text_command_echo() {
 }
 
 #[tokio::test]
-async fn lock_clears_all_without_residue_and_matches_legacy_copy() {
+async fn lock_clears_all_without_residue_and_reports_clear_state() {
     let gw = approval();
     gw.submit_branch("$a", MatrixBranch::Credential).await;
-    gw.submit_branch("$b", MatrixBranch::Audit).await;
+    gw.submit_branch("$b", MatrixBranch::Unknown).await;
     assert_eq!(
         gw.resolve("$a", "@admin:example.com", true).await,
         ResolveOutcome::Applied(true)
@@ -249,8 +250,18 @@ async fn lock_clears_all_without_residue_and_matches_legacy_copy() {
             secrets: 0,
         },
     )
-    .await;
-    assert!(lock.is_some_and(|s| s.contains("🔒 Proxy 已锁定")));
+    .await
+    .expect("lock 须有回执");
+    assert!(!lock.contains("已锁定"), "lock 不得宣称已锁定: {lock}");
+    assert!(lock.contains("口令缓存"), "lock 须报告清理条数: {lock}");
+    assert!(
+        lock.contains("主密码缓存"),
+        "lock 须报告主密码缓存状态: {lock}"
+    );
+    assert!(
+        lock.contains("未决 0 单已按拒绝落定"),
+        "lock 须报告按拒绝落定的票数: {lock}"
+    );
     let status = MatrixBot::handle_text_command_full(
         &gw,
         TextCommand::Status,
@@ -262,7 +273,94 @@ async fn lock_clears_all_without_residue_and_matches_legacy_copy() {
     .await;
     assert_eq!(
         status.as_deref(),
-        Some("Proxy: 🔒 未解锁 | 待审批: 0 | LLM secrets: 3")
+        Some("Proxy: 主密码缓存: 未载入 | 待审批: 0 | LLM secrets: 3")
+    );
+}
+
+#[derive(Debug)]
+struct CachedCleanup;
+
+impl GatewayCleanup for CachedCleanup {
+    fn keepass_unlocked(&self) -> bool { true }
+
+    fn master_password_cached(&self) -> bool { true }
+
+    fn vault_len(&self) -> usize { 0 }
+
+    fn lock_cleanup(&self) -> usize { 0 }
+
+    fn forget_cleanup(&self) -> usize { 0 }
+}
+
+#[tokio::test]
+async fn status_reports_loaded_master_password_without_unlock_wording() {
+    let gw = approval();
+    let status =
+        MatrixBot::handle_text_command_full(&gw, TextCommand::Status, &CachedCleanup).await;
+    let status = status.expect("status 须有回执");
+    assert!(
+        status.contains("主密码缓存: 已载入"),
+        "须报告真实载入状态: {status}"
+    );
+    assert!(!status.contains("已解锁"), "不得使用已解锁表述: {status}");
+    assert!(!status.contains("未解锁"), "不得使用未解锁表述: {status}");
+    let lock = MatrixBot::handle_text_command_full(&gw, TextCommand::Lock, &CachedCleanup).await;
+    let lock = lock.expect("lock 须有回执");
+    assert!(!lock.contains("已锁定"), "lock 不得宣称已锁定: {lock}");
+    assert!(
+        lock.contains("主密码缓存: 已载入→未载入")
+            || lock.contains("主密码缓存: 已载入（清理未生效）"),
+        "lock 须报告主密码缓存清理前后状态: {lock}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_empty_drops_text_commands_without_reply() {
+    let gw = approval();
+    let cleanup = FixedCleanup {
+        unlocked: true,
+        secrets: 0,
+    };
+    let text = TextInput {
+        body: "status".to_string(),
+        sender: "@admin:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 2000,
+    };
+    assert_eq!(
+        MatrixBot::handle_text_event(&gw, &cleanup, "", "!r:example.com", 1000, &text).await,
+        None,
+        "whoami 为空须丢弃全部文本指令（fail-closed），不产生回执"
+    );
+    assert!(
+        MatrixBot::handle_text_event(
+            &gw,
+            &cleanup,
+            "@bot:example.com",
+            "!r:example.com",
+            1000,
+            &text
+        )
+        .await
+        .is_some(),
+        "whoami 已知时同一文本指令须正常回执"
+    );
+    let own_text = TextInput {
+        sender: "@bot:example.com".to_string(),
+        ..text
+    };
+    assert_eq!(
+        MatrixBot::handle_text_event(
+            &gw,
+            &cleanup,
+            "@bot:example.com",
+            "!r:example.com",
+            1000,
+            &own_text
+        )
+        .await,
+        None,
+        "Bot 自身文本须丢弃"
     );
 }
 
@@ -289,32 +387,41 @@ async fn concurrent_single_ask_shares_same_decision() {
 }
 
 #[tokio::test]
-async fn unlock_branch_emoji_semantics_with_timeout_cleanup() {
+async fn revoke_branch_accepts_only_yes_no_and_times_out_cleanup() {
     assert_eq!(
-        reaction_to_decision(MatrixBranch::Unlock, "✅"),
-        Some((true, false))
+        reaction_to_decision(MatrixBranch::Revoke, "✅"),
+        ReactionAction::Approve
     );
     assert_eq!(
-        reaction_to_decision(MatrixBranch::Unlock, "❎"),
-        Some((false, false))
+        reaction_to_decision(MatrixBranch::Revoke, "❎"),
+        ReactionAction::Reject
     );
-    assert_eq!(reaction_to_decision(MatrixBranch::Unlock, "🔓"), None);
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Revoke, "♾️"),
+        ReactionAction::NotAccepted
+    );
     let gw = approval();
-    gw.submit_branch("$unlock1", MatrixBranch::Unlock).await;
-    assert_eq!(gw.ask("$unlock1", Duration::from_millis(80)).await, None);
+    gw.submit_branch("$revoke1", MatrixBranch::Revoke).await;
+    assert_eq!(gw.ask("$revoke1", Duration::from_millis(80)).await, None);
     assert_eq!(gw.pending_len().await, 0);
 }
 
 #[tokio::test]
-async fn credential_and_audit_auto_reaction_not_settled() {
-    assert_eq!(reaction_to_decision(MatrixBranch::Credential, "🔓"), None);
-    assert_eq!(reaction_to_decision(MatrixBranch::Audit, "🔓"), None);
+async fn credential_and_audit_always_reaction_not_settled() {
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Credential, "♾️"),
+        ReactionAction::NotAccepted
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Audit, "♾️"),
+        ReactionAction::NotAnOrderBranch
+    );
     let gw = approval();
     gw.submit_branch("$cred-auto", MatrixBranch::Credential)
         .await;
     let auto = ReactionInput {
         target_event_id: "$cred-auto".to_string(),
-        key: "🔓".to_string(),
+        key: "♾️".to_string(),
         sender: "@admin:example.com".to_string(),
         room_id: "!r:example.com".to_string(),
         server_ts_ms: 2000,
@@ -322,9 +429,9 @@ async fn credential_and_audit_auto_reaction_not_settled() {
     assert_eq!(
         gw.on_reaction(&auto, "@bot:example.com", "!r:example.com", 1000)
             .await,
-        ReactionOutcome::Ignored("未知表情")
+        ReactionOutcome::Notify(NOTICE_NOT_ACCEPTED)
     );
-    assert_eq!(gw.applied_auto("$cred-auto").await, None);
+    assert_eq!(gw.applied_always("$cred-auto").await, None);
 }
 
 #[tokio::test]
@@ -571,7 +678,7 @@ async fn on_reaction_empty_whitelist_no_filter_settles() {
             .await,
         ReactionOutcome::Applied {
             approved: true,
-            auto: false
+            always: false
         },
         "空白名单不得忽略非成员 reaction"
     );
@@ -579,4 +686,51 @@ async fn on_reaction_empty_whitelist_no_filter_settles() {
         gw.ask("$open-wl", Duration::from_millis(100)).await,
         Some(true)
     );
+}
+
+#[tokio::test]
+async fn unknown_and_retired_reactions_notify_without_settling() {
+    let gw = approval();
+    gw.submit_branch("$unknown-emoji", MatrixBranch::Register)
+        .await;
+    let input = ReactionInput {
+        target_event_id: "$unknown-emoji".to_string(),
+        key: "👍".to_string(),
+        sender: "@admin:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 2000,
+    };
+    assert_eq!(
+        gw.on_reaction(&input, "@bot:example.com", "!r:example.com", 1000)
+            .await,
+        ReactionOutcome::Notify(NOTICE_UNKNOWN_REACTION)
+    );
+    let retired = ReactionInput {
+        key: "🔓".to_string(),
+        ..input.clone()
+    };
+    assert_eq!(
+        gw.on_reaction(&retired, "@bot:example.com", "!r:example.com", 1000)
+            .await,
+        ReactionOutcome::Notify(NOTICE_UNKNOWN_REACTION)
+    );
+    assert_eq!(gw.decision("$unknown-emoji").await, Some(None));
+}
+
+#[tokio::test]
+async fn whoami_failure_discards_reactions_fail_closed() {
+    let gw = approval();
+    gw.submit_branch("$no-whoami", MatrixBranch::Register).await;
+    let input = ReactionInput {
+        target_event_id: "$no-whoami".to_string(),
+        key: "♾️".to_string(),
+        sender: "@admin:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 2000,
+    };
+    assert_eq!(
+        gw.on_reaction(&input, "", "!r:example.com", 1000).await,
+        ReactionOutcome::Silent("whoami 失败，自反应过滤不可用")
+    );
+    assert_eq!(gw.decision("$no-whoami").await, Some(None));
 }

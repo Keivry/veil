@@ -516,12 +516,26 @@ async fn t6_revoke_by_name_and_reuse() {
         .await
         .unwrap();
     assert_eq!(reg.status().as_u16(), 202);
+    let missing_reaction = client
+        .post(format!("{base}/approve-hash-change"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/byname-a.sh",
+            "new_hash": "h-byname-a",
+            "auth": {"caller_hash": "h-byname-a", "caller_path": "/srv/byname-a.sh"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_reaction.status().as_u16(), 400, "reaction 必填");
     let enable = client
         .post(format!("{base}/approve-hash-change"))
         .header("X-Veilctl-Binary-Hash", "gethash1")
         .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
             "caller_path": "/srv/byname-a.sh",
+            "reaction": "♾️",
             "new_hash": "h-byname-a",
             "auth": {"caller_hash": "h-byname-a", "caller_path": "/srv/byname-a.sh"}
         }))

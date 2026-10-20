@@ -5,9 +5,11 @@ use {
         CREDENTIAL_TIMEOUT_SECS,
         MatrixBranch,
         ORPHAN_SWEEP_SECS,
+        ReactionAction,
         ReactionInput,
         ReactionOutcome,
         ResolveOutcome,
+        is_known_reaction,
         is_mxid_allowed,
         reaction_to_decision,
     },
@@ -18,13 +20,18 @@ use {
     },
 };
 
+/// 分支不受理该表情时的回执（票保持未决）。
+const NOTICE_NOT_ACCEPTED: &str = "该分支不受理此表情，票保持未决（可用：✅/❎）";
+/// 未知表情（含已退役的旧解锁表情）回执。
+const NOTICE_UNKNOWN_REACTION: &str = "未知表情，票保持未决（可用：✅/♾️/❎；旧解锁表情已退役）";
+
 struct PendingEntry {
     created: Instant,
     decided: Option<bool>,
     /// 落定时刻（`decided` 写入时设置），供已决无 waiter 票的有界回收。
     decided_at: Option<Instant>,
-    /// 落定是否来自「自动放行」表情（`🔓`，注册三态用）。
-    auto: bool,
+    /// 落定是否来自「批准并持久放行」表情（`♾️`）。
+    always: bool,
     branch: MatrixBranch,
     /// 决议唤醒通道：所有决议路径经同一 setter 在此发送 `Some(decided)`。
     notify: tokio::sync::watch::Sender<Option<bool>>,
@@ -36,21 +43,21 @@ impl std::fmt::Debug for PendingEntry {
             .field("created", &self.created)
             .field("decided", &self.decided)
             .field("decided_at", &self.decided_at)
-            .field("auto", &self.auto)
+            .field("always", &self.always)
             .field("branch", &self.branch)
             .finish_non_exhaustive()
     }
 }
 
-/// 按分支取回收 TTL（秒）。凭据类 300s（覆盖阻塞等待者），
-/// 审计/解锁类 60s；已决票按落定时刻、未决票按建单时刻施加同一族 TTL。
+/// 按分支取回收 TTL（秒）。有阻塞等待者的分支 300s，其余 60s。
 fn orphan_ttl_secs(branch: MatrixBranch) -> u64 {
     match branch {
         MatrixBranch::Register
         | MatrixBranch::HashChange
         | MatrixBranch::Credential
-        | MatrixBranch::Command => CREDENTIAL_TIMEOUT_SECS,
-        MatrixBranch::Unlock | MatrixBranch::Audit | MatrixBranch::Unknown => ORPHAN_SWEEP_SECS,
+        | MatrixBranch::Command
+        | MatrixBranch::Revoke => CREDENTIAL_TIMEOUT_SECS,
+        MatrixBranch::Audit | MatrixBranch::Unknown => ORPHAN_SWEEP_SECS,
     }
 }
 
@@ -96,7 +103,7 @@ impl MatrixApproval {
                 created: Instant::now(),
                 decided: None,
                 decided_at: None,
-                auto: false,
+                always: false,
                 branch,
                 notify,
             },
@@ -106,13 +113,13 @@ impl MatrixApproval {
 
     /// 决议写入唯一 setter：同一 `pending` 锁临界区内写 `decided`/`decided_at`/
     /// `auto` 后 `send(Some(decided))`；已决则幂等短路（每票至多一次发送）。
-    fn settle(entry: &mut PendingEntry, decided: bool, auto: bool) {
+    fn settle(entry: &mut PendingEntry, decided: bool, always: bool) {
         if entry.decided.is_some() {
             return;
         }
         entry.decided = Some(decided);
         entry.decided_at = Some(Instant::now());
-        entry.auto = auto;
+        entry.always = always;
         entry.notify.send_replace(Some(decided));
     }
 
@@ -122,18 +129,18 @@ impl MatrixApproval {
 
     /// reaction 落定：白名单 + event id 精确匹配 + 幂等。
     pub async fn resolve(&self, event_id: &str, sender: &str, approved: bool) -> ResolveOutcome {
-        self.resolve_with_auto(event_id, sender, approved, false)
+        self.resolve_with_always(event_id, sender, approved, false)
             .await
     }
 
-    /// 带自动放行标志的落定：`auto=true` 表示 `🔓`（注册保持未激活）。
-    /// `decided` 与 `auto` 在同一锁临界区写入，等待者读到决议时 `auto` 必已就绪。
-    pub async fn resolve_with_auto(
+    /// 带持久放行标志的落定：`always=true` 表示 `♾️`。
+    /// `decided` 与 `always` 在同一锁临界区写入，等待者读到决议时两者必已就绪。
+    pub async fn resolve_with_always(
         &self,
         event_id: &str,
         sender: &str,
         approved: bool,
-        auto: bool,
+        always: bool,
     ) -> ResolveOutcome {
         if !is_mxid_allowed(sender, &self.whitelist) {
             tracing::warn!("审批 reaction 被忽略: 发送者 {sender} 不在白名单");
@@ -146,7 +153,7 @@ impl MatrixApproval {
                 if entry.decided.is_some() {
                     return ResolveOutcome::Duplicate;
                 }
-                Self::settle(entry, approved, auto);
+                Self::settle(entry, approved, always);
                 tracing::info!(
                     "审批结果: event {event_id} 发送者 {sender} 决议 {}",
                     if approved { "批准" } else { "拒绝" }
@@ -162,16 +169,16 @@ impl MatrixApproval {
         self.pending.lock().await.get(event_id).map(|e| e.decided)
     }
 
-    pub async fn applied_auto(&self, event_id: &str) -> Option<bool> {
+    pub async fn applied_always(&self, event_id: &str) -> Option<bool> {
         self.pending
             .lock()
             .await
             .get(event_id)
-            .and_then(|e| e.decided.map(|_| e.auto))
+            .and_then(|e| e.decided.map(|_| e.always))
     }
 
-    /// `on_reaction` 五分支入口：房间/自反应/启动时间戳/表情/分支/白名单逐层过滤，
-    /// 失配一律 no-op；命中后经 `resolve` 落定。
+    /// `on_reaction` 入口：房间/时间/自反应/票/分支/白名单/表情逐层过滤。
+    /// 非白名单成员与非建单分支保持静默；分支不受理与未知表情回一条说明。
     pub async fn on_reaction(
         &self,
         input: &ReactionInput,
@@ -180,38 +187,47 @@ impl MatrixApproval {
         start_ts_ms: u128,
     ) -> ReactionOutcome {
         if input.room_id != expected_room {
-            return ReactionOutcome::Ignored("非目标房间");
+            return ReactionOutcome::Silent("非目标房间");
         }
         if input.server_ts_ms < start_ts_ms {
-            return ReactionOutcome::Ignored("历史事件");
+            return ReactionOutcome::Silent("历史事件");
         }
-        if !own_user_id.is_empty() && input.sender == own_user_id {
-            return ReactionOutcome::Ignored("自反应");
+        if own_user_id.is_empty() {
+            return ReactionOutcome::Silent("whoami 失败，自反应过滤不可用");
+        }
+        if input.sender == own_user_id {
+            return ReactionOutcome::Silent("自反应");
         }
         if input.target_event_id.is_empty() {
-            return ReactionOutcome::Ignored("event id 无精确匹配");
+            return ReactionOutcome::Silent("event id 无精确匹配");
         }
-        let branch = self.pending_branch(&input.target_event_id).await;
-        let Some(branch) = branch else {
-            return ReactionOutcome::Ignored("event id 无精确匹配");
+        let Some(branch) = self.pending_branch(&input.target_event_id).await else {
+            return ReactionOutcome::Silent("event id 无精确匹配");
         };
-        if !branch.is_known() {
-            return ReactionOutcome::Ignored("未知分支");
+        if !branch.is_known() || !branch.is_matrix_order_branch() {
+            return ReactionOutcome::Silent("非建单分支");
         }
-        let Some((approved, auto)) = reaction_to_decision(branch, &input.key) else {
-            return ReactionOutcome::Ignored("未知表情");
-        };
         if !is_mxid_allowed(&input.sender, &self.whitelist) {
             tracing::warn!("审批 reaction 被忽略: 发送者 {} 不在白名单", input.sender);
-            return ReactionOutcome::Ignored("发送者不在白名单");
+            return ReactionOutcome::Silent("发送者不在白名单");
         }
+        if !is_known_reaction(&input.key) {
+            return ReactionOutcome::Notify(NOTICE_UNKNOWN_REACTION);
+        }
+        let (approved, always) = match reaction_to_decision(branch, &input.key) {
+            ReactionAction::Approve => (true, false),
+            ReactionAction::Reject => (false, false),
+            ReactionAction::ApproveAlways => (true, true),
+            ReactionAction::NotAccepted => return ReactionOutcome::Notify(NOTICE_NOT_ACCEPTED),
+            ReactionAction::NotAnOrderBranch => return ReactionOutcome::Silent("非建单分支"),
+        };
         match self
-            .resolve_with_auto(&input.target_event_id, &input.sender, approved, auto)
+            .resolve_with_always(&input.target_event_id, &input.sender, approved, always)
             .await
         {
-            ResolveOutcome::Applied(_) => ReactionOutcome::Applied { approved, auto },
+            ResolveOutcome::Applied(_) => ReactionOutcome::Applied { approved, always },
             ResolveOutcome::Duplicate => ReactionOutcome::Duplicate,
-            ResolveOutcome::Ignored(reason) => ReactionOutcome::Ignored(reason),
+            ResolveOutcome::Ignored(reason) => ReactionOutcome::Silent(reason),
         }
     }
 

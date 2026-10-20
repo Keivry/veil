@@ -65,6 +65,8 @@ fn revoke_body(key: &str) -> Json<EmergencyRevokeBody> {
         caller_path: None,
         caller_hash: None,
         admin_token: None,
+        auth: None,
+        secret: None,
     })
 }
 
@@ -117,104 +119,122 @@ async fn register_caller_handler_response_carries_nonempty_reg_id_and_legacy_fie
 }
 
 #[tokio::test]
-async fn forged_proxy_headers_do_not_bypass_revoke_check() {
-    // 内网豁免只认 TCP 远端：公网对端携带伪造内网 XFF 仍转审批，不直接吊销。
+async fn emergency_revoke_without_token_requires_three_factor() {
     let state = revoke_test_state();
     service::register_caller(&state, "/s/xff.sh", "h-xff", "src-xff")
         .await
         .unwrap();
+    state
+        .registry
+        .write()
+        .await
+        .set_enabled("/s/xff.sh", true)
+        .unwrap();
     let mut forged = HeaderMap::new();
     forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
-    let err = emergency_revoke_handler(
-        State(state.clone()),
-        PeerIp(Some("203.0.113.9".parse().unwrap())),
-        forged,
-        revoke_body("/s/xff.sh"),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.status_code(), StatusCode::ACCEPTED);
-    // 回环 TCP 对端无头时豁免路径仍可用。
-    let ok = emergency_revoke_handler(
-        State(state),
-        PeerIp(Some("127.0.0.1".parse().unwrap())),
-        HeaderMap::new(),
-        revoke_body("/s/xff.sh"),
-    )
-    .await
-    .unwrap();
-    assert_eq!(ok.0["ok"], true);
+    let err = emergency_revoke_handler(State(state.clone()), forged, revoke_body("/s/xff.sh"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.status_code(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "无 token 且无三因子须 401/403: {err:?}"
+    );
+    assert_eq!(state.pending.len(), 0, "不成立时不得建单");
+    assert_eq!(state.approval.pending_len().await, 0, "不得建 Matrix 票");
+    let registry = state.registry.read().await;
+    let entry = registry.lookup_by_path("/s/xff.sh").unwrap();
+    assert!(entry.enabled && !entry.revoked, "条目不得被吊销");
 }
 
 #[tokio::test]
-async fn emergency_revoke_network_ranges() {
-    // 保留现有内网网段放行（`file_present` 自证通道已移除），只认 TCP 远端。
+async fn emergency_revoke_network_position_is_irrelevant() {
+    // 回环/私网/容器网段在无 token 时与公网同权：一律先过三因子。
     let state = revoke_test_state();
     service::register_caller(&state, "/s/net.sh", "h-net", "src-net")
         .await
         .unwrap();
-    let private = [
-        "127.0.0.1",
-        "::1",
-        "10.1.2.3",
-        "172.20.0.1",
-        "192.168.0.5",
-        "169.254.10.20",
-        "100.64.0.1",
-        "fd00::1",
-        "fe80::1",
-    ];
-    assert!(
-        crate::auth::is_private_ip("localhost"),
-        "localhost 须判内网"
-    );
-    for ip in private {
-        assert!(crate::auth::is_private_ip(ip), "{ip} 须判内网");
-        let peer: std::net::IpAddr = ip.parse().unwrap();
-        let Json(resp) = emergency_revoke_handler(
+    state
+        .registry
+        .write()
+        .await
+        .set_enabled("/s/net.sh", true)
+        .unwrap();
+    for _source in ["127.0.0.1", "10.0.0.1", "172.17.0.1"] {
+        let err = emergency_revoke_handler(
             State(state.clone()),
-            PeerIp(Some(peer)),
             HeaderMap::new(),
             revoke_body("/s/net.sh"),
         )
         .await
-        .unwrap();
-        assert_eq!(resp["ok"], true, "{ip} 须直接吊销（内网豁免）");
+        .unwrap_err();
+        assert!(
+            matches!(
+                err.status_code(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "任何来源无 token 均须 401/403: {err:?}"
+        );
     }
-    // 公网来源转常规审批（202），不直接吊销。
-    let public: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    assert_eq!(state.pending.len(), 0, "不成立时不得建单");
+    let registry = state.registry.read().await;
+    let entry = registry.lookup_by_path("/s/net.sh").unwrap();
+    assert!(entry.enabled && !entry.revoked, "条目不得被吊销");
+}
+
+#[tokio::test]
+async fn emergency_revoke_three_factor_without_token_creates_ticket() {
+    let state = revoke_test_state();
+    service::register_caller(&state, "/s/tf.sh", "h-tf", "src-tf")
+        .await
+        .unwrap();
+    state
+        .registry
+        .write()
+        .await
+        .set_enabled("/s/tf.sh", true)
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-veilctl-secret", "s3cr3t".parse().unwrap());
     let err = emergency_revoke_handler(
         State(state.clone()),
-        PeerIp(Some(public)),
-        HeaderMap::new(),
-        revoke_body("/s/net.sh"),
+        headers,
+        Json(EmergencyRevokeBody {
+            key: Some("/s/tf.sh".to_string()),
+            caller_path: None,
+            caller_hash: None,
+            admin_token: None,
+            auth: Some(service::AuthBlock {
+                caller_hash: Some("h-tf".to_string()),
+                caller_path: Some("/s/tf.sh".to_string()),
+                veilctl_binary_hash: None,
+                veilctl_secret: None,
+            }),
+            secret: Some("s3cr3t".to_string()),
+        }),
     )
     .await
     .unwrap_err();
-    assert_eq!(err.status_code(), StatusCode::ACCEPTED, "公网须转审批");
-    // 伪造内网 X-Forwarded-For 不改变 TCP 远端判定，仍转审批。
-    let mut forged = HeaderMap::new();
-    forged.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
-    let err = emergency_revoke_handler(
-        State(state),
-        PeerIp(Some(public)),
-        forged,
-        revoke_body("/s/net.sh"),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.status_code(), StatusCode::ACCEPTED, "XFF 伪造无效");
+    assert_eq!(
+        err.status_code(),
+        StatusCode::ACCEPTED,
+        "三因子成立须转审批"
+    );
+    let registry = state.registry.read().await;
+    let entry = registry.lookup_by_path("/s/tf.sh").unwrap();
+    assert!(entry.enabled && !entry.revoked, "转审批时条目未吊销");
 }
 
 #[tokio::test]
 async fn approve_hash_change_handler_contract() {
-    // 缺 `reg_id`/`reaction` 按 `caller_path` + 保持自动落定并返回成功。
-    // 落定不激活既有条目（仅更新哈希与宽限）。
+    // `reaction` 必填：缺省返回 400 且不落定（旧「保持自动」默认已移除）。
     let state = revoke_test_state();
     service::register_caller(&state, "/s/contract.sh", "c-old", "src-contract")
         .await
         .unwrap();
-    let Json(resp) = approve_hash_change_handler(
+    let err = approve_hash_change_handler(
         State(state.clone()),
         HeaderMap::new(),
         Json(ApproveHashChangeBody {
@@ -232,25 +252,24 @@ async fn approve_hash_change_handler_contract() {
         }),
     )
     .await
-    .unwrap();
-    assert_eq!(resp["ok"], true);
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::VeilError::BadRequest { .. }),
+        "缺省 reaction 须 400: {err:?}"
+    );
+    assert!(err.to_string().contains("♾"), "{err}");
     {
         let registry = state.registry.read().await;
         let e = registry.lookup_by_path("/s/contract.sh").unwrap();
-        assert_eq!(e.expected_hash, "c-new");
-        assert!(
-            !e.enabled && !e.revoked,
-            "缺省 reaction 仅更新哈希，不激活既有条目"
-        );
-        assert_eq!(e.allow_mode, None, "缺省 reaction 不得改动 allow_mode");
+        assert_eq!(e.expected_hash, "c-old", "400 不得落定哈希");
     }
     // `reg_id`（哈希）可定位：显式 `✅` 降级人工。
     let Json(resp2) = approve_hash_change_handler(
         State(state.clone()),
         HeaderMap::new(),
         Json(ApproveHashChangeBody {
-            caller_path: String::new(),
-            reg_id: "c-new".to_string(),
+            caller_path: "/s/contract.sh".to_string(),
+            reg_id: String::new(),
             reaction: Some("✅".to_string()),
             new_hash: "c-next".to_string(),
             auth: Some(service::AuthBlock {
@@ -669,18 +688,15 @@ async fn emergency_revoke_forged_file_present_rejected() {
         "file_present": true,
     }))
     .expect("未知字段 file_present 须被忽略而非拒解析");
-    let err = emergency_revoke_handler(
-        State(state.clone()),
-        PeerIp(Some("203.0.113.9".parse().unwrap())),
-        HeaderMap::new(),
-        Json(body),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        err.status_code(),
-        StatusCode::ACCEPTED,
-        "伪造 file_present 须转审批"
+    let err = emergency_revoke_handler(State(state.clone()), HeaderMap::new(), Json(body))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.status_code(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "无 token 且无三因子须 401/403: {err:?}"
     );
     let registry = state.registry.read().await;
     let entry = registry.lookup_by_path("/s/forged.sh").unwrap();
@@ -702,13 +718,14 @@ async fn emergency_revoke_admin_token_only() {
         .unwrap();
     let Json(resp) = emergency_revoke_handler(
         State(state.clone()),
-        PeerIp(Some("203.0.113.9".parse().unwrap())),
         HeaderMap::new(),
         Json(EmergencyRevokeBody {
             key: Some("/s/admin-only.sh".to_string()),
             caller_path: None,
             caller_hash: None,
             admin_token: Some("observability-admin-token-0123456789".to_string()),
+            auth: None,
+            secret: None,
         }),
     )
     .await

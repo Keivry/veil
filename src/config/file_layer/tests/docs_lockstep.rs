@@ -33,6 +33,8 @@ use {
 const ENGINEERING_REFERENCE: &str = include_str!("../../../../docs/engineering-reference.md");
 /// 可加载示例（示例侧锁步真源）。
 const EXAMPLE_TOML: &str = include_str!("../../../../examples/veil.toml");
+/// 容器版示例（仅 `[server].bind` 与本机版不同）。
+const CONTAINER_EXAMPLE_TOML: &str = include_str!("../../../../examples/veil.container.toml");
 
 /// 文档侧子节标题（§1 内，非顶级 §N）。
 const SUBSECTION_HEADING: &str = "### 配置文件层（TOML）";
@@ -398,6 +400,43 @@ fn alias_env_explicit_sets_match_design_d6() {
 /// 示例文件：键集 ⊆ schema（含文件专属键根，**非全等**）、每个 schema 分节至少一个
 /// 代表键、且不声明任何密钥类键（0644 可加载）。
 #[test]
+fn container_example_differs_only_in_server_bind_and_loads() {
+    let local: FileConfig = toml::from_str(EXAMPLE_TOML).expect("本机示例须可解析");
+    let container: FileConfig = toml::from_str(CONTAINER_EXAMPLE_TOML).expect("容器示例须可解析");
+    let mut local_value = serde_json::to_value(&local).expect("本机示例序列化");
+    let mut container_value = serde_json::to_value(&container).expect("容器示例序列化");
+    assert_eq!(
+        local_value["server"]["bind"],
+        serde_json::json!("127.0.0.1:8877")
+    );
+    assert_eq!(
+        container_value["server"]["bind"],
+        serde_json::json!("0.0.0.0:8877")
+    );
+    local_value["server"]["bind"] = serde_json::json!("normalized");
+    container_value["server"]["bind"] = serde_json::json!("normalized");
+    assert_eq!(
+        local_value, container_value,
+        "两份示例除 [server].bind 外须逐项一致"
+    );
+
+    for (content, want) in [
+        (EXAMPLE_TOML, "127.0.0.1:8877"),
+        (CONTAINER_EXAMPLE_TOML, "0.0.0.0:8877"),
+    ] {
+        let file = TempFile::new("example-bind.toml", content);
+        let mut env = base_env();
+        env.insert(
+            BOOTSTRAP_VAR.to_string(),
+            file.path().to_string_lossy().into_owned(),
+        );
+        let outcome = apply_config_file(&mut env).expect("示例须可经引导加载");
+        let cfg = Config::load_from_with_file(&env, outcome).expect("示例配置须可加载");
+        assert_eq!(cfg.server_bind, want.parse().expect("SocketAddr 字面量"));
+    }
+}
+
+#[test]
 fn example_file_covers_all_sections_and_declares_no_secret_keys() {
     let cfg: FileConfig = toml::from_str(EXAMPLE_TOML).expect("示例文件须可解析为 FileConfig");
     assert!(
@@ -471,7 +510,7 @@ fn example_file_loads_and_applies_from_disk() {
     let cfg = Config::load_from_with_targets(&env, targets).expect("示例文件须通过既有校验链");
     assert_eq!(cfg.pii_scope_ttl_secs, 3600);
     assert!(cfg.pii_detection_hardening);
-    assert_eq!(cfg.entry_mode, EntryMode::CredentialOnly);
+    assert_eq!(cfg.entry_mode, EntryMode::Full);
     assert_eq!(cfg.auto_approve, AutoApprove::Pending);
     assert_eq!(
         cfg.llm_default_upstream.as_deref(),

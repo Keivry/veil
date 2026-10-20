@@ -575,7 +575,7 @@ async fn accept_always_persists_and_skips_approval() {
         .expect("须建审批单");
     state
         .approval
-        .resolve_with_auto(&event_id, "", true, true)
+        .resolve_with_always(&event_id, "", true, true)
         .await;
     let resp = client
         .post(format!("{base}/commands/run/invoke"))
@@ -948,7 +948,7 @@ async fn accept_always_survives_restart() {
         .expect("须建审批单");
     state
         .approval
-        .resolve_with_auto(&event_id, "", true, true)
+        .resolve_with_always(&event_id, "", true, true)
         .await;
     let resp = client
         .post(format!("{base}/commands/run/invoke"))

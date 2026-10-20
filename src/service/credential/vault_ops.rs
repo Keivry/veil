@@ -31,7 +31,7 @@ use {
         registration_view,
     },
     crate::{
-        auth::{is_private_ip, secret_eq},
+        auth::secret_eq,
         config::{EntryMode, REGISTER_RATE_WINDOW_SECS},
         error::{Result, VeilError},
         registry::{HashChangeOutcome, RegisterParams},
@@ -141,7 +141,7 @@ pub async fn query_keepass(
 fn notify_keepass_failure(state: &impl AppStateParts, entry: &str, detail: &str) {
     let spool = state.notify();
     let summary = format!("KeePass 查询失败 :: {entry} :: {detail}");
-    let text = spool.format_approval(matrix::MatrixBranch::Credential, Some(false), &summary);
+    let text = spool.format_notice(matrix::MatrixBranch::Credential, Some(false), &summary);
     spool.notify_text(text);
 }
 
@@ -243,8 +243,8 @@ fn approval_timeout(state: &impl AppStateParts) -> Duration {
     Duration::from_secs(state.config().credential_approval_timeout_secs.max(1) as u64)
 }
 
-/// 三态落定：`🔓 (true, true)` 保持 `disabled`；`✅ (true, false)` 启用；
-/// `❎ (false, _)` 与 `None`（超时）置 `revoked=true`。落定后原子落盘。
+/// 三态落定：`♾️ (true, true)` 启用并置持久放行；`✅ (true, false)` 启用并保留
+/// 注册声明的 `allow_mode`；`❎ (false, _)` 与 `None`（超时）置 `revoked=true`。
 async fn apply_register_approval(
     state: &impl AppStateParts,
     caller_path: &str,
@@ -254,10 +254,15 @@ async fn apply_register_approval(
     let bytes = {
         let mut registry = state.registry().write().await;
         match decision {
-            Some((true, true)) => {}
-            Some((true, false)) => {
+            Some((true, always)) => {
                 if let Err(e) = registry.set_enabled(caller_path, true) {
                     tracing::warn!("注册审批启用失败 {caller_path}: {e}");
+                }
+                if always
+                    && let Err(e) = registry
+                        .set_allow_mode(caller_path, Some(crate::config::AutoApprove::Allow))
+                {
+                    tracing::warn!("注册审批置持久放行失败 {caller_path}: {e}");
                 }
             }
             _ => {
@@ -383,7 +388,7 @@ pub async fn register_caller_with_approval(
             let decision = owned.approval().ask(&event_id, timeout).await;
             let auto = owned
                 .approval()
-                .applied_auto(&event_id)
+                .applied_always(&event_id)
                 .await
                 .unwrap_or(false);
             apply_register_approval(&owned, &path_for_task, decision.map(|ok| (ok, auto))).await;
@@ -400,7 +405,7 @@ pub async fn register_caller_with_approval(
         .await;
     let auto = state
         .approval()
-        .applied_auto(&event_id)
+        .applied_always(&event_id)
         .await
         .unwrap_or(false);
     apply_register_approval(state, &caller_path, decision.map(|ok| (ok, auto))).await;
@@ -417,7 +422,7 @@ pub async fn register_caller_with_approval(
     }
 }
 
-/// 常规吊销审批链。仅 `✅ (true, false)` 执行吊销；`❎`（含 `🔓`）与
+/// 常规吊销审批链。仅 `✅` 执行吊销；`❎` 与
 /// 超时保持条目原状（不做破坏性动作）。默认 `202` 抛单，阻塞模式同
 /// `CREDENTIAL_BLOCK_WAIT` 口径。
 /// 同一未决吊销请求重试经决策表幂等复用（`202 + E_PENDING`，不重复建单）；
@@ -469,7 +474,7 @@ pub async fn revoke_caller_with_approval(
         state,
         &caller_path,
         &reason,
-        matrix::MatrixBranch::Register,
+        matrix::MatrixBranch::Revoke,
         "",
         None,
     )
@@ -488,23 +493,12 @@ pub async fn revoke_caller_with_approval(
         tokio::task::spawn(async move {
             let timeout = approval_timeout(&owned);
             let decision = owned.approval().ask(&event_id, timeout).await;
-            let auto = owned
-                .approval()
-                .applied_auto(&event_id)
-                .await
-                .unwrap_or(false);
-            // `🔓`（`Some(true) && auto`）按拒绝落定，不执行吊销。
-            let effective = if decision == Some(true) && auto {
-                Some(false)
-            } else {
-                decision
-            };
-            if effective == Some(true)
+            if decision == Some(true)
                 && let Err(e) = revoke_caller(&owned, &path_for_task).await
             {
                 tracing::warn!("吊销审批落定失败 {path_for_task}: {e}");
             }
-            record_credential_decision(&owned, &key_for_task, effective);
+            record_credential_decision(&owned, &key_for_task, decision);
             clear_terminal_pending(&owned, &path_for_task, &event_id).await;
         });
         return Err(VeilError::PendingApproval {
@@ -515,14 +509,9 @@ pub async fn revoke_caller_with_approval(
         .approval()
         .ask(&event_id, approval_timeout(state))
         .await;
-    let auto = state
-        .approval()
-        .applied_auto(&event_id)
-        .await
-        .unwrap_or(false);
     clear_terminal_pending(state, &caller_path, &event_id).await;
     consume_decision_key(state, &pending_key);
-    if decision == Some(true) && !auto {
+    if decision == Some(true) {
         return revoke_caller(state, &caller_path).await;
     }
     Err(VeilError::Auth {
@@ -543,24 +532,10 @@ pub async fn revoke_caller(state: &impl AppStateParts, key: &str) -> Result<Regi
     Ok(view)
 }
 
-/// 内网判定在 `auth::is_private_ip` 之上补 IPv4-mapped IPv6 形
-/// （如 `::ffff:127.0.0.1`，等价 `127.0.0.0/8`），避免映射环回绕过内网豁免。
-fn is_private_peer(host: &str) -> bool {
-    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
-    if let Ok(v6) = h.parse::<std::net::Ipv6Addr>()
-        && let Some(v4) = v6.to_ipv4_mapped()
-        && is_private_ip(&v4.to_string())
-    {
-        return true;
-    }
-    is_private_ip(host)
-}
-
 pub async fn emergency_revoke(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     key: &str,
     admin_token: Option<&str>,
-    peer_ip: Option<&str>,
 ) -> Result<RegistrationView> {
     let admin_ok = match (
         admin_token,
@@ -569,8 +544,7 @@ pub async fn emergency_revoke(
         (Some(got), expected) if !got.is_empty() => secret_eq(got, expected),
         _ => false,
     };
-    let net_ok = peer_ip.is_some_and(is_private_peer);
-    if admin_ok || net_ok {
+    if admin_ok {
         return revoke_caller(state, key).await;
     }
     // 转常规审批不再裸建单，改走同一决策闭环（批准动作 = 吊销注册）。
@@ -585,7 +559,7 @@ pub async fn emergency_revoke(
         ClosureLane {
             label: "吊销",
             auto_policy: AutoPolicy::Reject,
-            branch: matrix::MatrixBranch::Register,
+            branch: matrix::MatrixBranch::Revoke,
         },
         || revoke_caller(state, key),
     )

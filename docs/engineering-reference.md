@@ -8,7 +8,7 @@
 
 ### 环境变量表
 
-进程 env 的允许读取面（配置过滤集合 ∪ Config 外直读）恰为下表 9 个具名变量。按端口选择上游的变量
+进程 env 的允许读取面（配置过滤集合 ∪ Config 外直读）恰为下表各具名变量。按端口选择上游的变量
 （`LLM_` 前缀加端口，如 `LLM_8878`）不在读取面内：其进程 env 置位仅启动期 `warn`，请改用配置文件
 `[llm.upstreams]`。白名单之外的进程 env 不影响生效配置（生效配置即 `Config`）：其中属文件专属清单者置位仅启动期
 `warn` 并指引改用 `VEIL_CONFIG_FILE`，其余名一律不读取（例外仅下方三条）。白名单内的配置概念维持
@@ -109,6 +109,7 @@
 | `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16 |
 | `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标键、硬拒清单、保留键与三段语义见下 |
 | `command` | `（文件专属）` | table（命令配置分节） | 下游命令执行配置（文件专属，无 env 对应源）；schema 与行为见 command-api 规格 |
+| `server` | `（文件专属）` | table（`bind` → 监听地址） | 监听地址（文件专属，无 env 对应源）：`bind` 须为 `IP:PORT` 字面量（不接受主机名）；缺省 `127.0.0.1:8877`，容器内写 `0.0.0.0:8877` |
 | `keepass.backend` | `VEIL_KEEPASS_BACKEND` | enum `real`/`mock` | `mock` 仅 CI 逃生（生产禁用） |
 
 **[llm.targets] 上游覆盖（文件专属分节，无 env 对应源；未声明时零行为变化）**
@@ -383,10 +384,10 @@ done
 在同批终态清理，不依赖空闲票 `60s` 孤儿清扫延迟。
 
 审批票回收两口径并存、不可混用：**空闲票 60s 回收上限**——
-无阻塞等待者的孤儿票按分支 TTL（审计/解锁类 `60s`）清扫；**有阻塞等待者凭据类票 300s 阻塞 TTL**——
+无阻塞等待者的孤儿票按分支 TTL（审计类 `60s`）清扫；**有阻塞等待者凭据类票 300s 阻塞 TTL**——
 凭据/注册/哈希变更类存在阻塞等待者的未决票在其自身 `300s` 阻塞超时前不被回收。前者是清扫延迟上限，
 后者是阻塞等待保留时长，维度不同（详见 §8.4）。内存侧 `PendingApprovals` 清扫与矩阵侧同口径按记录 TTL
-执行（凭据/注册/哈希变更类阻塞票 `300s`、空闲/审计/解锁类 `60s`），不再对全部记录一律 `60s`。
+执行（凭据/注册/吊销/哈希变更类阻塞票 `300s`、空闲/审计类 `60s`），不再对全部记录一律 `60s`。
 
 `GET /health` 与 `/_admin/health` 的 `pii_custom_disabled`（只增字段）为已停用自定义规则计数
 （`disabled_snapshot()` 口径）：ReDoS 守卫连续 3 次超时停用的
@@ -426,7 +427,7 @@ done
 | 取用凭据 | `POST /credential` | 三因子（`X-Veilctl-Binary-Hash` + `X-Veilctl-Secret`/`body.secret` + `body.auth.caller_hash`/`caller_path`） |
 | 查看注册 | `GET /registrations` | 管理面鉴权（`X-Admin-Token` 或部署密钥 `X-Veilctl-Secret`，两者皆缺/不匹配 401）；对接脚本须带凭据，Go `veilctl list` 经部署密钥可用 |
 | 注册调用方 | `POST /register-caller` | 三因子（同取用；重名 409） |
-| 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销管理 token/内网两者任一（见 7.5） |
+| 吊销注册 | `POST /revoke`，紧急吊销 `POST /revoke/emergency` | 常规三因子；紧急吊销只认管理 token，无 token 须先过三因子（见 7.5） |
 | 批准哈希变更 | `POST /approve-hash-change` | 三因子 |
 | 命令目录 | `GET /commands` | 三因子写口径（头携带 `X-Veilctl-Binary-Hash`、`X-Veilctl-Secret`、`X-Caller-Hash`、`X-Caller-Path`） |
 | 命令调用 | `POST /commands/{id}/invoke` | 三因子写口径 + `downstreams.allow_commands` 授权 |
@@ -456,7 +457,7 @@ veilctl revoke --name "check-mail"
   与 `POST /credential` 同口径——`202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示**已建单
   待审批**，**不代表吊销已完成**；调用方 SHALL 对同一请求轮询重试（建议指数退避），批准后吊销生效
   （条目 `revoked=true`/`enabled=false`），拒绝/超时返回 `403`，重试不重复建单。`[storage].credential_block_wait = true`
-  时同请求阻塞返回终态、无需轮询。紧急吊销转常规审批路径同此契约。
+  时同请求阻塞返回终态、无需轮询。紧急吊销转常规审批路径**不受** `credential_block_wait` 影响，恒返回 `202 + E_PENDING`（`src/service/credential/vault_ops.rs::emergency_revoke` 经决策闭环异步落定）。
 
 - `POST /revoke` 定位顺序 `key → caller_path → caller_hash → name`：
   `veilctl revoke --name "check-mail"` 命中未吊销同名条目；重名 409——未吊销条目重名注册直接拒绝，
@@ -508,7 +509,7 @@ veilctl revoke --name "check-mail"
   自动放行（`requires_approval = false`、`auto_approve`、accept-always）仅在调用方已注册
   且哈希匹配时生效；未注册/哈希失配仅当 `caller_path` 已绑定、命令在 `allow_commands` 内、
   目标在 `hosts` 范围内时转审批，否则 403。
-- 审批：`MatrixBranch::Command`，`✅` 批准一次、`❎` 拒绝、`🔓` 批准并持久化 accept-always
+- 审批：`MatrixBranch::Command`，`✅` 批准一次、`❎` 拒绝、`♾️` 批准并持久化 accept-always
   （`data_dir/command_grants.json`，`0600` 原子写，损坏按空）；超时（默认 300s）按拒绝。
   默认 `202 + E_PENDING`，`[command].block_wait = true` 时阻塞至终态。
 - 幂等：同一次审批至多执行一次；并发/重复重入返回同一终态（不会重复执行）。
@@ -555,10 +556,19 @@ veilctl revoke --name "check-mail"
 - 默认（`[storage].credential_block_wait` 未开启）：enrolled 哈希篡改/未 enrolled 待审请求立即返回 `202` + `E_PENDING`，先经 tracked 发送取真实 Bot Matrix event id 并以之为 pending 键建单，再即返回；同一请求不阻塞。
 - 阻塞模式（`[storage].credential_block_wait = true`）：同请求阻塞至 `300`s，批准返回凭据、拒绝或超时按拒绝返回 `403`（`VeilError::Auth`，`src/service/credential/approval.rs`）。
 - 发送路由：审批建单走 `NotificationSink::send_text_tracked`（需真实回执——真实 `event_id` 是反应回调命中 pending 的唯一键；发送失败/取不到 id 即 fail-closed 返回 `403`，不建不可决单）；事件环/失败通知走 `notify_text` 有界 spool 的 best-effort 路径（可丢、不计回执）。二者共用同一 Bot。
-- 审批建单路径白名单：仅凭据、注册、吊销三类路径经 `send_text_tracked` 以真实 `event_id` 建单；`audit-hold` 仅内存 pending（见 §6.4）、`unlock` 无建单路径、哈希变更经 best-effort `notify_text` 通知（`src/service/credential/approval.rs::notify_hash_change`），三者不建 Matrix 审批票。
+- 审批建单路径白名单：仅凭据、注册、命令、吊销（`MatrixBranch::Revoke`）四类路径经 `send_text_tracked` 以真实 `event_id` 建单；`audit-hold` 仅内存 pending（见 §6.4）、哈希变更经 best-effort `notify_text` 通知（`src/service/credential/approval.rs::notify_hash_change`），两者不建 Matrix 审批票。`unlock` 分支已删除（无建单路径，见 §8.4）。
 - 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求（建议指数退避），批准后重试返回凭据、拒绝后 `403`。本仓内置 Go 客户端（`veilctl/`）按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）。
-- 注册审批链：`POST /register-caller` 写入中立条目（`enabled=false`）后建 `MatrixBranch::Register` 审批单，复用同一双模口径（默认 `202 + E_PENDING` 抛单，阻塞模式至 `300s`）。三态落定：`🔓` 保持 `disabled`（不激活）、`✅` 置 `enabled=true`、`❎` 与等待超时置 `revoked=true`（fail-closed）；未获 `✅` 前条目不可用。同一未决注册请求的重试经决策表幂等：返回同一 `202 + E_PENDING`、不重复建单、不返回 `409`；终态后重试返回终态（`✅` 放行、`❎`/超时 `403`），与 §5 revoke `202` 轮询契约同口径。
-- 吊销类审批 `🔓`（`REACTION_AUTO_UNLOCK`）不执行吊销，同请求重试返回 `403` 且条目保持原状（`revoked=false`、`enabled` 不变）；`✅` 正常执行吊销。注册审批 `🔓` 维持 `disabled`、凭据/审计分支 `🔓` 不落定，自动放行语义不外溢。
+- 注册审批链：`POST /register-caller` 写入中立条目（`enabled=false`）后建 `MatrixBranch::Register` 审批单，复用同一双模口径（默认 `202 + E_PENDING` 抛单，阻塞模式至 `300s`）。三态落定：`✅` 置 `enabled=true` 并保留注册声明的 `allow_mode`、`♾️` 置 `enabled=true` 且 `allow_mode = allow`、`❎` 与等待超时置 `revoked=true`（fail-closed）。同一未决注册请求的重试经决策表幂等：返回同一 `202 + E_PENDING`、不重复建单、不返回 `409`；终态后重试返回终态（`✅`/`♾️` 放行、`❎`/超时 `403`），与 §5 revoke `202` 轮询契约同口径。
+- 审批 reaction 四分支受理矩阵（常量 → 动作全局唯一，分支只决定受不受理）：
+
+  | 分支 | `✅` | `♾️` | `❎` |
+  | :-- | :-- | :-- | :-- |
+  | 注册（`Register`） | 激活，保留注册 `allow_mode` | 激活 + `allow_mode = allow` | 吊销 |
+  | 命令（`Command`） | 批准本次 | 批准 + 持久化 accept-always | 拒绝 |
+  | 吊销（`Revoke`） | 执行吊销 | **不受理**（回执，票保持未决） | 不吊销 |
+  | 凭据（`Credential`） | 批准本次 | **不受理**（回执，票保持未决） | 拒绝 |
+
+  `HashChange`/`Audit` 无 Matrix 建单路径（仅原因分类标签），reaction 一律不落定。分支不受理与未知表情（含已退役的旧解锁表情）均回一条说明性消息且票保持未决；非白名单成员、非建单分支、失配 event id 保持静默（无回执）。审批默认异步 `202 + E_PENDING`，等待超时按 `403` 落定（不是 `408`）。
 
 ### 6.8 三因子 `caller_path`/`caller_hash` 双必填
 
@@ -943,34 +953,40 @@ PII 与凭据计数口径：
 - 写端点鉴权前置：常规吊销 `POST /revoke`、注册 `POST /register-caller`、
   哈希变更 `POST /approve-hash-change` 的三因子守卫在部署未配置部署密钥
   （`VEILCTL_SECRET` 为空）时 fail-closed，动作前返回 `403`（`E_AUTH`）；
-  须配置非空部署密钥。紧急吊销 `POST /revoke/emergency` 不受此条约束（只认管理 token/内网，见下）。
-- 紧急吊销 `POST /revoke/emergency`：仅认两类放行依据——有效管理 token
-  （请求体 `admin_token` 或 `X-Admin-Token` 头）与内网来源；服务端
-  **不接受任何客户端自证放行字段**。
-  内网判定只认 TCP 远端地址（`ConnectInfo`），不采信 `X-Forwarded-For` 等代理头
-  （防伪造绕过）。未命中两依据时转常规审批，不直接吊销。与常规吊销同注册表定位条目
-  （见 `src/handler/credential.rs::emergency_revoke_handler`）。
-  管理 token 源为 `OBSERVABILITY_ADMIN_TOKEN`（与 `/_admin` 同一 token）；
-  `CREDENTIAL_ADMIN_TOKEN` **不作为紧急吊销放行依据**——仅携带该值且来源非内网时转常规审批，
-  不直接吊销（`src/service/credential/vault_ops.rs::emergency_revoke`）。
-- 紧急吊销豁免网段：内网来源覆盖
-  `localhost`/`::1`/`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、
-  `169.254.0.0/16`（链路本地）、`100.64.0.0/10`（CGNAT）、`fd00::/8`（ULA）、`fe80::/10`
-  （IPv6 链路本地）；命中管理 token 或内网来源两者任一即直接吊销，公网来源转
-  常规审批。内网判定只认 TCP 远端（`ConnectInfo`），伪造代理头无效。
+  须配置非空部署密钥。紧急吊销 `POST /revoke/emergency` 只认管理 token（见下）。
+- 紧急吊销 `POST /revoke/emergency`：**必须**携带有效管理 token（请求体 `admin_token`
+  或 `X-Admin-Token` 头，源为 `OBSERVABILITY_ADMIN_TOKEN`）；命中即直接吊销，不建审批单。
+  未携带/无效时**网络位置不再构成任何放行依据**（客户端自证字段一律不受理），
+  须先通过三因子校验（`body.auth` + `body.secret`，与写端点同源），不成立返回 `401`/`403`
+  且**不建审批单**；三因子成立才转常规审批（`202 + E_PENDING`，条目未吊销）。
+  容器内对端恒为 docker 网关地址，旧的按对端网段判定等于同网络任意容器可无 token 吊销，
+  故已删除（`src/service/credential/vault_ops.rs::emergency_revoke`）。
+- **Break-glass 前提（运维必读）**：无管理 token 的三因子路径需要建 Matrix 审批票，
+  因此**依赖 Matrix homeserver 可达**；Matrix 不可达时建票失败，接口返回 `403` 而非 `202`。
+  即"无 `OBSERVABILITY_ADMIN_TOKEN` + Matrix 宕机"等于**无法紧急吊销**。
+  `OBSERVABILITY_ADMIN_TOKEN` 必须作为托管凭据长期持有，不能假设三因子通道总能兜底；
+  上线前应演练一次"Matrix 宕机 + 紧急吊销"以确认 token 可用。
+  调用示例：
+
+  ```bash
+  curl -sS -X POST http://127.0.0.1:8877/revoke/emergency \
+    -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" \
+    -H "content-type: application/json" \
+    -d '{"caller_path":"/s/job.sh"}'
+  ```
 - 常规吊销 `POST /revoke`：经 Matrix 审批确认后执行——
-  建单（`MatrixBranch::Register` 三态映射）后仅 `✅` 置 `revoked=true` 且 `enabled=false`；
-  `❎` 与等待超时**保持条目原状**（不做破坏性动作）。默认 `202` 抛单，`[storage].credential_block_wait = true`
-  阻塞至 `300s`。与紧急吊销旁路（上条两通道）分工：常态吊销走审批，止损走旁路且不建审批单。
+  建单（`MatrixBranch::Revoke`，预置 `✅`/`❎`）后仅 `✅` 置 `revoked=true` 且 `enabled=false`；
+  `♾️` 不受理（回执，票保持未决）、`❎` 与等待超时**保持条目原状**（不做破坏性动作）。
+  默认 `202` 抛单，`[storage].credential_block_wait = true` 阻塞至 `300s`。
 - `GET /registrations`：要求管理面鉴权（`X-Admin-Token` 或部署密钥
   `X-Veilctl-Secret`，见 `src/handler/credential.rs::registrations_handler`），两者皆缺/不匹配 401。
   Go `veilctl list` 携带部署密钥可用。
-- 哈希变更 `POST /approve-hash-change`：经 Matrix 三态落定——
-  `🔓` 保持现有 `allow_mode`（自动放行延续）；`✅` 降级为人工审批模式（`allow_mode` 置 `none` 语义，
-  后续取用进入审批）；`❎` 与等待超时置 `enabled=false`（取用被拒绝）。三态均写入旧哈希宽限
-  （`old_hash` + `old_hash_expires_at = now + 3600s`）并更新 `script_sha256`。落定入口接受
-  `reg_id`/`reaction` 可选入参：`reg_id` 缺省回退 `caller_path`，`reaction` 缺省按保持自动；
-  缺省不返回 `400`（仅 `reaction` 非 `🔓/✅/❎` 才 `400`）。
+- 哈希变更 `POST /approve-hash-change`：`reaction` **必填**——
+  `♾️` 批准新哈希并置 `allow_mode = allow`（自动放行）；`✅` 批准新哈希并降级为人工审批
+  （`allow_mode = pending`）；`❎` 置 `enabled=false`。三态均写入旧哈希宽限
+  （`old_hash` + `old_hash_expires_at = now + 3600s`）并更新 `script_sha256`。
+  `reg_id` 仍可缺省回退 `caller_path`；`reaction` 缺省/空串/旧解锁表情/集合外取值返回 `400`
+  并列出合法取值 `♾️`/`✅`/`❎`。
 - 旧格式迁移：`[storage].caller_registry_path` 指向旧格式
   （`version`/`callers`/`allowed_entries` 形态）时，加载期一次性迁移——先备份 `.bak`（备份失败
   拒绝覆盖写，fail-closed），随后以新格式写回并返回内存态；新格式文件直读、不生成 `.bak`、不改写。
@@ -1121,13 +1137,14 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 - 非 `full` 入口下 `approve_hash_change` 降级为阻断（返回鉴权失败，不执行哈希变更，
   见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
 - Matrix 审批返回 `None` 即 rejected 并清理；审批票回收两口径并存、不得混用：
-  **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（审计/解锁类）按分支 TTL `60s` 清扫；
+  **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（审计类）按分支 TTL `60s` 清扫；
   **有阻塞等待者凭据类票 300s 阻塞 TTL**——凭据/注册/哈希变更类存在阻塞等待者的未决票，
   在其自身 `300s` 阻塞超时前不被回收；
   两口径对矩阵侧票与内存侧 `PendingApprovals` 一致适用。
 - 文本指令 `lock`/`forget` 经网关侧清理接线：
-  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，再次解锁须重新经
-  TPM 解封）+ 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。
+  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，**不阻止下次取用**——再次取用仍经 TPM 解封）+ 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。
+- `MatrixBranch::Unlock` 已删除：`unlock`/`解锁` 前缀原因在 `from_reason` 直接返回错误，
+  `record_pending` fail-closed（不建一张永远不可决的票）。
 - `[storage].auto_approve` 三态：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（见 §2）。
 
 ### 8.5 测试口径注明

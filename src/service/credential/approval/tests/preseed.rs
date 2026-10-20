@@ -75,7 +75,18 @@ async fn approval_reaction_preseed() {
     )
     .await
     .unwrap();
-    assert_eq!(sink.reactions(), 3, "注册分支须预置 🔓/✅/❎");
+    assert_eq!(sink.reactions(), 3, "注册分支须预置 ✅/♾️/❎");
+    submit_pending_with_branch(
+        &state,
+        "/s/pre-revoke.sh",
+        "revoke审批",
+        MatrixBranch::Revoke,
+        "",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sink.reactions(), 5, "吊销分支须预置 ✅/❎");
     submit_pending_with_branch(
         &state,
         "/s/pre-cred.sh",
@@ -86,8 +97,8 @@ async fn approval_reaction_preseed() {
     )
     .await
     .unwrap();
-    assert_eq!(sink.reactions(), 5, "凭据分支须预置 ✅/❎");
-    submit_pending_with_branch(
+    assert_eq!(sink.reactions(), 7, "凭据分支须预置 ✅/❎");
+    let err = submit_pending_with_branch(
         &state,
         "/s/pre-hash.sh",
         "hash-change",
@@ -96,8 +107,21 @@ async fn approval_reaction_preseed() {
         None,
     )
     .await
-    .unwrap();
-    assert_eq!(sink.reactions(), 8, "哈希变更分支须预置 🔓/✅/❎");
+    .expect_err("HashChange 仅为分类标签，不得建票");
+    assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(sink.reactions(), 7, "HashChange 标签不得预置任何 reaction");
+    let err = submit_pending_with_branch(
+        &state,
+        "/s/pre-audit.sh",
+        "audit-hold",
+        MatrixBranch::Audit,
+        "",
+        None,
+    )
+    .await
+    .expect_err("Audit 仅为分类标签，不得建票");
+    assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(sink.reactions(), 7, "Audit 标签不得预置任何 reaction");
 }
 
 #[tokio::test]

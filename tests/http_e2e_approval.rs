@@ -136,6 +136,24 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
             .send()
             .await
             .unwrap();
+        assert_eq!(
+            approve.status().as_u16(),
+            400,
+            "{mode} 下缺 reaction 须先 400（必填校验先于入口门禁）"
+        );
+        let approve = client
+            .post(format!("{base}/approve-hash-change"))
+            .header("X-Veilctl-Binary-Hash", "gethash1")
+            .header("X-Veilctl-Secret", "s3cr3t")
+            .json(&serde_json::json!({
+                "caller_path": "/srv/b8deg.sh",
+                "reaction": "✅",
+                "new_hash": "h-b8-deg-B",
+                "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
+            }))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(approve.status().as_u16(), 403, "{mode} 下须降级阻断");
         // 未执行变更（credential-only 下验证：同一 vault_ops 入口门覆盖全部非 full 模式）：
         // 新哈希仍走篡改分支转审批 202，而非匹配后拒绝 403。

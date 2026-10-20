@@ -145,14 +145,9 @@ async fn emergency_revoke_token_source() {
         .unwrap();
     enable(&state, key).await;
 
-    let old = emergency_revoke(
-        &state,
-        key,
-        Some("legacy-credential-admin-token"),
-        Some("203.0.113.9"),
-    )
-    .await
-    .unwrap_err();
+    let old = emergency_revoke(&state, key, Some("legacy-credential-admin-token"))
+        .await
+        .unwrap_err();
     assert_eq!(
         old.status_code(),
         StatusCode::ACCEPTED,
@@ -164,14 +159,9 @@ async fn emergency_revoke_token_source() {
         assert!(entry.enabled && !entry.revoked, "旧 token 源不得吊销条目");
     }
 
-    let view = emergency_revoke(
-        &state,
-        key,
-        Some("observability-admin-token-0123456789"),
-        Some("203.0.113.9"),
-    )
-    .await
-    .unwrap();
+    let view = emergency_revoke(&state, key, Some("observability-admin-token-0123456789"))
+        .await
+        .unwrap();
     assert!(
         view.revoked && !view.enabled,
         "OBSERVABILITY_ADMIN_TOKEN 须放行: {view:?}"

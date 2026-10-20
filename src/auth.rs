@@ -1,5 +1,5 @@
 //! owner 声明：本文件为哈希/密钥比较工具实体
-//! （`ct_eq` 定长哈希、`secret_eq` 变长 Secret、`sha256_hex`、`is_private_ip`），
+//! （`ct_eq` 定长哈希、`secret_eq` 变长 Secret、`sha256_hex`），
 //! 与 `service::credential::auth`（三因子网关核验入口）职责不同、非垫片关系；
 //! 新比较原语归本文件，新网关鉴权逻辑归 `credential::auth`（其经 `crate::auth`
 //! 复用本原语），不得互抄。
@@ -41,32 +41,6 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(data))
 }
 
-pub fn is_private_ip(host: &str) -> bool {
-    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
-    if h == "localhost" || h == "::1" {
-        return true;
-    }
-    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                o[0] == 10
-                    || o[0] == 127
-                    || (o[0] == 192 && o[1] == 168)
-                    || (o[0] == 172 && (16..=31).contains(&o[1]))
-                    || (o[0] == 169 && o[1] == 254)
-                    || (o[0] == 100 && (64..=127).contains(&o[1]))
-            }
-            std::net::IpAddr::V6(v6) => {
-                let s = v6.segments();
-                // fd00::/8（ULA）+ fe80::/10（链路本地）；::1 已在上分支返回。
-                s[0] & 0xff00 == 0xfd00 || s[0] & 0xffc0 == 0xfe80
-            }
-        };
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,30 +64,5 @@ mod tests {
         assert!(!secret_eq("", "x"));
         assert!(!secret_eq("x", ""));
         assert!(secret_eq("", ""));
-    }
-
-    #[test]
-    fn private_ip_covers_three_ranges() {
-        assert!(is_private_ip("127.0.0.1"));
-        assert!(is_private_ip("10.1.2.3"));
-        assert!(is_private_ip("192.168.0.5"));
-        assert!(is_private_ip("172.20.0.1"));
-        assert!(!is_private_ip("8.8.8.8"));
-        assert!(!is_private_ip("203.0.113.1"));
-    }
-
-    #[test]
-    fn private_ip_covers_link_local_and_carrier_nat() {
-        assert!(is_private_ip("169.254.10.20"));
-        assert!(is_private_ip("100.64.0.1"));
-        assert!(is_private_ip("100.127.255.255"));
-        assert!(!is_private_ip("100.128.0.1"));
-        assert!(is_private_ip("fd00::1"));
-        assert!(is_private_ip("fd12:3456::1"));
-        assert!(is_private_ip("fe80::1"));
-        assert!(is_private_ip("[fe80::1]"));
-        assert!(is_private_ip("::1"));
-        assert!(!is_private_ip("2001:db8::1"));
-        assert!(!is_private_ip("8.8.8.8"));
     }
 }

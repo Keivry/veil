@@ -24,20 +24,35 @@ export VEIL_ALLOW_MOCK_TPM=1
 - 配置文件缺省时 `[storage].data_dir` 为 `/data`；本地直跑请在 TOML 里设成可写路径。
 - `MATRIX_ACCESS_TOKEN` 与 `OBSERVABILITY_ADMIN_TOKEN` 均可缺省——缺 Matrix token 时仅审批/凭据同步关闭，缺 admin token（且未设 `[auth].observability_disable`）时 `/_admin*` 全返回 404（管理面未启用）；两 token 均非空且相同时按配置错误拒绝启动，建议 ≥32 字符（不足仅告警）。
 - `VEIL_ALLOW_MOCK_TPM=1` 仅限无 TPM 硬件的开发机与 CI，生产必须接 TPM 2.0 并去掉这一项。
-- 监听地址硬编码为 `127.0.0.1:8877`，端口不可配；换宿主机入口端口只能走容器映射。
+- 监听地址由配置文件 `[server].bind` 承载（缺省 `127.0.0.1:8877`，必须是 `IP:PORT` 字面量）；本机直跑保持回环即可，换宿主机入口端口仍走容器映射。
 
 ### 容器
 
 ```bash
 export MATRIX_ACCESS_TOKEN='syt_...'
 export OBSERVABILITY_ADMIN_TOKEN="$(openssl rand -hex 32)"
-cp examples/veil.toml ./veil.toml
+export TPM_GID="$(stat -c '%g' /dev/tpmrm0)"   # 无 TPM 开发机：TPM_GID=$(id -g)
 docker compose up -d
 ```
 
-- compose 把宿主机 `./veil.toml` 只读挂到 `/etc/veil/veil.toml` 并设 `VEIL_CONFIG_FILE`；数据卷父卷 `${DATA_DIR:-./data}` 是**宿主机侧**的卷路径（仅 compose 变量），与配置文件的 `[storage].data_dir`（默认 `/data`）相互独立。
+- 三项前置：① 容器版示例 `examples/veil.container.toml`（`[server].bind = "0.0.0.0:8877"`，compose 直接只读挂载；需要私有配置时改挂自己的 TOML）；② `TPM_GID` 必填（`docker compose config` 阶段即失败并提示取值方式）；③ runtime 镜像已含 `tpm2-tools`。
+- **数据目录属主（首次部署必做）**：容器内以非 root 运行（镜像 `uid=999`，`docker run --rm --entrypoint id <image>` 可确认）。`/data` 是**读写**卷（compose 写 `metrics.sqlite`、`audit.log`、`commands.sqlite` 等），`/data/tpm` 与 `/data/db` 是**只读**卷（只读 seal 文件与 `.kdbx`）。若父目录由 `docker compose` 首次自动建成 `root:root 0755`，容器对 `/data` 无写权限，日志报 `sqlite 初始化失败: ... Error code 14` 并以退出码退出；`restart: unless-stopped` 会反复重启（`tpm`/`db` 只读，0755 下仍可读，不报此错）。首次部署前先建目录并交权（**两种引擎命令不同**）：
+  ```bash
+  # Docker Engine（rootful）：属主直接写成镜像内 uid/gid
+  sudo mkdir -p ./data ./data/tpm ./data/db
+  sudo chown -R 999:999 ./data
+
+  # Podman（rootless）：普通 chown 会报「不允许的操作」，须在用户命名空间内改
+  mkdir -p ./data ./data/tpm ./data/db
+  podman unshare chown -R 999:999 ./data
+  ```
+  rootless 下改完后宿主 `ls -ln ./data` 显示的是高位 subuid（如 `100998`）而非 `999`，这是 uid 映射的正常表现，不影响容器内读写。换用命名卷（`volumes: veil_data:/data`）时由引擎自动继承镜像内属主，可跳过此步。
+- **从旧版本升级**：两处默认值变了，都表现为"容器是绿的但不可用"。① `[server]` 段是本版新增：若实际挂载的 TOML（例如升级前自己维护的 `veil.toml`）没有 `[server].bind`，容器会回退到缺省 `127.0.0.1:8877`——容器内 `/health` 仍然 `ok:true`（健康检查在容器内跑），但宿主机发布端口一律被 reset。② `docker-compose.yml` 的默认挂载已从 `./veil.toml` 改为只读的 `examples/veil.container.toml`；旧部署里自己维护的 `./veil.toml` 不再被挂载，私有的 homeserver/room_id/data_dir 会被示例占位值取代（审批相关请求转 403）。升级后须确认实际挂载的 TOML 是你自己的配置且含 `[server].bind = "0.0.0.0:8877"`。
+- compose 把配置文件只读挂到 `/etc/veil/veil.toml` 并设 `VEIL_CONFIG_FILE`；数据卷父卷 `${DATA_DIR:-./data}` 是**宿主机侧**的卷路径（仅 compose 变量），与配置文件的 `[storage].data_dir`（默认 `/data`）相互独立。
+- 监听地址分两层：容器内必须 `[server].bind = "0.0.0.0:8877"`（bridge 网络的 DNAT 目标不是回环，写回环收不到），宿主机侧仍只发布到 `127.0.0.1`（见 `ports`）——对外不暴露到局域网。
+- `cap_add: IPC_LOCK` 与 `ulimits.memlock: -1` 让 `mlockall` 成功；若受限 daemon 拒绝 `ulimits`，删除该段只保留 `cap_add` 即可（`mlockall` 检查的是 `CAP_IPC_LOCK`）。
 - 三条映射都指向容器内 `8877`；入口端口只区分选路上游，`[llm].default_upstream` 是缺省上游。宿主机端口可经 `PORT_8877`/`PORT_8878`/`PORT_8879` 覆盖，容器内监听恒为 `8877`。
-- 无 TPM 硬件时注释掉 `devices` 两行，并补上 `VEIL_ALLOW_MOCK_TPM=1`。
+- 无 TPM 硬件：注释掉 `devices` 两行，设置 `VEIL_ALLOW_MOCK_TPM=1`，并用 `TPM_GID=$(id -g)` 满足 compose 必填校验（mock 路径不需要真实设备属组）。
 
 ### 健康检查与停止
 
@@ -56,11 +71,11 @@ docker compose up -d
 }
 ```
 
-`ok:true` 表示进程存活，探针不需要鉴权；`unlocked:false` 是凭据库尚未解锁（不影响 LLM 面），`pending` 是待审批数，`pii_custom_disabled` 是被停用的自定义 PII 规则数。停止：二进制是前台进程，`Ctrl-C` 即退出；容器用 `docker compose down`；`[storage].data_dir` 下 sqlite 与审计日志会自己收尾，无需额外清理。
+`ok:true` 表示进程存活，探针不需要鉴权。`unlocked` 仅反映 .kdbx 库文件是否在位（`RealKeePass::is_unlocked` 只做 `is_file()` 快检，不触发解密、无副作用），`false` 表示库文件未就位，**不代表"需要人工解锁"**；凭据取用是否可用的权威口径是 `status` 字段与 `fetch_entry` 的实时错误。`pending` 是待审批数，`pii_custom_disabled` 是被停用的自定义 PII 规则数。停止：二进制是前台进程，`Ctrl-C` 即退出；容器用 `docker compose down`；`[storage].data_dir` 下 sqlite 与审计日志会自己收尾，无需额外清理。
 
 ## 核心配置
 
-配置分两层：**环境变量表**（进程 env 白名单，共 9 个具名变量，见下）与 **TOML 配置文件**（其余设置的唯一来源）。优先级：白名单概念维持 `env 显式 > 文件 > 内建默认`；非白名单概念只由文件承载（同名 env 置位不生效、仅启动期告警）。
+配置分两层：**环境变量表**（进程 env 白名单，变量逐名见下表）与 **TOML 配置文件**（其余设置的唯一来源）。优先级：白名单概念维持 `env 显式 > 文件 > 内建默认`；非白名单概念只由文件承载（同名 env 置位不生效、仅启动期告警）。
 
 ### 环境变量表
 
@@ -84,6 +99,7 @@ docker compose up -d
 
 | 文件键 | 默认 | 作用 |
 | :-- | :-- | :-- |
+| `[server].bind` | `127.0.0.1:8877` | 监听地址（文件专属，须 `IP:PORT` 字面量）；容器内写 `0.0.0.0:8877` |
 | `[auth].homeserver` / `[auth].room_id` | 空（可选） | Matrix homeserver 与审批房间；缺失即关闭 Matrix 通知/审批（不拒启动） |
 | `[auth].matrix_access_token` / `[auth].observability_admin_token` | 空（可 env 注入） | 密钥类；写入文件须 `0600` |
 | `[storage].data_dir` | `/data` | sqlite 与审计日志父目录；派生 `db_dir`/`tpm_dir`/`caller_registry_path` |
@@ -92,6 +108,8 @@ docker compose up -d
 | `[pii_scope].mode` | `"request"` | 逐请求隔离；`"conversation"` 启用有界的会话级关联 |
 | `[limits].sse_frame_hard_bytes` | `8388608`（8MiB） | SSE 单帧/单行硬上限（字节，≥1）；超限 fail-closed 并按协议合成终止帧 |
 | `[audit].mode` | `"off"` | `"off"` / `"block"` / `"approve"`；`"approve"` 必须配 `[audit].approval_whitelist` |
+
+紧急吊销 `POST /revoke/emergency` 必须携带 `X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN`（或 body `admin_token`）；无有效 token 时须通过三因子（body `auth` + `secret`），不成立返回 `401`/`403` 且不建审批单。
 
 ### 配置文件（可选）
 
@@ -103,7 +121,7 @@ docker compose up -d
 
 - `GET /commands` 返回该下游可见的命令目录与参数定义；
 - `POST /commands/{id}/invoke` 执行命令（argv 直传、禁止 shell），返回退出码与输出；
-- 需审批的命令经 Matrix `✅`/`❎`/`🔓` 落定（`🔓` 持久化 accept-always），默认 `202 + E_PENDING`，
+- 需审批的命令经 Matrix `✅`/`❎`/`♾️` 落定（`♾️` 批准并持久化 accept-always），默认 `202 + E_PENDING`，
   `[command].block_wait = true` 时阻塞至终态；
 - 每次调用写入 `data_dir/commands.sqlite`，可在 `/_admin/commands` 与控制台「命令调用」分区查看。
 

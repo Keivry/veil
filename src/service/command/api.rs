@@ -551,15 +551,15 @@ async fn complete(
         &pending.event_id,
         execution_record_ttl(pending.timeout_secs),
     );
-    let auto = state
+    let always = state
         .approval()
-        .applied_auto(&pending.event_id)
+        .applied_always(&pending.event_id)
         .await
         .unwrap_or(false);
     clear_terminal_pending(state, &pending.pending_key, &pending.event_id).await;
     let terminal = match decision {
         Some(true) => {
-            if auto {
+            if always {
                 state
                     .command()
                     .grants

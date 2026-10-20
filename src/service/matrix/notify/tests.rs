@@ -98,7 +98,7 @@ async fn notification_spool_reuse() {
     assert_eq!(sink.sent(), 6, "多次通知经单一消费者送达一次");
     assert_eq!(spool.dropped_count(), 0, "容量内不得丢弃");
     // 复用同一 Bot 格式化，不新建实例。
-    let text = spool.format_approval(MatrixBranch::Credential, Some(false), "KeePass 失败");
+    let text = spool.format_notice(MatrixBranch::Credential, Some(false), "KeePass 失败");
     assert!(text.contains("[凭据]"), "格式化经 spool 单一 Bot: {text}");
     spool.shutdown();
 }

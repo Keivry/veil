@@ -276,3 +276,58 @@ fn tpm_tempdir_cleanup() {
     assert!(err.to_string().contains("密封文件缺失"), "{err}");
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn probe_reports_missing_tool_with_actionable_hint() {
+    let base = unique_test_base("probe-missing");
+    let bin_dir = base.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let tpm = RealTpm::with_bin_dir(base.join("seal"), bin_dir);
+    let err = tpm.probe().unwrap_err();
+    assert!(err.contains("tpm2_pcrread 不存在"), "{err}");
+    assert!(err.contains("tpm2-tools"), "{err}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn probe_surfaces_stderr_and_permission_hint() {
+    let base = unique_test_base("probe-stderr");
+    let bin_dir = base.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_executable(
+        &bin_dir.join("tpm2_pcrread"),
+        "#!/bin/sh\necho 'pcrread boom detail' >&2\nexit 1\n",
+    );
+    let tpm = RealTpm::with_bin_dir(base.join("seal"), bin_dir.clone());
+    let err = tpm.probe().unwrap_err();
+    assert!(err.contains("pcrread boom detail"), "{err}");
+    assert!(!err.contains("group_add"), "{err}");
+
+    write_executable(
+        &bin_dir.join("tpm2_pcrread"),
+        "#!/bin/sh\necho 'ERROR: Permission denied' >&2\nexit 1\n",
+    );
+    let err = tpm.probe().unwrap_err();
+    assert!(err.contains("Permission denied"), "{err}");
+    assert!(err.contains("group_add TPM_GID"), "{err}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn probe_succeeds_with_zero_exit_and_gate_prepends_reason() {
+    let base = unique_test_base("probe-ok");
+    let bin_dir = base.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_executable(&bin_dir.join("tpm2_pcrread"), "#!/bin/sh\nexit 0\n");
+    let tpm = RealTpm::with_bin_dir(base.join("seal"), bin_dir);
+    assert!(tpm.probe().is_ok());
+    std::fs::remove_dir_all(&base).ok();
+
+    let err = require_hardware_tpm(&MockTpm::unavailable()).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("TPM 不可用，拒绝启动（禁止软件回退）"),
+        "{text}"
+    );
+    assert!(text.contains("TPM 不可用"), "{text}");
+}

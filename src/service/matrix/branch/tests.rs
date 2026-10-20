@@ -104,51 +104,146 @@ fn sync_token_persist_roundtrip() {
 }
 
 #[test]
-fn unknown_emoji_and_branch_map_to_noop() {
-    assert_eq!(reaction_to_decision(MatrixBranch::Credential, "👍"), None);
-    assert_eq!(reaction_to_decision(MatrixBranch::Unknown, "✅"), None);
-    assert_eq!(reaction_to_decision(MatrixBranch::Credential, "🔓"), None);
+fn reaction_actions_are_global_and_fe0f_insensitive() {
+    use ReactionAction::{Approve, ApproveAlways, NotAccepted, NotAnOrderBranch, Reject};
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Register, "♾"),
+        ApproveAlways
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Register, "♾️"),
+        ApproveAlways
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Command, "♾️"),
+        ApproveAlways
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Revoke, "♾️"),
+        NotAccepted
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Credential, "♾️"),
+        NotAccepted
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::Audit, "♾️"),
+        NotAnOrderBranch
+    );
+    assert_eq!(
+        reaction_to_decision(MatrixBranch::HashChange, "✅"),
+        NotAnOrderBranch
+    );
     assert_eq!(
         reaction_to_decision(MatrixBranch::Register, "🔓"),
-        Some((true, true))
+        NotAccepted
+    );
+    assert_eq!(reaction_to_decision(MatrixBranch::Register, "✅"), Approve);
+    assert_eq!(reaction_to_decision(MatrixBranch::Revoke, "❎"), Reject);
+    assert!(is_known_reaction("♾"));
+    assert!(is_known_reaction("♾️"));
+    assert!(!is_known_reaction("🔓"));
+    assert!(!is_known_reaction("👍"));
+}
+
+#[test]
+fn presets_and_pending_status_decoupled_from_reactions() {
+    assert_eq!(
+        MatrixBranch::Register.reaction_presets(),
+        &[REACTION_APPROVE, REACTION_APPROVE_ALWAYS, REACTION_REJECT]
     );
     assert_eq!(
-        reaction_to_decision(MatrixBranch::Audit, "✅"),
-        Some((true, false))
+        MatrixBranch::Revoke.reaction_presets(),
+        &[REACTION_APPROVE, REACTION_REJECT]
     );
     assert_eq!(
-        reaction_to_decision(MatrixBranch::Audit, "❎"),
-        Some((false, false))
+        MatrixBranch::Credential.reaction_presets(),
+        &[REACTION_APPROVE, REACTION_REJECT]
     );
+    assert!(
+        MatrixBranch::HashChange.reaction_presets().is_empty(),
+        "HashChange 仅为分类标签，不得预置 reaction"
+    );
+    assert!(
+        MatrixBranch::Audit.reaction_presets().is_empty(),
+        "Audit 仅为分类标签，不得预置 reaction"
+    );
+    for branch in [
+        MatrixBranch::Register,
+        MatrixBranch::Revoke,
+        MatrixBranch::Credential,
+        MatrixBranch::Audit,
+    ] {
+        assert_eq!(branch.status_emoji_pending(), "⏳");
+    }
+}
+
+#[test]
+fn from_reason_routes_revoke_and_rejects_unlock() {
+    assert!(MatrixBranch::from_reason("unlock credential").is_err());
+    assert!(MatrixBranch::from_reason("解锁凭据").is_err());
+    assert_eq!(
+        MatrixBranch::from_reason("revoke caller").unwrap(),
+        MatrixBranch::Revoke
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("吊销 x").unwrap(),
+        MatrixBranch::Revoke
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("注册审批").unwrap(),
+        MatrixBranch::Register
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("hash-change").unwrap(),
+        MatrixBranch::HashChange
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("hash_mismatch").unwrap(),
+        MatrixBranch::Credential,
+        "凭据取用的 hash_mismatch 原因串不得被分类为 HashChange 建单标签"
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("凭据下发").unwrap(),
+        MatrixBranch::Credential
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("command_invoke").unwrap(),
+        MatrixBranch::Command
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("audit-hold").unwrap(),
+        MatrixBranch::Audit
+    );
+    assert_eq!(
+        MatrixBranch::from_reason("加急转交").unwrap(),
+        MatrixBranch::Unknown
+    );
+    assert!(!MatrixBranch::Unknown.is_known());
+    assert!(!MatrixBranch::HashChange.is_matrix_order_branch());
+    assert!(!MatrixBranch::Audit.is_matrix_order_branch());
+    assert!(MatrixBranch::Revoke.is_matrix_order_branch());
+    assert_eq!(MatrixBranch::Audit.status_emoji_approved(), "✅");
+    assert_eq!(MatrixBranch::Audit.status_emoji_rejected(), "❎");
 }
 
 #[test]
 fn command_branch_three_state_reactions() {
     assert_eq!(
         reaction_to_decision(MatrixBranch::Command, REACTION_APPROVE),
-        Some((true, false)),
+        ReactionAction::Approve,
         "✅ 批准一次"
     );
     assert_eq!(
         reaction_to_decision(MatrixBranch::Command, REACTION_REJECT),
-        Some((false, false)),
+        ReactionAction::Reject,
         "❎ 拒绝"
     );
     assert_eq!(
-        reaction_to_decision(MatrixBranch::Command, REACTION_AUTO_UNLOCK),
-        Some((true, true)),
-        "🔓 批准并持久化 accept-always"
+        reaction_to_decision(MatrixBranch::Command, REACTION_APPROVE_ALWAYS),
+        ReactionAction::ApproveAlways,
+        "♾️ 批准并持久化 accept-always"
     );
-    assert_eq!(reaction_to_decision(MatrixBranch::Command, "👍"), None);
-    assert_eq!(
-        MatrixBranch::Command.reaction_presets(),
-        &[REACTION_AUTO_UNLOCK, REACTION_APPROVE, REACTION_REJECT]
-    );
-    assert_eq!(
-        MatrixBranch::from_reason("command_invoke"),
-        MatrixBranch::Command
-    );
-    assert_eq!(MatrixBranch::from_reason("命令审批"), MatrixBranch::Command);
 }
 
 #[test]
@@ -158,36 +253,4 @@ fn text_commands_parse_three_instructions() {
     assert_eq!(parse_text_command("status"), TextCommand::Status);
     assert_eq!(parse_text_command("forget secrets"), TextCommand::Forget);
     assert_eq!(parse_text_command("hello"), TextCommand::Unknown);
-}
-
-#[test]
-fn five_branches_map_and_identify() {
-    assert_eq!(MatrixBranch::from_reason("unlock"), MatrixBranch::Unlock);
-    assert_eq!(
-        MatrixBranch::from_reason("注册审批"),
-        MatrixBranch::Register
-    );
-    // 常规吊销复用 `Register` 分支的三态映射（`from_reason` 须识别）。
-    assert_eq!(
-        MatrixBranch::from_reason("revoke审批"),
-        MatrixBranch::Register
-    );
-    assert_eq!(
-        MatrixBranch::from_reason("吊销审批"),
-        MatrixBranch::Register
-    );
-    assert_eq!(
-        MatrixBranch::from_reason("hash-change"),
-        MatrixBranch::HashChange
-    );
-    assert_eq!(
-        MatrixBranch::from_reason("凭据下发"),
-        MatrixBranch::Credential
-    );
-    assert_eq!(MatrixBranch::from_reason("audit-hold"), MatrixBranch::Audit);
-    assert_eq!(MatrixBranch::from_reason("加急转交"), MatrixBranch::Unknown);
-    assert!(!MatrixBranch::Unknown.is_known());
-    assert_eq!(MatrixBranch::Audit.status_emoji_approved(), "✅");
-    assert_eq!(MatrixBranch::Audit.status_emoji_rejected(), "❎");
-    assert_eq!(MatrixBranch::Audit.status_emoji_pending(), "🔓");
 }

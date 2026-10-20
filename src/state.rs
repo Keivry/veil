@@ -316,6 +316,8 @@ impl crate::service::credential::AppStateParts for AppState {
 impl crate::service::matrix::GatewayCleanup for AppState {
     fn keepass_unlocked(&self) -> bool { self.keepass.is_unlocked() }
 
+    fn master_password_cached(&self) -> bool { self.keepass.master_password_cached() }
+
     fn vault_len(&self) -> usize { self.vault.len() }
 
     fn lock_cleanup(&self) -> usize {

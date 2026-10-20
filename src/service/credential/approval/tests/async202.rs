@@ -360,7 +360,7 @@ impl KeePassBackend for FlakyKeePass {
             if self.remaining_failures.load(Ordering::SeqCst) > 0 {
                 self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
                 return Err(VeilError::Unavailable {
-                    message: "KeePass 未解锁（瞬时）".to_string(),
+                    message: "KeePass 密码库未载入（瞬时）".to_string(),
                 });
             }
             Ok(EntrySnapshot {

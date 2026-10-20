@@ -303,7 +303,7 @@ impl KeePassBackend for LockableKeePass {
         Box::pin(async move {
             if !self.unlocked.load(Ordering::SeqCst) {
                 return Err(VeilError::Unavailable {
-                    message: "KeePass 未解锁".to_string(),
+                    message: "KeePass 密码库未载入".to_string(),
                 });
             }
             Ok(crate::keepass::EntrySnapshot {
@@ -357,7 +357,12 @@ async fn lock_cleanup_clears_vault() {
         .await;
     let reply =
         MatrixBot::handle_text_command_full(&state.approval, TextCommand::Lock, &state).await;
-    assert!(reply.is_some_and(|s| s.contains("🔒 Proxy 已锁定")));
+    let reply = reply.expect("lock 须有回执");
+    assert!(!reply.contains("已锁定"), "lock 不得宣称已锁定: {reply}");
+    assert!(
+        reply.contains("未决 1 单已按拒绝落定"),
+        "lock 须报告按拒绝落定的票数: {reply}"
+    );
     assert!(state.vault.is_empty(), "lock 后口令缓存须清空");
     assert_eq!(state.pending.len(), 0, "lock 后内存 pending 须清零");
     assert_eq!(
@@ -392,8 +397,26 @@ async fn lock_clears_master_password_cache() {
         .await
         .expect("首次取用须经 TPM 解封成功");
     assert!(cache.has_cached(), "取用后 TPM 主密码缓存须已填充");
-    let _ = crate::service::matrix::GatewayCleanup::lock_cleanup(&state);
+    assert!(
+        crate::service::matrix::GatewayCleanup::master_password_cached(&state),
+        "status 须能读到真实的主密码缓存载入状态"
+    );
+    let reply = crate::service::matrix::MatrixBot::handle_text_command_full(
+        &state.approval,
+        crate::service::matrix::TextCommand::Lock,
+        &state,
+    )
+    .await
+    .expect("lock 须有回执");
+    assert!(
+        reply.contains("主密码缓存: 已载入→未载入"),
+        "lock 回执须报告主密码缓存清理前后状态: {reply}"
+    );
     assert!(!cache.has_cached(), "lock 后 TPM 主密码缓存须清空");
+    assert!(
+        !crate::service::matrix::GatewayCleanup::master_password_cached(&state),
+        "lock 后 status 须读到未载入"
+    );
     state
         .keepass
         .fetch_entry("网易".to_string())

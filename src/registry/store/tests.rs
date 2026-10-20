@@ -45,7 +45,13 @@ fn reregister_clears_old_hash_grace() {
         ..RegisterParams::default()
     })
     .unwrap();
-    reg.approve_hash_change("/s/grace-reuse.sh", "h2").unwrap();
+    reg.approve_hash_change_with_script_sha256(
+        "/s/grace-reuse.sh",
+        "h2",
+        "sha-h2".to_string(),
+        HashChangeOutcome::ApproveAlways,
+    )
+    .unwrap();
     assert!(
         reg.lookup_by_path("/s/grace-reuse.sh")
             .unwrap()
@@ -90,7 +96,7 @@ fn new_registration_disabled_by_default() {
     let mut reg = CallerRegistry::empty();
     let e = reg.register("/s/a.sh", "h1").unwrap();
     assert!(!e.enabled && !e.revoked);
-    assert_eq!(e.status_emoji(), "🔓");
+    assert_eq!(e.status_emoji(), "⏳");
 }
 
 #[test]
@@ -165,7 +171,13 @@ fn approve_hash_change_applies_and_enables() {
     let mut reg = CallerRegistry::empty();
     reg.register("/s/a.sh", "h1").unwrap();
     reg.set_enabled("/s/a.sh", true).unwrap();
-    reg.approve_hash_change("/s/a.sh", "h2").unwrap();
+    reg.approve_hash_change_with_script_sha256(
+        "/s/a.sh",
+        "h2",
+        "sha-h2".to_string(),
+        HashChangeOutcome::ApproveAlways,
+    )
+    .unwrap();
     let e = reg.lookup_by_path("/s/a.sh").unwrap();
     assert_eq!(e.expected_hash, "h2");
     assert!(e.enabled && !e.revoked);
@@ -174,7 +186,7 @@ fn approve_hash_change_applies_and_enables() {
 
 #[test]
 fn hash_change_no_resurrect() {
-    // KeepAuto/DemoteManual 不激活未启用条目，仅更新 script_sha256 与宽限。
+    // ApproveAlways/DemoteManual 不激活未启用条目，仅更新 script_sha256、allow_mode 与宽限。
     let mut reg = CallerRegistry::empty();
     reg.register_extended(&RegisterParams {
         caller_path: "/s/idle-keep.sh".to_string(),
@@ -186,13 +198,13 @@ fn hash_change_no_resurrect() {
         "/s/idle-keep.sh",
         "keep-new",
         "sha-keep".to_string(),
-        HashChangeOutcome::KeepAuto,
+        HashChangeOutcome::ApproveAlways,
     )
     .unwrap();
     let e = reg.lookup_by_path("/s/idle-keep.sh").unwrap();
     assert!(
         !e.enabled && !e.revoked,
-        "未启用条目不因 KeepAuto 被激活: {e:?}"
+        "未启用条目不因 ApproveAlways 被激活: {e:?}"
     );
     assert_eq!(e.expected_hash, "keep-new");
     assert_eq!(e.script_sha256, "sha-keep");
@@ -224,7 +236,7 @@ fn hash_change_no_resurrect() {
 
 #[test]
 fn revoked_entry_hash_change_stays_revoked() {
-    // 已吊销条目的哈希变更（🔓/✅）保持 revoked=true，不被写入 revoked=false/enabled=true。
+    // 已吊销条目的哈希变更（♾️/✅）保持 revoked=true，不被写入 revoked=false/enabled=true。
     let mut reg = CallerRegistry::empty();
     reg.register("/s/dead.sh", "d-old").unwrap();
     reg.set_enabled("/s/dead.sh", true).unwrap();
@@ -233,11 +245,11 @@ fn revoked_entry_hash_change_stays_revoked() {
         "/s/dead.sh",
         "d-new",
         "sha-d".to_string(),
-        HashChangeOutcome::KeepAuto,
+        HashChangeOutcome::ApproveAlways,
     )
     .unwrap();
     let e = reg.lookup_by_path("/s/dead.sh").unwrap();
-    assert!(e.revoked && !e.enabled, "KeepAuto 后仍吊销: {e:?}");
+    assert!(e.revoked && !e.enabled, "ApproveAlways 后仍吊销: {e:?}");
     assert_eq!(e.expected_hash, "d-new");
     assert_eq!(e.script_sha256, "sha-d");
     assert_eq!(e.old_hash.as_deref(), Some("d-old"));
@@ -259,7 +271,7 @@ fn revoked_entry_hash_change_stays_revoked() {
 #[test]
 fn hash_change_three_state() {
     let mut reg = CallerRegistry::empty();
-    // 🔓 保持 allow_mode 不变，写宽限但不改 enabled。
+    // ♾️ 置 allow_mode = Allow，写宽限但不改 enabled。
     reg.register_extended(&RegisterParams {
         caller_path: "/s/keep.sh".to_string(),
         caller_hash: "keep-old".to_string(),
@@ -270,12 +282,16 @@ fn hash_change_three_state() {
         "/s/keep.sh",
         "keep-new",
         "sha-keep".to_string(),
-        HashChangeOutcome::KeepAuto,
+        HashChangeOutcome::ApproveAlways,
     )
     .unwrap();
     let e = reg.lookup_by_path("/s/keep.sh").unwrap();
-    assert_eq!(e.allow_mode, None, "🔓 须保持 allow_mode 不变");
-    assert!(!e.enabled && !e.revoked, "🔓 不激活未启用条目: {e:?}");
+    assert_eq!(
+        e.allow_mode,
+        Some(crate::config::AutoApprove::Allow),
+        "♾️ 须置持久放行"
+    );
+    assert!(!e.enabled && !e.revoked, "♾️ 不激活未启用条目: {e:?}");
     assert_eq!(e.old_hash.as_deref(), Some("keep-old"));
     assert!(e.old_hash_expires_at.is_some());
     assert_eq!(e.script_sha256, "sha-keep");

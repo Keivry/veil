@@ -386,10 +386,15 @@ async fn register_approval_three_state() {
         .expect("✅ 须批准");
     assert!(ok.enabled && !ok.revoked, "✅ 置 enabled");
 
-    let un = react_blocking_register(&state, "/s/tri-unlock.sh", "tri-h-un", "🔓")
+    let always = react_blocking_register(&state, "/s/tri-always.sh", "tri-h-always", "♾️")
         .await
-        .expect("🔓 须落定");
-    assert!(!un.enabled && !un.revoked, "🔓 保持 disabled");
+        .expect("♾️ 须落定");
+    assert!(always.enabled && !always.revoked, "♾️ 激活");
+    assert_eq!(
+        always.allow_mode,
+        Some(crate::config::AutoApprove::Allow),
+        "♾️ 置持久放行"
+    );
 
     let no = react_blocking_register(&state, "/s/tri-no.sh", "tri-h-no", "❎").await;
     assert!(no.is_err(), "❎ 须拒绝");
@@ -520,7 +525,7 @@ async fn react(state: &AppState, event_id: &str, key: &str) {
 }
 
 async fn emergency_revoke_public_ip(state: &AppState, key: &str) -> Result<RegistrationView> {
-    emergency_revoke(state, key, None, Some("203.0.113.9")).await
+    emergency_revoke(state, key, None).await
 }
 
 async fn wait_decision_slot(state: &AppState, key: &str, want: DecisionSlot) {
@@ -705,7 +710,7 @@ async fn emergency_revoke_202_e2e() {
         assert!(entry.enabled && !entry.revoked, "❎ 后条目须原状");
     }
 
-    // 场景 2b：🔓 → 不执行吊销、重试 403 且条目原状。
+    // 场景 2b：♾️ 不受理 → 票保持未决，重试仍 202 且条目原状。
     register_caller_extended(&state, &params("/s/e2e-rev-auto.sh", "e2e-h5"), "e2e-src-5")
         .await
         .unwrap();
@@ -721,17 +726,42 @@ async fn emergency_revoke_202_e2e() {
         .unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
     let auto_event = wait_new_event_id(&state, &[]).await;
-    react(&state, &auto_event, "🔓").await;
-    wait_decision_slot(&state, &format!("revoke:{auto_key}"), DecisionSlot::Denied).await;
-    let auto_denied = emergency_revoke_public_ip(&state, auto_key)
+    let outcome = {
+        let input = ReactionInput {
+            target_event_id: auto_event.clone(),
+            key: "♾️".to_string(),
+            sender: "@admin:example.com".to_string(),
+            room_id: "!r:example.com".to_string(),
+            server_ts_ms: 1,
+        };
+        state
+            .approval
+            .on_reaction(&input, "@bot:example.com", "!r:example.com", 0)
+            .await
+    };
+    assert!(
+        matches!(outcome, ReactionOutcome::Notify(_)),
+        "♾️ 在吊销分支须回执不落定: {outcome:?}"
+    );
+    assert_eq!(
+        credential_decision_slot(&state, &format!("revoke:{auto_key}")),
+        Some(DecisionSlot::Pending),
+        "不受理后票须保持未决"
+    );
+    let auto_retry = emergency_revoke_public_ip(&state, auto_key)
         .await
         .unwrap_err();
-    assert_eq!(auto_denied.status_code(), axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        auto_retry.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "重试仍为 202 + E_PENDING"
+    );
     {
         let registry = state.registry.read().await;
         let entry = registry.lookup_by_path(auto_key).unwrap();
-        assert!(entry.enabled && !entry.revoked, "🔓 后条目须原状");
+        assert!(entry.enabled && !entry.revoked, "♾️ 后条目须原状");
     }
+    state.approval.remove(&auto_event).await;
 
     // 场景 4：未决 → 重试 202 且不新建第二单。
     register_caller_extended(&state, &params("/s/e2e-rev-pd.sh", "e2e-h4"), "e2e-src-4")

@@ -1,8 +1,8 @@
 //! 凭据面加固回归（自 `vault_ops/tests.rs` 拆出，保持 800 行红线内）：
-//! 管理 token 恒时等长比较与 IPv4-mapped IPv6 内网识别。
+//! 管理 token 恒时等长比较与「网络位置不再构成放行依据」。
 
 use {
-    super::super::{emergency_revoke, is_private_peer, register_caller},
+    super::super::{emergency_revoke, register_caller},
     crate::service::credential::test_support::{cred_env, cred_state},
     axum::http::StatusCode,
 };
@@ -34,7 +34,7 @@ async fn admin_token_length_indistinguishable() {
     ];
     for candidate in candidates {
         assert!(!crate::auth::secret_eq(candidate, ADMIN_TOKEN));
-        let err = emergency_revoke(&state, path, Some(candidate), Some("203.0.113.9"))
+        let err = emergency_revoke(&state, path, Some(candidate))
             .await
             .unwrap_err();
         assert_eq!(
@@ -48,7 +48,7 @@ async fn admin_token_length_indistinguishable() {
         drop(registry);
     }
 
-    let view = emergency_revoke(&state, path, Some(ADMIN_TOKEN), Some("203.0.113.9"))
+    let view = emergency_revoke(&state, path, Some(ADMIN_TOKEN))
         .await
         .unwrap();
     assert_eq!(view.status, "❎");
@@ -56,7 +56,7 @@ async fn admin_token_length_indistinguishable() {
 }
 
 #[tokio::test]
-async fn ipv4_mapped_loopback() {
+async fn network_position_no_longer_unlocks_emergency_revoke() {
     let state = cred_state(&cred_env(&[]));
     let path = "/s/mapped-loop.sh";
     register_caller(&state, path, "mapped-h", "mapped-src")
@@ -69,16 +69,13 @@ async fn ipv4_mapped_loopback() {
         .set_enabled(path, true)
         .unwrap();
 
-    assert!(is_private_peer("::ffff:127.0.0.1"));
-    assert!(is_private_peer("[::ffff:127.0.0.1]"));
-    assert!(is_private_peer("::ffff:10.0.0.1"));
-    assert!(is_private_peer("::ffff:192.168.0.5"));
-    assert!(!is_private_peer("::ffff:203.0.113.9"));
-
-    let view = emergency_revoke(&state, path, None, Some("::ffff:127.0.0.1"))
-        .await
-        .unwrap();
-    assert_eq!(view.status, "❎");
-    assert!(view.revoked && !view.enabled, "映射环回须直接吊销");
-    assert_eq!(state.pending.len(), 0, "直接吊销不建审批单");
+    let err = emergency_revoke(&state, path, None).await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        StatusCode::ACCEPTED,
+        "无 token 一律转审批，与来源无关"
+    );
+    let registry = state.registry.read().await;
+    let entry = registry.lookup_by_path(path).expect("条目须在");
+    assert!(entry.enabled && !entry.revoked, "来源不得触发直接吊销");
 }

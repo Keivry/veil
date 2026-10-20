@@ -6,10 +6,15 @@
 # 复用 api_conformance.py 的 MockUpstream / start_veil / raw_post / 临时 kdbx 设施，
 # 覆盖：5.1 Go 直连取用全链路（整条目/单字段原文/status/转发以 HTTP 代表）+
 # 5.2 三因子齐全放行与缺失/错误明确拒绝（含 403 与转审 202）+ 5.3 Go 消费阻断流终止。
+#
+# 就地依赖两项：
+#   - 本地 Matrix stub（whoami/sync/send）——转审 `202 + E_PENDING` 需可达 homeserver；
+#   - 预置调用方注册表（按 Go wrapper 的真实 sha256）——取用相须命中已启用调用方。
 # Go 二进制经 make build 产出 veilctl-linux-amd64；veil 经 cargo build --bin veil。
 # 打印 PASS/FAIL <name> 与耗时，汇总「共 N 项，失败 M 项」，失败非零退出。
 # 前置不可得（TPM/pykeepass/go 工具链/网络）时显式报错并非零退出，不静默跳过。
 
+import hashlib
 import json
 import os
 import subprocess
@@ -19,7 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -36,6 +41,67 @@ GO_BIN = os.path.join(GET_DIR, "veilctl-linux-amd64")
 
 RESULTS = []
 WRAP_DIR = None
+
+# 审批转审相需要可达 Matrix：轻量 stub 只提供 whoami / sync / send 三端点，
+# 使 `202 + E_PENDING` 建单路径可被端到端验证（不依赖外部 homeserver）。
+class MatrixStub(BaseHTTPRequestHandler):
+    server_version = "MatrixStub/1.0"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _drain(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+
+    def do_GET(self):
+        if "/account/whoami" in self.path:
+            return self._json({"user_id": "@bot:example.com"})
+        if "/sync" in self.path:
+            return self._json({"next_batch": "s1", "rooms": {"join": {}}})
+        return self._json({})
+
+    def do_PUT(self):
+        self._drain()
+        MatrixStub.sent += 1
+        return self._json({"event_id": "$stub-event-%d" % MatrixStub.sent})
+
+    sent = 0
+
+
+def start_matrix_stub():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), MatrixStub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+
+def seed_caller_registry(path, tags):
+    """预置已启用调用方：Go 客户端发送 wrapper 的真实 sha256，须与注册表逐字一致。"""
+    entries = {}
+    # 注册表完整性 sha256 按 `BTreeMap`（键有序）序列化，Python 侧须按路径排序重建。
+    for tag in sorted(tags):
+        wrapper = make_wrapper(tag)
+        digest = hashlib.sha256(open(wrapper, "rb").read()).hexdigest()
+        caller_hash = "sha256:%s" % digest
+        entries[wrapper] = ac._caller_entry(wrapper, caller_hash)
+    entries = dict(sorted(entries.items()))
+    canonical = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    payload = {
+        "entries": entries,
+        "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
 
 
 def check(name, fn):
@@ -260,9 +326,19 @@ def s52_http_transfer_202():
             "name": "e2e-pending",
             "entries": {"网易": []},
             "allow_mode": "true",
+            "auth": {
+                "caller_hash": "sha256:pending-h1",
+                "caller_path": path,
+                "veilctl_secret": SECRET,
+            },
+            "secret": SECRET,
         },
+        {"X-Veilctl-Secret": SECRET},
     )
-    assert status == 200, (status, body)
+    # 注册默认转 Matrix 人工审批（202 + E_PENDING）；同步 200 仅出现在审批已落定时。
+    assert status in (200, 202), (status, body)
+    if status == 202:
+        assert (body.get("error") or {}).get("code") == "E_PENDING", body
     status, body = http_post(
         "/credential",
         {
@@ -361,7 +437,29 @@ def main():
     mock_port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    veil = ac.start_veil({"DB_DIR": work, "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port})
+    matrix_srv, matrix_url = start_matrix_stub()
+    # 审批建单需可达 Matrix：把临时 TOML 的 homeserver 指向本地 stub。
+    _orig_toml_document = ac._toml_document
+
+    def _toml_with_stub(migrated):
+        return _orig_toml_document(migrated).replace(
+            "https://matrix.example.com", matrix_url
+        )
+
+    ac._toml_document = _toml_with_stub
+    # Go 取用相须命中已启用调用方：按 wrapper 真实 sha256 预置注册表，
+    # 未 enrolled 会转审批（202），与「取用即返凭据」的断言不符。
+    reg_path = seed_caller_registry(
+        os.path.join(work, "caller_registry.json"), ["full", "raw", "allow"]
+    )
+
+    veil = ac.start_veil(
+        {
+            "DB_DIR": work,
+            "CALLER_REGISTRY_PATH": reg_path,
+            "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port,
+        }
+    )
     try:
         check("5.1 取用 Go 整条目", s51_go_full_entry)
         check("5.1 取用 Go 单字段原文", s51_go_single_raw)
@@ -385,6 +483,7 @@ def main():
     veil_b = ac.start_veil(
         {
             "DB_DIR": work,
+            "CALLER_REGISTRY_PATH": reg_path,
             "LLM_UPSTREAM": "http://127.0.0.1:%d" % mock_port,
             "AUDIT_MODE": "block",
             "AUDIT_HOLD_MAX_BYTES": "16",
@@ -433,6 +532,7 @@ def main():
         veil_b.terminate()
         veil_b.wait(timeout=15)
         server.shutdown()
+        matrix_srv.shutdown()
 
     failed = [n for n, ok in RESULTS if not ok]
     print("共 %d 项，失败 %d 项" % (len(RESULTS), len(failed)))

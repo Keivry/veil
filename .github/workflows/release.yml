@@ -76,7 +76,8 @@ jobs:
           cp README.md dist/stage/README.md
           cp docs/engineering-reference.md dist/stage/docs/
           cp examples/veil.toml dist/stage/examples/
-          tar -C dist/stage -czf "dist/${pkg}" veil README.md docs/engineering-reference.md examples/veil.toml
+          cp examples/veil.container.toml dist/stage/examples/
+          tar -C dist/stage -czf "dist/${pkg}" veil README.md docs/engineering-reference.md examples/veil.toml examples/veil.container.toml
       - name: 上传 gnu 产物
         uses: actions/upload-artifact@v7
         with:
@@ -123,7 +124,8 @@ jobs:
           cp README.md dist/stage/README.md
           cp docs/engineering-reference.md dist/stage/docs/
           cp examples/veil.toml dist/stage/examples/
-          tar -C dist/stage -czf "dist/${pkg}" veil README.md docs/engineering-reference.md examples/veil.toml
+          cp examples/veil.container.toml dist/stage/examples/
+          tar -C dist/stage -czf "dist/${pkg}" veil README.md docs/engineering-reference.md examples/veil.toml examples/veil.container.toml
       - name: 上传 musl 产物
         uses: actions/upload-artifact@v7
         with:
