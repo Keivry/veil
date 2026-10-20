@@ -250,9 +250,9 @@ impl MatrixApproval {
         count
     }
 
-    /// `lock` 全清：全部未决按拒绝落定后清空 pending 表。
-    /// 网关接线人注意：`lock` 还须清理口令缓存 + KeePass 会话 +
-    /// PII scope 缓存，见 [`super::bot::MatrixBot::handle_text_command_full`] 的审批链说明。
+    /// `lock` 全清：清空 pending 表并返回清掉的条目数。
+    /// 内存材料（口令缓存、KeePass 会话、PII 会话作用域）的清理归
+    /// [`super::GatewayCleanup::lock_cleanup`]，由调用方在同一序列内先行触发。
     pub async fn lock_clear_all(&self) -> usize {
         let mut guard = self.pending.lock().await;
         let mut count = 0;

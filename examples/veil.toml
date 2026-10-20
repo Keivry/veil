@@ -46,9 +46,13 @@ data_dir = "/data"                  # 派生 db_dir / tpm_dir / caller_registry_
 # tpm_dir = "/data/tpm"
 # caller_registry_path = "/data/caller_registry.json"
 auto_approve = "pending"            # allow | deny | pending
-entry_mode = "full"                 # full | credential-only | llm-only
-# 注意：credential-only 会让 auto_approve = "pending" 的条目跳过审批直接放行；
-#       llm-only 使凭据面不可用。示例给最不意外的 full。
+entry_mode = "full"                 # full | llm-only（credential-only 已废弃，等价于 full）
+# 注意：entry_mode 不改变任何审批口径——allow_mode = "pending" 的条目在任一取值下
+#       都每次建票；需要自动放行请在条目上显式声明 allow_mode = "allow"。
+#       llm-only 使凭据面不可用（取用返回鉴权失败）。示例给最不意外的 full。
+authorization_ttl_secs = 0           # 授权窗口（秒）；0 = 无期限（缺省，行为同升级前）
+# 非 0 时授权到期即转审批（建票 + 阻塞至 300s 超时），无人值守脚本必须配置审批人；
+# 每次到期或续期都会写一次注册表。设过小（<60）会在启动期 warn。
 credential_block_wait = false
 # 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
 # veilctl_secret = "..."

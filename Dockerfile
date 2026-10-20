@@ -44,6 +44,6 @@ VOLUME ["/data"]
 EXPOSE 8877
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8877/health | grep -q '"ok"'
+    CMD curl -fsS http://127.0.0.1:8877/health | grep -q '"ok":true'
 
 ENTRYPOINT ["/usr/local/bin/veil"]

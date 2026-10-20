@@ -4,8 +4,8 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"veilctl/internal"
 	"os"
+	"veilctl/internal"
 )
 
 // Revoke 吊销注册
@@ -94,9 +94,27 @@ func Status(args []string) {
 	}
 	fmt.Printf("状态: %s\n", st.Status)
 	if st.Unlocked {
-		fmt.Println("解锁: ✅ 已解锁")
+		fmt.Println("库文件: ✅ 在位")
 	} else {
-		fmt.Println("解锁: 🔒 未解锁")
+		fmt.Println("库文件: ❌ 缺失")
+	}
+	switch {
+	case st.TpmOk == nil:
+		fmt.Println("TPM: ❔ 未知（服务端未上报该字段）")
+	case *st.TpmOk:
+		fmt.Println("TPM: ✅ 可用")
+	case st.TpmError != nil && *st.TpmError != "":
+		fmt.Printf("TPM: ❌ 不可用（%s）\n", *st.TpmError)
+	default:
+		fmt.Println("TPM: ❌ 不可用")
+	}
+	switch {
+	case st.MasterPasswordCached == nil:
+		fmt.Println("主密码缓存: ❔ 未知（服务端未上报该字段）")
+	case *st.MasterPasswordCached:
+		fmt.Println("主密码缓存: ✅ 已载入")
+	default:
+		fmt.Println("主密码缓存: ⬜ 未载入")
 	}
 	fmt.Printf("待审批: %d\n", st.Pending)
 	fmt.Printf("LLM 凭据: %d\n", st.LlmSecrets)

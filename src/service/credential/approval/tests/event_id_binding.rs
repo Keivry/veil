@@ -52,6 +52,7 @@ async fn approval_send_failure_fail_closed() {
         description: String::new(),
         entries: TestMap::new(),
         allow_mode: None,
+        authorization_ttl: crate::registry::AuthorizationTtl::Absent,
     };
     let err = register_caller_with_approval(&state, &params, "fail-src")
         .await

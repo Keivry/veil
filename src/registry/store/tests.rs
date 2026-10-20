@@ -378,6 +378,47 @@ fn load_from_migrates_legacy() {
 }
 
 #[test]
+fn load_from_accepts_pre_ttl_format_without_rehash_breakage() {
+    // 升级回归：v0.1.1 写出的注册表不含 authorized_at/authorized_ttl_secs。
+    // 若新字段的 None 被序列化成 null，重算哈希必然失配，而旧形态迁移入口只认得
+    // 远古 `callers` 数组，会 fail-closed 拒启动。此处用字面旧字节 + 字面旧 sha256
+    // 锁定「升级方向必须可加载」。
+    let dir = std::env::temp_dir().join(format!(
+        "veil-reg-prettl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("caller_registry.json");
+    let legacy_canonical = concat!(
+        r#"{"/s/legacy-ttl.sh":{"caller_path":"/s/legacy-ttl.sh","expected_hash":"legacy-h1","#,
+        r#""script_sha256":"legacy-sha","enabled":true,"revoked":false,"auto_approve":null,"#,
+        r#""name":"legacy-job","description":"","entries":{},"allow_mode":null,"old_hash":null,"#,
+        r#""old_hash_expires_at":null,"reg_id":"/s/legacy-ttl.sh"}}"#
+    );
+    let file = serde_json::json!({
+        "entries": serde_json::from_str::<serde_json::Value>(legacy_canonical).unwrap(),
+        "sha256": "e8de6af2a5be6bf964455004d18802bfa3eb4358dd2b784666f749c159aaf32c",
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+
+    let loaded = CallerRegistry::load_from(&path).expect("旧版本注册表须可直接加载");
+    assert_eq!(loaded.len(), 1);
+    let e = loaded.lookup_by_path("/s/legacy-ttl.sh").unwrap();
+    assert_eq!(e.expected_hash, "legacy-h1");
+    assert_eq!(e.authorized_at, None);
+    assert_eq!(e.authorized_ttl_secs, None);
+    assert_eq!(crate::registry::authorization_expires_at(e), None);
+    // 再次落盘后哈希须自洽（省略 None 使新旧两个方向的 canonical 一致）。
+    loaded.save_to(&path).unwrap();
+    assert_eq!(CallerRegistry::load_from(&path).unwrap().len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn saved_file_permissions_0600() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = std::env::temp_dir().join(format!(
@@ -408,6 +449,7 @@ fn extended_register_keeps_name_desc_and_allowlist() {
         description: "检查邮件".to_string(),
         entries: BTreeMap::from([("网易".to_string(), vec!["授权码".to_string()])]),
         allow_mode: Some(crate::config::AutoApprove::Pending),
+        authorization_ttl: crate::registry::AuthorizationTtl::Absent,
     })
     .unwrap();
     let e = reg.lookup_by_path("/s/go.sh").unwrap();

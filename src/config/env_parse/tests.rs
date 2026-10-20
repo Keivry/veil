@@ -450,3 +450,98 @@ fn disable_and_missing_token_toggle_admin_surface() {
         assert!(!cfg.admin_surface_enabled());
     }
 }
+
+#[test]
+fn entry_mode_notice_only_for_non_full_modes() {
+    assert!(
+        entry_mode_notice(EntryMode::Full).is_none(),
+        "full 无启动提示"
+    );
+    let credential_only = entry_mode_notice(EntryMode::CredentialOnly).expect("须有提示");
+    assert!(
+        credential_only.contains("已等价于 full"),
+        "{credential_only}"
+    );
+    assert!(
+        credential_only.contains("审批豁免已删除"),
+        "{credential_only}"
+    );
+    assert!(
+        credential_only.contains("allow_mode = allow"),
+        "须给出改用条目 ACL 的指引: {credential_only}"
+    );
+    let llm_only = entry_mode_notice(EntryMode::LlmOnly).expect("须有提示");
+    assert!(llm_only.contains("凭据面"), "{llm_only}");
+    assert!(llm_only.contains("不可用"), "{llm_only}");
+}
+
+#[test]
+fn authorization_ttl_defaults_to_none_and_zero_normalizes() {
+    let cfg = Config::load_from(&base_env()).unwrap();
+    assert_eq!(cfg.authorization_ttl, None, "缺省须为无期限");
+
+    let mut env = base_env();
+    env.insert("AUTHORIZATION_TTL_SECS".to_string(), "0".to_string());
+    assert_eq!(
+        Config::load_from(&env).unwrap().authorization_ttl,
+        None,
+        "0 须归一为无期限"
+    );
+
+    let mut env = base_env();
+    env.insert("AUTHORIZATION_TTL_SECS".to_string(), "3600".to_string());
+    assert_eq!(
+        Config::load_from(&env).unwrap().authorization_ttl,
+        Some(3_600)
+    );
+}
+
+#[test]
+fn authorization_ttl_invalid_value_rejects_startup() {
+    for raw in ["-1", "abc", "1.5", ""] {
+        let mut env = base_env();
+        env.insert("AUTHORIZATION_TTL_SECS".to_string(), raw.to_string());
+        let result = Config::load_from(&env);
+        if raw.is_empty() {
+            assert_eq!(
+                result.expect("空串等同于未设置").authorization_ttl,
+                None,
+                "空串须按缺省处理"
+            );
+            continue;
+        }
+        let err = result.expect_err(&format!("{raw:?} 须拒启动"));
+        let text = err.to_string();
+        assert!(
+            text.contains("AUTHORIZATION_TTL_SECS"),
+            "错误须含变量名: {text}"
+        );
+    }
+}
+
+#[test]
+fn authorization_ttl_loaded_from_config_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "veil-auth-ttl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("veil.toml");
+    std::fs::write(
+        &path,
+        "[storage]\ndata_dir = \"/tmp/veil-ttl\"\nauthorization_ttl_secs = 7200\n",
+    )
+    .unwrap();
+    let mut env = base_env();
+    env.insert(
+        "VEIL_CONFIG_FILE".to_string(),
+        path.to_string_lossy().into_owned(),
+    );
+    let cfg = Config::from_env_map(env).expect("文件层须可加载该键（`load_from` 不含文件层）");
+    assert_eq!(cfg.authorization_ttl, Some(7_200));
+    std::fs::remove_dir_all(&dir).ok();
+}

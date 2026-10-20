@@ -77,6 +77,8 @@ pub struct AppState {
     pub notify: Arc<crate::service::matrix::NotificationSpool>,
     /// 命令面运行时（`[command].enabled = false` 时为零行为差异的禁用态）。
     pub command: Arc<crate::service::command::CommandRuntime>,
+    /// TPM 运行期健康快照（`/health` 的 `tpm_ok`/`tpm_error` 来源）。
+    pub tpm_health: Arc<crate::service::tpm::TpmHealthCache>,
 }
 
 /// 手工 `Debug`：`conversation_secret`（会话 HMAC 密钥）派生 `Debug`
@@ -111,6 +113,7 @@ impl std::fmt::Debug for AppState {
             .field("conversation_secret", &"[redacted]")
             .field("notify", &self.notify)
             .field("command", &self.command)
+            .field("tpm_health", &self.tpm_health)
             .finish()
     }
 }
@@ -241,6 +244,7 @@ impl AppState {
             conversation_secret,
             notify,
             command,
+            tpm_health: Arc::new(crate::service::tpm::TpmHealthCache::uninitialized()),
         })
     }
 
@@ -248,6 +252,12 @@ impl AppState {
 
     pub fn with_keepass(mut self, backend: Arc<dyn KeePassBackend>) -> Self {
         self.keepass = backend;
+        self
+    }
+
+    /// `main` 在 TPM 启动门禁之后注入健康缓存（`try_new` 内不重复探测 TPM）。
+    pub fn with_tpm_health(mut self, cache: Arc<crate::service::tpm::TpmHealthCache>) -> Self {
+        self.tpm_health = cache;
         self
     }
 
@@ -309,6 +319,8 @@ impl crate::service::credential::AppStateParts for AppState {
     fn notify(&self) -> &Arc<crate::service::matrix::NotificationSpool> { &self.notify }
 
     fn command(&self) -> &Arc<crate::service::command::CommandRuntime> { &self.command }
+
+    fn tpm_health(&self) -> &Arc<crate::service::tpm::TpmHealthCache> { &self.tpm_health }
 }
 
 /// 网关侧清理接线——Matrix 文本指令经此读写真实口令缓存、
@@ -320,15 +332,23 @@ impl crate::service::matrix::GatewayCleanup for AppState {
 
     fn vault_len(&self) -> usize { self.vault.len() }
 
-    fn lock_cleanup(&self) -> usize {
-        let cleared = self.vault.clear();
+    fn lock_cleanup(&self) -> crate::service::matrix::LockCleanupReport {
+        let vault_cleared = self.vault.clear();
         self.keepass.clear_cache();
         let master_cleared = self.keepass.clear_master_password();
         let pending = self.pending.clear_all();
+        let pii_scopes_cleared = self
+            .conversation_scope_store
+            .as_ref()
+            .map(|store| store.clear())
+            .unwrap_or(0);
         tracing::info!(
-            "lock 清理: 口令缓存 {cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}"
+            "lock 清理: 口令缓存 {vault_cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}、PII 会话作用域 {pii_scopes_cleared} 个"
         );
-        cleared
+        crate::service::matrix::LockCleanupReport {
+            vault_cleared,
+            pii_scopes_cleared,
+        }
     }
 
     fn forget_cleanup(&self) -> usize {

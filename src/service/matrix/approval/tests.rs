@@ -287,7 +287,9 @@ impl GatewayCleanup for CachedCleanup {
 
     fn vault_len(&self) -> usize { 0 }
 
-    fn lock_cleanup(&self) -> usize { 0 }
+    fn lock_cleanup(&self) -> super::super::LockCleanupReport {
+        super::super::LockCleanupReport::default()
+    }
 
     fn forget_cleanup(&self) -> usize { 0 }
 }

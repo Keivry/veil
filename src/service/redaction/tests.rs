@@ -451,3 +451,38 @@ async fn placeholder_prefix_differs_across_conversations() {
     .await;
     assert_ne!(out_a, out_b, "不同会话键的注入前缀不得误判相等");
 }
+
+#[test]
+fn conversation_store_clear_returns_removed_count_and_idempotent() {
+    // `lock` 路径依赖 clear() 报真实条数：返回值须等于清理前 len()，再次调用幂等返回 0。
+    let store = ConversationScopeStore::new(8, Duration::from_secs(1800));
+    let keys = [
+        scoped_key(SECRET, TENANT, "conv-clear-a"),
+        scoped_key(SECRET, TENANT, "conv-clear-b"),
+        scoped_key(SECRET, TENANT, "conv-clear-c"),
+    ];
+    for key in &keys {
+        store.get_or_insert(key);
+    }
+    let before = store.len();
+    assert_eq!(before, keys.len(), "三条会话键须各占一条");
+    assert_eq!(store.clear(), before, "clear() 须返回清理前条数");
+    assert_eq!(store.len(), 0, "clear() 后须为空");
+    assert!(store.is_empty());
+    assert_eq!(store.clear(), 0, "空表 clear() 须返回 0");
+}
+
+#[test]
+fn conversation_store_clear_does_not_count_as_capacity_eviction() {
+    // 显式清空不得混入容量淘汰计数（否则容量压力观测失真）。
+    let metrics = Arc::new(GatewayMetrics::default());
+    let store = ConversationScopeStore::new(8, Duration::from_secs(1800))
+        .with_metrics(Arc::clone(&metrics));
+    store.get_or_insert(&scoped_key(SECRET, TENANT, "conv-metric"));
+    assert_eq!(store.clear(), 1);
+    assert_eq!(
+        metrics.conversation_eviction_count(),
+        0,
+        "显式清空不得计入容量淘汰指标"
+    );
+}

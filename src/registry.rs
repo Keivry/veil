@@ -15,7 +15,14 @@ pub(crate) use store::{
     SAVE_TEST_WRITE_STARTS,
 };
 pub use {
-    entry::{CallerEntry, HashChangeOutcome, OLD_HASH_GRACE_SECS, RegisterParams},
+    acl::{authorization_expires_at, is_authorization_expired, normalize_ttl},
+    entry::{
+        AuthorizationTtl,
+        CallerEntry,
+        HashChangeOutcome,
+        OLD_HASH_GRACE_SECS,
+        RegisterParams,
+    },
     store::{
         BIND_SCRIPT_MAX_BYTES,
         CallerRegistry,

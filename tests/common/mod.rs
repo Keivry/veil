@@ -184,7 +184,9 @@ pub fn test_app(opts: impl Into<TestOpts>) -> (axum::Router, AppState) {
             db_path,
         },
     )
-    .with_keepass(keepass);
+    .with_keepass(keepass)
+    // 与 `main` 一致：显式注入健康缓存（类型默认值 fail-closed）。
+    .with_tpm_health(Arc::new(veil::service::tpm::TpmHealthCache::mock()));
     let bot = Arc::new(MatrixBot::new(
         state.config.homeserver.clone(),
         state.config.room_id.clone(),

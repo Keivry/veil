@@ -136,6 +136,8 @@ impl CallerRegistry {
                         .map(str::to_string),
                     old_hash_expires_at: c.get("old_hash_expires_at").and_then(|v| v.as_u64()),
                     reg_id,
+                    authorized_at: None,
+                    authorized_ttl_secs: None,
                 },
             );
         }

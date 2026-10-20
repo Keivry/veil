@@ -83,8 +83,9 @@
 | `storage.veilctl_secret` | `VEILCTL_SECRET` | string | 三因子之部署密钥；密钥类（须 0600） |
 | `storage.veilctl_binary_hash` | `VEILCTL_BINARY_HASH` | string | 直调哈希门禁；密钥类（保守纳入门禁，须 0600） |
 | `storage.auto_approve` | `AUTO_APPROVE` | enum `allow`/`deny`/`pending` | `allow`→放行、`deny`→拒绝、`pending`→Matrix 审批 |
-| `storage.entry_mode` | `VEIL_ENTRY_MODE` | enum `full`/`credential-only`/`llm-only` | 入口语义模式 |
+| `storage.entry_mode` | `VEIL_ENTRY_MODE` | enum `full`/`credential-only`(已废弃,=full)/`llm-only` | 入口语义模式；不改变审批口径 |
 | `storage.credential_block_wait` | `CREDENTIAL_BLOCK_WAIT` | bool | 凭据审批 300s 阻塞双模开关 |
+| `storage.authorization_ttl_secs` | `AUTHORIZATION_TTL_SECS` | u64，`0`=无期限 | 授权窗口长度（秒）；到期转审批，不自动吊销 |
 | `redaction.enabled` | `REDACTION_ENABLED` | bool | 脱敏总开关；env 别名 `PII_REDACTION_ENABLED` |
 | `redaction.fuzzy_restore` | `PII_FUZZY_RESTORE` | bool | 残缺占位符按序号回查还原 |
 | `redaction.detection_hardening` | `PII_DETECTION_HARDENING` | bool | 严格边界复核（丢弃 ASCII 粘连与前导零 IPv4） |
@@ -258,8 +259,9 @@ docker compose up -d --build
 ```bash
 # 存活探针（无需鉴权）
 curl -fsS http://127.0.0.1:8877/health
-# 期望（含超集字段 status/unlocked/pending/llm_secrets/pii_custom_disabled，向后兼容只增不减）：
-# {"ok":true,"sqlite_ok":true,"sqlite_error":null,"status":"ok","unlocked":true,"pending":0,"llm_secrets":0,"pii_custom_disabled":0}
+# 期望（12 字段，向后兼容只增不减）：
+# {"ok":true,"sqlite_ok":true,"sqlite_error":null,"status":"ok","unlocked":true,"pending":0,"llm_secrets":0,"pii_custom_disabled":0,"tpm_ok":true,"tpm_error":null,"master_password_cached":false,"authorization_expiring":0}
+# `ok` 为派生值 `sqlite_ok && tpm_ok`，`status` 跟随（"ok"/"degraded"）；HTTP 恒 200，判活只看 `ok`。
 
 # 管理面探针（需 X-Admin-Token）
 curl -fsS -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8877/_admin/health
@@ -1133,19 +1135,53 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 
 ### 8.4 入口与审批语义
 
-- `[storage].entry_mode` 三态：`full`（默认）/ `credential-only` / `llm-only`，非法值拒启动。
-- 非 `full` 入口下 `approve_hash_change` 降级为阻断（返回鉴权失败，不执行哈希变更，
-  见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
+- `[storage].entry_mode` 三态：`full`（默认）/ `credential-only`（**已废弃，等价于 `full`**）/ `llm-only`，非法值拒启动。
+- `entry_mode` **不改变任何审批口径**：`allow_mode = pending` 的条目在任一取值下都每次建票（`credential-only`
+  曾经的「`Pending` 跳过审批」豁免已删除）。需要自动放行的部署须在条目上显式声明 `allow_mode = allow`，
+  使决策可被注册表与审批记录审计。`credential-only` 被解析时启动期输出不可抑制告警（裸 stderr）。
+- `llm-only` 入口下凭据面整体不可用（取用返回鉴权失败），`approve_hash_change` 亦降级为阻断
+  （见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
 - Matrix 审批返回 `None` 即 rejected 并清理；审批票回收两口径并存、不得混用：
   **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（`Audit`/`Unknown`）按分支 TTL `60s` 清扫；
   **有阻塞等待者凭据类票 300s 阻塞 TTL**——凭据/注册/命令/吊销类存在阻塞等待者的未决票，
   在其自身 `300s` 阻塞超时前不被回收（`HashChange` 仅作原因标签、不建票）；
   两口径对矩阵侧票与内存侧 `PendingApprovals` 一致适用。
 - 文本指令 `lock`/`forget` 经网关侧清理接线：
-  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，**不阻止下次取用**——再次取用仍经 TPM 解封）+ 内存/矩阵 pending；`forget` 清 token 映射并以真实条数回执。发送者须经与 reaction 相同的白名单判定（`[audit].approval_whitelist`）；非成员发送的 `lock`/`status`/`forget` 在指令解析前被丢弃（`debug` 日志），不产生回执。
+  `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，**不阻止下次取用**——再次取用仍经 TPM 解封）+ 内存/矩阵 pending + PII 会话作用域（`pii_scope_mode = conversation` 时的跨请求共享存储，`request` 模式无该存储、回执报 `0`）；`forget` 清 token 映射并以真实条数回执。
+  明确不在 `lock` 清理范围的两项：`DecisionTable`（已落定的审批结论，条目本身按 TTL 自然过期，清它等于让「已批准」变成「无记录」）与 `previous_response_map`（只存 HMAC 派生会话键、不含明文 PII 或口令材料）。清理范围以 `service::matrix::GatewayCleanup::lock_cleanup` 的 `LockCleanupReport` 为准，回执条数取自其真实返回值。发送者须经与 reaction 相同的白名单判定（`[audit].approval_whitelist`）；非成员发送的 `lock`/`status`/`forget` 在指令解析前被丢弃（`debug` 日志），不产生回执。
 - `MatrixBranch::Unlock` 已删除：`unlock`/`解锁` 前缀原因在 `from_reason` 直接返回错误，
   `record_pending` fail-closed（不建一张永远不可决的票）。
 - `[storage].auto_approve` 三态：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（见 §2）。
+
+授权生命周期（`[storage].authorization_ttl_secs`，规范 env 名 `AUTHORIZATION_TTL_SECS`——该名不在白名单内，进程 env 置位仅触发迁移告警、不改变生效配置）：
+
+- 条目可选带授权窗口：`authorized_at`（落定时刻）+ `authorized_ttl_secs`（窗口长度）。两者任一为
+  `null` 即**无期限**（缺省），行为与未引入该特性前完全一致。配置值 `0` 归一为无期限（与 `null` 同义）。
+- 到期语义是**重新询问**而非拒绝：条目到期后，其有效 `allow_mode` 被覆盖为 `pending`，
+  取用返回 `202` + `E_PENDING` 并建票，原因标签为 `authorization_expired`。到期 SHALL NOT 写
+  `revoked`、SHALL NOT 改 `enabled`——不存在「到期自动吊销」。
+- 判定顺序：先 ACL（`check_entry_allowed`），后到期覆盖。条目本身无权访问该 entry/field 时仍直接
+  `403`、不建票——否则到期会变成越权探测的放大器。
+- 落定写窗口：`✅` 批准写 `authorized_at` 为落定时刻，TTL 取「请求声明值优先、未声明取配置缺省、显式 `0` 为无期限」；`♾️` 批准写
+  `authorized_at` 且 TTL 置 `null`（永久）；`❎` 与超时不写。到期票（原因 `authorization_expired`）
+  在 `✅` 落定时刷新 `authorized_at`、保留原 TTL（原为 `null` 则保持无期限），即实现续期——无单独
+  续期端点；普通审批票（`auto_approve_none`/`hash_mismatch`）批准不改变授权窗口。
+- `GET /health` 的 `authorization_expiring` 为「24h 内到期且 `enabled && !revoked`」的条目数，
+  每次请求现算（不缓存，避免与吊销/`lock` 产生失效同步问题）；`null` 不出现，无符合条目为 `0`。
+  边界为 `(now, now+86400]`；面板只拿到读锁的瞬时值，写锁被占时本次探测按 `0` 计并留 debug 日志
+  （预警字段的可接受近似，下一次探测即恢复真值）。
+- 已知弱点：`authorized_at` 来自系统时钟，时钟回拨会让已到期条目重新变有效。不引入 TPM/monotonic
+  依据（需持久化启动基线，超出本特性范围）。
+
+部署前提（TPM 密封对象）：
+
+- `GET /health` 的 `tpm_ok` 由「启动期门禁结果 + 60s 周期后台探测」构成，探测项为 `tpm2_pcrread sha256:0`
+  与 `seal.pub`/`seal.priv` 在位检查。它回答的是「TPM 设备与其工具链当前是否可用」，**不校验密封对象与
+  运行时状态的绑定关系**。
+- 当前密封对象（`<tpm_dir>/seal.pub`、`seal.priv`）**未绑定 PCR policy**：解封不校验启动度量值，
+  因而无法阻止同一枚 TPM 上的其它 OS 解封同一对象。补上该绑定需在部署侧**重新生成**密封对象
+  （`tpm2_create -L`/`-p` 带 policy 并 `tpm2_policypcr`），属运维动作而非本仓代码变更；在此之前
+  TPM 提供的是「密钥不出设备」而非「仅本系统可解封」。
 
 ### 8.5 测试口径注明
 

@@ -22,6 +22,7 @@ fn parse_register_params_trim() {
         fields: Some(&json!(["密码", " 授权码 "])),
         allow_mode: Some(" auto "),
         auto: Some(false),
+        authorization_ttl_secs: None,
     });
     assert_eq!(p.caller_path, "/srv/job.sh");
     assert_eq!(p.caller_hash, "hash1");
@@ -45,6 +46,7 @@ fn parse_register_params_trim() {
         fields: None,
         allow_mode: Some("bogus"),
         auto: Some(true),
+        authorization_ttl_secs: None,
     });
     assert_eq!(p2.caller_path, "", "空白 caller_path 归一空串");
     assert_eq!(p2.entries, expected("腾讯", &["微信"]));

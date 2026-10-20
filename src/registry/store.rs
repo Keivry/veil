@@ -295,15 +295,20 @@ impl CallerRegistry {
     pub fn register_extended(&mut self, params: &RegisterParams) -> Result<&CallerEntry> {
         let script_sha256 =
             bind_script_sha256(params.caller_path.trim(), params.caller_hash.trim());
-        self.register_extended_with_script_sha256(params, script_sha256)
+        // 未声明时按无期限落定：配置缺省的解析属服务层职责，存储层不做策略判断。
+        let ttl = params.authorization_ttl.resolve(None);
+        self.register_extended_with_script_sha256(params, script_sha256, ttl)
     }
 
     /// 预计算脚本哈希入口：生产写路径在取写锁前异步读取后传入，
     /// 锁内零文件 I/O。
+    ///
+    /// `authorized_ttl_secs` 为调用方已解析的落定窗口（`None` = 无期限）。
     pub fn register_extended_with_script_sha256(
         &mut self,
         params: &RegisterParams,
         script_sha256: String,
+        authorized_ttl_secs: Option<u64>,
     ) -> Result<&CallerEntry> {
         let caller_path = params.caller_path.trim();
         let caller_hash = params.caller_hash.trim();
@@ -345,6 +350,9 @@ impl CallerRegistry {
             old_hash: None,
             old_hash_expires_at: None,
             reg_id: caller_path.to_string(),
+            // 授权窗口先记下，待批准落定时才写 `authorized_at` 使其生效。
+            authorized_at: None,
+            authorized_ttl_secs,
         };
         self.entries.insert(caller_path.to_string(), entry);
         self.entries
@@ -423,6 +431,21 @@ impl CallerRegistry {
         Ok(())
     }
 
+    /// 测试与落定路径共用的授权窗口写入：`at`/`ttl` 同为 `None` 即清空窗口（无期限）。
+    pub fn set_authorization_window(
+        &mut self,
+        key: &str,
+        authorized_at: Option<u64>,
+        authorized_ttl_secs: Option<u64>,
+    ) -> Result<()> {
+        let entry = self.find_mut(key).ok_or_else(|| VeilError::BadRequest {
+            message: format!("调用方不存在: {key}"),
+        })?;
+        entry.authorized_at = authorized_at;
+        entry.authorized_ttl_secs = authorized_ttl_secs;
+        Ok(())
+    }
+
     pub fn set_enabled(&mut self, key: &str, enabled: bool) -> Result<()> {
         let entry = self.find_mut(key).ok_or_else(|| VeilError::BadRequest {
             message: format!("调用方不存在: {key}"),
@@ -465,3 +488,39 @@ impl CallerRegistry {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod re_registration_ttl_tests {
+    use super::*;
+
+    fn params(path: &str, hash: &str) -> RegisterParams {
+        RegisterParams {
+            caller_path: path.to_string(),
+            caller_hash: hash.to_string(),
+            ..RegisterParams::default()
+        }
+    }
+
+    #[test]
+    fn re_registration_of_revoked_entry_resets_authorization_window() {
+        // 已吊销条目复用路径：新条目不得继承旧授权窗口。
+        let mut reg = CallerRegistry::empty();
+        reg.register_extended(&params("/s/re.sh", "h1")).unwrap();
+        reg.set_authorization_window("/s/re.sh", Some(1_700_000_000), Some(3_600))
+            .unwrap();
+        assert_eq!(
+            reg.lookup_by_path("/s/re.sh").unwrap().authorized_at,
+            Some(1_700_000_000)
+        );
+
+        reg.revoke("/s/re.sh").unwrap();
+        let fresh = reg
+            .register_extended(&params("/s/re.sh", "h2"))
+            .expect("已吊销路径须可重注册");
+        assert_eq!(fresh.authorized_at, None, "重注册须清空授权起点");
+        assert_eq!(
+            fresh.authorized_ttl_secs, None,
+            "重注册不得继承旧 TTL（新请求未声明期限）"
+        );
+    }
+}

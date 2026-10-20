@@ -11,7 +11,13 @@ use {
             admin::ADMIN_RATE_SWEEP_SECS,
             audit::AuditPolicy,
             metrics::METRICS_FLUSH_INTERVAL_SECS,
-            tpm::{allow_mock_from_env, startup_tpm_in},
+            tpm::{
+                TPM_HEALTH_REFRESH_SECS,
+                TpmHealth,
+                TpmHealthCache,
+                allow_mock_from_env,
+                startup_tpm_in,
+            },
         },
         state::{AppState, init_sqlite},
     },
@@ -74,6 +80,8 @@ struct CleanupHandles {
     keepass: std::sync::Arc<dyn veil::keepass::KeePassBackend>,
     vault: std::sync::Arc<veil::service::credential_vault::CredentialVault>,
     pending: std::sync::Arc<veil::approval::PendingApprovals>,
+    conversation_scope_store:
+        Option<std::sync::Arc<veil::service::redaction::ConversationScopeStore>>,
 }
 
 impl veil::service::matrix::GatewayCleanup for CleanupHandles {
@@ -83,15 +91,23 @@ impl veil::service::matrix::GatewayCleanup for CleanupHandles {
 
     fn vault_len(&self) -> usize { self.vault.len() }
 
-    fn lock_cleanup(&self) -> usize {
-        let cleared = self.vault.clear();
+    fn lock_cleanup(&self) -> veil::service::matrix::LockCleanupReport {
+        let vault_cleared = self.vault.clear();
         self.keepass.clear_cache();
         let master_cleared = self.keepass.clear_master_password();
         let pending = self.pending.clear_all();
+        let pii_scopes_cleared = self
+            .conversation_scope_store
+            .as_ref()
+            .map(|store| store.clear())
+            .unwrap_or(0);
         tracing::info!(
-            "lock 清理: 口令缓存 {cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}"
+            "lock 清理: 口令缓存 {vault_cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}、PII 会话作用域 {pii_scopes_cleared} 个"
         );
-        cleared
+        veil::service::matrix::LockCleanupReport {
+            vault_cleared,
+            pii_scopes_cleared,
+        }
     }
 
     fn forget_cleanup(&self) -> usize {
@@ -201,6 +217,18 @@ async fn main() -> ExitCode {
             "警告: PII_VALUE_SAMPLE_ENABLED=1 且未设 PII_VALUE_SAMPLE_HMAC_KEY：hash 退化为无盐 SHA256，低熵 PII 可被离线字典枚举，生产必须配置"
         );
     }
+    if let Some(msg) = veil::config::entry_mode_notice(config.entry_mode) {
+        eprintln!("警告: {msg}");
+    }
+    // 极短授权窗口是可跑但高摩擦的误配：每轮取用都建票并阻塞至 300s 超时。
+    // 走 tracing（可抑制），与不可抑制的安全降级告警区分。
+    if let Some(ttl) = config.authorization_ttl
+        && ttl < 60
+    {
+        tracing::warn!(
+            "[storage].authorization_ttl_secs = {ttl}（< 60s）：授权窗口极短，每次到期都会重建成审批票，无人值守脚本将频繁阻塞至 300s 超时"
+        );
+    }
     match startup_tpm_in(&config.tpm_dir, allow_mock_tpm) {
         Ok(sealed) => {
             tracing::info!("TPM 门禁通过（密封 {} 字节，明文已弃置）", sealed.len());
@@ -213,6 +241,21 @@ async fn main() -> ExitCode {
             );
             return ExitCode::from(1);
         }
+    };
+    // 启动门禁已确认密封材料在位，故初始快照为可用；此后由刷新任务跟踪运行期变化。
+    // Mock 模式无真实设备可探，恒报可用且不启动刷新（避免每 60s 空探测）。
+    let tpm_health = if allow_mock_tpm {
+        std::sync::Arc::new(TpmHealthCache::mock())
+    } else {
+        let cache = std::sync::Arc::new(TpmHealthCache::new(
+            config.tpm_dir.clone(),
+            TpmHealth {
+                ok: true,
+                error: None,
+            },
+        ));
+        cache.spawn_refresher(std::time::Duration::from_secs(TPM_HEALTH_REFRESH_SECS));
+        cache
     };
 
     let outcome = match init_sqlite(&config.data_dir).await {
@@ -231,6 +274,7 @@ async fn main() -> ExitCode {
 
     let mut state = AppState::new(config, outcome);
     state = state.with_audit_policy(Arc::new(audit_policy));
+    state = state.with_tpm_health(tpm_health);
     if state.config.keepass_backend == KeepassBackendKind::Real {
         let resolved = resolve_kdbx(&state.config.db_dir);
         let (db_path, keyfile_path) = match &resolved {
@@ -287,6 +331,7 @@ async fn main() -> ExitCode {
                 keepass: state.keepass.clone(),
                 vault: state.vault.clone(),
                 pending: state.pending.clone(),
+                conversation_scope_store: state.conversation_scope_store.clone(),
             });
         sync_bot.spawn_sync_loop(
             std::sync::Arc::clone(&state.approval),

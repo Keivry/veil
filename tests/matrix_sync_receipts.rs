@@ -32,6 +32,7 @@ use {
     veil::service::matrix::{
         FixedCleanup,
         GatewayCleanup,
+        LockCleanupReport,
         MatrixApproval,
         MatrixBot,
         MatrixBranch,
@@ -104,9 +105,9 @@ impl GatewayCleanup for RecordingCleanup {
 
     fn vault_len(&self) -> usize { self.secrets.load(Ordering::SeqCst) }
 
-    fn lock_cleanup(&self) -> usize {
+    fn lock_cleanup(&self) -> LockCleanupReport {
         self.lock_cleanup_calls.fetch_add(1, Ordering::SeqCst);
-        0
+        LockCleanupReport::default()
     }
 
     fn forget_cleanup(&self) -> usize {

@@ -13,6 +13,7 @@ fn file_len_redline() {
 mod hardening;
 mod retry;
 mod rollback;
+mod ttl;
 
 use {
     super::{
@@ -87,10 +88,19 @@ async fn react_blocking_register(
     hash: &str,
     key: &str,
 ) -> Result<RegistrationView> {
+    let source = hash.to_string();
+    react_blocking_register_with(state, params(path, hash), source, key).await
+}
+
+/// 同 [`react_blocking_register`]，但由调用方给定完整注册参数（含请求声明的 TTL）。
+async fn react_blocking_register_with(
+    state: &AppState,
+    p: RegisterParams,
+    source: String,
+    key: &str,
+) -> Result<RegistrationView> {
     let before = state.approval.pending_event_ids().await;
     let worker = state.clone();
-    let p = params(path, hash);
-    let source = hash.to_string();
     let handle =
         tokio::spawn(async move { register_caller_with_approval(&worker, &p, &source).await });
     let event_id = wait_new_event_id(state, &before).await;
@@ -1004,4 +1014,18 @@ async fn emergency_revoke_202_e2e() {
         .await
         .unwrap_err();
     assert_eq!(timed.status_code(), axum::http::StatusCode::FORBIDDEN);
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 读取条目的授权窗口（`(authorized_at, authorized_ttl_secs)`）。
+async fn authorization_window(state: &AppState, path: &str) -> (Option<u64>, Option<u64>) {
+    let reg = state.registry.read().await;
+    let entry = reg.lookup_by_path(path).expect("条目须存在");
+    (entry.authorized_at, entry.authorized_ttl_secs)
 }

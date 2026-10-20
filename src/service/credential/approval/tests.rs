@@ -157,8 +157,31 @@ async fn auto_approve_none_turns_to_202() {
 }
 
 #[tokio::test]
-async fn credential_only_entry_approve_blocked_forbidden() {
+async fn credential_only_entry_approve_allowed_as_full() {
+    // credential-only 已等价于 full：approve 不再被阻断。
     let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
+    let state = cred_state(&env);
+    register_caller(&state, "/s/a.sh", "h1", "test-src")
+        .await
+        .unwrap();
+    let view = approve_hash_change(
+        &state,
+        "/s/a.sh",
+        "h2",
+        crate::registry::HashChangeOutcome::ApproveAlways,
+    )
+    .await
+    .expect("credential-only 下 approve 须与 full 同效，不得被入口模式阻断");
+    assert_eq!(
+        view.status, "⏳",
+        "须进入待审批流转（与 full 同效），而非被入口模式拒绝"
+    );
+}
+
+#[tokio::test]
+async fn llm_only_entry_approve_blocked_forbidden() {
+    // llm-only 凭据面整体不可用，approve 仍须阻断。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "llm-only")]);
     let state = cred_state(&env);
     register_caller(&state, "/s/a.sh", "h1", "test-src")
         .await
@@ -556,12 +579,16 @@ async fn pending_tables_atomic_cleanup() {
         .await;
     let err = settle_approval(
         &state,
-        "/s/timeout.sh:h",
+        &CredentialApproval {
+            key: "/s/timeout.sh:h",
+            caller_path: "/s/timeout.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
         "$timeout-ev",
         None,
-        "网易",
-        Some("授权码"),
-        false,
     )
     .await
     .unwrap_err();
@@ -613,12 +640,16 @@ async fn credential_timeout_single_ask() {
     ]));
     let err = settle_approval(
         &state,
-        "/s/cred-timeout:h",
+        &CredentialApproval {
+            key: "/s/cred-timeout:h",
+            caller_path: "/s/cred-timeout",
+            reason: "auto_approve_none",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
         "$cred-timeout",
         None,
-        "网易",
-        Some("授权码"),
-        false,
     )
     .await
     .unwrap_err();
@@ -734,12 +765,16 @@ async fn pending_both_tables_cleanup() {
         assert_eq!(state.approval.pending_len().await, 1);
         let err = settle_approval(
             &state,
-            key,
+            &CredentialApproval {
+                key,
+                caller_path: "/s/cap.sh",
+                reason: "hash_mismatch",
+                entry: "网易",
+                field: Some("授权码"),
+                use_token: false,
+            },
             event_id,
             decision,
-            "网易",
-            Some("授权码"),
-            false,
         )
         .await
         .unwrap_err();

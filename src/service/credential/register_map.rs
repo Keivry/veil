@@ -153,6 +153,9 @@ pub struct RegisterInputs<'a> {
     pub fields: Option<&'a Value>,
     pub allow_mode: Option<&'a str>,
     pub auto: Option<bool>,
+    /// 请求声明的授权窗口原值（已校验：`0` 保留为 `Some(0)`，交由
+    /// [`crate::registry::AuthorizationTtl::from_request`] 归一为「无期限」）。
+    pub authorization_ttl_secs: Option<u64>,
 }
 
 /// 越层收敛：字段 trim 与 [`crate::registry::RegisterParams`] 构造
@@ -160,6 +163,9 @@ pub struct RegisterInputs<'a> {
 /// （`caller_path` 空白归一空串，其余 trim；`entries`/`allow_mode` 复用同批解析）。
 pub fn parse_register_params(input: RegisterInputs<'_>) -> crate::registry::RegisterParams {
     crate::registry::RegisterParams {
+        authorization_ttl: crate::registry::AuthorizationTtl::from_request(
+            input.authorization_ttl_secs,
+        ),
         caller_path: if input.caller_path.trim().is_empty() {
             String::new()
         } else {

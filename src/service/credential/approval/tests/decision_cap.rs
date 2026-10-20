@@ -1,6 +1,7 @@
 use {
     super::super::{
         BeginOutcome,
+        CredentialApproval,
         DECISION_TABLE_MAX_ENTRIES,
         DecisionEntry,
         DecisionSlot,
@@ -162,11 +163,14 @@ async fn decision_table_begin_saturated_429() {
 
     let new_err = approval_async_202(
         &state,
-        "/s/sat-new.sh:badhash",
-        "hash_mismatch",
-        "网易",
-        Some("授权码"),
-        false,
+        &CredentialApproval {
+            key: "/s/sat-new.sh:badhash",
+            caller_path: "/s/sat-new.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
     )
     .await
     .unwrap_err();
@@ -191,11 +195,14 @@ async fn decision_table_begin_saturated_429() {
 
     let busy_err = approval_async_202(
         &state,
-        "sat-0",
-        "hash_mismatch",
-        "网易",
-        Some("授权码"),
-        false,
+        &CredentialApproval {
+            key: "sat-0",
+            caller_path: "/s/sat-0.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
     )
     .await
     .unwrap_err();

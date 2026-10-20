@@ -16,6 +16,7 @@ use {
         auth::{ct_eq, secret_eq},
         config::{AutoApprove, CREDENTIAL_RATE_WINDOW_SECS, EntryMode},
         error::{Result, VeilError},
+        registry::CallerEntry,
     },
 };
 
@@ -276,6 +277,12 @@ pub async fn handle_credential(
     let mut grace_notify: Option<(String, String, u64)> = None;
     // 调用者身份未匹配任何注册条目时置位；自动放行仅对已注册条目生效。
     let mut unenrolled = false;
+    // 授权窗口已到期：ACL 通过后覆盖有效 `allow_mode` 为 `Pending`（重新询问，非拒绝）。
+    let mut authorization_expired = false;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let decision = match resolve_caller(state, &caller_path, &caller_hash).await? {
         CallerLookup::Enrolled {
             entry: caller,
@@ -289,7 +296,12 @@ pub async fn handle_credential(
             }
             hash_grace = grace;
             grace_notify = notify;
-            Some(caller.effective_allow_mode(state.config().auto_approve))
+            authorization_expired = authorization_expiry_overrides(&caller, now_secs);
+            Some(effective_decision(
+                &caller,
+                state.config().auto_approve,
+                authorization_expired,
+            ))
         }
         CallerLookup::HashMismatch => None,
         CallerLookup::ByHash { entry: caller } => {
@@ -298,7 +310,12 @@ pub async fn handle_credential(
                     message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
                 });
             }
-            Some(caller.effective_allow_mode(state.config().auto_approve))
+            authorization_expired = authorization_expiry_overrides(&caller, now_secs);
+            Some(effective_decision(
+                &caller,
+                state.config().auto_approve,
+                authorization_expired,
+            ))
         }
         CallerLookup::Unknown => {
             unenrolled = true;
@@ -325,11 +342,14 @@ pub async fn handle_credential(
             _ => {
                 approval_dual_mode(
                     state,
-                    &pending_key,
-                    "unenrolled_default_pending",
-                    &entry,
-                    field.as_deref(),
-                    use_token,
+                    &super::approval::CredentialApproval {
+                        key: &pending_key,
+                        caller_path: &caller_path,
+                        reason: "unenrolled_default_pending",
+                        entry: &entry,
+                        field: field.as_deref(),
+                        use_token,
+                    },
                 )
                 .await
             }
@@ -340,11 +360,14 @@ pub async fn handle_credential(
         None => {
             return approval_dual_mode(
                 state,
-                &pending_key,
-                "hash_mismatch",
-                &entry,
-                field.as_deref(),
-                use_token,
+                &super::approval::CredentialApproval {
+                    key: &pending_key,
+                    caller_path: &caller_path,
+                    reason: "hash_mismatch",
+                    entry: &entry,
+                    field: field.as_deref(),
+                    use_token,
+                },
             )
             .await;
         }
@@ -353,14 +376,22 @@ pub async fn handle_credential(
                 message: "自动放行=False，拒绝".to_string(),
             });
         }
-        Some(AutoApprove::Pending) if pending_entry_needs_approval(state.config().entry_mode) => {
+        Some(AutoApprove::Pending) => {
+            let reason = if authorization_expired {
+                super::approval::AUTHORIZATION_EXPIRED_REASON
+            } else {
+                "auto_approve_none"
+            };
             return approval_dual_mode(
                 state,
-                &pending_key,
-                "auto_approve_none",
-                &entry,
-                field.as_deref(),
-                use_token,
+                &super::approval::CredentialApproval {
+                    key: &pending_key,
+                    caller_path: &caller_path,
+                    reason,
+                    entry: &entry,
+                    field: field.as_deref(),
+                    use_token,
+                },
             )
             .await;
         }
@@ -370,9 +401,18 @@ pub async fn handle_credential(
     query_keepass(state, &entry, field.as_deref(), use_token).await
 }
 
-/// `Pending` 条目是否进审批：`credential-only` 显式跳过（直接放行）。
-fn pending_entry_needs_approval(entry_mode: EntryMode) -> bool {
-    entry_mode != EntryMode::CredentialOnly
+/// 授权窗口判定：到期即须重新询问。纯转调，集中在此以便分流处只读一个布尔。
+fn authorization_expiry_overrides(caller: &CallerEntry, now_secs: u64) -> bool {
+    crate::registry::is_authorization_expired(caller, now_secs)
+}
+
+/// 有效审批口径：到期无条件覆盖为 `Pending`（复用既有审批通道，不新增分支）。
+fn effective_decision(caller: &CallerEntry, fallback: AutoApprove, expired: bool) -> AutoApprove {
+    if expired {
+        AutoApprove::Pending
+    } else {
+        caller.effective_allow_mode(fallback)
+    }
 }
 
 #[cfg(test)]

@@ -200,6 +200,7 @@ veilctl_binary_hash = "abcdef0123456789"
 auto_approve = "pending"
 entry_mode = "credential-only"
 credential_block_wait = true
+authorization_ttl_secs = 3600
 
 [redaction]
 enabled = true
@@ -236,7 +237,7 @@ pool_idle_timeout_secs = 90
 backend = "mock"
 "#;
 
-const EXPECTED_KEYS: [&str; 44] = [
+const EXPECTED_KEYS: [&str; 45] = [
     "auth.homeserver",
     "auth.room_id",
     "auth.matrix_access_token",
@@ -258,6 +259,7 @@ const EXPECTED_KEYS: [&str; 44] = [
     "storage.auto_approve",
     "storage.entry_mode",
     "storage.credential_block_wait",
+    "storage.authorization_ttl_secs",
     "redaction.enabled",
     "redaction.fuzzy_restore",
     "redaction.detection_hardening",

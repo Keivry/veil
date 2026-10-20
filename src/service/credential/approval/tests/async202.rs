@@ -1,6 +1,7 @@
 use {
     super::super::{
         BeginOutcome,
+        CredentialApproval,
         CredentialDecision,
         DecisionSlot,
         approval_async_202,
@@ -404,9 +405,19 @@ async fn approved_decision_fetch_failure_retry() {
         Some(DecisionSlot::Approved)
     );
 
-    let err = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
-        .await
-        .unwrap_err();
+    let err = approval_async_202(
+        &state,
+        &CredentialApproval {
+            key,
+            caller_path: "/s/test-caller.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         err.status_code(),
         StatusCode::SERVICE_UNAVAILABLE,
@@ -418,9 +429,19 @@ async fn approved_decision_fetch_failure_retry() {
         "取库失败后决策槽位仍为 Approved"
     );
 
-    let out = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
-        .await
-        .expect("重试成功返回凭据");
+    let out = approval_async_202(
+        &state,
+        &CredentialApproval {
+            key,
+            caller_path: "/s/test-caller.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
+    )
+    .await
+    .expect("重试成功返回凭据");
     assert!(credential_value(&out).starts_with("__MOCK_CRED_"));
     assert_eq!(
         credential_decision_slot(&state, key),
@@ -436,9 +457,19 @@ async fn approved_decision_not_lost_on_fetch_error() {
     record_credential_decision(&state, key, Some(true));
 
     for attempt in 0..2 {
-        let err = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
-            .await
-            .unwrap_err();
+        let err = approval_async_202(
+            &state,
+            &CredentialApproval {
+                key,
+                caller_path: "/s/test-caller.sh",
+                reason: "hash_mismatch",
+                entry: "网易",
+                field: Some("授权码"),
+                use_token: false,
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err.status_code(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -451,15 +482,35 @@ async fn approved_decision_not_lost_on_fetch_error() {
         );
     }
 
-    let out = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
-        .await
-        .expect("第三次取库成功");
+    let out = approval_async_202(
+        &state,
+        &CredentialApproval {
+            key,
+            caller_path: "/s/test-caller.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
+    )
+    .await
+    .expect("第三次取库成功");
     assert!(credential_value(&out).starts_with("__MOCK_CRED_"));
     assert_eq!(credential_decision_slot(&state, key), None, "成功即消费");
 
-    let after = approval_async_202(&state, key, "hash_mismatch", "网易", Some("授权码"), false)
-        .await
-        .unwrap_err();
+    let after = approval_async_202(
+        &state,
+        &CredentialApproval {
+            key,
+            caller_path: "/s/test-caller.sh",
+            reason: "hash_mismatch",
+            entry: "网易",
+            field: Some("授权码"),
+            use_token: false,
+        },
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         after.status_code(),
         StatusCode::ACCEPTED,

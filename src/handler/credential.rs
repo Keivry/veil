@@ -126,6 +126,38 @@ pub struct RegisterBody {
     pub auth: Option<service::AuthBlock>,
     #[serde(default)]
     pub secret: Option<String>,
+    /// 授权窗口（秒）；`null`/缺省取全局配置，`0` 表示显式无期限。
+    #[serde(default, deserialize_with = "deserialize_optional_ttl")]
+    pub authorization_ttl_secs: Option<serde_json::Value>,
+}
+
+/// 原样收取 `authorization_ttl_secs`，把「非法」与「缺失」分开：缺失为 `None`，
+/// 任何非 null 值保留原 JSON 交由 [`parse_authorization_ttl`] 判定（非法即 400），
+/// 避免 serde 的整数类型不匹配被静默吞成 `None`。
+fn deserialize_optional_ttl<'de, D>(
+    de: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(de)
+}
+
+/// 请求级 TTL 解析：`null`/缺失返回 `None`（未声明）；显式 `0` 原样保留为
+/// `Some(0)`，由注册链归一为「无期限」；非整数、负数、越界一律 400。
+fn parse_authorization_ttl(raw: Option<&serde_json::Value>) -> Result<Option<u64>> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| crate::error::VeilError::BadRequest {
+            message: format!("authorization_ttl_secs 须为非负整数: {value}"),
+        })
 }
 
 /// Go 加性兼容（网关侧补齐）：推导非空 `reg_id`。
@@ -168,6 +200,7 @@ pub async fn register_caller_handler(
             fields: body.fields.as_ref(),
             allow_mode: body.allow_mode.as_deref(),
             auto: body.auto,
+            authorization_ttl_secs: parse_authorization_ttl(body.authorization_ttl_secs.as_ref())?,
         });
     let view = service::register_caller_with_approval(
         &state,

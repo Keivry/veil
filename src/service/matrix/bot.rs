@@ -16,41 +16,10 @@ use {
             sync_backoff_secs,
             sync_request_timeout,
         },
+        cleanup::GatewayCleanup,
     },
     std::{path::PathBuf, sync::Arc, time::Duration},
 };
-
-/// 网关侧清理回调：Matrix 层不依赖 `AppState`，由网关实现注入，
-/// 使 `lock`/`forget`/`status` 能读写真实的口令缓存、KeePass 会话与 token 映射。
-pub trait GatewayCleanup: Send + Sync {
-    /// `status`：KeePass 库文件是否在位（不代表内存材料已载入）。
-    fn keepass_unlocked(&self) -> bool;
-    /// `status`/`lock`：TPM 派生主密码缓存是否已载入；无该缓存的实现默认 `false`。
-    fn master_password_cached(&self) -> bool { false }
-    /// `status`：当前 token 映射条数（LLM secrets）。
-    fn vault_len(&self) -> usize;
-    /// `lock`：清口令缓存 + KeePass 会话 + 内存 pending；返回清掉的口令缓存条数。
-    fn lock_cleanup(&self) -> usize;
-    /// `forget`：清 token 映射；返回清掉的映射条数。
-    fn forget_cleanup(&self) -> usize;
-}
-
-/// 固定清理量兜底（兼容入口与单测）：只读 `unlocked/secrets`，清理动作 no-op。
-#[derive(Debug, Clone, Copy)]
-pub struct FixedCleanup {
-    pub unlocked: bool,
-    pub secrets: usize,
-}
-
-impl GatewayCleanup for FixedCleanup {
-    fn keepass_unlocked(&self) -> bool { self.unlocked }
-
-    fn vault_len(&self) -> usize { self.secrets }
-
-    fn lock_cleanup(&self) -> usize { 0 }
-
-    fn forget_cleanup(&self) -> usize { 0 }
-}
 
 /// Matrix Bot（reqwest 长轮询 sync，不引入 matrix-sdk）。
 #[derive(Debug, Clone)]
@@ -268,7 +237,7 @@ impl MatrixBot {
         match command {
             TextCommand::Lock => {
                 let cached_before = cleanup.master_password_cached();
-                let cleared = cleanup.lock_cleanup();
+                let report = cleanup.lock_cleanup();
                 let count = approval.lock_reject_all().await;
                 approval.lock_clear_all().await;
                 let master_state = match (cached_before, cleanup.master_password_cached()) {
@@ -276,8 +245,10 @@ impl MatrixBot {
                     (false, false) => "未载入",
                     (_, true) => "已载入（清理未生效）",
                 };
+                let cleared = report.vault_cleared;
+                let scopes = report.pii_scopes_cleared;
                 Some(format!(
-                    "🧹 已清除内存口令材料（口令缓存 {cleared} 条、主密码缓存: {master_state}、未决 {count} 单已按拒绝落定）"
+                    "🧹 已清除内存口令材料（口令缓存 {cleared} 条、主密码缓存: {master_state}、未决 {count} 单已按拒绝落定、PII 会话作用域 {scopes} 个）"
                 ))
             }
             TextCommand::Status => {
@@ -309,7 +280,7 @@ impl MatrixBot {
         approval: &MatrixApproval,
         command: TextCommand,
     ) -> Option<String> {
-        let fixed = FixedCleanup {
+        let fixed = super::cleanup::FixedCleanup {
             unlocked: true,
             secrets: 0,
         };

@@ -5,7 +5,11 @@
 //! 分支流转归 `service::matrix`；三处互不垫片。
 
 use {
-    super::{super::matrix, AppStateParts, vault_ops::query_keepass},
+    super::{
+        super::matrix,
+        AppStateParts,
+        vault_ops::{self, query_keepass},
+    },
     crate::{
         approval::{PENDING_TTL_SECS, PendingRecord},
         error::{Result, VeilError},
@@ -16,6 +20,20 @@ use {
         time::{Duration, Instant},
     },
 };
+
+/// 授权到期建票的原因标签：该原因的票在批准后须刷新授权窗口（续期）。
+pub(crate) const AUTHORIZATION_EXPIRED_REASON: &str = "authorization_expired";
+
+/// 一次凭据审批请求的上下文（双模入口共用，避免长参数列表）。
+pub(crate) struct CredentialApproval<'a> {
+    pub key: &'a str,
+    /// 调用方路径，仅 `authorization_expired` 票在批准后用它刷新授权窗口。
+    pub caller_path: &'a str,
+    pub reason: &'a str,
+    pub entry: &'a str,
+    pub field: Option<&'a str>,
+    pub use_token: bool,
+}
 
 /// 宽限通知去重上限（进程级，防无界增长；容量触发 TTL 清扫 + 逐出最小 `expires_at`）。
 const GRACE_NOTIFY_DEDUP_MAX: usize = 4096;
@@ -586,16 +604,15 @@ where
 /// 拒绝/超时 `403`；未决则复用既有票（不再建单），无记录方建单并 spawn 后台 waiter 落定。
 async fn approval_async_202(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
-    key: &str,
-    reason: &str,
-    entry: &str,
-    field: Option<&str>,
-    use_token: bool,
+    req: &CredentialApproval<'_>,
 ) -> Result<serde_json::Value> {
+    let renew = req.reason == AUTHORIZATION_EXPIRED_REASON;
+    let (entry, field, use_token, caller_path) =
+        (req.entry, req.field, req.use_token, req.caller_path);
     approval_decision_closure(
         state,
-        key,
-        reason,
+        req.key,
+        req.reason,
         entry,
         field,
         ClosureLane {
@@ -603,7 +620,13 @@ async fn approval_async_202(
             auto_policy: AutoPolicy::Accept,
             branch: matrix::MatrixBranch::Credential,
         },
-        || query_keepass(state, entry, field, use_token),
+        || async move {
+            let outcome = query_keepass(state, entry, field, use_token).await;
+            if renew && outcome.is_ok() {
+                vault_ops::renew_authorization(state, caller_path).await;
+            }
+            outcome
+        },
     )
     .await
 }
@@ -612,16 +635,19 @@ async fn approval_async_202(
 /// 无论何种终态均先同批清理内存侧与矩阵侧票，再返回。
 async fn settle_approval(
     state: &impl AppStateParts,
-    key: &str,
+    req: &CredentialApproval<'_>,
     event_id: &str,
     decision: Option<bool>,
-    entry: &str,
-    field: Option<&str>,
-    use_token: bool,
 ) -> Result<serde_json::Value> {
-    clear_terminal_pending(state, key, event_id).await;
+    clear_terminal_pending(state, req.key, event_id).await;
     match decision {
-        Some(true) => query_keepass(state, entry, field, use_token).await,
+        Some(true) => {
+            let outcome = query_keepass(state, req.entry, req.field, req.use_token).await;
+            if req.reason == AUTHORIZATION_EXPIRED_REASON && outcome.is_ok() {
+                vault_ops::renew_authorization(state, req.caller_path).await;
+            }
+            outcome
+        }
         Some(false) => Err(VeilError::Auth {
             message: "凭据审批被拒绝".to_string(),
         }),
@@ -633,28 +659,24 @@ async fn settle_approval(
 
 pub(crate) async fn approval_dual_mode(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
-    key: &str,
-    reason: &str,
-    entry: &str,
-    field: Option<&str>,
-    use_token: bool,
+    req: &CredentialApproval<'_>,
 ) -> Result<serde_json::Value> {
     if !state.config().credential_block_wait {
-        return approval_async_202(state, key, reason, entry, field, use_token).await;
+        return approval_async_202(state, req).await;
     }
     let event_id = submit_pending_with_branch(
         state,
-        key,
-        reason,
+        req.key,
+        req.reason,
         matrix::MatrixBranch::Credential,
-        entry,
-        field,
+        req.entry,
+        req.field,
     )
     .await?;
     let timeout =
         Duration::from_secs(state.config().credential_approval_timeout_secs.max(1) as u64);
     let decision = state.approval().ask(&event_id, timeout).await;
-    settle_approval(state, key, &event_id, decision, entry, field, use_token).await
+    settle_approval(state, req, &event_id, decision).await
 }
 
 pub(crate) fn notify_hash_change(

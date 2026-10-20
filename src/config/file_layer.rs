@@ -191,6 +191,7 @@ pub struct StorageSection {
     pub auto_approve: Option<FileAutoApprove>,
     pub entry_mode: Option<FileEntryMode>,
     pub credential_block_wait: Option<bool>,
+    pub authorization_ttl_secs: Option<u64>,
 }
 
 /// `[redaction]`：脱敏域。
@@ -355,6 +356,11 @@ const MAPPINGS: &[MappingDef] = &[
         "storage.credential_block_wait",
         "CREDENTIAL_BLOCK_WAIT",
         &["CREDENTIAL_BLOCK_WAIT"],
+    ),
+    env(
+        "storage.authorization_ttl_secs",
+        "AUTHORIZATION_TTL_SECS",
+        &["AUTHORIZATION_TTL_SECS"],
     ),
     env(
         "redaction.enabled",

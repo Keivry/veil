@@ -130,6 +130,16 @@ impl ConversationScopeStore {
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
+    /// 显式清空全部会话作用域（`lock` 路径）并返回清理条数。刻意不计入淘汰指标：
+    /// 该指标语义为「LRU 因容量驱逐」，混入显式清空会让容量压力观测失真。
+    pub fn clear(&self) -> usize {
+        let mut inner = lock_or_recover(self.inner.lock());
+        let removed = inner.map.len();
+        inner.map.clear();
+        inner.order.clear();
+        removed
+    }
+
     /// 仅测试：在持有锁时 panic 以强制中毒，验证 [`lock_or_recover`] 恢复路径。
     #[cfg(test)]
     pub(crate) fn force_poison(&self) {

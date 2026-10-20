@@ -14,12 +14,158 @@
 //! 阻塞语境，不迁移 `tokio::process`。调用点守护见
 //! `service::declaration_lock::tpm_sync_subprocess_guard`。
 
-use std::{
-    fmt::Debug,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+use {
+    crate::service::lock_recover::lock_or_recover,
+    std::{
+        fmt::Debug,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    },
 };
+
+/// TPM 运行期健康快照：`ok` 是 `/health` 的 `ok` 派生源之一（另一源为 sqlite）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmHealth {
+    pub ok: bool,
+    /// 不可用因由（可读文本，直出 `/health` 的 `tpm_error`）。
+    pub error: Option<String>,
+}
+
+/// 运行期探测周期（秒）：远大于单次探测 30s 超时上限，避免刷新任务叠压。
+pub const TPM_HEALTH_REFRESH_SECS: u64 = 60;
+
+/// TPM 健康缓存：后台周期探测写入、`/health` 请求期只读快照。
+///
+/// 请求路径 MUST NOT 触发探测（`tpm_sync_subprocess_guard` 约束 + 单次探测可能
+/// 逼近 30s 超时）；`snapshot()` 只做一次加锁读，外加两个 `stat`（密封对象在位）。
+///
+/// `tpm_dir` 为 `None` 表示 Mock 模式：无真实设备与密封材料，不探测也不校验密封
+/// 对象在位，`ok` 恒为构造期注入值。
+#[derive(Debug)]
+pub struct TpmHealthCache {
+    current: Mutex<TpmHealth>,
+    tpm_dir: Option<PathBuf>,
+}
+
+impl TpmHealthCache {
+    /// 真实 TPM 缓存：`snapshot()` 叠加 `seal.pub`/`seal.priv` 在位检查。
+    pub fn new(tpm_dir: PathBuf, initial: TpmHealth) -> Self {
+        Self {
+            current: Mutex::new(initial),
+            tpm_dir: Some(tpm_dir),
+        }
+    }
+
+    /// Mock 模式缓存：`ok=true, error=None`，不探测、不校验密封对象。
+    /// 未注入真实缓存时的默认值：fail-closed。
+    ///
+    /// `/health` 的 `ok` 由 `tpm_ok` 参与派生，默认值若报 `ok=true`，任何忘记注入
+    /// 的构造路径都会谎报健康。
+    pub fn uninitialized() -> Self {
+        Self {
+            current: Mutex::new(TpmHealth {
+                ok: false,
+                error: Some("TPM 健康缓存未注入".to_string()),
+            }),
+            tpm_dir: None,
+        }
+    }
+
+    pub fn mock() -> Self {
+        Self {
+            current: Mutex::new(TpmHealth {
+                ok: true,
+                error: None,
+            }),
+            tpm_dir: None,
+        }
+    }
+
+    /// 只读快照：缓存值 + 密封对象在位检查（缺失即覆盖为不可用）。
+    pub fn snapshot(&self) -> TpmHealth {
+        if let Some(dir) = &self.tpm_dir {
+            for path in [dir.join("seal.pub"), dir.join("seal.priv")] {
+                if !path.is_file() {
+                    return TpmHealth {
+                        ok: false,
+                        error: Some(format!("TPM 密封文件缺失 {}", path.display())),
+                    };
+                }
+            }
+        }
+        lock_or_recover(self.current.lock()).clone()
+    }
+
+    /// 落缓存并只在 `ok` 跃迁时告警/告知（错误文本变化不重复刷屏）。
+    fn apply(&self, next: TpmHealth) {
+        let mut current = lock_or_recover(self.current.lock());
+        if current.ok != next.ok {
+            if next.ok {
+                tracing::info!("TPM 运行期恢复可用");
+            } else {
+                tracing::warn!(
+                    "TPM 运行期不可用: {}",
+                    next.error.as_deref().unwrap_or("未知原因")
+                );
+            }
+        }
+        *current = next;
+    }
+
+    fn apply_probe_result(
+        &self,
+        result: std::result::Result<std::result::Result<(), String>, tokio::task::JoinError>,
+    ) {
+        self.apply(match result {
+            Ok(Ok(())) => TpmHealth {
+                ok: true,
+                error: None,
+            },
+            Ok(Err(reason)) => TpmHealth {
+                ok: false,
+                error: Some(reason),
+            },
+            Err(join) => TpmHealth {
+                ok: false,
+                error: Some(format!("TPM 健康探测任务异常: {join}")),
+            },
+        });
+    }
+
+    /// 后台周期刷新任务；Mock 缓存（`tpm_dir = None`）立即返回，不探测。
+    /// 探测体恒在 `spawn_blocking` 内（同步子进程约束），首 tick 立即触发一次。
+    pub fn spawn_refresher(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let cache = Arc::clone(self);
+        let tpm_dir = self.tpm_dir.clone();
+        tokio::spawn(async move {
+            let Some(tpm_dir) = tpm_dir else { return };
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let dir = tpm_dir.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || RealTpm::with_dir(dir).probe()).await;
+                cache.apply_probe_result(result);
+            }
+        })
+    }
+
+    /// 注入探测体的单次刷新（单测用：确定性驱动「失败 → 恢复」跃迁）。
+    #[cfg(test)]
+    pub(crate) async fn refresh_with<F>(&self, probe: F)
+    where
+        F: FnOnce() -> std::result::Result<(), String> + Send + 'static,
+    {
+        let result = tokio::task::spawn_blocking(probe).await;
+        self.apply_probe_result(result);
+    }
+}
 
 /// 解封工作目录序号，配合 pid/nanos 保证每次调用唯一，并发不互覆。
 static TPM_WORKDIR_SEQ: AtomicU64 = AtomicU64::new(0);

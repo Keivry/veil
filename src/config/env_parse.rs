@@ -30,9 +30,14 @@ use {
     std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration},
 };
 
+mod entry_mode;
 mod keepass;
 pub(crate) mod pii_scope;
-pub use {keepass::KeepassBackendKind, pii_scope::PiiScopeMode};
+pub use {
+    entry_mode::{EntryMode, entry_mode_notice},
+    keepass::KeepassBackendKind,
+    pii_scope::PiiScopeMode,
+};
 
 /// 默认监听地址：本机回环（容器部署在 `[server].bind` 显式写 `0.0.0.0:8877`）。
 pub const DEFAULT_SERVER_BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -114,30 +119,6 @@ impl std::str::FromStr for AutoApprove {
             "none" | "pending" | "matrix" => Ok(Self::Pending),
             other => Err(format!(
                 "AUTO_APPROVE 非法: {other:?}（取值 true/false/none）"
-            )),
-        }
-    }
-}
-
-/// 轻量入口语义开关：完整 vs credential-only 自动批准 vs llm-only 纯代理。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EntryMode {
-    #[default]
-    Full,
-    CredentialOnly,
-    LlmOnly,
-}
-
-impl std::str::FromStr for EntryMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "full" => Ok(Self::Full),
-            "credential-only" => Ok(Self::CredentialOnly),
-            "llm-only" => Ok(Self::LlmOnly),
-            other => Err(format!(
-                "VEIL_ENTRY_MODE 非法: {other:?}（取值 full/credential-only/llm-only）"
             )),
         }
     }
@@ -257,6 +238,9 @@ pub struct Config {
     pub db_dir: PathBuf,
     pub tpm_dir: PathBuf,
     pub keepass_backend: KeepassBackendKind,
+    /// 授权窗口长度（`AUTHORIZATION_TTL_SECS` / `[storage].authorization_ttl_secs`）：
+    /// `None` 表示无期限（缺省 `0` 归一为 `None`）。到期即转审批，不自动吊销。
+    pub authorization_ttl: Option<u64>,
     /// 凭据审批双模开关（`CREDENTIAL_BLOCK_WAIT`，默认关闭）：
     /// `=1` 时 enrolled 篡改/未 enrolled 待审走 300s 阻塞等 reaction，
     /// 默认保持 202 抛单（建单 + best-effort 发送即返回）。
@@ -361,6 +345,7 @@ impl Config {
             db_dir,
             tpm_dir,
             credential_block_wait,
+            authorization_ttl,
         } = load_storage(&get)?;
         let RedactionParts {
             redaction_enabled,
@@ -393,11 +378,6 @@ impl Config {
         let default_upstream = llm_default_upstream.as_deref();
         validate_target_upstreams(&llm_targets, &llm_upstreams, default_upstream)?;
         let keepass_backend = load_keepass_backend(&get)?;
-        if entry_mode != EntryMode::Full {
-            tracing::warn!(
-                "[storage].entry_mode = {entry_mode:?}（非 full）：Pending 条目在 credential-only 下会跳过审批直接放行；llm-only 使凭据面不可用"
-            );
-        }
 
         Ok(Self {
             homeserver,
@@ -448,6 +428,7 @@ impl Config {
             db_dir,
             tpm_dir,
             keepass_backend,
+            authorization_ttl,
             credential_block_wait,
         })
     }
@@ -613,6 +594,7 @@ struct StorageParts {
     db_dir: PathBuf,
     tpm_dir: PathBuf,
     credential_block_wait: bool,
+    authorization_ttl: Option<u64>,
 }
 
 fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
@@ -645,6 +627,7 @@ fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
         .filter(|v| !v.is_empty())
         .map_or_else(|| data_dir.join("tpm"), PathBuf::from);
     let credential_block_wait = parse_bool_off(get, "CREDENTIAL_BLOCK_WAIT");
+    let authorization_ttl = parse_authorization_ttl(get)?;
     Ok(StorageParts {
         data_dir,
         veilctl_secret,
@@ -655,7 +638,20 @@ fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
         db_dir,
         tpm_dir,
         credential_block_wait,
+        authorization_ttl,
     })
+}
+
+/// 授权窗口长度解析：缺省 `0`（无期限）；非数字/负数拒启动，`0` 归一为 `None`。
+fn parse_authorization_ttl(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<u64>> {
+    let raw = get("AUTHORIZATION_TTL_SECS")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "0".to_string());
+    let ttl: u64 = raw.parse().map_err(|_| VeilError::Config {
+        var: "AUTHORIZATION_TTL_SECS".to_string(),
+        message: format!("AUTHORIZATION_TTL_SECS 非法整数: {raw:?}"),
+    })?;
+    Ok(crate::registry::normalize_ttl(Some(ttl)))
 }
 
 /// 脱敏域：总开关/语义开关/自定义文件/值级采样/占位符说明。

@@ -10,6 +10,34 @@ use {
 
 fn test_app(extra: &[(&str, &str)]) -> Router { test_app_with_state(extra).0 }
 
+/// 同一装配，但注入降级的 TPM 健康缓存（验证 `/health` 派生与 HTTP 状态码解耦）。
+fn test_app_with_degraded_tpm(cache: Arc<crate::service::tpm::TpmHealthCache>) -> Router {
+    let env = HashMap::from([
+        (
+            "HOMESERVER".to_string(),
+            "https://matrix.example.com".to_string(),
+        ),
+        ("ROOM_ID".to_string(), "!r:example.com".to_string()),
+        ("MATRIX_ACCESS_TOKEN".to_string(), "syt_x".to_string()),
+        (
+            "OBSERVABILITY_ADMIN_TOKEN".to_string(),
+            "observability-admin-token-0123456789".to_string(),
+        ),
+        ("VEILCTL_SECRET".to_string(), "s3cr3t".to_string()),
+    ]);
+    let state = AppState::new(
+        Config::load_from(&env).unwrap(),
+        SqliteOutcome {
+            sqlite_ok: true,
+            sqlite_error: None,
+            db_path: PathBuf::from("/tmp/x.sqlite"),
+        },
+    )
+    .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()))
+    .with_tpm_health(cache);
+    build_router(state)
+}
+
 fn test_app_with_state(extra: &[(&str, &str)]) -> (Router, AppState) {
     let mut env = HashMap::from([
         (
@@ -36,7 +64,8 @@ fn test_app_with_state(extra: &[(&str, &str)]) -> (Router, AppState) {
                 db_path: PathBuf::from("/tmp/x.sqlite"),
             },
         )
-        .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked())),
+        .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()))
+        .with_tpm_health(Arc::new(crate::service::tpm::TpmHealthCache::mock())),
         InjectSink::success(),
     );
     (build_router(state.clone()), state)
@@ -61,7 +90,8 @@ fn test_app_missing_admin_token() -> Router {
                 db_path: PathBuf::from("/tmp/x.sqlite"),
             },
         )
-        .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked())),
+        .with_keepass(Arc::new(crate::keepass::MockKeePass::unlocked()))
+        .with_tpm_health(Arc::new(crate::service::tpm::TpmHealthCache::mock())),
         InjectSink::success(),
     );
     build_router(state)
@@ -675,5 +705,42 @@ async fn missing_admin_token_admin_surface_returns_404() {
     }
     let health = client.get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(health.status().as_u16(), 200, "健康检查不受影响");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn health_returns_200_with_derived_ok_false_over_http() {
+    // 契约：`/health` 恒 200，判活只看 `ok` 字段；容器 HEALTHCHECK 依赖
+    // 「HTTP 200 但 ok=false」能被 `grep '"ok":true'` 判为不健康。
+    let dir = std::env::temp_dir().join(format!(
+        "veil-router-health-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("seal.pub"), b"pub").unwrap();
+    std::fs::write(dir.join("seal.priv"), b"priv").unwrap();
+    let cache = crate::service::tpm::TpmHealthCache::new(
+        dir,
+        crate::service::tpm::TpmHealth {
+            ok: false,
+            error: Some("tpm2_pcrread 不存在".to_string()),
+        },
+    );
+    let app = test_app_with_degraded_tpm(Arc::new(cache));
+    let (base, handle) = serve_and_client(app).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "降级时仍须 HTTP 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false, "ok 须由 tpm_ok 派生: {body}");
+    assert_eq!(body["tpm_ok"], false);
+    assert_eq!(body["status"], "degraded");
     handle.abort();
 }

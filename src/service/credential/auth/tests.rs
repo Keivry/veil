@@ -508,19 +508,348 @@ async fn same_secret_cross_requests_same_token() {
     assert_eq!(credential_value(&first), credential_value(&second));
 }
 
-#[test]
-fn pending_entry_only_skips_approval_in_credential_only_mode() {
-    use crate::config::EntryMode;
-    assert!(
-        pending_entry_needs_approval(EntryMode::Full),
-        "full 须进审批"
+#[tokio::test]
+async fn pending_entry_always_requires_approval_in_credential_only_mode() {
+    // 审批豁免已删除：`credential-only` 下 `Pending` 条目仍须建票（202 + E_PENDING），
+    // 不得直接放行返回凭据。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
+    let state = cred_state(&env);
+    assert_eq!(
+        state.config().entry_mode,
+        crate::config::EntryMode::CredentialOnly
     );
-    assert!(
-        pending_entry_needs_approval(EntryMode::LlmOnly),
-        "llm-only 亦须进审批（凭据面不可用属另一约束）"
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("credonly1", "/s/credonly.sh", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(err.code(), "E_PENDING");
+    assert_eq!(state.pending.len(), 1, "credential-only 下仍须建审批单");
+}
+
+#[tokio::test]
+async fn pending_entry_always_requires_approval_in_full_mode() {
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "full")]);
+    let state = cred_state(&env);
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("fullmode1", "/s/fullmode.sh", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(state.pending.len(), 1);
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// 把条目置为「已到期」：`authorized_at = now - ttl - 1`。
+async fn expire_entry(state: &impl AppStateParts, path: &str, ttl: u64) {
+    let at = now_secs().saturating_sub(ttl).saturating_sub(1);
+    set_authorization(state, path, Some(at), Some(ttl)).await;
+}
+
+/// 直接改写条目的授权窗口（测试注入口；注册表无公开 setter）。
+async fn set_authorization(
+    state: &impl AppStateParts,
+    path: &str,
+    at: Option<u64>,
+    ttl: Option<u64>,
+) {
+    let mut registry = state.registry().write().await;
+    registry.set_authorization_window(path, at, ttl).unwrap();
+}
+
+#[tokio::test]
+async fn expired_allow_entry_turns_into_pending_ticket() {
+    // 到期覆盖：`allow_mode = allow` 的条目到期后必须建票（202/E_PENDING），不再直接返回凭据。
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    enrolled_with_entries(
+        &state,
+        "/s/exp-allow.sh",
+        "h-exp-allow",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode("/s/exp-allow.sh", Some(crate::config::AutoApprove::Allow))
+        .unwrap();
+    expire_entry(&state, "/s/exp-allow.sh", 3_600).await;
+
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("h-exp-allow", "/s/exp-allow.sh", Some("网易")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(err.code(), "E_PENDING");
+    assert_eq!(state.pending.len(), 1, "到期须建审批票");
+    let reason = state
+        .pending
+        .get("/s/exp-allow.sh:h-exp-allow")
+        .expect("到期须建 pending 记录")
+        .reason;
+    assert_eq!(
+        reason, "authorization_expired",
+        "原因标签须区别于 auto_approve_none"
     );
+}
+
+#[tokio::test]
+async fn unexpired_allow_entry_still_returns_credential() {
+    // 对照：窗口未到期时不建票，直接返回凭据。
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    enrolled_with_entries(
+        &state,
+        "/s/live-allow.sh",
+        "h-live-allow",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode("/s/live-allow.sh", Some(crate::config::AutoApprove::Allow))
+        .unwrap();
+    set_authorization(&state, "/s/live-allow.sh", Some(now_secs()), Some(3_600)).await;
+    let value = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("h-live-allow", "/s/live-allow.sh", Some("网易")),
+    )
+    .await
+    .expect("未到期须直接放行");
     assert!(
-        !pending_entry_needs_approval(EntryMode::CredentialOnly),
-        "credential-only 下 Pending 直接放行（示例不得用该模式配 pending）"
+        credential_value(&value).starts_with("__CRED_"),
+        "未到期须返回 token 化凭据: {value}"
     );
+    assert_eq!(state.pending.len(), 0, "未到期不得建票");
+}
+
+#[tokio::test]
+async fn expired_entry_with_global_deny_still_creates_ticket() {
+    // 到期是「重新询问」而非「拒绝」：全局 deny 也不得让到期条目直接 403。
+    let env = cred_env(&[("AUTO_APPROVE", "false")]);
+    let state = cred_state(&env);
+    enrolled_with_entries(
+        &state,
+        "/s/exp-deny.sh",
+        "h-exp-deny",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode("/s/exp-deny.sh", Some(crate::config::AutoApprove::Deny))
+        .unwrap();
+    expire_entry(&state, "/s/exp-deny.sh", 3_600).await;
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("h-exp-deny", "/s/exp-deny.sh", Some("网易")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(err.code(), "E_PENDING");
+    assert_eq!(state.pending.len(), 1);
+}
+
+#[tokio::test]
+async fn entry_without_ttl_never_expires() {
+    // `authorized_ttl_secs = None` 即无期限：久远的 `authorized_at` 也不触发建票。
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    enrolled_with_entries(
+        &state,
+        "/s/no-ttl.sh",
+        "h-no-ttl",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode("/s/no-ttl.sh", Some(crate::config::AutoApprove::Allow))
+        .unwrap();
+    set_authorization(&state, "/s/no-ttl.sh", Some(1), None).await;
+    let value = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("h-no-ttl", "/s/no-ttl.sh", Some("网易")),
+    )
+    .await
+    .expect("无期限条目须直接放行");
+    assert!(
+        credential_value(&value).starts_with("__CRED_"),
+        "无期限条目须返回 token 化凭据: {value}"
+    );
+    assert_eq!(state.pending.len(), 0);
+}
+
+#[tokio::test]
+async fn expired_entry_in_credential_only_mode_still_creates_ticket() {
+    // 到期与 entry_mode 无交互：credential-only 下到期条目仍建票。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
+    let state = cred_state(&env);
+    enrolled_with_entries(
+        &state,
+        "/s/exp-co.sh",
+        "h-exp-co",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode("/s/exp-co.sh", Some(crate::config::AutoApprove::Allow))
+        .unwrap();
+    expire_entry(&state, "/s/exp-co.sh", 3_600).await;
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("h-exp-co", "/s/exp-co.sh", Some("网易")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(err.code(), "E_PENDING");
+    assert_eq!(state.pending.len(), 1);
+}
+
+#[tokio::test]
+async fn expired_entry_without_acl_still_forbidden_no_ticket() {
+    // 到期判定在 ACL 之后：越权请求仍 403，不因到期而建票（否则成越权探测放大器）。
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    enrolled_with_entries(
+        &state,
+        "/s/exp-acl.sh",
+        "h-exp-acl",
+        entries_for("网易", &["授权码"]),
+    )
+    .await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode("/s/exp-acl.sh", Some(crate::config::AutoApprove::Allow))
+        .unwrap();
+    expire_entry(&state, "/s/exp-acl.sh", 3_600).await;
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &unauthorized_body("h-exp-acl", "/s/exp-acl.sh"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(state.pending.len(), 0, "越权不得建票");
+}
+
+/// 请求一个条目 ACL 未授予的 selector（越权探测用）。
+fn unauthorized_body(hash: &str, path: &str) -> CredentialBody {
+    let mut b = body(hash, path, Some("s3cr3t"));
+    b.entry = Some("未授权条目".to_string());
+    b.field = Some("任意字段".to_string());
+    b
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approving_expired_ticket_renews_authorization_window() {
+    // 到期 → 建票 → `✅` 落定后须续期：`authorized_at` 刷新、原 TTL 保留，
+    // 且下一次取用直接返回凭据（不再建票）。这是 spec「到期后重新批准即续期」
+    // 的端到端锁定——此前只有注册审批写入窗口，凭据票批准后续不上。
+    let env = cred_env(&[
+        ("CREDENTIAL_BLOCK_WAIT", "1"),
+        ("APPROVAL_WHITELIST", "@admin:example.com"),
+    ]);
+    let state = cred_state(&env);
+    let path = "/s/exp-renew.sh";
+    let hash = "h-exp-renew";
+    enrolled_with_entries(&state, path, hash, entries_for("网易", &["授权码"])).await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode(path, Some(crate::config::AutoApprove::Allow))
+        .unwrap();
+    expire_entry(&state, path, 3_600).await;
+
+    let before = now_secs();
+    let worker = state.clone();
+    let handle = tokio::spawn(async move {
+        handle_credential(
+            &worker,
+            &headers("gethash", Some("s3cr3t")),
+            &body(hash, path, Some("网易")),
+        )
+        .await
+    });
+    let event_id = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ids = state.approval.pending_event_ids().await;
+            if let Some(id) = ids.first() {
+                break id.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "到期票未建单");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let input = crate::service::matrix::ReactionInput {
+        target_event_id: event_id,
+        key: "✅".to_string(),
+        sender: "@admin:example.com".to_string(),
+        room_id: "!r:example.com".to_string(),
+        server_ts_ms: 1,
+    };
+    state
+        .approval
+        .on_reaction(&input, "@bot:example.com", "!r:example.com", 0)
+        .await;
+    let out = handle.await.unwrap().expect("批准后须返回凭据");
+    assert!(credential_value(&out).starts_with("__CRED_"));
+
+    let (at, ttl) = {
+        let reg = state.registry.read().await;
+        let entry = reg.lookup_by_path(path).unwrap();
+        (entry.authorized_at, entry.authorized_ttl_secs)
+    };
+    let at = at.expect("批准须刷新 authorized_at");
+    assert!(at >= before, "续期须写批准时刻: {at} >= {before}");
+    assert_eq!(ttl, Some(3_600), "续期须保留原 TTL");
+
+    // 窗口已续期：下一次取用直接放行，不再建票。
+    // 限流窗口 2s 且上一步已取用一次，故等过窗口再验证放行语义。
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    let out = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, Some("网易")),
+    )
+    .await
+    .expect("续期后须直接放行");
+    assert!(credential_value(&out).starts_with("__CRED_"));
 }

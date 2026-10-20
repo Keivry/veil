@@ -94,6 +94,7 @@ async fn register_caller_handler_response_carries_nonempty_reg_id_and_legacy_fie
             veilctl_secret: None,
         }),
         secret: Some("s3cr3t".to_string()),
+        authorization_ttl_secs: None,
     });
     let worker = state.clone();
     let request = tokio::spawn(async move {
@@ -480,6 +481,7 @@ async fn register_caller_requires_three_factor() {
             auto: None,
             auth: None,
             secret: None,
+            authorization_ttl_secs: None,
         }),
     )
     .await
@@ -600,6 +602,7 @@ async fn write_endpoints_require_deployment_secret() {
                 veilctl_secret: None,
             }),
             secret: None,
+            authorization_ttl_secs: None,
         }),
     )
     .await
@@ -677,6 +680,7 @@ async fn register_handler_auto_mode_effective() {
             veilctl_secret: Some("s3cr3t".to_string()),
         }),
         secret: None,
+        authorization_ttl_secs: None,
     });
     let err = register_caller_handler(State(state.clone()), HeaderMap::new(), body)
         .await
@@ -766,4 +770,189 @@ async fn emergency_revoke_admin_token_only() {
     }
     assert_eq!(state.pending.len(), 0, "直接吊销不建内存审批单");
     assert_eq!(state.approval.pending_len().await, 0, "不建 Matrix 审批单");
+}
+
+/// `GET /registrations` 每条目回显授权窗口三字段（`null` 亦须出现）。
+#[tokio::test]
+async fn registrations_response_echoes_authorization_window() {
+    use crate::registry::RegisterParams;
+    let state = three_factor_state();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    {
+        let mut registry = state.registry.write().await;
+        for (path, hash) in [
+            ("/s/win-bounded.sh", "win-bounded-h"),
+            ("/s/win-open.sh", "win-open-h"),
+        ] {
+            registry
+                .register_extended(&RegisterParams {
+                    caller_path: path.to_string(),
+                    caller_hash: hash.to_string(),
+                    name: hash.to_string(),
+                    ..RegisterParams::default()
+                })
+                .unwrap();
+        }
+        registry
+            .set_authorization_window("/s/win-bounded.sh", Some(now), Some(3_600))
+            .unwrap();
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("x-veilctl-secret", "s3cr3t".parse().unwrap());
+    let Json(body) = registrations_handler(State(state.clone()), headers)
+        .await
+        .unwrap();
+    let bounded = list_items(&body, "/s/win-bounded.sh");
+    assert_eq!(bounded["authorized_at"], now);
+    assert_eq!(bounded["authorized_ttl_secs"], 3_600);
+    assert_eq!(
+        bounded["authorization_expires_at"],
+        now + 3_600,
+        "到期时刻须由后端计算: {bounded}"
+    );
+    let open = list_items(&body, "/s/win-open.sh");
+    assert!(open["authorized_at"].is_null(), "{open}");
+    assert!(open["authorized_ttl_secs"].is_null(), "{open}");
+    assert!(open["authorization_expires_at"].is_null(), "{open}");
+}
+
+/// `/health` 含 `authorization_expiring` 且为数值。
+#[tokio::test]
+async fn health_exposes_authorization_expiring_numeric() {
+    let state = three_factor_state();
+    let Json(body) = crate::handler::health_handler(State(state)).await;
+    assert!(
+        body["authorization_expiring"].is_u64(),
+        "authorization_expiring 须为数值: {body}"
+    );
+    assert_eq!(body["authorization_expiring"], 0, "{body}");
+}
+
+/// 请求级 `authorization_ttl_secs` 非法（负数/非数字）须 400，且不建单。
+#[tokio::test]
+async fn register_rejects_invalid_authorization_ttl() {
+    for bad in [
+        json!(-1),
+        json!("abc"),
+        json!(1.5),
+        json!(true),
+        json!([]),
+        json!({}),
+        // serde_json 会把超出 u64 的字面量降级为 f64，`as_u64` 取不到值即 400。
+        serde_json::from_str::<serde_json::Value>("18446744073709551616").unwrap(),
+    ] {
+        let state = three_factor_state();
+        let body = RegisterBody {
+            caller_path: "/s/bad-ttl.sh".to_string(),
+            caller_hash: "bad-ttl-h".to_string(),
+            source: None,
+            name: "bad-ttl".to_string(),
+            description: String::new(),
+            entries: None,
+            entry: None,
+            fields: None,
+            field: None,
+            allow_mode: None,
+            auto: None,
+            auth: Some(service::AuthBlock {
+                caller_hash: Some("bad-ttl-h".to_string()),
+                caller_path: Some("/s/bad-ttl.sh".to_string()),
+                veilctl_binary_hash: Some("gethash".to_string()),
+                veilctl_secret: Some("s3cr3t".to_string()),
+            }),
+            secret: None,
+            authorization_ttl_secs: Some(bad.clone()),
+        };
+        let err = register_caller_handler(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status_code(),
+            StatusCode::BAD_REQUEST,
+            "非法 TTL {bad} 须 400"
+        );
+        assert!(
+            state.registry.read().await.is_empty(),
+            "非法 TTL 不得建注册条目"
+        );
+        assert_eq!(state.pending.len(), 0, "非法 TTL 不得建审批单");
+    }
+}
+
+/// 请求级 `authorization_ttl_secs = 0` 等价于无期限（归一为 `null`）。
+#[tokio::test]
+async fn register_zero_ttl_normalizes_to_unbounded() {
+    let state = three_factor_state();
+    let body = RegisterBody {
+        caller_path: "/s/zero-ttl.sh".to_string(),
+        caller_hash: "zero-ttl-h".to_string(),
+        source: None,
+        name: "zero-ttl".to_string(),
+        description: String::new(),
+        entries: None,
+        entry: None,
+        fields: None,
+        field: None,
+        allow_mode: None,
+        auto: None,
+        auth: Some(service::AuthBlock {
+            caller_hash: Some("zero-ttl-h".to_string()),
+            caller_path: Some("/s/zero-ttl.sh".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
+        }),
+        secret: None,
+        authorization_ttl_secs: Some(json!(0)),
+    };
+    let _ = register_caller_handler(State(state.clone()), HeaderMap::new(), Json(body))
+        .await
+        .unwrap_err();
+    let registry = state.registry.read().await;
+    let entry = registry
+        .lookup_by_path("/s/zero-ttl.sh")
+        .expect("条目须已建");
+    assert_eq!(entry.authorized_ttl_secs, None, "0 须归一为无期限");
+    assert_eq!(entry.authorized_at, None, "未批准前不得有授权起点");
+}
+
+/// 请求声明的非零 TTL 记入条目，待批准落定后生效。
+#[tokio::test]
+async fn register_declared_ttl_is_recorded_on_entry() {
+    let state = three_factor_state();
+    let body = RegisterBody {
+        caller_path: "/s/decl-ttl.sh".to_string(),
+        caller_hash: "decl-ttl-h".to_string(),
+        source: None,
+        name: "decl-ttl".to_string(),
+        description: String::new(),
+        entries: None,
+        entry: None,
+        fields: None,
+        field: None,
+        allow_mode: None,
+        auto: None,
+        auth: Some(service::AuthBlock {
+            caller_hash: Some("decl-ttl-h".to_string()),
+            caller_path: Some("/s/decl-ttl.sh".to_string()),
+            veilctl_binary_hash: Some("gethash".to_string()),
+            veilctl_secret: Some("s3cr3t".to_string()),
+        }),
+        secret: None,
+        authorization_ttl_secs: Some(json!(600)),
+    };
+    let _ = register_caller_handler(State(state.clone()), HeaderMap::new(), Json(body))
+        .await
+        .unwrap_err();
+    let registry = state.registry.read().await;
+    let entry = registry
+        .lookup_by_path("/s/decl-ttl.sh")
+        .expect("条目须已建");
+    assert_eq!(
+        entry.authorized_ttl_secs,
+        Some(600),
+        "请求声明的窗口须记入条目，待批准时生效"
+    );
 }

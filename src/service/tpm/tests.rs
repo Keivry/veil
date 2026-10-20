@@ -331,3 +331,139 @@ fn probe_succeeds_with_zero_exit_and_gate_prepends_reason() {
     );
     assert!(text.contains("TPM 不可用"), "{text}");
 }
+
+#[test]
+fn health_snapshot_reports_missing_seal_file() {
+    let base = unique_test_base("health-missing-seal");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("seal.pub"), b"pub").unwrap();
+    let cache = TpmHealthCache::new(
+        base.clone(),
+        TpmHealth {
+            ok: true,
+            error: None,
+        },
+    );
+    let snap = cache.snapshot();
+    assert!(!snap.ok, "密封对象缺失须置 ok=false: {snap:?}");
+    assert!(
+        snap.error.as_deref().unwrap_or("").contains("seal.priv"),
+        "错误须指出缺失文件: {snap:?}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn health_snapshot_reads_cached_state_when_seal_present() {
+    let base = unique_test_base("health-cached");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("seal.pub"), b"pub").unwrap();
+    std::fs::write(base.join("seal.priv"), b"priv").unwrap();
+    let cache = TpmHealthCache::new(
+        base.clone(),
+        TpmHealth {
+            ok: false,
+            error: Some("tpm2_pcrread 不存在".to_string()),
+        },
+    );
+    let snap = cache.snapshot();
+    assert!(!snap.ok);
+    assert_eq!(snap.error.as_deref(), Some("tpm2_pcrread 不存在"));
+
+    let healthy = TpmHealthCache::new(
+        base.clone(),
+        TpmHealth {
+            ok: true,
+            error: None,
+        },
+    );
+    let snap = healthy.snapshot();
+    assert!(snap.ok && snap.error.is_none(), "{snap:?}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn mock_health_cache_never_checks_seal_files() {
+    let cache = TpmHealthCache::mock();
+    let snap = cache.snapshot();
+    assert!(snap.ok, "Mock 缓存恒 ok=true: {snap:?}");
+    assert!(snap.error.is_none(), "{snap:?}");
+}
+
+#[tokio::test]
+async fn health_refresh_updates_error_reason() {
+    let base = unique_test_base("health-refresh");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("seal.pub"), b"pub").unwrap();
+    std::fs::write(base.join("seal.priv"), b"priv").unwrap();
+    let cache = Arc::new(TpmHealthCache::new(
+        base.clone(),
+        TpmHealth {
+            ok: true,
+            error: None,
+        },
+    ));
+    cache
+        .refresh_with(|| Err("tpm2_pcrread 退出码 1".to_string()))
+        .await;
+    let snap = cache.snapshot();
+    assert!(!snap.ok, "探测失败须置 ok=false: {snap:?}");
+    assert_eq!(snap.error.as_deref(), Some("tpm2_pcrread 退出码 1"));
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_refresh_recovers_from_failure() {
+    let base = unique_test_base("health-recover");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("seal.pub"), b"pub").unwrap();
+    std::fs::write(base.join("seal.priv"), b"priv").unwrap();
+    let cache = Arc::new(TpmHealthCache::new(
+        base.clone(),
+        TpmHealth {
+            ok: false,
+            error: Some("设备权限不足".to_string()),
+        },
+    ));
+    cache.refresh_with(|| Ok(())).await;
+    let snap = cache.snapshot();
+    assert!(snap.ok, "首次失败后二次成功须翻转为 ok: {snap:?}");
+    assert!(snap.error.is_none(), "{snap:?}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn health_snapshot_concurrent_reads_do_not_block() {
+    let base = unique_test_base("health-concurrent");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("seal.pub"), b"pub").unwrap();
+    std::fs::write(base.join("seal.priv"), b"priv").unwrap();
+    let cache = Arc::new(TpmHealthCache::new(
+        base.clone(),
+        TpmHealth {
+            ok: true,
+            error: None,
+        },
+    ));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let cache = Arc::clone(&cache);
+        handles.push(tokio::task::spawn_blocking(move || {
+            for _ in 0..64 {
+                assert!(cache.snapshot().ok);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("并发快照不得 panic");
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_health_refresher_exits_without_probing() {
+    let cache = Arc::new(TpmHealthCache::mock());
+    let handle = cache.spawn_refresher(Duration::from_millis(10));
+    handle.await.expect("Mock 刷新任务须立即结束（不探测）");
+    assert!(cache.snapshot().ok);
+}

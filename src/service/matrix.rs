@@ -20,6 +20,7 @@
 pub mod approval;
 pub mod bot;
 pub mod branch;
+pub mod cleanup;
 pub mod notify;
 
-pub use {approval::*, bot::*, branch::*, notify::*};
+pub use {approval::*, bot::*, branch::*, cleanup::*, notify::*};

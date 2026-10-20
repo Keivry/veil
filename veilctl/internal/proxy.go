@@ -397,12 +397,18 @@ func ListRegistrations() ([]RegistrationItem, error) {
 }
 
 // ProxyStatus Proxy /health 响应
+//
+// TpmOk / TpmError / MasterPasswordCached 用指针：旧服务端缺字段时为 nil，
+// 与「字段存在但为 false」可区分，避免把未知状态谎报为不可用。
 type ProxyStatus struct {
-	Status     string     `json:"status"`
-	Unlocked   bool       `json:"unlocked"`
-	Pending    int        `json:"pending"`
-	LlmSecrets int        `json:"llm_secrets"`
-	Error      ErrMessage `json:"error,omitempty"`
+	Status               string     `json:"status"`
+	Unlocked             bool       `json:"unlocked"`
+	Pending              int        `json:"pending"`
+	LlmSecrets           int        `json:"llm_secrets"`
+	TpmOk                *bool      `json:"tpm_ok,omitempty"`
+	TpmError             *string    `json:"tpm_error,omitempty"`
+	MasterPasswordCached *bool      `json:"master_password_cached,omitempty"`
+	Error                ErrMessage `json:"error,omitempty"`
 }
 
 // UnmarshalJSON 解析响应并归一化错误消息（兼容网关对象与 Python 字符串错误体）。

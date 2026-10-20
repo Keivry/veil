@@ -638,3 +638,71 @@ fn conversation_secret_fallback_is_full_nonzero_32_bytes() {
     assert!(flag);
     assert!(ok.iter().all(|b| *b == 0xAB));
 }
+
+#[tokio::test]
+async fn lock_cleanup_reports_zero_pii_scopes_in_request_mode() {
+    // request 模式不装配会话作用域存储：回执中的 0 是真实值（None → 0），非占位符。
+    let state = state_with_keepass(Arc::new(LockableKeePass::new(true)));
+    assert!(
+        state.conversation_scope_store.is_none(),
+        "request 模式须不装配 ConversationScopeStore"
+    );
+    let reply = crate::service::matrix::MatrixBot::handle_text_command_full(
+        &state.approval,
+        crate::service::matrix::TextCommand::Lock,
+        &state,
+    )
+    .await
+    .expect("lock 须有回执");
+    assert!(
+        reply.contains("PII 会话作用域 0 个"),
+        "request 模式下回执须报 0 个作用域: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn lock_cleanup_clears_pii_conversation_scopes() {
+    // conversation 模式：lock 须真的清空会话作用域并报真实条数。
+    let state = state_with_keepass(Arc::new(LockableKeePass::new(true)));
+    let store = Arc::new(crate::service::redaction::ConversationScopeStore::new(
+        8,
+        std::time::Duration::from_secs(1800),
+    ));
+    let keys = [0u8, 1, 2].map(|i| {
+        crate::service::redaction::conversation_key::scoped_key(
+            b"lock-scope-secret",
+            "tenant-lock",
+            &format!("conv-lock-{i}"),
+        )
+    });
+    for key in &keys {
+        store.get_or_insert(key);
+    }
+    assert_eq!(store.len(), keys.len(), "前置：须有 3 条会话作用域");
+    let mut sampled = state.clone();
+    sampled.conversation_scope_store = Some(Arc::clone(&store));
+
+    let report = crate::service::matrix::GatewayCleanup::lock_cleanup(&sampled);
+    assert_eq!(report.pii_scopes_cleared, keys.len(), "须报真实清理条数");
+    assert_eq!(store.len(), 0, "lock 后会话作用域须清空");
+
+    let reply = crate::service::matrix::MatrixBot::handle_text_command_full(
+        &sampled.approval,
+        crate::service::matrix::TextCommand::Lock,
+        &sampled,
+    )
+    .await
+    .expect("lock 须有回执");
+    assert!(
+        reply.contains("PII 会话作用域 0 个"),
+        "二次 lock 时作用域已空，回执须报 0: {reply}"
+    );
+    assert!(
+        reply.contains("口令缓存"),
+        "既有口令缓存文案须保留: {reply}"
+    );
+    assert!(
+        reply.contains("未决 0 单已按拒绝落定"),
+        "既有未决票数文案须保留: {reply}"
+    );
+}

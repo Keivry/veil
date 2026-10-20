@@ -200,6 +200,11 @@ pub async fn register_caller_extended(
             message: "caller_path 与 caller_hash 均必填".to_string(),
         });
     }
+    // 授权窗口的唯一解析点：`Absent` 取配置缺省，`Unbounded`/`Secs` 按声明值。
+    // 解析结果随条目持久化，批准落定直接写入，任何地方都不再回落配置。
+    let resolved_ttl = params
+        .authorization_ttl
+        .resolve(state.config().authorization_ttl);
     {
         let registry = state.registry().read().await;
         let name = params.name.trim();
@@ -230,7 +235,8 @@ pub async fn register_caller_extended(
     let save_guard = state.registry_save_lock().lock().await;
     let (view, bytes) = {
         let mut registry = state.registry().write().await;
-        let entry = registry.register_extended_with_script_sha256(params, script_sha256)?;
+        let entry =
+            registry.register_extended_with_script_sha256(params, script_sha256, resolved_ttl)?;
         let view = registration_view(entry);
         (view, registry.to_file_bytes())
     };
@@ -246,6 +252,13 @@ fn approval_timeout(state: &impl AppStateParts) -> Duration {
 /// 三态落定：`♾️ (true, true)` 启用并置持久放行；`✅ (true, false)` 启用并保留
 /// 注册声明的 `allow_mode`；`❎ (false, _)` 与 `None`（超时）置 `revoked=true`。
 /// 例外：批准分支命中已 `revoked` 条目时拒绝复活（吊销为终态）。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 async fn apply_register_approval(
     state: &impl AppStateParts,
     caller_path: &str,
@@ -273,6 +286,20 @@ async fn apply_register_approval(
                             .set_allow_mode(caller_path, Some(crate::config::AutoApprove::Allow))
                     {
                         tracing::warn!("注册审批置持久放行失败 {caller_path}: {e}");
+                    }
+                    // `♾️` 永久（窗口清空）；`✅` 沿用条目既有窗口，包含续期保留原值
+                    // 与首次批准沿用注册时解析值两种情形。此处不做配置回落。
+                    let ttl = if always {
+                        None
+                    } else {
+                        registry
+                            .lookup_by_path(caller_path)
+                            .and_then(|entry| entry.authorized_ttl_secs)
+                    };
+                    if let Err(e) =
+                        registry.set_authorization_window(caller_path, Some(now_secs()), ttl)
+                    {
+                        tracing::warn!("注册审批写授权窗口失败 {caller_path}: {e}");
                     }
                 }
             }
@@ -330,6 +357,32 @@ async fn read_registration_view(
     Ok(registration_view(entry))
 }
 
+/// 授权到期后经人工批准即续期：刷新 `authorized_at` 为批准时刻，保留原 TTL
+/// （原为无期限者保持无期限）。条目已被吊销或不存在时静默跳过。
+///
+/// 锁序与 `apply_register_approval` 一致：`registry_save_lock` → 写锁 → 释放写锁
+/// → 落盘。
+pub(crate) async fn renew_authorization(state: &impl AppStateParts, caller_path: &str) {
+    let save_guard = state.registry_save_lock().lock().await;
+    let bytes = {
+        let mut registry = state.registry().write().await;
+        let ttl = match registry.lookup_by_path(caller_path) {
+            Some(entry) if !entry.revoked => entry.authorized_ttl_secs,
+            _ => {
+                drop(registry);
+                drop(save_guard);
+                return;
+            }
+        };
+        if let Err(e) = registry.set_authorization_window(caller_path, Some(now_secs()), ttl) {
+            tracing::warn!("授权续期写窗口失败 {caller_path}: {e}");
+        }
+        registry.to_file_bytes()
+    };
+    persist_registry_bytes(state.registry_path(), bytes).await;
+    drop(save_guard);
+}
+
 /// 注册审批链。先落盘中立条目（`disabled`），再建 `Register` 审批单，
 /// 复用双模：默认 `202` 抛单（后台等待落定回写），`CREDENTIAL_BLOCK_WAIT=1`
 /// 阻塞至 `300s`。三态落定见 `apply_register_approval`。
@@ -381,7 +434,19 @@ pub async fn register_caller_with_approval(
     } else {
         view.script_hash.clone()
     };
-    let reason = format!("register审批 :: {reg_id} :: {caller_path}");
+    // 票面须带上被请求的授权窗口：长度由调用方声明且无上限，不呈现则审批人
+    // 无法察觉自己批准的是一次事实上的永久授权。
+    let requested_ttl = {
+        let registry = state.registry().read().await;
+        registry
+            .lookup_by_path(&caller_path)
+            .and_then(|entry| entry.authorized_ttl_secs)
+    };
+    let window = match requested_ttl {
+        Some(secs) => format!("授权窗口={secs}s"),
+        None => "授权窗口=无期限".to_string(),
+    };
+    let reason = format!("register审批 :: {reg_id} :: {caller_path} :: {window}");
     let event_id = match submit_pending_with_branch(
         state,
         &caller_path,
@@ -592,13 +657,13 @@ pub async fn approve_hash_change(
     new_hash: &str,
     outcome: HashChangeOutcome,
 ) -> Result<RegistrationView> {
-    if state.config().entry_mode != EntryMode::Full {
+    if state.config().entry_mode == EntryMode::LlmOnly {
         tracing::warn!(
-            "轻量入口（{:?}）配 approve：已降级为阻断，不执行哈希变更",
+            "llm-only 纯代理入口（{:?}）配 approve：凭据面不可用，已降级为阻断",
             state.config().entry_mode
         );
         return Err(VeilError::Auth {
-            message: "轻量入口 approve 已降级为阻断".to_string(),
+            message: "llm-only 入口 approve 已降级为阻断".to_string(),
         });
     }
     if key.is_empty() || new_hash.is_empty() {

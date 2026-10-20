@@ -38,6 +38,17 @@ pub struct CallerEntry {
     /// `reg_id`（缺省回退 `caller_path`）。空串不序列化，保持既有文件完整性哈希不变。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reg_id: String,
+    /// 授权窗口起点（unix 秒）；`None` 表示从未落定过带窗口的批准。
+    ///
+    /// `skip_serializing_if` 不可省：注册表完整性哈希是「反序列化 → 重序列化 →
+    /// sha256」（见 `store::integrity_of`）。旧文件不含这两个键，若 `None` 也序列化
+    /// 成 `null`，升级后 canonical 字节改变导致哈希失配，而迁移入口只认得远古
+    /// `callers` 数组，最终 fail-closed 拒绝启动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_at: Option<u64>,
+    /// 授权窗口长度（秒）；`None` 表示无期限。同 `authorized_at` 需省略 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_ttl_secs: Option<u64>,
 }
 
 /// 旧哈希宽限窗口（秒，3600s）。
@@ -68,6 +79,44 @@ impl HashChangeOutcome {
     }
 }
 
+/// 注册时对授权窗口的诉求。
+///
+/// 必须三态：`Absent`（未声明，取配置缺省）与 `Unbounded`（请求显式 `0`，本条
+/// 永久）在归一后都是「无秒数」，若压成 `Option<u64>` 就无法区分，会把显式无期限
+/// 静默改成配置窗口。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuthorizationTtl {
+    /// 未声明：落定时取 `[storage].authorization_ttl_secs`。
+    #[default]
+    Absent,
+    /// 声明为无期限。
+    Unbounded,
+    /// 声明为指定秒数（恒 > 0，`0` 已归一为 [`Self::Unbounded`]）。
+    Secs(u64),
+}
+
+impl AuthorizationTtl {
+    /// 归一：`0` 视为无期限；非 0 保留秒数。
+    ///
+    /// `raw` 为 `None` 时返回 `fallback`（即「未声明」）。
+    pub fn from_request(raw: Option<u64>) -> Self {
+        match crate::registry::normalize_ttl(raw) {
+            Some(secs) => Self::Secs(secs),
+            None if raw.is_some() => Self::Unbounded,
+            None => Self::Absent,
+        }
+    }
+
+    /// 解析为落定写入的窗口长度：`Absent` 取配置缺省，其余按声明值。
+    pub fn resolve(self, configured: Option<u64>) -> Option<u64> {
+        match self {
+            Self::Absent => configured,
+            Self::Unbounded => None,
+            Self::Secs(secs) => Some(secs),
+        }
+    }
+}
+
 /// 注册扩展参数（网关侧做 Go 字段映射，协议不 breaking）。
 #[derive(Debug, Clone, Default)]
 pub struct RegisterParams {
@@ -77,6 +126,8 @@ pub struct RegisterParams {
     pub description: String,
     pub entries: BTreeMap<String, Vec<String>>,
     pub allow_mode: Option<AutoApprove>,
+    /// 授权窗口诉求；由 `register_caller_extended` 单点解析为落定值后写入条目。
+    pub authorization_ttl: AuthorizationTtl,
 }
 
 impl CallerEntry {
@@ -145,6 +196,8 @@ mod tests {
             old_hash: Some("old".to_string()),
             old_hash_expires_at: Some(exp),
             reg_id: String::new(),
+            authorized_at: None,
+            authorized_ttl_secs: None,
         }
     }
 
@@ -180,5 +233,45 @@ mod tests {
         // 边界：exp+1s（已过 1s）失效，且其它 hash 不匹配。
         assert!(!entry_with_expiry(now.saturating_sub(1)).matches_old_hash("old"));
         assert!(!entry_with_expiry(now + 1).matches_old_hash("other"));
+    }
+}
+
+#[cfg(test)]
+mod ttl_field_tests {
+    use super::CallerEntry;
+
+    #[test]
+    fn legacy_json_without_ttl_keys_deserializes_to_none() {
+        // 旧格式（无 authorized_at / authorized_ttl_secs）须可加载，两字段为 None。
+        let json = r#"{
+            "caller_path": "/s/legacy.sh",
+            "expected_hash": "h1",
+            "script_sha256": "sha",
+            "enabled": true,
+            "revoked": false
+        }"#;
+        let entry: CallerEntry = serde_json::from_str(json).expect("旧格式须可反序列化");
+        assert_eq!(entry.authorized_at, None);
+        assert_eq!(entry.authorized_ttl_secs, None);
+        assert!(!crate::registry::is_authorization_expired(&entry, u64::MAX));
+    }
+
+    #[test]
+    fn ttl_keys_round_trip_through_json() {
+        let json = r#"{
+            "caller_path": "/s/ttl.sh",
+            "expected_hash": "h1",
+            "script_sha256": "sha",
+            "enabled": true,
+            "revoked": false,
+            "authorized_at": 1700000000,
+            "authorized_ttl_secs": 3600
+        }"#;
+        let entry: CallerEntry = serde_json::from_str(json).expect("含 TTL 键须可反序列化");
+        assert_eq!(entry.authorized_at, Some(1_700_000_000));
+        assert_eq!(entry.authorized_ttl_secs, Some(3_600));
+        let back = serde_json::to_string(&entry).expect("须可序列化");
+        assert!(back.contains("\"authorized_at\":1700000000"), "{back}");
+        assert!(back.contains("\"authorized_ttl_secs\":3600"), "{back}");
     }
 }

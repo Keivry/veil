@@ -75,6 +75,8 @@ pub trait AppStateParts {
     fn notify(&self) -> &Arc<matrix::NotificationSpool>;
     /// 命令面运行时（配置、授权、执行后端、日志与幂等表）。
     fn command(&self) -> &Arc<crate::service::command::CommandRuntime>;
+    /// TPM 运行期健康快照（后台周期探测写入，此处只读）。
+    fn tpm_health(&self) -> &Arc<crate::service::tpm::TpmHealthCache>;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,16 +86,52 @@ pub struct HealthStatus {
     pub unlocked: bool,
     pub pending: usize,
     pub llm_secrets: usize,
+    pub tpm_ok: bool,
+    pub tpm_error: Option<String>,
+    pub master_password_cached: bool,
+    /// 24h 内到期且 `enabled && !revoked` 的条目数（每次 `/health` 现算，不缓存）。
+    pub authorization_expiring: usize,
 }
 
 pub fn health_status(state: &impl AppStateParts) -> HealthStatus {
+    let tpm = state.tpm_health().snapshot();
     HealthStatus {
         sqlite_ok: state.sqlite_ok_flag(),
         sqlite_error: state.sqlite_error_text(),
         unlocked: state.keepass().is_unlocked(),
         pending: state.pending().len(),
         llm_secrets: state.vault().len(),
+        tpm_ok: tpm.ok,
+        tpm_error: tpm.error,
+        master_password_cached: state.keepass().master_password_cached(),
+        authorization_expiring: count_authorization_expiring(state),
     }
+}
+
+/// 健康面授权到期预警计数：仅统计仍生效且将在 24h 内到期的条目。
+/// 现算不缓存——注册表规模是调用方数量，线性扫描成本可忽略，且避免与
+/// 吊销/审批落定产生失效同步问题。
+fn count_authorization_expiring(state: &impl AppStateParts) -> usize {
+    const WINDOW_SECS: u64 = 86_400;
+    let Ok(registry) = state.registry().try_read() else {
+        // 写锁被占（审批落定/吊销正在落盘）时本字段降级为 0。`/health` 是同步只读
+        // 探针，为它引入 async 会传染整条调用链；此字段仅作预警，且写锁持有窗口
+        // 极短，下一次探测即可恢复真值，故接受这一近似并记录以便排查。
+        tracing::debug!("authorization_expiring 读取注册表失败（写锁占用），本次按 0 计");
+        return 0;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let horizon = now.saturating_add(WINDOW_SECS);
+    registry
+        .snapshot()
+        .iter()
+        .filter(|entry| entry.enabled && !entry.revoked)
+        .filter_map(crate::registry::authorization_expires_at)
+        .filter(|expires_at| *expires_at > now && *expires_at <= horizon)
+        .count()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -178,6 +216,16 @@ pub struct RegistrationView {
     /// Go 加性兼容：条目→字段授权映射回显。
     #[serde(default)]
     pub entries: std::collections::BTreeMap<String, Vec<String>>,
+    /// 授权窗口起点（unix 秒）；`null` 表示从未落定带窗口的批准。
+    #[serde(default)]
+    pub authorized_at: Option<u64>,
+    /// 授权窗口长度（秒）；`null` 表示无期限。
+    #[serde(default)]
+    pub authorized_ttl_secs: Option<u64>,
+    /// 到期时刻：由后端按 `authorized_at + authorized_ttl_secs` 饱和相加得出，
+    /// 客户端 SHALL NOT 自行相加。
+    #[serde(default)]
+    pub authorization_expires_at: Option<u64>,
 }
 
 pub(crate) fn registration_view(entry: &CallerEntry) -> RegistrationView {
@@ -192,6 +240,11 @@ pub(crate) fn registration_view(entry: &CallerEntry) -> RegistrationView {
         script_path: entry.caller_path.clone(),
         script_hash: entry.expected_hash.clone(),
         entries: entry.entries.clone(),
+        authorized_at: entry.authorized_at,
+        // 未落定批准前不对外回显窗口长度：条目上的 `authorized_ttl_secs` 此时只是
+        // 「待批请求值」，与「本次授权有效期」语义不同，回显会自相矛盾。
+        authorized_ttl_secs: entry.authorized_at.and(entry.authorized_ttl_secs),
+        authorization_expires_at: crate::registry::authorization_expires_at(entry),
     }
 }
 
@@ -445,6 +498,7 @@ pub(crate) mod test_support {
                 description: String::new(),
                 entries,
                 allow_mode: None,
+                authorization_ttl: crate::registry::AuthorizationTtl::Absent,
             },
             &format!("acl-test-{path}"),
         )
@@ -507,5 +561,192 @@ mod tests {
             db_path: std::path::PathBuf::from("/tmp/x.sqlite"),
         };
         assert!(!out.sqlite_ok, "降级须与 sqlite_error 成对出现");
+    }
+}
+
+#[cfg(test)]
+mod authorization_ttl_tests {
+    use {super::*, test_support::*};
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn registration_view_echoes_window_and_computes_expiry() {
+        let state = cred_state(&cred_env(&[]));
+        enrolled_with_entries(
+            &state,
+            "/s/view-ttl.sh",
+            "h-view-ttl",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let at = now_secs();
+        state
+            .registry
+            .write()
+            .await
+            .set_authorization_window("/s/view-ttl.sh", Some(at), Some(3_600))
+            .unwrap();
+        let views = list_registrations(&state, Some("observability-admin-token-0123456789"), None)
+            .await
+            .expect("查询须成功");
+        let view = views
+            .iter()
+            .find(|v| v.caller_path == "/s/view-ttl.sh")
+            .expect("条目须在列表中");
+        assert_eq!(view.authorized_at, Some(at));
+        assert_eq!(view.authorized_ttl_secs, Some(3_600));
+        assert_eq!(
+            view.authorization_expires_at,
+            Some(at + 3_600),
+            "到期时刻须由后端相加得出"
+        );
+        assert_eq!(view.status, "✅", "到期不改变状态徽标");
+        assert!(view.enabled && !view.revoked);
+    }
+
+    #[tokio::test]
+    async fn registration_view_unbounded_entry_has_null_expiry() {
+        let state = cred_state(&cred_env(&[]));
+        enrolled_with_entries(
+            &state,
+            "/s/view-none.sh",
+            "h-view-none",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        let views = list_registrations(&state, Some("observability-admin-token-0123456789"), None)
+            .await
+            .unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.caller_path == "/s/view-none.sh")
+            .unwrap();
+        assert_eq!(view.authorized_at, None);
+        assert_eq!(view.authorized_ttl_secs, None);
+        assert_eq!(view.authorization_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn health_counts_only_enabled_unrevoked_entries_expiring_within_24h() {
+        let state = cred_state(&cred_env(&[]));
+        let now = now_secs();
+        let soon = now + 3_600;
+        let later = now + 86_400 * 2;
+        for (path, hash, at, ttl) in [
+            ("/s/exp-soon.sh", "h-soon", now, Some(soon - now)),
+            ("/s/exp-later.sh", "h-later", now, Some(later - now)),
+        ] {
+            vault_ops::register_caller_extended(
+                &state,
+                &crate::registry::RegisterParams {
+                    caller_path: path.to_string(),
+                    caller_hash: hash.to_string(),
+                    name: path.to_string(),
+                    entries: entries_for("网易", &["授权码"]),
+                    ..crate::registry::RegisterParams::default()
+                },
+                path,
+            )
+            .await
+            .unwrap();
+            state
+                .registry
+                .write()
+                .await
+                .set_enabled(path, true)
+                .unwrap();
+            state
+                .registry
+                .write()
+                .await
+                .set_authorization_window(path, Some(at), ttl)
+                .unwrap();
+        }
+        assert_eq!(
+            health_status(&state).authorization_expiring,
+            1,
+            "仅计 24h 内到期的生效条目"
+        );
+
+        state
+            .registry
+            .write()
+            .await
+            .set_enabled("/s/exp-soon.sh", false)
+            .unwrap();
+        assert_eq!(
+            health_status(&state).authorization_expiring,
+            0,
+            "停用条目不计入"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_authorization_expiring_boundary_is_exclusive_now_inclusive_horizon() {
+        // 边界语义 `(now, now+86400]`：恰好到期于 now 的已属过期（不计入），
+        // 恰好到期于 now+86400 的仍算「24h 内将到期」（计入）。
+        let state = cred_state(&cred_env(&[]));
+        let now = now_secs();
+        for (path, hash, at, ttl) in [
+            ("/s/exp-at-now.sh", "h-at-now", now, Some(0)),
+            ("/s/exp-at-edge.sh", "h-at-edge", now, Some(86_400)),
+            (
+                "/s/exp-at-edge-plus.sh",
+                "h-at-edge-plus",
+                now,
+                Some(86_401),
+            ),
+        ] {
+            vault_ops::register_caller_extended(
+                &state,
+                &crate::registry::RegisterParams {
+                    caller_path: path.to_string(),
+                    caller_hash: hash.to_string(),
+                    name: path.to_string(),
+                    entries: entries_for("网易", &["授权码"]),
+                    ..crate::registry::RegisterParams::default()
+                },
+                path,
+            )
+            .await
+            .unwrap();
+            state
+                .registry
+                .write()
+                .await
+                .set_enabled(path, true)
+                .unwrap();
+            state
+                .registry
+                .write()
+                .await
+                .set_authorization_window(path, Some(at), ttl)
+                .unwrap();
+        }
+        // `Some(0)` 窗口在 `authorization_expires_at` 中等于起点时刻，即已过期。
+        assert_eq!(
+            health_status(&state).authorization_expiring,
+            1,
+            "仅 now+86400 恰好落在窗口内边界"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_authorization_expiring_is_zero_without_deadlines() {
+        let state = cred_state(&cred_env(&[]));
+        enrolled_with_entries(
+            &state,
+            "/s/exp-none.sh",
+            "h-exp-none",
+            entries_for("网易", &["授权码"]),
+        )
+        .await;
+        assert_eq!(health_status(&state).authorization_expiring, 0);
     }
 }

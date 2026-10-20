@@ -47,7 +47,7 @@ docker compose up -d
   podman unshare chown -R 999:999 ./data
   ```
   rootless 下改完后宿主 `ls -ln ./data` 显示的是高位 subuid（如 `100998`）而非 `999`，这是 uid 映射的正常表现，不影响容器内读写。换用命名卷（`volumes: veil_data:/data`）时由引擎自动继承镜像内属主，可跳过此步。
-- **从旧版本升级**：两处默认值变了，都表现为"容器是绿的但不可用"。① `[server]` 段是本版新增：若实际挂载的 TOML（例如升级前自己维护的 `veil.toml`）没有 `[server].bind`，容器会回退到缺省 `127.0.0.1:8877`——容器内 `/health` 仍然 `ok:true`（健康检查在容器内跑），但宿主机发布端口一律被 reset。② `docker-compose.yml` 的默认挂载已从 `./veil.toml` 改为只读的 `examples/veil.container.toml`；旧部署里自己维护的 `./veil.toml` 不再被挂载，私有的 homeserver/room_id/data_dir 会被示例占位值取代（审批相关请求转 403）。升级后须确认实际挂载的 TOML 是你自己的配置且含 `[server].bind = "0.0.0.0:8877"`。③ 文本指令现已受 `[audit].approval_whitelist` 约束：非白名单成员发送 `lock`/`status`/`forget` 会被静默丢弃（无回执）。若此前依赖「房间里任何成员都能发运维指令」，升级后须把运维 MXID 显式加入白名单，否则运维指令全部失效。
+- **从旧版本升级**：两处默认值变了，都表现为"容器是绿的但不可用"。① `[server]` 段是本版新增：若实际挂载的 TOML（例如升级前自己维护的 `veil.toml`）没有 `[server].bind`，容器会回退到缺省 `127.0.0.1:8877`——容器内 `/health` 仍然 `ok:true`（健康检查在容器内跑），但宿主机发布端口一律被 reset。② `docker-compose.yml` 的默认挂载已从 `./veil.toml` 改为只读的 `examples/veil.container.toml`；旧部署里自己维护的 `./veil.toml` 不再被挂载，私有的 homeserver/room_id/data_dir 会被示例占位值取代（审批相关请求转 403）。升级后须确认实际挂载的 TOML 是你自己的配置且含 `[server].bind = "0.0.0.0:8877"`。③ `/health` 的 `ok` 不再是恒真字面量，改为 `sqlite_ok && tpm_ok` 派生：TPM 在启动后被移除（设备权限丢失、`tpm2d` 挂掉）或密封对象被删时，容器会转 `unhealthy` 并可能被重启策略拉起，读 `tpm_error` 可定位原因。④ `entry_mode = "credential-only"` 的审批豁免已删除：该取值仍可解析（等价于 `full`），但 `allow_mode = "pending"` 的条目恢复每次取用建票，依赖旧豁免的无人值守脚本会阻塞至 300s 超时；启动期 stderr 有不可抑制告警，按提示把条目改为 `allow_mode = "allow"` 即可。⑤ 授权 TTL 缺省为 `0`（无期限，行为与升级前完全一致）；设为非 0 后条目授权到期即转审批（建票并阻塞至 300s 超时），无人值守脚本必须配置审批人，且 `GET /health` 的 `authorization_expiring` 会预告 24h 内到期的生效条目数。⑥ **回滚前须先备份注册表**：本版给 `caller_registry.json` 的条目新增 `authorized_at` / `authorized_ttl_secs` 两个键。升级方向已做兼容（`None` 不落盘，旧文件的完整性哈希保持有效，直接可读）；但一旦新版本写入过授权窗口，旧二进制会因完整性哈希不匹配而拒启动（`注册表解析失败（新旧格式均不匹配）`）。回滚前请备份并删除 `caller_registry.json`（或手工移除这两个键并重算 `sha256`），否则旧版本无法启动。⑦ 文本指令现已受 `[audit].approval_whitelist` 约束：非白名单成员发送 `lock`/`status`/`forget` 会被静默丢弃（无回执）。若此前依赖「房间里任何成员都能发运维指令」，升级后须把运维 MXID 显式加入白名单，否则运维指令全部失效。
 - compose 把配置文件只读挂到 `/etc/veil/veil.toml` 并设 `VEIL_CONFIG_FILE`；数据卷父卷 `${DATA_DIR:-./data}` 是**宿主机侧**的卷路径（仅 compose 变量），与配置文件的 `[storage].data_dir`（默认 `/data`）相互独立。
 - 监听地址分两层：容器内必须 `[server].bind = "0.0.0.0:8877"`（bridge 网络的 DNAT 目标不是回环，写回环收不到），宿主机侧仍只发布到 `127.0.0.1`（见 `ports`）——对外不暴露到局域网。
 - `cap_add: IPC_LOCK` 与 `ulimits.memlock: -1` 让 `mlockall` 成功；若受限 daemon 拒绝 `ulimits`，删除该段只保留 `cap_add` 即可（`mlockall` 检查的是 `CAP_IPC_LOCK`）。
@@ -56,7 +56,7 @@ docker compose up -d
 
 ### 健康检查与停止
 
-探活：`curl -sS http://127.0.0.1:8877/health`（无需鉴权），实测返回 8 个字段：
+探活：`curl -sS http://127.0.0.1:8877/health`（无需鉴权），实测返回 12 个字段：
 
 ```json
 {
@@ -67,11 +67,15 @@ docker compose up -d
   "unlocked": false,
   "pending": 0,
   "llm_secrets": 0,
-  "pii_custom_disabled": 0
+  "pii_custom_disabled": 0,
+  "tpm_ok": true,
+  "tpm_error": null,
+  "master_password_cached": false,
+  "authorization_expiring": 0
 }
 ```
 
-`ok:true` 表示进程存活，探针不需要鉴权。`unlocked` 仅反映 .kdbx 库文件是否在位（`RealKeePass::is_unlocked` 只做 `is_file()` 快检，不触发解密、无副作用），`false` 表示库文件未就位，**不代表"需要人工解锁"**；凭据取用是否可用的权威口径是 `status` 字段与 `fetch_entry` 的实时错误。`pending` 是待审批数，`pii_custom_disabled` 是被停用的自定义 PII 规则数。停止：二进制是前台进程，`Ctrl-C` 即退出；容器用 `docker compose down`；`[storage].data_dir` 下 sqlite 与审计日志会自己收尾，无需额外清理。
+`ok` 是**派生值**：`ok = sqlite_ok && tpm_ok`，`status` 跟随同一判据（`"ok"` / `"degraded"`）。HTTP 状态码恒为 200——判活请只看 `ok` 字段（容器 `HEALTHCHECK` 即 `grep '"ok":true'`），不要把「有响应」当成「可用」。`tpm_ok` 来自启动期门禁结果加 60s 周期后台探测（探 `tpm2_pcrread` 与密封对象 `seal.pub`/`seal.priv` 在位），不可用时 `tpm_error` 给出因由；`VEIL_ALLOW_MOCK_TPM=1` 下恒为 `true`（Mock 无真实设备可探）。`unlocked` 仅反映 .kdbx 库文件是否在位（`RealKeePass::is_unlocked` 只做 `is_file()` 快检，不触发解密、无副作用），`false` 表示库文件未就位，**不代表"需要人工解锁"**；`master_password_cached` 才是 TPM 派生主密码是否已载入内存。`pending` 是待审批数，`pii_custom_disabled` 是被停用的自定义 PII 规则数。停止：二进制是前台进程，`Ctrl-C` 即退出；容器用 `docker compose down`；`[storage].data_dir` 下 sqlite 与审计日志会自己收尾，无需额外清理。
 
 ## 核心配置
 
@@ -104,6 +108,7 @@ docker compose up -d
 | `[auth].matrix_access_token` / `[auth].observability_admin_token` | 空（可 env 注入） | 密钥类；写入文件须 `0600` |
 | `[storage].data_dir` | `/data` | sqlite 与审计日志父目录；派生 `db_dir`/`tpm_dir`/`caller_registry_path` |
 | `[llm].default_upstream` / `[llm.upstreams."<port>"]` | 空 | 缺省上游与按入口端口选路 |
+| `[storage].authorization_ttl_secs`（env 名 `AUTHORIZATION_TTL_SECS`） | `0` | 授权窗口（秒）；`0` = 无期限；非 0 时到期转审批 |
 | `[redaction].enabled` | `true` | 脱敏总开关 |
 | `[pii_scope].mode` | `"request"` | 逐请求隔离；`"conversation"` 启用有界的会话级关联 |
 | `[limits].sse_frame_hard_bytes` | `8388608`（8MiB） | SSE 单帧/单行硬上限（字节，≥1）；超限 fail-closed 并按协议合成终止帧 |

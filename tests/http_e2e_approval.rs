@@ -98,78 +98,124 @@ fn b8_auto_approve_invalid_rejects_startup_and_case_variants() {
     assert!(Config::load_from(&env).is_ok());
 }
 
-// 非 full 入口下 approve_hash_change 降级阻断（403）且不执行变更。
+// `llm-only` 入口下 approve_hash_change 降级阻断（403）且不执行变更；
+// `credential-only` 已等价于 full，不再被入口模式阻断（见下方 credential-only 用例）。
 #[tokio::test]
 async fn b8_non_full_entry_approve_blocked_without_mutation() {
-    for mode in ["credential-only", "llm-only"] {
-        let (base, handle) = serve(test_app_router(&[
-            ("VEIL_ENTRY_MODE", mode),
-            ("AUTO_APPROVE", "false"),
-        ]))
-        .await;
-        let client = reqwest::Client::new();
-        let reg = client
-            .post(format!("{base}/register-caller"))
-            .header("X-Veilctl-Binary-Hash", "gethash1")
-            .header("X-Veilctl-Secret", "s3cr3t")
-            .json(&serde_json::json!({
-                "caller_path": "/srv/b8deg.sh",
-                "caller_hash": "h-b8-deg-A",
-                "name": "b8deg-job",
-                "entry": "网易",
-                "field": "授权码",
-                "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(reg.status().as_u16(), 202, "{mode}");
-        let approve = client
-            .post(format!("{base}/approve-hash-change"))
-            .header("X-Veilctl-Binary-Hash", "gethash1")
-            .header("X-Veilctl-Secret", "s3cr3t")
-            .json(&serde_json::json!({
-                "caller_path": "/srv/b8deg.sh",
-                "new_hash": "h-b8-deg-B",
-                "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            approve.status().as_u16(),
-            400,
-            "{mode} 下缺 reaction 须先 400（必填校验先于入口门禁）"
-        );
-        let approve = client
-            .post(format!("{base}/approve-hash-change"))
-            .header("X-Veilctl-Binary-Hash", "gethash1")
-            .header("X-Veilctl-Secret", "s3cr3t")
-            .json(&serde_json::json!({
-                "caller_path": "/srv/b8deg.sh",
-                "reaction": "✅",
-                "new_hash": "h-b8-deg-B",
-                "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(approve.status().as_u16(), 403, "{mode} 下须降级阻断");
-        // 未执行变更（credential-only 下验证：同一 vault_ops 入口门覆盖全部非 full 模式）：
-        // 新哈希仍走篡改分支转审批 202，而非匹配后拒绝 403。
-        if mode == "credential-only" {
-            let use_b = client
-                .post(format!("{base}/credential"))
-                .header("X-Veilctl-Binary-Hash", "gethash1")
-                .header("X-Veilctl-Secret", "s3cr3t")
-                .json(&cred_body("h-b8-deg-B", "/srv/b8deg.sh"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(use_b.status().as_u16(), 202, "{mode} 下变更须未生效");
-        }
-        handle.abort();
-    }
+    let mode = "llm-only";
+    let (base, handle) = serve(test_app_router(&[
+        ("VEIL_ENTRY_MODE", mode),
+        ("AUTO_APPROVE", "false"),
+    ]))
+    .await;
+    let client = reqwest::Client::new();
+    let reg = client
+        .post(format!("{base}/register-caller"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/b8deg.sh",
+            "caller_hash": "h-b8-deg-A",
+            "name": "b8deg-job",
+            "entry": "网易",
+            "field": "授权码",
+            "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg.status().as_u16(), 202, "{mode}");
+    let approve = client
+        .post(format!("{base}/approve-hash-change"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/b8deg.sh",
+            "new_hash": "h-b8-deg-B",
+            "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        approve.status().as_u16(),
+        400,
+        "{mode} 下缺 reaction 须先 400（必填校验先于入口门禁）"
+    );
+    let approve = client
+        .post(format!("{base}/approve-hash-change"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/b8deg.sh",
+            "reaction": "✅",
+            "new_hash": "h-b8-deg-B",
+            "auth": {"caller_hash": "h-b8-deg-A", "caller_path": "/srv/b8deg.sh"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status().as_u16(), 403, "{mode} 下须降级阻断");
+    let use_b = client
+        .post(format!("{base}/credential"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&cred_body("h-b8-deg-B", "/srv/b8deg.sh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        use_b.status().as_u16(),
+        403,
+        "{mode} 下变更须未生效，且凭据面整体不可用"
+    );
+    handle.abort();
+}
+
+// `credential-only` 已等价于 full：approve 不再被入口模式阻断，而是走审批流转。
+#[tokio::test]
+async fn b8_credential_only_entry_approve_not_blocked_by_entry_mode() {
+    let (base, handle) = serve(test_app_router(&[
+        ("VEIL_ENTRY_MODE", "credential-only"),
+        ("AUTO_APPROVE", "false"),
+    ]))
+    .await;
+    let client = reqwest::Client::new();
+    let reg = client
+        .post(format!("{base}/register-caller"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/b8co.sh",
+            "caller_hash": "h-b8-co-A",
+            "name": "b8co-job",
+            "entry": "网易",
+            "field": "授权码",
+            "auth": {"caller_hash": "h-b8-co-A", "caller_path": "/srv/b8co.sh"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg.status().as_u16(), 202);
+    let approve = client
+        .post(format!("{base}/approve-hash-change"))
+        .header("X-Veilctl-Binary-Hash", "gethash1")
+        .header("X-Veilctl-Secret", "s3cr3t")
+        .json(&serde_json::json!({
+            "caller_path": "/srv/b8co.sh",
+            "reaction": "✅",
+            "new_hash": "h-b8-co-B",
+            "auth": {"caller_hash": "h-b8-co-A", "caller_path": "/srv/b8co.sh"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        approve.status().as_u16(),
+        403,
+        "credential-only 已等价于 full，不得被入口模式阻断"
+    );
+    handle.abort();
 }
 
 // 已注册篡改哈希返回 202 建单 pending。
