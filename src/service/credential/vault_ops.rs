@@ -74,6 +74,39 @@ async fn persist_registry_bytes(path: &std::path::Path, bytes: Result<Vec<u8>>) 
     }
 }
 
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn path_basename(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 吊销目标定位：按路径/哈希/注册名解析出条目路径与展示字段。
+async fn resolve_revoke_target(
+    state: &impl AppStateParts,
+    key: &str,
+) -> Result<(String, Option<String>, Option<String>)> {
+    let registry = state.registry().read().await;
+    let entry = registry
+        .lookup_by_path(key)
+        .or_else(|| registry.lookup_by_hash(key))
+        .or_else(|| registry.lookup_by_name(key))
+        .ok_or_else(|| VeilError::BadRequest {
+            message: format!("调用方不存在: {key}"),
+        })?;
+    Ok((
+        entry.caller_path.clone(),
+        non_empty(entry.name.clone()),
+        non_empty(entry.description.clone()),
+    ))
+}
+
 pub async fn query_keepass(
     state: &impl AppStateParts,
     entry: &str,
@@ -139,10 +172,24 @@ pub async fn query_keepass(
 }
 
 fn notify_keepass_failure(state: &impl AppStateParts, entry: &str, detail: &str) {
+    let facts = [matrix::Fact {
+        label: "原因",
+        value: detail.to_string(),
+    }];
+    let ctx = matrix::TicketContext {
+        branch: matrix::MatrixBranch::Credential,
+        subject: entry,
+        caller: matrix::CallerIdentity {
+            path: "",
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason: "keepass_lookup_failed",
+        facts: &facts,
+    };
     let spool = state.notify();
-    let summary = format!("KeePass 查询失败 :: {entry} :: {detail}");
-    let text = spool.format_notice(matrix::MatrixBranch::Credential, Some(false), &summary);
-    spool.notify_text(text);
+    spool.notify_text(spool.format_notice(&ctx, Some(false)));
 }
 
 pub async fn list_registrations(
@@ -429,11 +476,6 @@ pub async fn register_caller_with_approval(
         }
     };
     let caller_path = view.caller_path.clone();
-    let reg_id = if view.script_hash.is_empty() {
-        caller_path.clone()
-    } else {
-        view.script_hash.clone()
-    };
     // 票面须带上被请求的授权窗口：长度由调用方声明且无上限，不呈现则审批人
     // 无法察觉自己批准的是一次事实上的永久授权。
     let requested_ttl = {
@@ -443,20 +485,31 @@ pub async fn register_caller_with_approval(
             .and_then(|entry| entry.authorized_ttl_secs)
     };
     let window = match requested_ttl {
-        Some(secs) => format!("授权窗口={secs}s"),
-        None => "授权窗口=无期限".to_string(),
+        Some(secs) => format!("{secs}s"),
+        None => "无期限".to_string(),
     };
-    let reason = format!("register审批 :: {reg_id} :: {caller_path} :: {window}");
-    let event_id = match submit_pending_with_branch(
-        state,
-        &caller_path,
-        &reason,
-        matrix::MatrixBranch::Register,
-        "",
-        None,
-    )
-    .await
-    {
+    let subject = if view.name.trim().is_empty() {
+        path_basename(&caller_path)
+    } else {
+        view.name.clone()
+    };
+    let facts = [matrix::Fact {
+        label: "授权窗口",
+        value: window,
+    }];
+    let ctx = matrix::TicketContext {
+        branch: matrix::MatrixBranch::Register,
+        subject: &subject,
+        caller: matrix::CallerIdentity {
+            path: &caller_path,
+            name: (!view.name.trim().is_empty()).then_some(view.name.as_str()),
+            desc: None,
+            enrolled: true,
+        },
+        reason: "register",
+        facts: &facts,
+    };
+    let event_id = match submit_pending_with_branch(state, &caller_path, &ctx).await {
         Ok(event_id) => event_id,
         Err(err) => {
             rollback_registered_entry(state, &caller_path).await;
@@ -516,17 +569,8 @@ pub async fn revoke_caller_with_approval(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     key: &str,
 ) -> Result<RegistrationView> {
-    let caller_path = {
-        let registry = state.registry().read().await;
-        registry
-            .lookup_by_path(key)
-            .or_else(|| registry.lookup_by_hash(key))
-            .or_else(|| registry.lookup_by_name(key))
-            .map(|entry| entry.caller_path.clone())
-            .ok_or_else(|| VeilError::BadRequest {
-                message: format!("调用方不存在: {key}"),
-            })?
-    };
+    let (caller_path, caller_name, caller_desc) = resolve_revoke_target(state, key).await?;
+    let subject = caller_name.clone().unwrap_or_else(|| caller_path.clone());
     let pending_key = format!("revoke:{caller_path}");
     match begin_decision(state, &pending_key) {
         Some(BeginOutcome::Busy) => {
@@ -554,17 +598,19 @@ pub async fn revoke_caller_with_approval(
         }
         Some(BeginOutcome::Reserved) | None => {}
     }
-    let reason = format!("revoke审批 :: {caller_path}");
-    let event_id = match submit_pending_with_branch(
-        state,
-        &caller_path,
-        &reason,
-        matrix::MatrixBranch::Revoke,
-        "",
-        None,
-    )
-    .await
-    {
+    let ctx = matrix::TicketContext {
+        branch: matrix::MatrixBranch::Revoke,
+        subject: &subject,
+        caller: matrix::CallerIdentity {
+            path: &caller_path,
+            name: caller_name.as_deref(),
+            desc: caller_desc.as_deref(),
+            enrolled: true,
+        },
+        reason: "revoke",
+        facts: &[],
+    };
+    let event_id = match submit_pending_with_branch(state, &caller_path, &ctx).await {
         Ok(event_id) => event_id,
         Err(err) => {
             cancel_decision(state, &pending_key);
@@ -635,12 +681,31 @@ pub async fn emergency_revoke(
     // 转常规审批不再裸建单，改走同一决策闭环（批准动作 = 吊销注册）。
     // 决策键由吊销定位键派生，同一请求重试命中同一票；未决不重复建单。
     let pending_key = format!("revoke:{key}");
+    let (caller_path, caller_name, caller_desc, enrolled) =
+        match resolve_revoke_target(state, key).await {
+            Ok(target) => (target.0, target.1, target.2, true),
+            Err(err) => {
+                tracing::warn!("紧急吊销目标未在注册表中，按未注册呈现: key {key} {err}");
+                (key.to_string(), None, None, false)
+            }
+        };
+    let subject = caller_name.as_deref().unwrap_or(&caller_path);
+    let ctx = matrix::TicketContext {
+        branch: matrix::MatrixBranch::Revoke,
+        subject,
+        caller: matrix::CallerIdentity {
+            path: &caller_path,
+            name: caller_name.as_deref(),
+            desc: caller_desc.as_deref(),
+            enrolled,
+        },
+        reason: "emergency_revoke转常规审批",
+        facts: &[],
+    };
     approval_decision_closure(
         state,
         &pending_key,
-        "emergency_revoke转常规审批",
-        "",
-        None,
+        &ctx,
         ClosureLane {
             label: "吊销",
             auto_policy: AutoPolicy::Reject,

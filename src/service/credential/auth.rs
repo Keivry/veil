@@ -8,7 +8,13 @@ use {
         AppStateParts,
         CredentialBody,
         CredentialHeaders,
-        approval::{approval_dual_mode, notify_hash_grace_once},
+        approval::{
+            AUTHORIZATION_EXPIRED_REASON,
+            CredentialApproval,
+            approval_dual_mode,
+            hash_change_fact,
+            notify_hash_grace_once,
+        },
         ratelimit::check_rate,
         vault_ops::query_keepass,
     },
@@ -17,6 +23,7 @@ use {
         config::{AutoApprove, CREDENTIAL_RATE_WINDOW_SECS, EntryMode},
         error::{Result, VeilError},
         registry::CallerEntry,
+        service::matrix::CallerIdentity,
     },
 };
 
@@ -173,8 +180,8 @@ pub(crate) enum CallerLookup {
         hash_grace: bool,
         grace_notify: Option<(String, String, u64)>,
     },
-    /// `caller_path` 命中但哈希失配（未吊销）。
-    HashMismatch,
+    /// `caller_path` 命中但哈希失配（未吊销）；携带命中的注册条目供票面展示 `name`。
+    HashMismatch { entry: crate::registry::CallerEntry },
     /// `caller_path` 未命中、但哈希命中另一注册条目。
     ByHash { entry: crate::registry::CallerEntry },
     /// 注册表无任何匹配。
@@ -224,7 +231,9 @@ pub(crate) async fn resolve_caller(
                 message: "调用方已吊销，拒绝".to_string(),
             });
         }
-        return Ok(CallerLookup::HashMismatch);
+        return Ok(CallerLookup::HashMismatch {
+            entry: caller.clone(),
+        });
     }
     if let Some(caller) = registry.lookup_by_hash(caller_hash) {
         if caller.revoked || !caller.enabled {
@@ -279,6 +288,9 @@ pub async fn handle_credential(
     let mut unenrolled = false;
     // 授权窗口已到期：ACL 通过后覆盖有效 `allow_mode` 为 `Pending`（重新询问，非拒绝）。
     let mut authorization_expired = false;
+    let mut caller_name: Option<String> = None;
+    let mut caller_desc: Option<String> = None;
+    let mut expected_hash: Option<String> = None;
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -294,6 +306,8 @@ pub async fn handle_credential(
                     message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
                 });
             }
+            caller_name = Some(caller.name.clone());
+            caller_desc = Some(caller.description.clone());
             hash_grace = grace;
             grace_notify = notify;
             authorization_expired = authorization_expiry_overrides(&caller, now_secs);
@@ -303,13 +317,20 @@ pub async fn handle_credential(
                 authorization_expired,
             ))
         }
-        CallerLookup::HashMismatch => None,
+        CallerLookup::HashMismatch { entry: caller } => {
+            caller_name = Some(caller.name.clone());
+            caller_desc = Some(caller.description.clone());
+            expected_hash = Some(caller.expected_hash.clone());
+            None
+        }
         CallerLookup::ByHash { entry: caller } => {
             if !caller.check_entry_allowed(&entry, field.as_deref()) {
                 return Err(VeilError::Auth {
                     message: format!("越权：调用方 {caller_path} 未授权访问 {entry}，拒绝"),
                 });
             }
+            caller_name = Some(caller.name.clone());
+            caller_desc = Some(caller.description.clone());
             authorization_expired = authorization_expiry_overrides(&caller, now_secs);
             Some(effective_decision(
                 &caller,
@@ -333,43 +354,44 @@ pub async fn handle_credential(
     )
     .await?;
 
+    let caller = CallerIdentity {
+        path: &caller_path,
+        name: caller_name.as_deref().filter(|name| !name.is_empty()),
+        desc: caller_desc.as_deref().filter(|desc| !desc.is_empty()),
+        enrolled: !unenrolled,
+    };
+    let approval = |reason: &'static str| {
+        let mut req = CredentialApproval::new(
+            &pending_key,
+            &caller_path,
+            reason,
+            &entry,
+            field.as_deref(),
+            use_token,
+        )
+        .with_caller(caller);
+        if let Some(expected) = expected_hash
+            .as_deref()
+            .filter(|_| reason == "hash_mismatch")
+        {
+            req = req.with_facts(hash_change_fact(expected, &caller_hash));
+        }
+        req
+    };
+
     // 未注册调用方默认转审批（显式 `Deny` 才拒绝），不因全局默认放行取值直接放行。
     if unenrolled {
         return match state.config().auto_approve {
             AutoApprove::Deny => Err(VeilError::Auth {
                 message: "未注册调用方且自动放行=False，拒绝".to_string(),
             }),
-            _ => {
-                approval_dual_mode(
-                    state,
-                    &super::approval::CredentialApproval {
-                        key: &pending_key,
-                        caller_path: &caller_path,
-                        reason: "unenrolled_default_pending",
-                        entry: &entry,
-                        field: field.as_deref(),
-                        use_token,
-                    },
-                )
-                .await
-            }
+            _ => approval_dual_mode(state, &approval("unenrolled_default_pending")).await,
         };
     }
 
     match decision {
         None => {
-            return approval_dual_mode(
-                state,
-                &super::approval::CredentialApproval {
-                    key: &pending_key,
-                    caller_path: &caller_path,
-                    reason: "hash_mismatch",
-                    entry: &entry,
-                    field: field.as_deref(),
-                    use_token,
-                },
-            )
-            .await;
+            return approval_dual_mode(state, &approval("hash_mismatch")).await;
         }
         Some(AutoApprove::Deny) => {
             return Err(VeilError::Auth {
@@ -378,22 +400,11 @@ pub async fn handle_credential(
         }
         Some(AutoApprove::Pending) => {
             let reason = if authorization_expired {
-                super::approval::AUTHORIZATION_EXPIRED_REASON
+                AUTHORIZATION_EXPIRED_REASON
             } else {
                 "auto_approve_none"
             };
-            return approval_dual_mode(
-                state,
-                &super::approval::CredentialApproval {
-                    key: &pending_key,
-                    caller_path: &caller_path,
-                    reason,
-                    entry: &entry,
-                    field: field.as_deref(),
-                    use_token,
-                },
-            )
-            .await;
+            return approval_dual_mode(state, &approval(reason)).await;
         }
         Some(_) => {}
     }

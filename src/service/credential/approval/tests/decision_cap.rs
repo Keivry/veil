@@ -163,14 +163,14 @@ async fn decision_table_begin_saturated_429() {
 
     let new_err = approval_async_202(
         &state,
-        &CredentialApproval {
-            key: "/s/sat-new.sh:badhash",
-            caller_path: "/s/sat-new.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+        &CredentialApproval::new(
+            "/s/sat-new.sh:badhash",
+            "/s/sat-new.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
     )
     .await
     .unwrap_err();
@@ -195,14 +195,14 @@ async fn decision_table_begin_saturated_429() {
 
     let busy_err = approval_async_202(
         &state,
-        &CredentialApproval {
-            key: "sat-0",
-            caller_path: "/s/sat-0.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+        &CredentialApproval::new(
+            "sat-0",
+            "/s/sat-0.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
     )
     .await
     .unwrap_err();

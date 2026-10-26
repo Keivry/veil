@@ -14,13 +14,14 @@
 //! `main` 启动 `spawn_sweeper` 常驻清扫 +
 //! `MatrixBot::spawn_sync_loop` 常驻同步（since 持久化 + 指数退避 + 启动时间戳过滤）。
 //!
-//! 子模块划分：`branch` 分支/白名单/reaction 纯函数，`approval` 审批网关，
-//! `bot` 长轮询 Bot；旧路径经重导出兼容，对外 `service::matrix::*` 不变。
+//! 子模块划分：`branch` 分支/白名单/reaction 纯函数，`ticket` 票面/通知渲染，
+//! `approval` 审批网关，`bot` 长轮询 Bot；旧路径经重导出兼容，对外 `service::matrix::*` 不变。
 
 pub mod approval;
 pub mod bot;
 pub mod branch;
 pub mod cleanup;
 pub mod notify;
+pub mod ticket;
 
-pub use {approval::*, bot::*, branch::*, cleanup::*, notify::*};
+pub use {approval::*, bot::*, branch::*, cleanup::*, notify::*, ticket::*};

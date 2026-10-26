@@ -4,7 +4,6 @@ use {
     super::{
         approval::MatrixApproval,
         branch::{
-            MatrixBranch,
             ReactionInput,
             ReactionOutcome,
             SYNC_TIMEOUT_MS,
@@ -17,6 +16,7 @@ use {
             sync_request_timeout,
         },
         cleanup::GatewayCleanup,
+        ticket::{self, TicketContext},
     },
     std::{path::PathBuf, sync::Arc, time::Duration},
 };
@@ -51,63 +51,13 @@ impl MatrixBot {
 
     fn auth_header(&self) -> String { format!("Bearer {}", self.access_token) }
 
-    fn branch_name(branch: MatrixBranch) -> &'static str {
-        match branch {
-            MatrixBranch::Register => "注册",
-            MatrixBranch::HashChange => "哈希变更",
-            MatrixBranch::Credential => "凭据",
-            MatrixBranch::Command => "命令",
-            MatrixBranch::Audit => "审计",
-            MatrixBranch::Revoke => "吊销",
-            MatrixBranch::Unknown => "未知分支（已忽略）",
-        }
-    }
+    /// 建单消息正文：排版全部委托 [`super::ticket::render_ticket`]，
+    /// 房间号仅用于发送 URL，SHALL NOT 进入正文。
+    pub fn format_ticket(&self, ctx: &TicketContext) -> String { ticket::render_ticket(ctx) }
 
-    /// 建单分支的 reaction 图例；`HashChange`/`Audit` 仅为原因分类标签，
-    /// 不建票也无图例（空串由 `format_ticket` 省略整行）。
-    fn reaction_legend(branch: MatrixBranch) -> &'static str {
-        match branch {
-            MatrixBranch::Register => "✅ 激活（保留注册声明）/ ♾️ 激活并持久放行 / ❎ 吊销",
-            MatrixBranch::Command => "✅ 批准本次 / ♾️ 批准并持久放行 / ❎ 拒绝",
-            MatrixBranch::Revoke => "✅ 执行吊销 / ❎ 不吊销",
-            MatrixBranch::Credential => "✅ 批准本次 / ❎ 拒绝",
-            MatrixBranch::HashChange | MatrixBranch::Audit | MatrixBranch::Unknown => "",
-        }
-    }
-
-    /// 建单消息正文：分支 + 待审标识 + 脱敏摘要 + 该分支 reaction 图例。
-    /// 无图例的原因标签分支不追加空的"可选反应"行。
-    pub fn format_ticket(&self, branch: MatrixBranch, summary: &str) -> String {
-        let clean = crate::service::audit::sanitize_for_log(summary);
-        let head = format!(
-            "{} [{}] {} :: {clean}",
-            branch.status_emoji_pending(),
-            Self::branch_name(branch),
-            self.room_id
-        );
-        let legend = Self::reaction_legend(branch);
-        let tail = (!legend.is_empty()).then(|| format!("\n可选反应：{legend}"));
-        format!("{head}{}", tail.unwrap_or_default())
-    }
-
-    /// 无票通知正文（哈希变更/失败 spool）：分支 + 状态标识 + 脱敏摘要，不含图例。
-    pub fn format_notice(
-        &self,
-        branch: MatrixBranch,
-        approved: Option<bool>,
-        summary: &str,
-    ) -> String {
-        let mark = match approved {
-            Some(true) => branch.status_emoji_approved(),
-            Some(false) => branch.status_emoji_rejected(),
-            None => branch.status_emoji_pending(),
-        };
-        let clean = crate::service::audit::sanitize_for_log(summary);
-        format!(
-            "{mark} [{name}] {room} :: {clean}",
-            name = Self::branch_name(branch),
-            room = self.room_id
-        )
+    /// 无票通知正文：同骨架、无图例，房间号同样不进入正文。
+    pub fn format_notice(&self, ctx: &TicketContext, approved: Option<bool>) -> String {
+        ticket::render_notice(ctx, approved)
     }
 
     /// 发送房间文本消息（发送失败返回 Err，调用方按审批超时路径默认拒绝）。
@@ -550,16 +500,41 @@ fn url_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod bot_tests {
-    use super::*;
+    use {
+        super::*,
+        crate::service::matrix::{MatrixBranch, ticket::CallerIdentity},
+    };
+
+    fn ctx<'a>(branch: MatrixBranch, subject: &'a str, reason: &'a str) -> TicketContext<'a> {
+        TicketContext {
+            branch,
+            subject,
+            caller: CallerIdentity {
+                path: "/s/a.sh",
+                name: None,
+                desc: None,
+                enrolled: false,
+            },
+            reason,
+            facts: &[],
+        }
+    }
 
     #[test]
-    fn approval_summary_contains_no_plaintext() {
+    fn notice_contains_no_plaintext() {
         let bot = MatrixBot::new(
             "https://m.example.com".to_string(),
             "!r:example.com".to_string(),
             "tok".to_string(),
         );
-        let msg = bot.format_notice(MatrixBranch::Audit, None, r#"rm -rf / password=hunter2"#);
+        let msg = bot.format_notice(
+            &ctx(
+                MatrixBranch::HashChange,
+                "rm -rf / password=hunter2",
+                "hash_mismatch",
+            ),
+            None,
+        );
         assert!(msg.contains("⏳"), "{msg}");
         assert!(!msg.contains("hunter2"), "{msg}");
     }
@@ -651,22 +626,6 @@ mod bot_tests {
     }
 
     #[test]
-    fn hash_change_has_no_ticket_legend_but_keeps_notice_branch_name() {
-        let bot = MatrixBot::new(
-            "https://m.example.com".into(),
-            "!r:example.com".into(),
-            "tok".into(),
-        );
-        let ticket = bot.format_ticket(MatrixBranch::HashChange, "摘要");
-        assert!(
-            !ticket.contains('♾') && !ticket.contains("可选反应"),
-            "{ticket}"
-        );
-        let notice = bot.format_notice(MatrixBranch::HashChange, None, "摘要");
-        assert!(notice.contains("哈希变更"), "{notice}");
-    }
-
-    #[test]
     fn sync_parses_reactions_and_text_filtering_other_rooms() {
         let sync = serde_json::json!({
             "next_batch": "s1",
@@ -739,32 +698,47 @@ mod bot_tests {
             "!r:example.com".to_string(),
             "tok".to_string(),
         );
-        for (branch, name) in [
-            (MatrixBranch::Register, "注册"),
+        for (branch, title) in [
+            (MatrixBranch::Register, "注册请求"),
             (MatrixBranch::HashChange, "哈希变更"),
-            (MatrixBranch::Credential, "凭据"),
-            (MatrixBranch::Command, "命令"),
-            (MatrixBranch::Audit, "审计"),
-            (MatrixBranch::Revoke, "吊销"),
+            (MatrixBranch::Credential, "凭据取用失败"),
+            (MatrixBranch::Command, "命令请求"),
+            (MatrixBranch::Revoke, "吊销请求"),
         ] {
-            let pending = bot.format_notice(branch, None, "rm -rf / password=hunter2");
-            assert!(pending.contains("⏳"), "{pending}");
-            assert!(pending.contains(name), "{pending}");
-            assert!(pending.contains("!r:example.com"), "{pending}");
+            let notice = |approved| {
+                bot.format_notice(
+                    &ctx(branch, "密码 password=hunter2", "auto_approve_none"),
+                    approved,
+                )
+            };
+            let pending = notice(None);
+            assert!(pending.contains('⏳'), "{pending}");
+            assert!(pending.contains(title), "{pending}");
             assert!(!pending.contains("hunter2"), "{pending}");
-            let ok = bot.format_notice(branch, Some(true), "secret=hunter2");
-            assert!(ok.contains("✅") && ok.contains(name), "{ok}");
-            assert!(!ok.contains("hunter2"), "{ok}");
-            let no = bot.format_notice(branch, Some(false), "token=hunter2");
-            assert!(no.contains("❎") && no.contains(name), "{no}");
-            assert!(!no.contains("hunter2"), "{no}");
+            assert!(!pending.contains("!r:example.com"), "{pending}");
+            assert!(!pending.contains("可选反应"), "{pending}");
+            assert!(notice(Some(true)).contains('✅'), "{branch:?}");
+            assert!(notice(Some(false)).contains('❎'), "{branch:?}");
         }
-        let ticket = bot.format_ticket(MatrixBranch::Register, "注册 :: /s/a.sh");
-        assert!(
-            ticket.contains("可选反应") && ticket.contains("♾️"),
-            "{ticket}"
-        );
-        let notice = bot.format_notice(MatrixBranch::Register, None, "注册 :: /s/a.sh");
+        for branch in [MatrixBranch::Audit, MatrixBranch::Unknown] {
+            let notice = bot.format_notice(&ctx(branch, "摘要", "audit-hold"), None);
+            assert!(notice.is_empty(), "{branch:?} 无通知路径: {notice}");
+        }
+        let ticket = bot.format_ticket(&ctx(MatrixBranch::Register, "构建脚本", "register"));
+        assert!(ticket.contains("♾️"), "{ticket}");
+        assert!(!ticket.contains("!r:example.com"), "{ticket}");
+        assert!(!ticket.contains("可选反应"), "{ticket}");
+        assert!(!ticket.contains("::"), "{ticket}");
+        let notice = bot.format_notice(&ctx(MatrixBranch::Register, "构建脚本", "register"), None);
         assert!(!notice.contains("可选反应"), "{notice}");
+        assert!(!notice.contains("♾️"), "{notice}");
+        let hash_change = ctx(MatrixBranch::HashChange, "摘要", "hash_mismatch");
+        assert!(
+            bot.format_ticket(&hash_change).is_empty(),
+            "HashChange 不建票"
+        );
+        let notice = bot.format_notice(&hash_change, None);
+        assert!(notice.contains("哈希变更"), "{notice}");
+        assert!(!notice.contains("!r:example.com"), "{notice}");
     }
 }

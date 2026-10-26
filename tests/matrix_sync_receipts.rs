@@ -30,6 +30,7 @@ use {
         time::Duration,
     },
     veil::service::matrix::{
+        CallerIdentity,
         FixedCleanup,
         GatewayCleanup,
         LockCleanupReport,
@@ -37,6 +38,7 @@ use {
         MatrixBot,
         MatrixBranch,
         ReactionOutcome,
+        TicketContext,
     },
 };
 
@@ -487,7 +489,8 @@ async fn receipt_copy_distinguishes_not_accepted_from_unknown() {
     assert_ne!(not_accepted, unknown);
 }
 
-/// 四类建单消息各自带本分支图例；吊销票图例不含 `♾️`（不受理时不诱导点选）。
+/// 四类建单消息各自带本分支图例（动作短句，无「可选反应」字段名）；
+/// 吊销票图例不含 `♾️`（不受理时不诱导点选），且正文不含房间号与调用方哈希。
 #[test]
 fn ticket_legends_name_each_branch_action() {
     let bot = MatrixBot::new(
@@ -495,6 +498,18 @@ fn ticket_legends_name_each_branch_action() {
         "!r:example.com".to_string(),
         "tok".to_string(),
     );
+    let ticket = |branch, subject: &'static str, reason| TicketContext {
+        branch,
+        subject,
+        caller: CallerIdentity {
+            path: "/s/a.sh",
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason,
+        facts: &[],
+    };
     for (branch, needles) in [
         (
             MatrixBranch::Register,
@@ -507,21 +522,24 @@ fn ticket_legends_name_each_branch_action() {
         (MatrixBranch::Revoke, vec!["执行吊销", "不吊销"]),
         (MatrixBranch::Credential, vec!["批准本次", "拒绝"]),
     ] {
-        let ticket = bot.format_ticket(branch, "摘要");
-        assert!(ticket.contains("可选反应"), "{branch:?} 缺图例: {ticket}");
+        let text = bot.format_ticket(&ticket(branch, "和风天气 / 授权码", "auto_approve_none"));
         for needle in needles {
             assert!(
-                ticket.contains(needle),
-                "{branch:?} 图例缺 {needle:?}: {ticket}"
+                text.contains(needle),
+                "{branch:?} 图例缺 {needle:?}: {text}"
             );
         }
+        assert!(!text.contains("可选反应"), "{branch:?}: {text}");
+        assert!(!text.contains("!r:example.com"), "{branch:?}: {text}");
+        assert!(!text.contains("sha256:"), "{branch:?}: {text}");
     }
-    let revoke_ticket = bot.format_ticket(MatrixBranch::Revoke, "吊销 :: /s/a.sh");
+    let revoke_ticket = bot.format_ticket(&ticket(MatrixBranch::Revoke, "构建脚本", "revoke"));
     assert!(
         !revoke_ticket.contains('♾'),
         "吊销票图例不得出现 ♾️: {revoke_ticket}"
     );
-    let credential_ticket = bot.format_ticket(MatrixBranch::Credential, "取用 :: 网易");
+    let credential_ticket =
+        bot.format_ticket(&ticket(MatrixBranch::Credential, "网易", "hash_mismatch"));
     assert!(
         !credential_ticket.contains('♾'),
         "凭据票图例不得出现 ♾️: {credential_ticket}"

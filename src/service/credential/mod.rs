@@ -330,11 +330,12 @@ pub(crate) mod test_support {
     }
 
     /// 测试注入 sink：成功返回自增真实 id（`$test-event-{n}`），失败返回 `None`。
-    /// 默认注入成功 sink，避免审批建单触发真实网络；失败分支供 fail-closed 断言。
+    /// tracked 正文留存在 `texts()`，供票面文案断言。
     #[derive(Debug)]
     pub(crate) struct InjectSink {
         next: AtomicU64,
         fail: bool,
+        texts: std::sync::Mutex<Vec<String>>,
     }
 
     impl InjectSink {
@@ -342,6 +343,7 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 next: AtomicU64::new(1),
                 fail: false,
+                texts: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -349,7 +351,15 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 next: AtomicU64::new(1),
                 fail: true,
+                texts: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        pub(crate) fn texts(&self) -> Vec<String> {
+            self.texts
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -360,8 +370,11 @@ pub(crate) mod test_support {
 
         fn send_text_tracked(
             &self,
-            _text: String,
+            text: String,
         ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+            if let Ok(mut guard) = self.texts.lock() {
+                guard.push(text);
+            }
             let id = (!self.fail)
                 .then(|| format!("$test-event-{}", self.next.fetch_add(1, Ordering::SeqCst)));
             Box::pin(async move { id })

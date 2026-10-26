@@ -5,7 +5,12 @@
 //! 且审批不绕过 `allow_commands` 与目标范围校验。
 
 use {
-    super::{ExecutionEntry, PendingInvocation, execution_record_ttl},
+    super::{
+        ExecutionEntry,
+        PendingInvocation,
+        execution_record_ttl,
+        ticket::{approval_message, command_ticket_parts},
+    },
     crate::{
         config::{CommandDef, ParameterKind, command::placeholders},
         error::{Result, VeilError},
@@ -15,11 +20,10 @@ use {
                 AuthBlock,
                 CredentialBody,
                 CredentialHeaders,
-                approval::{clear_terminal_pending, submit_pending_with_summary},
+                approval::{clear_terminal_pending, submit_pending_with_branch},
                 auth::{CallerLookup, effective_caller, resolve_caller},
                 ratelimit::check_rate,
             },
-            matrix::MatrixBranch,
         },
     },
     serde::Deserialize,
@@ -166,7 +170,11 @@ fn deny(message: impl Into<String>) -> VeilError {
 struct CallerContext {
     caller_path: String,
     caller_hash: String,
+    /// 命中注册条目且启用：自动放行与命令目录的准入依据。
     registered: bool,
+    /// 注册表认得该调用方（含哈希变更、按哈希命中）；仅用于票面措辞，
+    /// 不参与准入——准入一律看 `registered`。
+    known_entry: bool,
 }
 
 async fn authenticate(
@@ -177,10 +185,12 @@ async fn authenticate(
     crate::service::credential::verify_three_factor_write(state, headers, body).await?;
     let (caller_hash, caller_path) = effective_caller(headers, body);
     let lookup = resolve_caller(state, &caller_path, &caller_hash).await?;
+    let known_entry = !matches!(lookup, CallerLookup::Unknown);
     Ok(CallerContext {
         caller_path,
         caller_hash,
         registered: matches!(lookup, CallerLookup::Enrolled { .. }),
+        known_entry,
     })
 }
 
@@ -355,22 +365,15 @@ pub async fn invoke(
         return Ok(InvokeResult::Terminal(terminal));
     }
 
-    let summary = approval_message(
+    let parts = command_ticket_parts(command_id, &host, &argv, def.timeout_secs);
+    let ctx = approval_message(
+        &parts,
         &caller.caller_path,
-        command_id,
-        &host,
-        &argv,
-        def.timeout_secs,
+        Some(downstream_name),
+        caller.known_entry,
     );
     let pending_key = format!("command:{key}");
-    let event_id = submit_pending_with_summary(
-        state,
-        &pending_key,
-        "command_invoke",
-        MatrixBranch::Command,
-        &summary,
-    )
-    .await?;
+    let event_id = submit_pending_with_branch(state, &pending_key, &ctx).await?;
     let pending = Arc::new(PendingInvocation {
         event_id: event_id.clone(),
         pending_key,
@@ -407,18 +410,6 @@ pub async fn invoke(
         message: "命令调用待审批".to_string(),
         approval_event_id: event_id,
     })
-}
-
-fn approval_message(
-    caller_path: &str,
-    command_id: &str,
-    host: &str,
-    argv: &[String],
-    timeout_secs: u64,
-) -> String {
-    format!(
-        "command :: {caller_path} :: {command_id}@{host} :: argv={argv:?} :: timeout={timeout_secs}s"
-    )
 }
 
 fn validate_params(
@@ -597,6 +588,7 @@ async fn complete(
             caller_path: pending.caller_path.clone(),
             caller_hash: pending.caller_hash.clone(),
             registered: true,
+            known_entry: true,
         },
         &pending.downstream,
         &pending.command_id,
@@ -734,24 +726,4 @@ fn now_secs() -> i64 {
 fn invocation_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     format!("inv-{}-{}", now_secs(), SEQ.fetch_add(1, Ordering::Relaxed))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn approval_message_carries_identity_command_host_argv_timeout() {
-        let text = approval_message(
-            "/opt/ci/agent.sh",
-            "deploy",
-            "api",
-            &["--target".to_string(), "api".to_string()],
-            30,
-        );
-        assert!(text.contains("/opt/ci/agent.sh"), "{text}");
-        assert!(text.contains("deploy@api"), "{text}");
-        assert!(text.contains("--target"), "{text}");
-        assert!(text.contains("timeout=30s"), "{text}");
-    }
 }

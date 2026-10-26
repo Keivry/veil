@@ -2,7 +2,7 @@ use {
     super::super::submit_pending_with_branch,
     crate::service::{
         credential::test_support::{cred_env, cred_state_with_sink},
-        matrix::{MatrixBranch, NotificationSink},
+        matrix::{CallerIdentity, MatrixBranch, NotificationSink, TicketContext},
     },
     std::{
         future::Future,
@@ -13,6 +13,21 @@ use {
         },
     },
 };
+
+fn ticket<'a>(branch: MatrixBranch, reason: &'a str, subject: &'a str) -> TicketContext<'a> {
+    TicketContext {
+        branch,
+        subject,
+        caller: CallerIdentity {
+            path: "/s/preseed.sh",
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason,
+        facts: &[],
+    }
+}
 
 /// 测试 sink：统计预置 reaction 次数，可模拟 reaction 发送失败。
 #[derive(Debug)]
@@ -68,10 +83,7 @@ async fn approval_reaction_preseed() {
     submit_pending_with_branch(
         &state,
         "/s/pre-reg.sh",
-        "register审批",
-        MatrixBranch::Register,
-        "",
-        None,
+        &ticket(MatrixBranch::Register, "register", "构建脚本"),
     )
     .await
     .unwrap();
@@ -79,10 +91,7 @@ async fn approval_reaction_preseed() {
     submit_pending_with_branch(
         &state,
         "/s/pre-revoke.sh",
-        "revoke审批",
-        MatrixBranch::Revoke,
-        "",
-        None,
+        &ticket(MatrixBranch::Revoke, "revoke", "构建脚本"),
     )
     .await
     .unwrap();
@@ -90,10 +99,7 @@ async fn approval_reaction_preseed() {
     submit_pending_with_branch(
         &state,
         "/s/pre-cred.sh",
-        "hash_mismatch",
-        MatrixBranch::Credential,
-        "网易",
-        None,
+        &ticket(MatrixBranch::Credential, "hash_mismatch", "网易"),
     )
     .await
     .unwrap();
@@ -101,10 +107,7 @@ async fn approval_reaction_preseed() {
     let err = submit_pending_with_branch(
         &state,
         "/s/pre-hash.sh",
-        "hash-change",
-        MatrixBranch::HashChange,
-        "",
-        None,
+        &ticket(MatrixBranch::HashChange, "hash-change", ""),
     )
     .await
     .expect_err("HashChange 仅为分类标签，不得建票");
@@ -113,10 +116,7 @@ async fn approval_reaction_preseed() {
     let err = submit_pending_with_branch(
         &state,
         "/s/pre-audit.sh",
-        "audit-hold",
-        MatrixBranch::Audit,
-        "",
-        None,
+        &ticket(MatrixBranch::Audit, "audit-hold", ""),
     )
     .await
     .expect_err("Audit 仅为分类标签，不得建票");
@@ -132,10 +132,7 @@ async fn reaction_preseed_failure_warns() {
     let id = submit_pending_with_branch(
         &state,
         "/s/pre-fail.sh",
-        "register审批",
-        MatrixBranch::Register,
-        "",
-        None,
+        &ticket(MatrixBranch::Register, "register", "构建脚本"),
     )
     .await
     .expect("预置 reaction 失败不得阻断建单");

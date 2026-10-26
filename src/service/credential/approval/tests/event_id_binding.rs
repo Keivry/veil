@@ -10,11 +10,33 @@ use {
                 revoke_caller_with_approval,
                 test_support::*,
             },
-            matrix::{MatrixBranch, ReactionInput, ReactionOutcome, ResolveOutcome},
+            matrix::{
+                CallerIdentity,
+                MatrixBranch,
+                ReactionInput,
+                ReactionOutcome,
+                ResolveOutcome,
+                TicketContext,
+            },
         },
     },
     axum::http::StatusCode,
 };
+
+fn ticket<'a>(branch: MatrixBranch, reason: &'a str, path: &'a str) -> TicketContext<'a> {
+    TicketContext {
+        branch,
+        subject: "网易",
+        caller: CallerIdentity {
+            path,
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason,
+        facts: &[],
+    }
+}
 
 #[tokio::test]
 async fn approval_send_failure_fail_closed() {
@@ -81,9 +103,7 @@ async fn approval_pending_uses_real_event_id() {
     let event_id = submit_pending(
         &state,
         "/s/real.sh:h",
-        "hash_mismatch",
-        "网易",
-        Some("授权码"),
+        &ticket(MatrixBranch::Credential, "hash_mismatch", "/s/real.sh"),
     )
     .await
     .unwrap();
@@ -122,7 +142,7 @@ async fn audit_and_hash_labels_never_create_tickets() {
             MatrixBranch::HashChange,
         ),
     ] {
-        let err = submit_pending_with_branch(&state, key, reason, branch, "", None)
+        let err = submit_pending_with_branch(&state, key, &ticket(branch, reason, "/s/label.sh"))
             .await
             .expect_err("分类标签不得建票");
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
@@ -130,7 +150,7 @@ async fn audit_and_hash_labels_never_create_tickets() {
             state.approval.pending_event_ids().await.is_empty(),
             "{branch:?} 不得产生 Matrix 票"
         );
-        let err = submit_pending(&state, key, reason, "", None)
+        let err = submit_pending(&state, key, &ticket(branch, reason, "/s/label.sh"))
             .await
             .expect_err("原因串分类得到的标签不得建票");
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
@@ -146,30 +166,21 @@ async fn approval_reaction_three_state_and_timeout() {
     let approve_id = submit_pending_with_branch(
         &state,
         "/s/a.sh:h",
-        "hash_mismatch",
-        MatrixBranch::Credential,
-        "网易",
-        Some("授权码"),
+        &ticket(MatrixBranch::Credential, "hash_mismatch", "/s/a.sh"),
     )
     .await
     .unwrap();
     let reject_id = submit_pending_with_branch(
         &state,
         "/s/b.sh:h",
-        "hash_mismatch",
-        MatrixBranch::Credential,
-        "网易",
-        Some("授权码"),
+        &ticket(MatrixBranch::Credential, "hash_mismatch", "/s/b.sh"),
     )
     .await
     .unwrap();
     let auto_id = submit_pending_with_branch(
         &state,
         "/s/c.sh",
-        "register审批",
-        MatrixBranch::Register,
-        "",
-        None,
+        &ticket(MatrixBranch::Register, "register", "/s/c.sh"),
     )
     .await
     .unwrap();
@@ -231,10 +242,7 @@ async fn approval_reaction_three_state_and_timeout() {
     let timeout_id = submit_pending_with_branch(
         &state,
         "/s/d.sh:h",
-        "hash_mismatch",
-        MatrixBranch::Credential,
-        "网易",
-        Some("授权码"),
+        &ticket(MatrixBranch::Credential, "hash_mismatch", "/s/d.sh"),
     )
     .await
     .unwrap();

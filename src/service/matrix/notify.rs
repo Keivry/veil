@@ -4,9 +4,12 @@
 //! 有界 `tokio::sync::mpsc` 队列 + 常驻消费者（`JoinHandle` 由本结构持有，
 //! 停机 `shutdown` abort 口径明确）。`notify_text` 走 `try_send`，满队列或
 //! 消费者已停即丢弃并计数 + warn，不阻塞请求热路径（best-effort 语义不变）。
+//!
+//! 正文排版归 [`super::ticket`]：本层只把 [`TicketContext`] 透传给 `MatrixBot`，
+//! 不再接受自由拼接的摘要串。
 
 use {
-    super::{MatrixBot, MatrixBranch},
+    super::{MatrixBot, ticket::TicketContext},
     std::{
         fmt,
         future::Future,
@@ -140,7 +143,7 @@ impl NotificationSpool {
         Self::with_sink(bot, sink, capacity)
     }
 
-    /// 可注入 sink（测试用）：`bot` 仅承担 `format_ticket`，发送走 `sink`。
+    /// 可注入 sink（测试用）：`bot` 仅承担票面渲染，发送走 `sink`。
     pub fn with_sink(
         bot: Arc<MatrixBot>,
         sink: Arc<dyn NotificationSink>,
@@ -161,19 +164,12 @@ impl NotificationSpool {
 
     pub fn capacity(&self) -> usize { self.capacity }
 
-    /// 建单正文（含该分支 reaction 图例）。
-    pub fn format_ticket(&self, branch: MatrixBranch, summary: &str) -> String {
-        self.bot.format_ticket(branch, summary)
-    }
+    /// 建单正文（含该分支 reaction 图例），排版委托 `ticket`。
+    pub fn format_ticket(&self, ctx: &TicketContext<'_>) -> String { self.bot.format_ticket(ctx) }
 
-    /// 无票通知正文（不含图例）。
-    pub fn format_notice(
-        &self,
-        branch: MatrixBranch,
-        approved: Option<bool>,
-        summary: &str,
-    ) -> String {
-        self.bot.format_notice(branch, approved, summary)
+    /// 无票通知正文（不含图例），排版委托 `ticket`。
+    pub fn format_notice(&self, ctx: &TicketContext<'_>, approved: Option<bool>) -> String {
+        self.bot.format_notice(ctx, approved)
     }
 
     /// 审批建单专用 tracked 发送：直接 `await` sink 取真实 event id，`None` 即发送失败。

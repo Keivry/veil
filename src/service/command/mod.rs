@@ -4,6 +4,7 @@ pub mod api;
 pub mod exec;
 pub mod grants;
 pub mod log_store;
+pub(crate) mod ticket;
 
 use {
     super::RateTable,

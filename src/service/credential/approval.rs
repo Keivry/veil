@@ -6,7 +6,10 @@
 
 use {
     super::{
-        super::matrix,
+        super::{
+            audit::sanitize_for_log,
+            matrix::{self, CallerIdentity, Fact, MatrixBranch, TicketContext},
+        },
         AppStateParts,
         vault_ops::{self, query_keepass},
     },
@@ -24,6 +27,27 @@ use {
 /// 授权到期建票的原因标签：该原因的票在批准后须刷新授权窗口（续期）。
 pub(crate) const AUTHORIZATION_EXPIRED_REASON: &str = "authorization_expired";
 
+/// 凭据票的请求对象：`{entry} / {field}`，缺字段时仅 `{entry}`。
+pub(crate) fn credential_subject(entry: &str, field: Option<&str>) -> String {
+    let entry = entry.trim();
+    match field.map(str::trim).filter(|field| !field.is_empty()) {
+        Some(field) if !entry.is_empty() => format!("{entry} / {field}"),
+        _ => entry.to_string(),
+    }
+}
+
+/// 哈希变更票的唯一事实行：期望 → 实际（各自 8 位短前缀）。
+pub(crate) fn hash_change_fact<'a>(expected: &str, actual: &str) -> Vec<Fact<'a>> {
+    vec![Fact {
+        label: "哈希",
+        value: format!(
+            "{} → {}",
+            matrix::short_hash(expected),
+            matrix::short_hash(actual)
+        ),
+    }]
+}
+
 /// 一次凭据审批请求的上下文（双模入口共用，避免长参数列表）。
 pub(crate) struct CredentialApproval<'a> {
     pub key: &'a str,
@@ -33,6 +57,60 @@ pub(crate) struct CredentialApproval<'a> {
     pub entry: &'a str,
     pub field: Option<&'a str>,
     pub use_token: bool,
+    pub caller: CallerIdentity<'a>,
+    pub subject: String,
+    pub facts: Vec<Fact<'a>>,
+}
+
+impl<'a> CredentialApproval<'a> {
+    pub(crate) fn new(
+        key: &'a str,
+        caller_path: &'a str,
+        reason: &'a str,
+        entry: &'a str,
+        field: Option<&'a str>,
+        use_token: bool,
+    ) -> Self {
+        Self {
+            key,
+            caller_path,
+            reason,
+            entry,
+            field,
+            use_token,
+            caller: CallerIdentity {
+                path: caller_path,
+                name: None,
+                desc: None,
+                enrolled: false,
+            },
+            subject: credential_subject(entry, field),
+            facts: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_caller(mut self, caller: CallerIdentity<'a>) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    pub(crate) fn with_facts(mut self, facts: Vec<Fact<'a>>) -> Self {
+        if !facts.is_empty() {
+            self.facts = facts;
+        }
+        self
+    }
+
+    /// 渲染上下文：`subject`/`facts` 由本结构持有，借用期与 `self` 同寿。
+    pub(crate) fn ticket(&self) -> TicketContext<'_> {
+        TicketContext {
+            branch: MatrixBranch::Credential,
+            subject: self.subject.as_str(),
+            caller: self.caller,
+            reason: self.reason,
+            facts: &self.facts,
+        }
+    }
 }
 
 /// 宽限通知去重上限（进程级，防无界增长；容量触发 TTL 清扫 + 逐出最小 `expires_at`）。
@@ -75,23 +153,6 @@ fn first_grace_notification(dedup_key: &str, expires_at: u64, now_secs: u64) -> 
     true
 }
 
-/// 审批摘要 = 机器可读原因 + 调用方键 + 条目/字段元数据。
-/// 仅接收调用元数据，不接收凭据明文/部署 Secret，敏感值不落消息。
-pub(crate) fn approval_summary(
-    reason: &str,
-    key: &str,
-    entry: &str,
-    field: Option<&str>,
-) -> String {
-    let entry = entry.trim();
-    let field = field.map(str::trim).filter(|f| !f.is_empty());
-    match (entry.is_empty(), field) {
-        (false, Some(field)) => format!("{reason} :: {key} :: {entry}/{field}"),
-        (false, None) => format!("{reason} :: {key} :: {entry}"),
-        (true, _) => format!("{reason} :: {key}"),
-    }
-}
-
 /// 统一终态清理——同时清内存侧 `PendingApprovals`（health `pending` 计数来源）
 /// 与矩阵侧票，使 `GET /health pending` 在批准/拒绝/超时后即时归零，不等 60s 清扫。
 pub(crate) async fn clear_terminal_pending(state: &impl AppStateParts, key: &str, event_id: &str) {
@@ -108,28 +169,32 @@ fn matrix_disabled_error(state: &impl AppStateParts) -> VeilError {
     }
 }
 
+/// 建单（原因串分类入口）：`reason` 决定分支，票面上下文提供了请求对象与调用方。
 pub(crate) async fn submit_pending(
     state: &impl AppStateParts,
     key: &str,
-    reason: &str,
-    entry: &str,
-    field: Option<&str>,
+    ctx: &TicketContext<'_>,
 ) -> Result<String> {
-    let branch = matrix::MatrixBranch::from_reason(reason)
+    let branch = matrix::MatrixBranch::from_reason(ctx.reason)
         .map_err(|message| VeilError::BadRequest { message })?;
     if !branch.is_known() {
         return Err(VeilError::BadRequest {
-            message: format!("审批原因无法分类，按拒绝 fail-closed: {reason}"),
+            message: format!("审批原因无法分类，按拒绝 fail-closed: {}", ctx.reason),
         });
     }
     if !branch.is_matrix_order_branch() {
         return Err(VeilError::BadRequest {
             message: format!(
-                "审批原因被分类为 HashChange/Audit 标签，该标签不建 Matrix 票（仅用于原因串分类与文案），按拒绝 fail-closed: {reason}"
+                "审批原因被分类为 HashChange/Audit 标签，该标签不建 Matrix 票（仅用于原因串分类与文案），按拒绝 fail-closed: {}",
+                ctx.reason
             ),
         });
     }
-    submit_pending_with_branch(state, key, reason, branch, entry, field).await
+    let classified = TicketContext {
+        branch,
+        ..ctx.clone()
+    };
+    submit_pending_with_branch(state, key, &classified).await
 }
 
 /// 按分支取内存 pending 清扫 TTL（秒）——凭据/注册/命令/吊销四类建单票
@@ -154,24 +219,9 @@ fn pending_ttl_secs(branch: matrix::MatrixBranch) -> u64 {
 pub(crate) async fn submit_pending_with_branch(
     state: &impl AppStateParts,
     key: &str,
-    reason: &str,
-    branch: matrix::MatrixBranch,
-    entry: &str,
-    field: Option<&str>,
+    ctx: &TicketContext<'_>,
 ) -> Result<String> {
-    let summary = approval_summary(reason, key, entry, field);
-    submit_pending_with_summary(state, key, reason, branch, &summary).await
-}
-
-/// 显式正文建单：调用方自备摘要（命令审批需含 argv/超时），建单链路与
-/// [`submit_pending_with_branch`] 完全一致（tracked 发送、pending、presets）。
-pub(crate) async fn submit_pending_with_summary(
-    state: &impl AppStateParts,
-    key: &str,
-    reason: &str,
-    branch: matrix::MatrixBranch,
-    summary: &str,
-) -> Result<String> {
+    let branch = ctx.branch;
     if !branch.is_matrix_order_branch() {
         return Err(VeilError::BadRequest {
             message: format!(
@@ -182,16 +232,20 @@ pub(crate) async fn submit_pending_with_summary(
     if !state.config().matrix_enabled() {
         return Err(matrix_disabled_error(state));
     }
-    let text = state.notify().format_ticket(branch, summary);
+    let text = state.notify().format_ticket(ctx);
     let Some(event_id) = state.notify().send_tracked(text).await else {
-        tracing::warn!("审批发送失败，按拒绝 fail-closed（不建单）: 原因 {reason}");
+        tracing::warn!(
+            "审批发送失败，按拒绝 fail-closed（不建单）: key {key} 原因 {} subject {}",
+            ctx.reason,
+            sanitize_for_log(ctx.subject)
+        );
         return Err(VeilError::Auth {
             message: "审批发送失败，已按拒绝处理".to_string(),
         });
     };
     state.pending().insert(PendingRecord::with_ttl(
         key,
-        reason,
+        ctx.reason,
         pending_ttl_secs(branch),
     ));
     state.approval().submit_branch(&event_id, branch).await;
@@ -202,20 +256,26 @@ pub(crate) async fn submit_pending_with_summary(
             );
         }
     }
-    tracing::info!("审批已发送: event {event_id} 原因 {reason}");
+    tracing::info!(
+        "审批已发送: event {event_id} key {key} 原因 {} subject {}",
+        ctx.reason,
+        sanitize_for_log(ctx.subject)
+    );
     Ok(event_id)
 }
 
 pub(crate) async fn record_pending(
     state: &impl AppStateParts,
     key: &str,
-    reason: &str,
-    entry: &str,
-    field: Option<&str>,
+    ctx: &TicketContext<'_>,
 ) -> VeilError {
-    match submit_pending(state, key, reason, entry, field).await {
+    match submit_pending(state, key, ctx).await {
         Ok(_) => VeilError::PendingApproval {
-            message: format!("已转 Matrix 人工审批: {reason}"),
+            message: format!(
+                "已转 Matrix 人工审批: {} ({})",
+                sanitize_for_log(ctx.subject),
+                ctx.reason
+            ),
         },
         Err(err) => err,
     }
@@ -501,9 +561,13 @@ pub(crate) fn consume_decision_key(state: &impl AppStateParts, key: &str) {
     }
 }
 
-fn pending_error(reason: &str) -> VeilError {
+fn pending_error(ctx: &TicketContext<'_>) -> VeilError {
     VeilError::PendingApproval {
-        message: format!("已转 Matrix 人工审批: {reason}"),
+        message: format!(
+            "已转 Matrix 人工审批: {} ({})",
+            sanitize_for_log(ctx.subject),
+            ctx.reason
+        ),
     }
 }
 
@@ -517,9 +581,7 @@ fn pending_error(reason: &str) -> VeilError {
 pub(crate) async fn approval_decision_closure<T, F, Fut>(
     state: &(impl AppStateParts + Clone + Send + Sync + 'static),
     key: &str,
-    reason: &str,
-    entry: &str,
-    field: Option<&str>,
+    ctx: &TicketContext<'_>,
     lane: ClosureLane,
     approved: F,
 ) -> Result<T>
@@ -536,7 +598,7 @@ where
         .ok()
         .map(|mut table| table.begin(key));
     match begin {
-        None => return Err(record_pending(state, key, reason, entry, field).await),
+        None => return Err(record_pending(state, key, ctx).await),
         Some(BeginOutcome::Decided(CredentialDecision::Approved)) => {
             let result = approved().await;
             if result.is_ok() {
@@ -556,7 +618,7 @@ where
                 message: format!("{}审批超时，按拒绝处理", lane.label),
             });
         }
-        Some(BeginOutcome::Busy) => return Err(pending_error(reason)),
+        Some(BeginOutcome::Busy) => return Err(pending_error(ctx)),
         Some(BeginOutcome::Saturated) => {
             return Err(VeilError::RateLimited {
                 retry_after_secs: 60,
@@ -564,7 +626,11 @@ where
         }
         Some(BeginOutcome::Reserved) => {}
     }
-    match submit_pending_with_branch(state, key, reason, lane.branch, entry, field).await {
+    let ticket = TicketContext {
+        branch: lane.branch,
+        ..ctx.clone()
+    };
+    match submit_pending_with_branch(state, key, &ticket).await {
         Ok(event_id) => {
             if let Ok(mut table) = state.decisions().lock() {
                 table.set_event_id(key, &event_id);
@@ -589,7 +655,7 @@ where
                 clear_terminal_pending(&owned, &key_owned, &event_id).await;
                 record_credential_decision(&owned, &key_owned, decision);
             });
-            Err(pending_error(reason))
+            Err(pending_error(ctx))
         }
         Err(err) => {
             if let Ok(mut table) = state.decisions().lock() {
@@ -609,12 +675,11 @@ async fn approval_async_202(
     let renew = req.reason == AUTHORIZATION_EXPIRED_REASON;
     let (entry, field, use_token, caller_path) =
         (req.entry, req.field, req.use_token, req.caller_path);
+    let ctx = req.ticket();
     approval_decision_closure(
         state,
         req.key,
-        req.reason,
-        entry,
-        field,
+        &ctx,
         ClosureLane {
             label: "凭据",
             auto_policy: AutoPolicy::Accept,
@@ -664,15 +729,8 @@ pub(crate) async fn approval_dual_mode(
     if !state.config().credential_block_wait {
         return approval_async_202(state, req).await;
     }
-    let event_id = submit_pending_with_branch(
-        state,
-        req.key,
-        req.reason,
-        matrix::MatrixBranch::Credential,
-        req.entry,
-        req.field,
-    )
-    .await?;
+    let ctx = req.ticket();
+    let event_id = submit_pending_with_branch(state, req.key, &ctx).await?;
     let timeout =
         Duration::from_secs(state.config().credential_approval_timeout_secs.max(1) as u64);
     let decision = state.approval().ask(&event_id, timeout).await;
@@ -685,12 +743,25 @@ pub(crate) fn notify_hash_change(
     detail: &str,
     approved: Option<bool>,
 ) {
-    let summary = format!("哈希变更 :: {key} :: {detail}");
-    let text = state
-        .notify()
-        .format_notice(matrix::MatrixBranch::HashChange, approved, &summary);
+    let facts = vec![Fact {
+        label: "说明",
+        value: detail.to_string(),
+    }];
+    let ctx = TicketContext {
+        branch: MatrixBranch::HashChange,
+        subject: key,
+        caller: CallerIdentity {
+            path: "",
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason: "hash_mismatch",
+        facts: &facts,
+    };
+    let text = state.notify().format_notice(&ctx, approved);
     state.notify().notify_text(text);
-    tracing::warn!("调用方哈希变更通知: {summary}");
+    tracing::warn!("调用方哈希变更通知: {key} :: {detail}");
 }
 
 /// 旧哈希宽限内放行通知（按条目 + 宽限窗口去重，同窗口仅发一次）。

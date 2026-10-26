@@ -407,14 +407,14 @@ async fn approved_decision_fetch_failure_retry() {
 
     let err = approval_async_202(
         &state,
-        &CredentialApproval {
+        &CredentialApproval::new(
             key,
-            caller_path: "/s/test-caller.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+            "/s/test-caller.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
     )
     .await
     .unwrap_err();
@@ -431,14 +431,14 @@ async fn approved_decision_fetch_failure_retry() {
 
     let out = approval_async_202(
         &state,
-        &CredentialApproval {
+        &CredentialApproval::new(
             key,
-            caller_path: "/s/test-caller.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+            "/s/test-caller.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
     )
     .await
     .expect("重试成功返回凭据");
@@ -459,14 +459,14 @@ async fn approved_decision_not_lost_on_fetch_error() {
     for attempt in 0..2 {
         let err = approval_async_202(
             &state,
-            &CredentialApproval {
+            &CredentialApproval::new(
                 key,
-                caller_path: "/s/test-caller.sh",
-                reason: "hash_mismatch",
-                entry: "网易",
-                field: Some("授权码"),
-                use_token: false,
-            },
+                "/s/test-caller.sh",
+                "hash_mismatch",
+                "网易",
+                Some("授权码"),
+                false,
+            ),
         )
         .await
         .unwrap_err();
@@ -484,14 +484,14 @@ async fn approved_decision_not_lost_on_fetch_error() {
 
     let out = approval_async_202(
         &state,
-        &CredentialApproval {
+        &CredentialApproval::new(
             key,
-            caller_path: "/s/test-caller.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+            "/s/test-caller.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
     )
     .await
     .expect("第三次取库成功");
@@ -500,14 +500,14 @@ async fn approved_decision_not_lost_on_fetch_error() {
 
     let after = approval_async_202(
         &state,
-        &CredentialApproval {
+        &CredentialApproval::new(
             key,
-            caller_path: "/s/test-caller.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+            "/s/test-caller.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
     )
     .await
     .unwrap_err();
@@ -531,12 +531,22 @@ async fn matrix_disabled_closure_exits_before_reservation() {
     assert!(!state.config().matrix_enabled(), "三要素缺失须关闭 Matrix");
 
     let key = "/s/no-matrix-closure.sh:h";
+    let ctx = crate::service::matrix::TicketContext {
+        branch: crate::service::matrix::MatrixBranch::Credential,
+        subject: "网易 / 授权码",
+        caller: crate::service::matrix::CallerIdentity {
+            path: "/s/no-matrix-closure.sh",
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason: "hash_mismatch",
+        facts: &[],
+    };
     let err = super::super::approval_decision_closure(
         &state,
         key,
-        "hash_mismatch",
-        "网易",
-        Some("授权码"),
+        &ctx,
         super::super::ClosureLane {
             label: "凭据",
             auto_policy: super::super::AutoPolicy::Accept,

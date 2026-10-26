@@ -9,6 +9,7 @@ mod decision_cap;
 mod event_id_binding;
 mod grace;
 mod preseed;
+mod ticket_copy;
 
 use {
     super::*,
@@ -73,9 +74,18 @@ async fn matrix_disabled_approval_fails_closed_before_tracked_send() {
     let err = submit_pending(
         &state,
         "/s/no-matrix.sh:h",
-        "hash_mismatch",
-        "网易",
-        Some("授权码"),
+        &matrix::TicketContext {
+            branch: MatrixBranch::Credential,
+            subject: "网易 / 授权码",
+            caller: matrix::CallerIdentity {
+                path: "/s/no-matrix.sh",
+                name: None,
+                desc: None,
+                enrolled: false,
+            },
+            reason: "hash_mismatch",
+            facts: &[],
+        },
     )
     .await
     .unwrap_err();
@@ -579,14 +589,14 @@ async fn pending_tables_atomic_cleanup() {
         .await;
     let err = settle_approval(
         &state,
-        &CredentialApproval {
-            key: "/s/timeout.sh:h",
-            caller_path: "/s/timeout.sh",
-            reason: "hash_mismatch",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+        &CredentialApproval::new(
+            "/s/timeout.sh:h",
+            "/s/timeout.sh",
+            "hash_mismatch",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
         "$timeout-ev",
         None,
     )
@@ -610,24 +620,56 @@ async fn approval_message_context() {
         state.config().matrix_access_token.clone(),
         state.http_client().as_ref().clone(),
     );
-    let summary = approval_summary("hash_mismatch", "/s/job.sh:abc123", "网易", Some("授权码"));
-    let text = bot.format_notice(MatrixBranch::Credential, None, &summary);
-    assert!(text.contains("hash_mismatch"), "{text}");
+    let facts = hash_change_fact("sha256:50f7f169d22f9acad", "sha256:d58c1f7a00112233");
+    let ctx = matrix::TicketContext {
+        branch: MatrixBranch::Credential,
+        subject: &credential_subject("网易", Some("授权码")),
+        caller: matrix::CallerIdentity {
+            path: "/s/job.sh",
+            name: Some("构建脚本"),
+            desc: None,
+            enrolled: true,
+        },
+        reason: "hash_mismatch",
+        facts: &facts,
+    };
+    let text = bot.format_notice(&ctx, None);
+    assert!(text.contains("脚本哈希已变更"), "{text}");
+    assert!(!text.contains("hash_mismatch"), "{text}");
     assert!(text.contains("/s/job.sh"), "{text}");
-    assert!(text.contains("网易"), "{text}");
-    assert!(text.contains("授权码"), "{text}");
+    assert!(text.contains("构建脚本"), "{text}");
+    assert!(text.contains("网易 / 授权码"), "{text}");
+    assert!(text.contains("50f7f169 → d58c1f7a"), "{text}");
+    assert!(!text.contains("sha256:"), "{text}");
     assert!(
         !text.contains("s3cr3t"),
         "部署 Secret 不得出现在消息: {text}"
     );
+    assert!(!text.contains("!r:example.com"), "正文不得含房间号: {text}");
 
-    let no_field = approval_summary("auto_approve_none", "/s/job.sh:abc", "网易", None);
-    assert!(no_field.contains("网易"), "{no_field}");
-    assert!(!no_field.contains("授权码"), "{no_field}");
-    let blank_field = approval_summary("auto_approve_none", "/s/job.sh:abc", "网易", Some(""));
-    assert_eq!(blank_field, no_field, "空字段应省略为条目形态");
-    let no_entry = approval_summary("emergency_revoke转常规审批", "/s/job.sh", "", None);
-    assert_eq!(no_entry, "emergency_revoke转常规审批 :: /s/job.sh");
+    assert_eq!(credential_subject("网易", None), "网易");
+    assert_eq!(credential_subject("网易", Some("")), "网易", "空字段应省略");
+    assert_eq!(credential_subject("网易", Some("授权码")), "网易 / 授权码");
+
+    let plain = matrix::TicketContext {
+        branch: MatrixBranch::Credential,
+        subject: "网易",
+        caller: matrix::CallerIdentity {
+            path: "/s/job.sh",
+            name: None,
+            desc: None,
+            enrolled: false,
+        },
+        reason: "auto_approve_none",
+        facts: &[],
+    };
+    let plain_text = bot.format_ticket(&plain);
+    assert!(plain_text.contains("（未注册）"), "{plain_text}");
+    assert!(plain_text.contains("人工审批模式"), "{plain_text}");
+    assert!(!plain_text.contains("sha256:"), "{plain_text}");
+    for hash in ["50f7f169", "d58c1f7a"] {
+        assert!(!plain_text.contains(hash), "{plain_text}");
+    }
 }
 
 #[tokio::test]
@@ -640,14 +682,14 @@ async fn credential_timeout_single_ask() {
     ]));
     let err = settle_approval(
         &state,
-        &CredentialApproval {
-            key: "/s/cred-timeout:h",
-            caller_path: "/s/cred-timeout",
-            reason: "auto_approve_none",
-            entry: "网易",
-            field: Some("授权码"),
-            use_token: false,
-        },
+        &CredentialApproval::new(
+            "/s/cred-timeout:h",
+            "/s/cred-timeout",
+            "auto_approve_none",
+            "网易",
+            Some("授权码"),
+            false,
+        ),
         "$cred-timeout",
         None,
     )
@@ -722,9 +764,18 @@ async fn raw_context_and_tracked_send_failure() {
     let err = submit_pending(
         &state,
         "/s/ask-fail.sh:h",
-        "hash_mismatch",
-        "网易",
-        Some("授权码"),
+        &matrix::TicketContext {
+            branch: MatrixBranch::Credential,
+            subject: "网易 / 授权码",
+            caller: matrix::CallerIdentity {
+                path: "/s/ask-fail.sh",
+                name: None,
+                desc: None,
+                enrolled: false,
+            },
+            reason: "hash_mismatch",
+            facts: &[],
+        },
     )
     .await
     .unwrap_err();
@@ -765,14 +816,14 @@ async fn pending_both_tables_cleanup() {
         assert_eq!(state.approval.pending_len().await, 1);
         let err = settle_approval(
             &state,
-            &CredentialApproval {
+            &CredentialApproval::new(
                 key,
-                caller_path: "/s/cap.sh",
-                reason: "hash_mismatch",
-                entry: "网易",
-                field: Some("授权码"),
-                use_token: false,
-            },
+                "/s/cap.sh",
+                "hash_mismatch",
+                "网易",
+                Some("授权码"),
+                false,
+            ),
             event_id,
             decision,
         )

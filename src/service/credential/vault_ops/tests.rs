@@ -371,6 +371,63 @@ async fn locked_returns_503() {
     );
 }
 
+#[tokio::test]
+async fn keepass_failure_notice_names_entry_and_reason() {
+    use zeroize::Zeroizing;
+    let sink = CountingSink::new();
+    let env = cred_env(&[]);
+    let dir = unique_dir("keepass-failure");
+    let broken_db = dir.join("broken.kdbx");
+    std::fs::write(&broken_db, b"not-a-kdbx").unwrap();
+    let provider: crate::keepass::PasswordProvider =
+        Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let state = inject_sink(
+        AppState::new(
+            Config::load_from(&env).unwrap(),
+            SqliteOutcome {
+                sqlite_ok: true,
+                sqlite_error: None,
+                db_path: PathBuf::from("/tmp/x.sqlite"),
+            },
+        )
+        .with_keepass(Arc::new(crate::keepass::RealKeePass::new(
+            broken_db, None, provider,
+        ))),
+        sink.clone(),
+    );
+    enroll_allow(&state, "/s/kf.sh", "kf1").await;
+    state.notify.start();
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("kf1", "/s/kf.sh", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let mut texts = Vec::new();
+    for _ in 0..200 {
+        texts = sink.texts();
+        if !texts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    state.notify.shutdown();
+
+    let text = texts.join("\n");
+    assert!(text.contains("❎ 凭据取用失败：网易"), "{text}");
+    assert!(text.contains("原因："), "失败原因须同现: {text}");
+    assert!(!text.contains("!r:example.com"), "正文不得含房间号: {text}");
+    assert!(!text.contains("sha256:"), "正文不得含哈希: {text}");
+    assert!(!text.contains("可选反应"), "通知不得带图例: {text}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn register_requires_approval() {
     let state = cred_state(&cred_env(&[]));
