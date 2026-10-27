@@ -45,6 +45,7 @@ zeroize = "1"
 # 轻量流式构造（SSE 帧按需 yield），禁重型运行时依赖。
 async-stream = "0.3"
 bytes = "1"
+detect-container = "1"
 
 [lib]
 name = "veil"

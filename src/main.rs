@@ -1,6 +1,7 @@
 //! 二进制入口：配置 fail-closed 校验 → sqlite 初始化 → 单 serve 启动。
 
 use {
+    detect_container::is_container,
     std::{process::ExitCode, sync::Arc},
     veil::{
         config::{Config, KeepassBackendKind, resolve_kdbx},
@@ -140,13 +141,6 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-}
-
-/// 判定是否运行在容器内（Docker 与 Podman/CRI-O 各写一个标记文件）。
-/// 只用于启动告警口径，不参与任何安全判定。
-fn running_in_container() -> bool {
-    std::path::Path::new("/.dockerenv").exists()
-        || std::path::Path::new("/run/.containerenv").exists()
 }
 
 #[tokio::main]
@@ -342,12 +336,15 @@ async fn main() -> ExitCode {
     });
     let app = build_router(state.clone());
     let bind_addr = state.config.server_bind;
-    if !bind_addr.ip().is_loopback() {
+    let is_loopback = bind_addr.ip().is_loopback();
+    let is_container = is_container();
+    if !is_loopback && !is_container {
         tracing::warn!(
             "监听地址 {bind_addr} 非回环：该网卡上所有可达方均可访问本服务；\
              容器内需 0.0.0.0:8877，宿主机侧请仅发布到 127.0.0.1"
         );
-    } else if running_in_container() {
+    }
+    if is_loopback && is_container {
         // 容器内监听回环时，bridge 网络的 DNAT 目标不是 lo，宿主发布端口会被 reset；
         // 而 HEALTHCHECK 在容器内跑，仍报 healthy —— 这是"绿但不可达"的经典假象。
         tracing::warn!(
