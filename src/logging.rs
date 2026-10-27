@@ -65,6 +65,23 @@ pub fn init() -> bool {
     }
 }
 
+/// 在**当前** span 下派生任务：请求路径上的后台 waiter MUST 经此入口，否则
+/// `http` span 丢失、待审批/吊销落定行无法关联原请求。后台驱动（清扫、指标、
+/// TPM、Matrix 驱动等）语义上不属任何请求，仍直接 `tokio::spawn`。
+///
+/// 置于 `logging` 而非 `router`：`router` 已依赖 `service`，而 `service` 的
+/// 凭据/命令路径要调用本助手；放在此处使依赖保持单向（`service -> logging`），
+/// 避免 `router <-> service` 模块环。
+pub(crate) fn spawn_in_request_span<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use tracing::Instrument as _;
+
+    tokio::spawn(future.instrument(tracing::Span::current()))
+}
+
 #[cfg(test)]
 mod tests {
     use {

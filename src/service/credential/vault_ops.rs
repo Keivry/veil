@@ -521,7 +521,7 @@ pub async fn register_caller_with_approval(
         let owned = (*state).clone();
         let path_for_task = caller_path.clone();
         let key_for_task = pending_key.clone();
-        tokio::task::spawn(async move {
+        crate::logging::spawn_in_request_span(async move {
             let timeout = approval_timeout(&owned);
             let decision = owned.approval().ask(&event_id, timeout).await;
             let auto = owned
@@ -621,7 +621,7 @@ pub async fn revoke_caller_with_approval(
         let owned = (*state).clone();
         let path_for_task = caller_path.clone();
         let key_for_task = pending_key.clone();
-        tokio::task::spawn(async move {
+        crate::logging::spawn_in_request_span(async move {
             let timeout = approval_timeout(&owned);
             let decision = owned.approval().ask(&event_id, timeout).await;
             if decision == Some(true)

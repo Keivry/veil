@@ -84,7 +84,7 @@ async fn spawn_contained<F>(fut: F) -> Response
 where
     F: std::future::Future<Output = Response> + Send + 'static,
 {
-    match tokio::spawn(fut).await {
+    match crate::logging::spawn_in_request_span(fut).await {
         Ok(resp) => resp,
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

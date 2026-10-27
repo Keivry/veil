@@ -21,7 +21,7 @@ pub fn spawn_stream_pump(
     tx: tokio::sync::mpsc::Sender<String>,
     ctx: StreamPumpCtx,
 ) -> tokio::task::JoinHandle<PumpOutcome> {
-    tokio::spawn(async move {
+    crate::logging::spawn_in_request_span(async move {
         let mut upstream = upstream;
         let (env, mut state, mut parser): (
             setup::PumpEnv,

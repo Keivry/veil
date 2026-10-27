@@ -15,6 +15,7 @@ use {
             hash_change_fact,
             notify_hash_grace_once,
         },
+        decision,
         ratelimit::check_rate,
         vault_ops::query_keepass,
     },
@@ -347,12 +348,23 @@ pub async fn handle_credential(
         notify_hash_grace_once(state, &entry, &old_hash, exp);
     }
 
-    check_rate(
-        state.credential_hits(),
-        &pending_key,
-        CREDENTIAL_RATE_WINDOW_SECS,
-    )
-    .await?;
+    // 审批幂等重试豁免限流：仅「本次请求会进入审批通道」且「决策表已有该
+    // `pending_key` 条目（在途票或未消费终态）」时跳过 2s 限流；其余一律照常。
+    let enters_approval = if unenrolled {
+        !matches!(decision, Some(AutoApprove::Deny))
+    } else {
+        matches!(decision, None | Some(AutoApprove::Pending))
+    };
+    let approval_retry =
+        enters_approval && decision::credential_decision_exists(state, &pending_key);
+    if !approval_retry {
+        check_rate(
+            state.credential_hits(),
+            &pending_key,
+            CREDENTIAL_RATE_WINDOW_SECS,
+        )
+        .await?;
+    }
 
     let caller = CallerIdentity {
         path: &caller_path,

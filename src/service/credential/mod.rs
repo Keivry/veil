@@ -24,6 +24,7 @@ use {
 
 pub mod approval;
 pub mod auth;
+pub mod decision;
 pub mod ratelimit;
 pub mod register_map;
 pub mod vault_ops;

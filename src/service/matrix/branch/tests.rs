@@ -70,6 +70,14 @@ fn backoff_grows_exponentially_capped_at_60s() {
 }
 
 #[test]
+fn sync_delay_capped_at_2s_while_ticket_pending() {
+    assert_eq!(sync_delay_secs(6, 1), 2);
+    assert_eq!(sync_delay_secs(2, 3), 2);
+    assert_eq!(sync_delay_secs(6, 0), 60);
+    assert_eq!(sync_delay_secs(0, 0), 1);
+}
+
+#[test]
 fn sync_request_timeout_outlives_long_poll_window() {
     // 客户端总超时须严格大于服务端长轮询窗口（服务端窗口到点后还要叠加 RTT 才返回）；
     // 两者相等即空闲窗口恒被客户端先截断，落成假失败 + 退避噪声。

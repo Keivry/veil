@@ -128,7 +128,7 @@ docker compose up -d
 - `GET /commands` 返回该下游可见的命令目录与参数定义；
 - `POST /commands/{id}/invoke` 执行命令（argv 直传、禁止 shell），返回退出码与输出；
 - 需审批的命令经 Matrix `✅`/`❎`/`♾️` 落定（`♾️` 批准并持久化 accept-always），默认 `202 + E_PENDING`，
-  `[command].block_wait = true` 时阻塞至终态；
+  `[command].block_wait = true` 时阻塞至终态；待审期间的重试按幂等处理且不受 `2s` 凭据限流约束；
 - 每次调用写入 `data_dir/commands.sqlite`，可在 `/_admin/commands` 与控制台「命令调用」分区查看。
 
 `[command].enabled = false`（缺省）时命令端点 404、其余行为不变。示例见 `examples/veil.toml`。
@@ -160,7 +160,7 @@ docker compose up -d
 
 **日志默认打到 stderr，级别 `warn`；stdout 无输出。** `RUST_LOG` 控制级别与按目标过滤（如 `RUST_LOG=info ./target/release/veil`），非法指令不拒启动、回退默认并在 stderr 说明一行。两类诊断不受 `RUST_LOG` 影响（`off` 也照打）：进程终止类（启动校验失败、端口被占用、TPM 门禁不通过、`serve` 异常退出）与安全配置警告。
 
-持久观测面三个：`[storage].data_dir` 下的 `metrics.sqlite`（60 秒周期落盘）、`audit.log`（仅 `[audit].mode != "off"` 才写，`0600`）、`/_admin/*`（带 `X-Admin-Token` 头请求）。想确认脱敏是否生效，看 `audit.log` 或订阅 `/_admin/events/stream`，两处都是脱敏后内容。常见现象：配置文件非法值/未知键/权限不合规启动即退、stderr 指明原因；KeePass 缺 `.kdbx` 只打 warn、凭据接口 503、LLM 代理不受影响；Matrix 连不上进程照常运行。
+持久观测面三个：`[storage].data_dir` 下的 `metrics.sqlite`（60 秒周期落盘）、`audit.log`（仅 `[audit].mode != "off"` 才写，`0600`）、`/_admin/*`（带 `X-Admin-Token` 头请求）。想确认脱敏是否生效，看 `audit.log` 或订阅 `/_admin/events/stream`，两处都是脱敏后内容。想看审批 `202` 的受理日志行，用 `RUST_LOG=warn,veil::error=debug`；默认 `warn` 级别下 202 行是 `debug`、看不到。别只写 `veil::error=debug`，那会连带关掉 `veil::router` 的 ERROR span，行里就没 `request_id`/`method`/`route` 可定位了。常见现象：配置文件非法值/未知键/权限不合规启动即退、stderr 指明原因；KeePass 缺 `.kdbx` 只打 warn、凭据接口 503、LLM 代理不受影响；Matrix 连不上进程照常运行。
 
 ## 文档导航
 

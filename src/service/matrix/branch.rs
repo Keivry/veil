@@ -241,6 +241,13 @@ pub fn sync_backoff_secs(failures: u32) -> u64 {
         .clamp(1, SYNC_MAX_BACKOFF_SECS)
 }
 
+/// sync 重试间隔：有在途审批单时封顶 2s 以缩短决策送达延迟；
+/// 无在途单时沿用 `sync_backoff_secs` 的 1s→60s 指数退避（纯函数，可单测）。
+pub(crate) fn sync_delay_secs(failures: u32, pending: usize) -> u64 {
+    let delay = sync_backoff_secs(failures);
+    if pending > 0 { delay.min(2) } else { delay }
+}
+
 /// since token 读取：缺失/空/失败返回 None（调用方全量同步）。
 pub fn load_since_token(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;

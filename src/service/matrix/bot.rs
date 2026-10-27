@@ -13,6 +13,7 @@ use {
             parse_text_command,
             save_since_token,
             sync_backoff_secs,
+            sync_delay_secs,
             sync_request_timeout,
         },
         cleanup::GatewayCleanup,
@@ -394,7 +395,8 @@ impl MatrixBot {
                         }
                     }
                     Err(err) => {
-                        let delay = sync_backoff_secs(failures);
+                        let pending = approval.pending_len().await;
+                        let delay = sync_delay_secs(failures, pending);
                         tracing::warn!("Matrix sync 失败，{delay}s 后重试: {err:#}");
                         failures = failures.saturating_add(1);
                         tokio::time::sleep(Duration::from_secs(delay)).await;

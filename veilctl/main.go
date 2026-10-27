@@ -47,7 +47,7 @@ func usage() {
   PROXY_HTTP_TIMEOUT       单次 HTTP 超时秒数（默认 300）
   PROXY_APPROVAL_WAIT      是否等待审批终态（默认 1；0 立即返回待审批）
   PROXY_APPROVAL_TIMEOUT   等待审批终态总时限（默认 300s，支持 5m / 300 两种写法）
-  PROXY_APPROVAL_POLL      审批轮询起始间隔（默认 2s，逐次翻倍至 10s）
+  PROXY_APPROVAL_POLL      审批轮询起始间隔（默认 500ms，逐次翻倍至 10s；须带单位）
 
 退出码:
   0  动作已完成

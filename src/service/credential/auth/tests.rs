@@ -11,6 +11,7 @@ use {
             test_support::*,
         },
     },
+    axum::response::IntoResponse as _,
 };
 
 #[tokio::test]
@@ -851,5 +852,148 @@ async fn approving_expired_ticket_renews_authorization_window() {
     )
     .await
     .expect("续期后须直接放行");
+    assert!(credential_value(&out).starts_with("__CRED_"));
+}
+
+/// 审批幂等重试豁免（D4）：在途票存在时，同一 `pending_key` 的立即重试跳过 2s
+/// 限流，复用既有票返回 `202 + E_PENDING`，不得退化成 429。
+#[tokio::test]
+async fn in_flight_approval_retry_skips_rate_limit() {
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    let first = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("retryhash", "/s/retry.sh", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(first.status_code(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(first.code(), "E_PENDING");
+    assert_eq!(state.pending.len(), 1, "首次请求须建单");
+
+    let retry = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body("retryhash", "/s/retry.sh", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        retry.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "在途重试须复用既有票，不得 429"
+    );
+    assert_eq!(retry.code(), "E_PENDING");
+    assert_eq!(state.pending.len(), 1, "重试不得重复建单");
+}
+
+/// 对照：不进入审批通道（`allow_mode=allow`）的请求不产生决策表条目，
+/// 立即连发第二次仍按 2s 窗口限流（429 + `retry-after`）。
+#[tokio::test]
+async fn allow_path_without_decision_entry_still_rate_limited() {
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    let path = "/s/no-entry.sh";
+    let hash = "h-no-entry";
+    enroll_allow(&state, path, hash).await;
+    handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, None),
+    )
+    .await
+    .unwrap();
+    let key = format!("{path}:{hash}");
+    assert!(
+        !crate::service::credential::decision::credential_decision_exists(&state, &key),
+        "放行路径不得留下决策表条目"
+    );
+
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    let response = err.into_response();
+    assert!(response.headers().contains_key("retry-after"));
+}
+
+/// `enters_approval` 守卫：即便决策表已有同 `pending_key` 条目，`Allow` 调用方
+/// 也不得借豁免绕过限流——第二次立即请求仍 429。
+#[tokio::test]
+async fn allow_caller_with_decision_entry_still_rate_limited() {
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    let path = "/s/allow-entry.sh";
+    let hash = "h-allow-entry";
+    enrolled_with_entries(&state, path, hash, entries_for("网易", &["授权码"])).await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode(path, Some(AutoApprove::Allow))
+        .unwrap();
+    let key = format!("{path}:{hash}");
+    state.decisions().lock().unwrap().begin(&key);
+    assert!(crate::service::credential::decision::credential_decision_exists(&state, &key));
+
+    handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, None),
+    )
+    .await
+    .expect("放行调用方首次取用须成功");
+    let err = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        "Allow 调用方不享受审批重试豁免"
+    );
+}
+
+/// 未消费的 `Decided(Approved)` 重试：跳过 2s 限流并继续走批准动作取到凭据。
+#[tokio::test]
+async fn unconsumed_approved_retry_skips_rate_limit() {
+    let env = cred_env(&[]);
+    let state = cred_state(&env);
+    let path = "/s/decided-ok.sh";
+    let hash = "h-decided-ok";
+    enrolled_with_entries(&state, path, hash, entries_for("网易", &["授权码"])).await;
+    state
+        .registry
+        .write()
+        .await
+        .set_allow_mode(path, Some(AutoApprove::Pending))
+        .unwrap();
+    let key = format!("{path}:{hash}");
+
+    let first = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(first.code(), "E_PENDING");
+    state.decisions().lock().unwrap().resolve(&key, Some(true));
+
+    let out = handle_credential(
+        &state,
+        &headers("gethash", Some("s3cr3t")),
+        &body(hash, path, None),
+    )
+    .await
+    .expect("已批准未消费的重试须跳过限流并取到凭据");
     assert!(credential_value(&out).starts_with("__CRED_"));
 }

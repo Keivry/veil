@@ -23,6 +23,23 @@ use {
 };
 
 #[test]
+fn decision_table_has_entry_tracks_state() {
+    // 空表无条目；begin 占位后有条目；resolve 后终态仍保留（已批准未消费的重试须继续豁免限流）；
+    // consume 后条目消失。
+    let mut table = DecisionTable::with_max_entries(4);
+    assert!(!table.has_entry("k"), "空表须无条目");
+    assert_eq!(table.begin("k"), BeginOutcome::Reserved);
+    assert!(table.has_entry("k"), "begin 占位后须有条目");
+    table.resolve("k", Some(true));
+    assert!(
+        table.has_entry("k"),
+        "resolve 后终态须仍保留，供重试豁免限流"
+    );
+    assert!(table.consume("k"), "consume 须移除既有条目");
+    assert!(!table.has_entry("k"), "consume 后条目须消失");
+}
+
+#[test]
 fn decision_table_capacity_bounded() {
     // 软上限 4096，仅驱逐终态条目，决策表长度有界。
     let state = cred_state(&cred_env(&[]));
@@ -47,12 +64,12 @@ fn decision_table_soft_cap_evicts_only_decided() {
     table.resolve("d-new", Some(true));
     assert_eq!(table.begin("live"), BeginOutcome::Reserved);
     assert_eq!(table.slot("d-old"), None, "created 最早的终态须被驱逐腾位");
-    assert_eq!(table.entries.len(), 2, "驱逐一终态后插入，不超软上限");
+    assert_eq!(table.entries().len(), 2, "驱逐一终态后插入，不超软上限");
     table.resolve("d-newest", Some(true));
     assert!(
-        table.entries.len() <= 2,
+        table.entries().len() <= 2,
         "驱逐终态后须回到软上限内，实得 {}",
-        table.entries.len()
+        table.entries().len()
     );
     assert_eq!(
         table.slot("live"),
@@ -77,12 +94,12 @@ fn decision_table_overflow_only_inflight_no_evict() {
         "仅余 InFlight 时新键须饱和拒绝"
     );
     assert_eq!(table.overflow_count(), 1, "饱和拒绝须递增溢出计数");
-    assert_eq!(table.entries.len(), 2, "饱和不得插入或驱逐");
+    assert_eq!(table.entries().len(), 2, "饱和不得插入或驱逐");
     for k in ["i1", "i2"] {
         assert_eq!(table.slot(k), Some(DecisionSlot::Pending), "{k} 在途须保留");
     }
     table.resolve("decided-once", Some(true));
-    assert_eq!(table.entries.len(), 2, "落定终态驱逐后回软上限");
+    assert_eq!(table.entries().len(), 2, "落定终态驱逐后回软上限");
     assert_eq!(
         table.overflow_count(),
         1,
@@ -113,10 +130,10 @@ fn decision_table_terminal_writes_bounded_by_soft_cap() {
     for i in 0..10 {
         table.resolve(&format!("k{i}"), Some(true));
     }
-    assert!(table.entries.len() <= 2, "终态写入须受软上限约束");
+    assert!(table.entries().len() <= 2, "终态写入须受软上限约束");
     assert!(
         table
-            .entries
+            .entries()
             .values()
             .all(|e| matches!(e, DecisionEntry::Decided { .. })),
         "所余条目恒为终态"

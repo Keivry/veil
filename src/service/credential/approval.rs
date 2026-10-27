@@ -20,8 +20,20 @@ use {
     std::{
         collections::HashMap,
         sync::{Mutex, OnceLock},
-        time::{Duration, Instant},
+        time::Duration,
     },
+};
+
+// 决策表已迁至 `super::decision`（800 行预算）；经此处重导出保持既有导入路径不变。
+pub use super::decision::DecisionTable;
+pub(crate) use super::decision::{BeginOutcome, CredentialDecision, record_credential_decision};
+#[cfg(test)]
+pub(crate) use super::decision::{
+    DECISION_TABLE_MAX_ENTRIES,
+    DecisionEntry,
+    DecisionSlot,
+    credential_decision_len,
+    credential_decision_slot,
 };
 
 /// 授权到期建票的原因标签：该原因的票在批准后须刷新授权窗口（续期）。
@@ -281,15 +293,6 @@ pub(crate) async fn record_pending(
     }
 }
 
-/// 异步 `202` 决策三态。后台 waiter 落定后按 `pending_key` 落表，
-/// 重试请求先消费此表：批准 → 取凭据，拒绝/超时 → `403`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CredentialDecision {
-    Approved,
-    Denied,
-    TimedOut,
-}
-
 /// 闭环批准动作对「持久放行」表情（`♾️` → `always=true`）的策略。
 /// 吊销 lane 传 [`AutoPolicy::Reject`]（纵深防御：吊销票本就不受理 `♾️`）；
 /// 凭据 lane 传 [`AutoPolicy::Accept`]（行为不变）。
@@ -306,229 +309,6 @@ pub(crate) struct ClosureLane {
     pub auto_policy: AutoPolicy,
     /// 建单分支——决定矩阵票与内存 pending 的 TTL 口径（凭据/注册类 300s）。
     pub branch: matrix::MatrixBranch,
-}
-
-/// 决策表槽位（只读观测/测试用）：未决与三终态可区分。
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DecisionSlot {
-    Pending,
-    Approved,
-    Denied,
-    TimedOut,
-}
-
-/// `begin` 结果：新占位（须建单）/ 已在途（复用既有票，不再建单）/ 已决（终态待显式消费）/
-/// 饱和（满表且仅余 `InFlight`，调用点按 `429 + Retry-After` 拒绝新键）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BeginOutcome {
-    Reserved,
-    Busy,
-    Decided(CredentialDecision),
-    /// 满表仅余 `InFlight`——新键无票，SHALL NOT 伪造 `202 + E_PENDING`。
-    Saturated,
-}
-
-#[derive(Debug)]
-enum DecisionEntry {
-    InFlight {
-        event_id: Option<String>,
-    },
-    Decided {
-        decision: CredentialDecision,
-        created: Instant,
-    },
-}
-
-/// 审批决策表（键 = `pending_key`），由 `AppState` 以
-/// `Arc<Mutex<DecisionTable>>` 承载（进程级 `static` 已移除）。容量约束仅作用于终态：
-/// `begin` 满表时先驱逐终态 `Decided`（按 `created` 升序，同刻以 key 字典序 tie-break）
-/// 腾位，仅余 `InFlight` 时返回 `BeginOutcome::Saturated`（调用点映射
-/// `429 + Retry-After: 60`，不插入、不伪造 `202`），`InFlight` 永不驱逐；`resolve`
-/// 落定终态同受驱逐约束，无可驱逐终态时记 warn 并递增 `overflow_count`
-/// （`approval_decision_overflow_total`）。
-#[derive(Debug)]
-pub struct DecisionTable {
-    entries: HashMap<String, DecisionEntry>,
-    max_entries: usize,
-    overflow_count: u64,
-}
-
-const DECISION_TABLE_MAX_ENTRIES: usize = 4096;
-
-impl Default for DecisionTable {
-    fn default() -> Self { Self::with_max_entries(DECISION_TABLE_MAX_ENTRIES) }
-}
-
-impl DecisionTable {
-    fn with_max_entries(max_entries: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            max_entries,
-            overflow_count: 0,
-        }
-    }
-
-    /// 清扫过期已决条目（一次性消费语义的兜底）。
-    fn sweep(&mut self, now: Instant) {
-        self.entries.retain(|_, e| match e {
-            DecisionEntry::InFlight { .. } => true,
-            DecisionEntry::Decided { created, .. } => {
-                now.duration_since(*created).as_secs() < PENDING_TTL_SECS
-            }
-        });
-    }
-
-    /// 占位入口。顺序为 `sweep(now)` → 满表时循环驱逐最早终态 `Decided`
-    /// 腾位 → 满表且仅余 `InFlight` 时饱和拒绝（不插入、不驱逐在途）；同键在途仍
-    /// [`BeginOutcome::Busy`]，同键终态仍只读 [`BeginOutcome::Decided`]。
-    fn begin(&mut self, key: &str) -> BeginOutcome {
-        let now = Instant::now();
-        self.sweep(now);
-        match self.entries.get(key) {
-            Some(DecisionEntry::Decided { decision, .. }) => BeginOutcome::Decided(*decision),
-            Some(DecisionEntry::InFlight { .. }) => BeginOutcome::Busy,
-            None => {
-                while self.entries.len() >= self.max_entries {
-                    if self.evict_oldest_decided() {
-                        continue;
-                    }
-                    self.overflow_count = self.overflow_count.saturating_add(1);
-                    tracing::warn!(
-                        entries = self.entries.len(),
-                        max = self.max_entries,
-                        metric = "approval_decision_overflow_total",
-                        "决策表满且仅余 InFlight，新键拒绝为 429 且不驱逐在途审批"
-                    );
-                    return BeginOutcome::Saturated;
-                }
-                self.entries
-                    .insert(key.to_string(), DecisionEntry::InFlight { event_id: None });
-                BeginOutcome::Reserved
-            }
-        }
-    }
-
-    /// 终态显式消费。`begin` 只读，动作成功/终态返回后由调用方消费；
-    /// 动作失败时保留已批准态，使同一请求重试仍可按已批准执行。
-    fn consume(&mut self, key: &str) -> bool { self.entries.remove(key).is_some() }
-
-    fn set_event_id(&mut self, key: &str, event_id: &str) {
-        if let Some(DecisionEntry::InFlight { event_id: slot }) = self.entries.get_mut(key) {
-            *slot = Some(event_id.to_string());
-        }
-    }
-
-    fn cancel(&mut self, key: &str) { self.entries.remove(key); }
-
-    /// 驱逐 `created` 最早的终态 `Decided`（同刻以 key 字典序 tie-break）；
-    /// 仅余 `InFlight` 时返回 `false`（在途永不驱逐）。
-    fn evict_oldest_decided(&mut self) -> bool {
-        let victim = self
-            .entries
-            .iter()
-            .filter_map(|(k, e)| match e {
-                DecisionEntry::Decided { created, .. } => Some((k.clone(), *created)),
-                DecisionEntry::InFlight { .. } => None,
-            })
-            .min_by(|(ka, ca), (kb, cb)| ca.cmp(cb).then_with(|| ka.cmp(kb)))
-            .map(|(k, _)| k);
-        match victim {
-            Some(k) => {
-                self.entries.remove(&k);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// 软上限驱逐——循环驱逐终态 `Decided` 至不超上限；驱逐尽仍超限
-    /// （仅余 `InFlight`）时不驱逐、记 warn 并递增 `overflow_count`。
-    fn enforce_soft_cap(&mut self) {
-        while self.entries.len() > self.max_entries {
-            if !self.evict_oldest_decided() {
-                self.overflow_count = self.overflow_count.saturating_add(1);
-                tracing::warn!(
-                    entries = self.entries.len(),
-                    max = self.max_entries,
-                    metric = "approval_decision_overflow_total",
-                    "决策表仅余 InFlight，软上限暂时超出且不驱逐在途审批"
-                );
-                break;
-            }
-        }
-    }
-
-    /// waiter 落定：写入终态；容量按软上限驱逐终态条目（`InFlight` 永不驱逐）。
-    fn resolve(&mut self, key: &str, decision: Option<bool>) {
-        let decision = match decision {
-            Some(true) => CredentialDecision::Approved,
-            Some(false) => CredentialDecision::Denied,
-            None => CredentialDecision::TimedOut,
-        };
-        self.entries.insert(
-            key.to_string(),
-            DecisionEntry::Decided {
-                decision,
-                created: Instant::now(),
-            },
-        );
-        self.enforce_soft_cap();
-    }
-
-    #[cfg(test)]
-    fn slot(&self, key: &str) -> Option<DecisionSlot> {
-        self.entries.get(key).map(|e| match e {
-            DecisionEntry::InFlight { .. } => DecisionSlot::Pending,
-            DecisionEntry::Decided { decision, .. } => match decision {
-                CredentialDecision::Approved => DecisionSlot::Approved,
-                CredentialDecision::Denied => DecisionSlot::Denied,
-                CredentialDecision::TimedOut => DecisionSlot::TimedOut,
-            },
-        })
-    }
-
-    /// 软上限溢出累计（只读观测）——`/_admin/metrics` 暴露为
-    /// `approval_decision_overflow_total`；`InFlight` 超限且无可驱逐终态时递增。
-    pub fn overflow_count(&self) -> u64 { self.overflow_count }
-
-    /// 当前条目数（只读观测）——`/_admin/metrics` 暴露为
-    /// `decision_table_size`，使软上限占用状态可观测（含暂时超限的 `InFlight`）。
-    pub fn entry_count(&self) -> usize { self.entries.len() }
-}
-
-/// 后台 waiter 落定（`None` = 超时按拒绝）——经受管状态决策表写入终态。
-pub(crate) fn record_credential_decision(
-    state: &impl AppStateParts,
-    key: &str,
-    decision: Option<bool>,
-) {
-    if let Ok(mut table) = state.decisions().lock() {
-        table.resolve(key, decision);
-    }
-}
-
-/// 只读决策槽位（测试/观测用）。
-#[cfg(test)]
-pub(crate) fn credential_decision_slot(
-    state: &impl AppStateParts,
-    key: &str,
-) -> Option<DecisionSlot> {
-    state
-        .decisions()
-        .lock()
-        .ok()
-        .and_then(|table| table.slot(key))
-}
-
-/// 只读决策表条目数（测试/观测用）。
-#[cfg(test)]
-pub(crate) fn credential_decision_len(state: &impl AppStateParts) -> usize {
-    state
-        .decisions()
-        .lock()
-        .map(|table| table.entries.len())
-        .unwrap_or(0)
 }
 
 /// 显式消费决策表终态。
@@ -571,7 +351,7 @@ fn pending_error(ctx: &TicketContext<'_>) -> VeilError {
     }
 }
 
-/// 泛化审批决策闭环——共享 `DecisionTable`（`:140`）、后台 waiter
+/// 泛化审批决策闭环——共享 `DecisionTable`（`super::decision`）、后台 waiter
 /// [`await_credential_approval`] 与 [`clear_terminal_pending`] 终态清理，仅「批准后动作」
 /// 由调用方注入（凭据取库 [`query_keepass`] / 吊销注册 `revoke_caller`）。三态对外一致：
 /// 批准 → 执行动作并返回成功；拒绝/超时 → `403`；未决 → `202 + E_PENDING` 复用既有票
@@ -637,7 +417,7 @@ where
             }
             let owned = (*state).clone();
             let key_owned = key.to_string();
-            tokio::spawn(async move {
+            crate::logging::spawn_in_request_span(async move {
                 let decision = await_credential_approval(&owned, &event_id).await;
                 // `applied_always` 必须早于 `clear_terminal_pending` 读取——
                 // 后者移除矩阵侧票后回读恒 `None`。

@@ -160,15 +160,31 @@ impl VeilError {
 impl IntoResponse for VeilError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        // 日志级别纪律：5xx 记 error（被告警规则捕获），其余（预期 4xx、
-        // 202 审批挂起）记 warn，避免预期失败稀释真告警；`code` 字段保留。
+        // 日志级别纪律：5xx 记 error（被告警规则捕获），202 审批挂起记 debug
+        // （已受理、非失败），其余预期 4xx 记 warn；均带 `code` 与 `status` 便于
+        // 按状态定位。429 额外带 `retry_after`（仅该变体有此字段，不渲染 None）。
         // PII 安全：4xx/202 变体 message 可含用户可控文本（KeePass 条目/属性名、
-        // caller_path、注册 id 等），warn 分支 MUST NOT 以 `?self` 打印；5xx
+        // caller_path、注册 id 等），warn/debug 分支 MUST NOT 以 `?self` 打印；5xx
         // 保持内部细节入日志（仅构造于 admin/state，不承载请求体）。
         if status.is_server_error() {
-            tracing::error!(code = self.code(), error = ?self, "请求失败");
+            tracing::error!(
+                code = self.code(),
+                status = status.as_u16(),
+                error = ?self,
+                "请求失败"
+            );
+        } else if matches!(self, Self::PendingApproval { .. }) {
+            tracing::debug!(code = self.code(), status = status.as_u16(), "已受理待审批");
         } else {
-            tracing::warn!(code = self.code(), "请求失败");
+            match &self {
+                Self::RateLimited { retry_after_secs } => tracing::warn!(
+                    code = self.code(),
+                    status = status.as_u16(),
+                    retry_after = retry_after_secs,
+                    "请求被拒绝"
+                ),
+                _ => tracing::warn!(code = self.code(), status = status.as_u16(), "请求被拒绝"),
+            }
         }
         let message = self.public_message();
         let body = Json(json!({

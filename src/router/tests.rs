@@ -371,33 +371,41 @@ async fn gateway_body_too_large_413() {
 }
 
 #[tokio::test]
-async fn credential_rate_limit_returns_429_with_retry_after() {
-    let (base, handle) = serve_and_client(test_app(&[])).await;
+async fn credential_rate_limit_skips_pending_retry_but_caps_new_requests() {
+    let (app, state) = test_app_with_state(&[]);
+    let (base, handle) = serve_and_client(app).await;
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
         "auth": {"caller_hash": "rlhash1", "caller_path": "/srv/rl.sh"},
         "entry": "网易",
         "field": "授权码"
     });
-    let first = client
-        .post(format!("{base}/credential"))
-        .header("X-Veilctl-Binary-Hash", "rlhash1")
-        .header("X-Veilctl-Secret", "s3cr3t")
-        .json(&payload)
-        .send()
-        .await
-        .unwrap();
+    let post = || {
+        client
+            .post(format!("{base}/credential"))
+            .header("X-Veilctl-Binary-Hash", "rlhash1")
+            .header("X-Veilctl-Secret", "s3cr3t")
+            .json(&payload)
+            .send()
+    };
+    let first = post().await.unwrap();
     assert_eq!(first.status().as_u16(), 202, "未注册转审批");
-    let second = client
-        .post(format!("{base}/credential"))
-        .header("X-Veilctl-Binary-Hash", "rlhash1")
-        .header("X-Veilctl-Secret", "s3cr3t")
-        .json(&payload)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(second.status().as_u16(), 429);
-    assert!(second.headers().contains_key("retry-after"));
+    // 同一 pending_key 已有在途票：幂等重试豁免 2s 限流，继续 202 而非 429。
+    let retry = post().await.unwrap();
+    assert_eq!(retry.status().as_u16(), 202, "在途重试须复用既有票");
+    assert!(
+        !retry.headers().contains_key("retry-after"),
+        "豁免路径不得带 retry-after"
+    );
+    // 决策被消费后（批准动作已完成的等价状态），新请求重新受 2s 窗口约束。
+    state
+        .decisions()
+        .lock()
+        .unwrap()
+        .consume("/srv/rl.sh:rlhash1");
+    let fresh = post().await.unwrap();
+    assert_eq!(fresh.status().as_u16(), 429, "无在途票的新请求仍受限流");
+    assert!(fresh.headers().contains_key("retry-after"));
     handle.abort();
 }
 
@@ -743,4 +751,221 @@ async fn health_returns_200_with_derived_ok_false_over_http() {
     assert_eq!(body["tpm_ok"], false);
     assert_eq!(body["status"], "degraded");
     handle.abort();
+}
+
+/// `fmt` 写端：每行经 `MakeWriter` 取一个 `io::Write`，统一追加到进程内缓冲区。
+#[derive(Clone, Default)]
+struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogSink {
+    fn log(&self) -> String { String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned() }
+
+    /// 取第一条含 `needle` 的行，失败时打印全量捕获。
+    fn line_with(&self, needle: &str) -> String {
+        let log = self.log();
+        log.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("未捕获含 {needle:?} 的行:\n{log}"))
+            .to_string()
+    }
+
+    /// 取 `key=` 之后的值（至空白或 `}` 止）。
+    fn field(&self, line: &str, key: &str) -> Option<String> {
+        let rest = line.split(&format!("{key}=")).nth(1)?;
+        Some(
+            rest.split([' ', '}'])
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer { self.clone() }
+}
+
+/// 线程局部安装真实 `fmt` 订阅者：`Span` 字段只在 `Registry` 内跨 `enter` 保留，
+/// 事件字段抓取器（`test_support::with_capture_subscriber`）取不到 span 字段。
+///
+/// `FmtSpan::NEW` 让 span 建立本身也落一行（字段与后续事件行同格式），使「无任何
+/// 事件的路由」（如 `/` 的 502、gate 的早期 404）也能被断言；若 `request_context`
+/// 被错误地嵌在 gate 内侧，早期 404 会绕过它而不产生该行。
+fn capture_fmt(sink: &LogSink) -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+        .finish();
+    tracing::subscriber::set_default(subscriber)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn request_span_logs_request_id_method_and_route() {
+    let sink = LogSink::default();
+    let _guard = capture_fmt(&sink);
+    let (base, handle) = serve_and_client(test_app(&[])).await;
+    // 空体：三因子校验立即失败为 4xx，`VeilError::into_response` 的 warn 行落在 span 内。
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/credential"))
+        .header("x-request-id", "abc123")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    assert!(
+        !resp.headers().contains_key("x-request-id"),
+        "不得回写 x-request-id 响应头: {:?}",
+        resp.headers()
+    );
+    let span_line = sink.line_with("route=/credential");
+    assert!(span_line.contains("request_id=abc123"), "{span_line}");
+    assert!(span_line.contains("method=POST"), "{span_line}");
+    let warn_line = sink.line_with("请求被拒绝");
+    assert!(
+        warn_line.contains("request_id=abc123") && warn_line.contains("route=/credential"),
+        "4xx 行须继承请求 span: {warn_line}"
+    );
+    handle.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_or_absent_request_id_yields_generated_value() {
+    let sink = LogSink::default();
+    let _guard = capture_fmt(&sink);
+    let (base, handle) = serve_and_client(test_app(&[])).await;
+    let client = reqwest::Client::new();
+    let post = |id: Option<&'static str>| {
+        let mut req = client.post(format!("{base}/credential"));
+        if let Some(id) = id {
+            req = req.header("x-request-id", id);
+        }
+        req.json(&serde_json::json!({})).send()
+    };
+    // 非法头（含空格）→ 丢弃并生成；缺失头 → 同样生成。
+    for (index, id) in [Some("a b"), None].into_iter().enumerate() {
+        let seen_before = sink.log().lines().count();
+        let resp = post(id).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "{index}: {id:?}");
+        assert!(!resp.headers().contains_key("x-request-id"), "{index}");
+        let log = sink.log();
+        let line = log
+            .lines()
+            .skip(seen_before)
+            .find(|line| line.contains("route=/credential"))
+            .unwrap_or_else(|| panic!("{index}: 第 {index} 次请求未产生 span 行:\n{log}"))
+            .to_string();
+        let request_id = sink
+            .field(&line, "request_id")
+            .unwrap_or_else(|| panic!("行缺 request_id: {line}"));
+        assert!(
+            !request_id.is_empty(),
+            "{index} 生成的 request_id 不得为空: {line}"
+        );
+        if let Some(id) = id {
+            assert_ne!(request_id, id, "{index} 非法头须被替换: {line}");
+        }
+        assert!(
+            request_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+            "{index} 生成值须限于安全字符集: {line}"
+        );
+    }
+    handle.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn static_route_patterns_for_root_wildcard_and_admin() {
+    let sink = LogSink::default();
+    let _guard = capture_fmt(&sink);
+    let (base, handle) = serve_and_client(test_app_missing_admin_token()).await;
+    let client = reqwest::Client::new();
+
+    let root = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(root.status().as_u16(), 502, "`/` 无上游配置须 502");
+    assert!(
+        sink.line_with("route=/}").contains("method=GET"),
+        "`GET /` 须记静态 route=/:\n{}",
+        sink.log()
+    );
+
+    let llm = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-request-id", "llm-1")
+        .json(&serde_json::json!({"model": "m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(llm.status().as_u16(), 502);
+    assert!(
+        sink.line_with("request_id=llm-1")
+            .contains("route=/{*tail}"),
+        "LLM 通配路由须记静态模式:\n{}",
+        sink.log()
+    );
+
+    // 管理面未启用：gate 的早期 404 仍须落在 span 内（否则该行根本不会出现）。
+    let admin = client
+        .get(format!("{base}/_admin/whatever"))
+        .header("x-request-id", "admin-404")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin.status().as_u16(), 404, "管理面未启用须 404");
+    let line = sink.line_with("request_id=admin-404");
+    assert!(
+        line.contains("route=/_admin/{*rest}"),
+        "早期 404 须在 span 内且带静态 route: {line}"
+    );
+    handle.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawned_task_inherits_request_span() {
+    let sink = LogSink::default();
+    let _guard = capture_fmt(&sink);
+    let span = tracing::error_span!(
+        "http",
+        request_id = %"derived",
+        method = %"POST",
+        route = %"/x",
+    );
+    async {
+        crate::logging::spawn_in_request_span(async {
+            tracing::warn!("waiter 落定");
+        })
+        .await
+        .unwrap();
+    }
+    .instrument(span)
+    .await;
+    let line = sink.line_with("waiter 落定");
+    assert!(
+        line.contains("request_id=derived"),
+        "派生任务须继承父 span: {line}"
+    );
+}
+
+#[test]
+fn request_id_validation_rejects_unsafe_values() {
+    for value in ["", " ", "a b", "a=b", "a{b", "a\nb", &"x".repeat(65)] {
+        assert!(!is_valid_request_id(value), "须拒绝 {value:?}");
+    }
+    for value in ["a", "abc123", "req-7", "a.b_c-9", &"y".repeat(64)] {
+        assert!(is_valid_request_id(value), "须接受 {value:?}");
+    }
 }

@@ -299,7 +299,7 @@ func TestParseDurationEnvFallbackWarns300s(t *testing.T) {
 }
 
 // TestApprovalPollIntervalClamped 锁定 approval.go 的非正轮询间隔钳制：
-// 长超时下非正间隔必须被钳制为 2s 下界——恰好一次休眠且休眠参数为 2s。
+// 长超时下非正间隔必须被钳制为 500ms 下界——恰好一次休眠且休眠参数为 500ms。
 // 若钳制被删，休眠参数退化为 0（slept[0] == 0）而失败，具备判别力。
 func TestApprovalPollIntervalClamped(t *testing.T) {
 	approvalTestEnv(t)
@@ -324,7 +324,49 @@ func TestApprovalPollIntervalClamped(t *testing.T) {
 	if len(slept) != 1 {
 		t.Fatalf("应恰好休眠一次，实际 %d 次: %v", len(slept), slept)
 	}
-	if slept[0] != 2*time.Second {
-		t.Fatalf("非正间隔必须钳制为 2s 下界（approval.go 钳制），实际休眠 %v", slept[0])
+	if slept[0] != 500*time.Millisecond {
+		t.Fatalf("非正间隔必须钳制为 500ms 下界（approval.go 钳制），实际休眠 %v", slept[0])
+	}
+}
+
+// TestApprovalPollDefault500ms 锁定 D6 首轮轮询默认：空值时默认串 `500ms`，
+// 且首轮休眠 500ms、次轮翻倍至 1s。
+// 同时锁定裸写数字的陷阱：parseDurationEnv 对纯数字按秒解释，`500` 即 500 秒。
+func TestApprovalPollDefault500ms(t *testing.T) {
+	t.Setenv("PROXY_APPROVAL_POLL", "")
+	got := parseDurationEnv("PROXY_APPROVAL_POLL", approvalPollDefault, 500*time.Millisecond)
+	if got != 500*time.Millisecond {
+		t.Fatalf("空值应回退默认 500ms，实际 %v", got)
+	}
+
+	t.Setenv("TEST_POLL_TRAP", "500")
+	if trap := parseDurationEnv("TEST_POLL_TRAP", "1ms", time.Millisecond); trap != 500*time.Second {
+		t.Fatalf("裸写 500 应按秒解释为 500s（故默认串须带单位），实际 %v", trap)
+	}
+
+	approvalTestEnv(t)
+	approvalPollInterval = got
+	approvalTimeout = time.Minute
+	var slept []time.Duration
+	sleepFn = func(d time.Duration) { slept = append(slept, d) }
+
+	srv, _, _ := newScriptedServer(t, []scriptedResponse{
+		{http.StatusAccepted, pendingBody},
+		{http.StatusAccepted, pendingBody},
+		{http.StatusOK, `{"status":"revoked","name":"check-mail"}`},
+	})
+	ProxyURL = srv.URL
+
+	if err := RevokeCaller("check-mail"); err != nil {
+		t.Fatalf("批准后应返回 nil，实际: %v", err)
+	}
+	want := []time.Duration{500 * time.Millisecond, time.Second}
+	if len(slept) != len(want) {
+		t.Fatalf("应休眠 %d 次，实际 %d 次: %v", len(want), len(slept), slept)
+	}
+	for i := range want {
+		if slept[i] != want[i] {
+			t.Fatalf("第 %d 次休眠 = %v, want %v（首轮 500ms、逐次翻倍）", i+1, slept[i], want[i])
+		}
 	}
 }

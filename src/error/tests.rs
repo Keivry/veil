@@ -225,10 +225,15 @@ fn four_xx_logs_warn_five_xx_logs_error() {
         },
     ] {
         let expected = err.status_code();
+        let want_status = format!("status={}", expected.as_u16());
         let (lines, status) = captured_level_and_status(err);
         assert_eq!(status, expected);
         assert_eq!(lines.len(), 1, "{status}: {lines:?}");
         assert!(lines[0].starts_with("WARN"), "{status}: {lines:?}");
+        assert!(
+            lines[0].contains(&want_status),
+            "{status}: 须带 {want_status}: {lines:?}"
+        );
     }
     // 5xx → error（被告警规则捕获）。
     for err in [
@@ -242,18 +247,56 @@ fn four_xx_logs_warn_five_xx_logs_error() {
         },
     ] {
         let expected = err.status_code();
+        let want_status = format!("status={}", expected.as_u16());
         let (lines, status) = captured_level_and_status(err);
         assert_eq!(status, expected);
         assert_eq!(lines.len(), 1, "{status}: {lines:?}");
         assert!(lines[0].starts_with("ERROR"), "{status}: {lines:?}");
+        assert!(
+            lines[0].contains(&want_status),
+            "{status}: 须带 {want_status}: {lines:?}"
+        );
     }
-    // 202 审批挂起非 5xx，记 warn 不误报。
-    let (lines, status) = captured_level_and_status(VeilError::PendingApproval {
-        message: "待审".to_string(),
+    // 202 审批挂起属「已受理」，记 debug 而非失败口径的 warn/error。
+    let pending_text = "待审：KeePass 条目 私人邮箱-9f3a";
+    let pending = VeilError::PendingApproval {
+        message: pending_text.to_string(),
+    };
+    let capture = LogCapture::default();
+    let sink = capture.0.clone();
+    let response =
+        crate::test_support::with_capture_subscriber(capture, move || pending.into_response());
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let lines = sink.lock().unwrap().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("DEBUG"), "{lines:?}");
+    assert!(lines[0].contains("E_PENDING"), "{lines:?}");
+    assert!(lines[0].contains("status=202"), "{lines:?}");
+    assert!(!lines[0].contains("请求失败"), "{lines:?}");
+    assert!(
+        !lines[0].contains(pending_text),
+        "debug 行不得含用户可控 message: {lines:?}"
+    );
+    // 429 带 `retry_after` 字段（仅该变体渲染），响应头保持 retry-after。
+    let capture = LogCapture::default();
+    let sink = capture.0.clone();
+    let response = crate::test_support::with_capture_subscriber(capture, || {
+        VeilError::RateLimited {
+            retry_after_secs: 30,
+        }
+        .into_response()
     });
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers().get("retry-after").map(|v| v.as_bytes()),
+        Some(b"30".as_slice()),
+        "响应头须保留 retry-after"
+    );
+    let lines = sink.lock().unwrap().clone();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].starts_with("WARN"), "{lines:?}");
+    assert!(lines[0].contains("status=429"), "{lines:?}");
+    assert!(lines[0].contains("retry_after=30"), "{lines:?}");
     // 非 5xx warn 行不得含用户可控 message（`error = ?self` 已移出 warn
     // 分支），静态 `code` 保留；5xx error 行仍保留内部细节（排障口径）。
     let user_text = "KeePass 条目 私人邮箱-9f3a 未找到";

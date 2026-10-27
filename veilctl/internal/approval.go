@@ -41,8 +41,14 @@ var ApprovalWait = parseBoolEnv("PROXY_APPROVAL_WAIT", true)
 // approvalTimeout 等待终态的总时限（`PROXY_APPROVAL_TIMEOUT`，默认 300s）。
 var approvalTimeout = parseDurationEnv("PROXY_APPROVAL_TIMEOUT", "300", 300*time.Second)
 
-// approvalPollInterval 轮询起始间隔（`PROXY_APPROVAL_POLL`，默认 2s，逐次翻倍）。
-var approvalPollInterval = parseDurationEnv("PROXY_APPROVAL_POLL", "2", 2*time.Second)
+// approvalPollDefault 生产与测试共用的轮询默认串，避免默认值退化回无单位字面量仍静默通过。
+const approvalPollDefault = "500ms"
+
+// approvalPollInterval 轮询起始间隔（`PROXY_APPROVAL_POLL`，默认 500ms，逐次翻倍）。
+//
+// 默认串必须写 `500ms` 而非裸数字 `500`：parseDurationEnv 对纯数字按秒解释，
+// 裸写 `500` 会得到 500 秒。
+var approvalPollInterval = parseDurationEnv("PROXY_APPROVAL_POLL", approvalPollDefault, 500*time.Millisecond)
 
 // approvalPollMaxInterval 轮询间隔上限（退避封顶）。
 const approvalPollMaxInterval = 10 * time.Second
@@ -138,8 +144,8 @@ func postJSON(url string, data []byte) (approvalResult, error) {
 	interval := approvalPollInterval
 	if interval <= 0 {
 		// 守护：非正间隔（如 `PROXY_APPROVAL_POLL=0` 或负值）会使休眠立即返回并紧循环重发，
-		// 钳制回默认 2s 下界（仍受 deadline 约束）。
-		interval = 2 * time.Second
+		// 钳制回默认 500ms 下界（仍受 deadline 约束）。
+		interval = 500 * time.Millisecond
 	}
 	var firstPending []byte
 

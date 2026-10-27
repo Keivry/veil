@@ -341,6 +341,11 @@ curl -fsS http://127.0.0.1:8877/credential \
   不受影响（跨方故障隔离）。该维度按调用方分桶而非全局单桶——
   全局单桶下任一调用方高频会阻塞所有调用方（跨方 DoS 面）。回退条款：若运维要求严格
   全局单桶，须另行交付，本条不静默改行为。
+- 审批幂等重试豁免：`2s` 窗口仅对同时满足两个条件的重试跳过：本次请求进入审批通道
+  （决策为 `None`/`Pending`，或未注册且非 `Deny`），且决策表对该 `pending_key` 已存在任一条目
+  （在途或已决）。此类重试不计数、不返回 `429`，继续返回 `202 + E_PENDING` 直至终态。首次建单
+  （决策表尚无该键）仍受限流；自动放行取库（不产生审批票的 `Allow`）同样始终受限流。豁免只发生在
+  限流判定处，不改变建单与审批落定语义。
 - `/_admin/series` 的 `since` 仅接受 `[dhm]<整数>` 形态（与 `day_key`/`hour_key`/`five_min_key`
   产出同形）；非法值返回 `400 + E_BAD_REQUEST`（消息列明合法形态），**不以全量无过滤回退**
   （不接受 `i64::MIN` 哨兵）。epoch 或日期形态支持须另行交付。
@@ -480,7 +485,7 @@ veilctl revoke --name "check-mail"
 - Go `202` 处理（`veilctl/`，本仓内置客户端）：`veilctl revoke` / `veilctl register` / `veilctl credential` 在收到
   `202 + E_PENDING` 后按退避轮询**同一请求**（服务端经决策表幂等复用既有票，不重复建单）直至终态：
   批准 → 成功（吊销生效 / 注册生效 / 返回凭据），拒绝或超时 → `403` 报错；间隔与时限由
-  `PROXY_APPROVAL_POLL`（默认 `2s`，逐次翻倍至 `10s`）与 `PROXY_APPROVAL_TIMEOUT`（默认 `300s`）控制。
+  `PROXY_APPROVAL_POLL`（默认 `500ms`，逐次翻倍至 `10s`）与 `PROXY_APPROVAL_TIMEOUT`（默认 `300s`）控制。
   `--no-wait` 或 `PROXY_APPROVAL_WAIT=0` 时仅提交审批单并以**退出码 `2`** 表示「已受理未完成」
   （不再把 `202` 当成功）；`[storage].credential_block_wait = true` 时服务端阻塞返回终态，客户端单次调用即完成。
   错误体兼容（`ErrMessage`：网关对象取 `message`、兼容字符串形态错误体）与 `/credential`
@@ -489,7 +494,9 @@ veilctl revoke --name "check-mail"
   `PROXY_HTTP_TIMEOUT`（单次 HTTP 超时秒数，默认 `300`；非法值回退默认并向 stderr 告警，
   fail-closed 不回退 `30s`）、`PROXY_APPROVAL_WAIT`（默认 `1`；`0` 立即返回待审批）、
   `PROXY_APPROVAL_TIMEOUT`（审批终态总时限，默认 `300s`）、`PROXY_APPROVAL_POLL`（轮询起始间隔，
-  默认 `2s`，逐次翻倍至 `10s`）。审批真实网关 E2E（`veilctl/internal/approval_e2e_test.go`）由
+  默认 `500ms`，逐次翻倍至 `10s`）。**须写带单位的 `PROXY_APPROVAL_POLL=500ms`**：解析器对
+  纯数字按**秒**处理，`PROXY_APPROVAL_POLL=500` 会被当成 `500` 秒（不是 `500ms`）。
+  审批真实网关 E2E（`veilctl/internal/approval_e2e_test.go`）由
   `VEIL_APPROVAL_E2E_URL`（网关基址）与 `VEIL_APPROVAL_E2E_CALLER`（一次性调用方名）共同启用，
   二者未同时设置即 `t.Skip`；该用例会向网关提交对 `VEIL_APPROVAL_E2E_CALLER` 的**真实吊销审批单**
   （破坏性，仅限可弃用调用方）。
@@ -559,7 +566,7 @@ veilctl revoke --name "check-mail"
 - 阻塞模式（`[storage].credential_block_wait = true`）：同请求阻塞至 `300`s，批准返回凭据、拒绝或超时按拒绝返回 `403`（`VeilError::Auth`，`src/service/credential/approval.rs`）。
 - 发送路由：审批建单走 `NotificationSink::send_text_tracked`（需真实回执——真实 `event_id` 是反应回调命中 pending 的唯一键；发送失败/取不到 id 即 fail-closed 返回 `403`，不建不可决单）；事件环/失败通知走 `notify_text` 有界 spool 的 best-effort 路径（可丢、不计回执）。二者共用同一 Bot。
 - 审批建单路径白名单：仅凭据、注册、命令、吊销（`MatrixBranch::Revoke`）四类路径经 `send_text_tracked` 以真实 `event_id` 建单；`audit-hold` 仅内存 pending（见 §6.4）、哈希变更经 best-effort `notify_text` 通知（`src/service/credential/approval.rs::notify_hash_change`），两者不建 Matrix 审批票。`unlock` 分支已删除（无建单路径，见 §8.4）。
-- 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求（建议指数退避），批准后重试返回凭据、拒绝后 `403`。本仓内置 Go 客户端（`veilctl/`）按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）。
+- 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求（建议指数退避），批准后重试返回凭据、拒绝后 `403`。本仓内置 Go 客户端（`veilctl/`）按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）。待审期间的幂等重试不受 `2s` 凭据限流约束（见 §3 豁免条），故 500ms 级轮询不会换来 `429`；该重试的 `202` 响应日志为 `debug` 级、文案「已受理待审批」，不再以 WARN「请求失败」记录（见 §6.12）。
 - 注册审批链：`POST /register-caller` 写入中立条目（`enabled=false`）后建 `MatrixBranch::Register` 审批单，复用同一双模口径（默认 `202 + E_PENDING` 抛单，阻塞模式至 `300s`）。三态落定：`✅` 置 `enabled=true` 并保留注册声明的 `allow_mode`、`♾️` 置 `enabled=true` 且 `allow_mode = allow`、`❎` 与等待超时置 `revoked=true`（fail-closed）。同一未决注册请求的重试经决策表幂等：返回同一 `202 + E_PENDING`、不重复建单、不返回 `409`；终态后重试返回终态（`✅`/`♾️` 放行、`❎`/超时 `403`），与 §5 revoke `202` 轮询契约同口径。
 - 审批 reaction 四分支受理矩阵（常量 → 动作全局唯一，分支只决定受不受理）：
 
@@ -600,6 +607,9 @@ veilctl revoke --name "check-mail"
 
 - 进程启动第一步即安装 tracing 订阅者，默认向 stderr 输出 `warn` 及以上人类可读日志（无 ANSI），stdout 保持零输出。`RUST_LOG` 自此生效（`EnvFilter` 指令，支持 per-target 过滤；非法指令不拒启动，回退默认级别并在 stderr 说明一行）。
 - 降级类告警（`mlockall` 失败、sqlite 降级 memory-only、凭据 alternation 回退）走日志层，默认 `warn` 级别可见且可被 `RUST_LOG` 抑制；进程终止类诊断（fail-fast 启动失败、TPM 门禁、端口绑定失败、`serve` 异常退出）与缺 HMAC 安全配置告警（`[redaction].value_sample_enabled = true` 且未设 `PII_VALUE_SAMPLE_HMAC_KEY`）以及空白名单弱授权告警（Matrix 面启用且 `[audit].approval_whitelist` 为空，见 §6.11）保留裸 stderr，不受 `RUST_LOG` 影响（含 `RUST_LOG=off`）。`[storage].entry_mode != full` 的降级告警不在此列：它是可被 `RUST_LOG` 抑制的日志层 `warn`。
+- 响应日志三档（`VeilError` 的 `IntoResponse`，`src/error.rs`）：`202` 待审批（`PendingApproval`）记 `debug`、文案「已受理待审批」；4xx 记 `warn`、文案「请求被拒绝」；5xx 记 `error`、文案「请求失败」。三档均带 `code` 与数值 `status` 字段，`RateLimited`（`429`）另带 `retry_after`。意图是让预期结果不稀释告警：`202` 与常规 4xx 不落 `error`，故默认 `warn` 级别下看不到 202 行。
+- 请求作用域字段：每个 HTTP 请求建立 `request_id`/`method`/`route` 三个字段（`route` 为静态路由模式，如 `/`、`/{*tail}`、`/_admin/{*rest}`），响应日志与请求处理期日志自动继承，为继续处理同一请求而派生的异步任务（上游分发、流式泵、审批等待、命令审批等待）显式继承；`request_id` 取入站 `x-request-id`（限 `1..=64` 字节、字符集 `[A-Za-z0-9._-]`），不满足则进程生成。该字段不新增任何响应头。
+- 看 `202` 受理行需显式放开 `veil::error` 到 `debug`：用 `RUST_LOG=warn,veil::error=debug`。**不要**只写 `RUST_LOG=veil::error=debug`，那样 `EnvFilter` 的默认级别变为 `off`，按 target 前缀匹配会把 `veil::router` 的 ERROR span 一并关闭，`202` 行反而丢了 `request_id`/`method`/`route`，无法定位。
 - 更多细节设 `RUST_LOG=info`/`RUST_LOG=debug`；噪声大用 per-target 指令（如 `RUST_LOG=warn,veil::handler::llm=error`）。`RUST_LOG` 登记见 §1「环境变量表」。
 
 ### 6.13 出口透传、响应侧 PII 分类计数下线与凭据前缀
@@ -817,6 +827,10 @@ Matrix sync 长轮询超时口径：Bot 的 `/_matrix/client/v3/sync`
 一个 RTT 才返回，客户端 deadline 恒先触发，空闲窗口每次都被截断为假失败（warn + 退避），
 故窗口与余量均不得压缩；`whoami`/发送等短请求不带该覆盖，仍受 `[llm].timeout_secs`
 约束（见 `src/service/matrix/branch.rs::sync_request_timeout`）。
+
+sync 失败退避：常规序列 `1s→2s→4s→…→60s`（`sync_backoff_secs`，`1 << failures` 封顶 `60s`）；
+当存在未决审批票时（`approval.pending_len() > 0`，含已决但尚未移除的条目）退避 SHALL 封顶
+`2s`，以缩短 reaction 送达延迟（`sync_delay_secs(failures, pending)`）；待审清空后恢复常规范式。
 
 非流请求遇上游 SSE 口径：非流请求（`stream` 未显式为 `true`）
 而上游仍返回 `status<400` 且 `content-type: text/event-stream` 时，网关**复用已取得**的上游响应经

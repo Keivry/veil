@@ -401,7 +401,7 @@ pub async fn invoke(
     let owned = (*state).clone();
     let key_owned = key.clone();
     let waiter = pending.clone();
-    tokio::spawn(async move {
+    crate::logging::spawn_in_request_span(async move {
         let decision =
             crate::service::credential::await_credential_approval(&owned, &waiter.event_id).await;
         let _ = complete(&owned, &key_owned, &waiter, decision).await;
