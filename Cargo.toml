@@ -1,6 +1,6 @@
 [package]
 name = "veil"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 # 构建工具链下限（MSRV）：源码使用 `str::floor_char_boundary`/`ceil_char_boundary`，
 # 旧工具链只会在编译期抛晦涩的 E0658；此处声明后，任何更旧工具链（含 Dockerfile
@@ -20,7 +20,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "stream",
 ] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # TOML 配置文件层（可选补充层，env 恒优先）：serde 原生强类型反序列化 +
@@ -37,10 +37,10 @@ hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
 regex = "1.13.1"
-fancy-regex = "0.19.1"
+fancy-regex = "0.20"
 moka = { version = "0.12.16", features = ["future"] }
 # 真实 kdbx 后端（KDBX3/4 + keyfile，纯 Rust 无系统依赖）+ 密钥零化。
-keepass = { version = "0.15", features = ["save_kdbx4"] }
+keepass = { version = "0.17", features = ["save_kdbx4"] }
 zeroize = "1"
 # 轻量流式构造（SSE 帧按需 yield），禁重型运行时依赖。
 async-stream = "0.3"
