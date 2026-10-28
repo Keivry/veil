@@ -15,3 +15,6 @@ __pycache__/
 
 # Python 一致性 venv（gate 第 6 步）
 /.venv
+
+# Playwright MCP 产物目录（每次浏览器自动化运行都会重新生成）
+/.playwright-mcp/
