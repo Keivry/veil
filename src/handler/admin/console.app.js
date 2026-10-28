@@ -15,6 +15,8 @@
   var SVGNS = 'http:' + '//www.w3.org/2000/svg';
   // 延迟 12 桶上界（毫秒），与网关口径一致，末桶为 +∞。
   var BUCKET_BOUNDS = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
+  // resize 去抖句柄：0 表示没有待执行的重绘。
+  var resizeTimer = 0;
 
   function $(id) { return document.getElementById(id); }
 
@@ -330,107 +332,24 @@
   }
   /* @veil-testable:end */
 
-  // ── 内联 SVG 柱状分布（PII / 协议 / 模型共用；tips 为可选的悬停/无障碍
+  // ── 横向条形分布（PII / 协议 / 模型三图共用；tips 为可选的悬停/无障碍
   // 文本映射，缺省时沿用 `key: 计数` 文案）──
-  function drawBars(boxId, data, tips) {
-    var box = $(boxId);
-    box.textContent = '';
-    var keys = Object.keys(data || {});
-    var pairs = keys.map(function (k) { return [k, countOf(data[k])]; })
-      .filter(function (p) { return p[1] > 0; });
-    if (!pairs.length) {
-      box.innerHTML = '<span class="empty">暂无数据</span>';
-      return;
-    }
-    pairs.sort(function (a, b) { return b[1] - a[1]; });
-    pairs = pairs.slice(0, 12);
-    var NS = SVGNS;
-    var max = pairs[0][1] || 1;
-    var gradId = 'barg-' + boxId;
-    // 类别标签较长时改用横向条形：标签完整可读，不再截断。
-    var maxLab = 0;
-    pairs.forEach(function (p) { if (String(p[0]).length > maxLab) maxLab = String(p[0]).length; });
-    if (maxLab > 10) { drawBarsH(box, pairs, tips, NS, max, gradId); return; }
-    var bw = 44, gap = 10, h = 178, baseY = h - 26, topPad = 18;
-    var innerW = Math.min(1200, Math.max(460, pairs.length * (bw + gap) + 16));
-    var svg = document.createElementNS(NS, 'svg');
-    svg.setAttribute('width', String(innerW));
-    svg.setAttribute('height', String(h));
-    svg.setAttribute('style', 'max-width:100%');
-    svg.setAttribute('role', 'img');
-    // 每箱独立的渐变 id，避免同页多箱互相串色。
-    var defs = document.createElementNS(NS, 'defs');
-    var grad = document.createElementNS(NS, 'linearGradient');
-    grad.setAttribute('id', gradId);
-    grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
-    grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
-    var gs1 = document.createElementNS(NS, 'stop');
-    gs1.setAttribute('offset', '0%'); gs1.setAttribute('stop-color', '#5cc8ff'); gs1.setAttribute('stop-opacity', '.92');
-    var gs2 = document.createElementNS(NS, 'stop');
-    gs2.setAttribute('offset', '100%'); gs2.setAttribute('stop-color', '#7c9cff'); gs2.setAttribute('stop-opacity', '.34');
-    grad.appendChild(gs1); grad.appendChild(gs2);
-    defs.appendChild(grad);
-    svg.appendChild(defs);
-    var axis = document.createElementNS(NS, 'line');
-    axis.setAttribute('class', 'axis');
-    axis.setAttribute('x1', '8'); axis.setAttribute('y1', (baseY + 0.5).toFixed(1));
-    axis.setAttribute('x2', String(innerW - 8)); axis.setAttribute('y2', (baseY + 0.5).toFixed(1));
-    svg.appendChild(axis);
-    pairs.forEach(function (p, i) {
-      var k = p[0], cnt = p[1];
-      var tip = tips && tips[k];
-      var bh = Math.max(3, (cnt / max) * (baseY - topPad));
-      var x = 8 + i * (bw + gap);
-      var y = baseY - bh;
-      var g = document.createElementNS(NS, 'g');
-      var rect = document.createElementNS(NS, 'rect');
-      rect.setAttribute('x', String(x));
-      rect.setAttribute('y', String(y.toFixed(1)));
-      rect.setAttribute('width', String(bw));
-      rect.setAttribute('height', String(bh.toFixed(1)));
-      rect.setAttribute('rx', '5');
-      rect.setAttribute('ry', '5');
-      rect.setAttribute('class', 'bar-rect');
-      rect.setAttribute('fill', 'url(#' + gradId + ')');
-      rect.setAttribute('tabindex', '0');
-      rect.setAttribute('aria-label', tip ? tip.aria : (String(k) + ':' + String(cnt)));
-      var title = document.createElementNS(NS, 'title');
-      title.textContent = tip ? tip.title : (String(k) + ': ' + Number(cnt).toLocaleString('en-US'));
-      rect.appendChild(title);
-      var tVal = document.createElementNS(NS, 'text');
-      tVal.setAttribute('class', 'v');
-      tVal.setAttribute('x', String(x + bw / 2));
-      tVal.setAttribute('y', String(Math.max(11, y - 5).toFixed(1)));
-      tVal.setAttribute('text-anchor', 'middle');
-      tVal.textContent = fmtNum(cnt);
-      var tLab = document.createElementNS(NS, 'text');
-      tLab.setAttribute('x', String(x + bw / 2));
-      tLab.setAttribute('y', String(h - 8));
-      tLab.setAttribute('text-anchor', 'middle');
-      tLab.textContent = String(k).slice(0, 10);
-      if (String(k).length > 10) {
-        var labTitle = document.createElementNS(NS, 'title');
-        labTitle.textContent = String(k);
-        tLab.appendChild(labTitle);
-      }
-      g.appendChild(rect);
-      g.appendChild(tVal);
-      g.appendChild(tLab);
-      svg.appendChild(g);
-    });
-    // 兼容 SVG 命名空间写法：经 DOM API 创建，无需转义处理。
-    box.appendChild(svg);
-  }
-
-  // 横向条形分布：类别标签较长时由 drawBars 自动改走此路，标签完整可读（不截断），
-  // 数值右对齐；柱色沿用同一渐变 id 体系。
-  function drawBarsH(box, pairs, tips, NS, max, gradId) {
+  // 分布图只有这一种形态：三图恒为横向条，不存在纵向柱与横向条之间的切换。
+  // 数值右对齐；柱色沿用同一渐变 id 体系。`labelCap` 为可选标签列宽上限（缺省为
+  // 宽度的 62%）；`fixedLabelW` 为分布图三图共享的标签列宽（由 `sharedDistLabelW`
+  // 预计算，保证同分区三图左边界逐像素对齐）。
+  function drawBarsH(box, pairs, tips, NS, max, gradId, labelCap, fixedLabelW) {
     var rowH = 30, padT = 6, padB = 6;
     var W = (box.clientWidth && box.clientWidth > 200) ? (box.clientWidth - 4) : 620;
-    // 标签列宽随最长类别自适应（标签不再截断），上限 62% 宽度以留出条形区。
+    // 标签列宽随最长类别自适应（标签不再截断），上限缺省 62% 宽度以留出条形区。
     var maxLab = 0;
     pairs.forEach(function (p) { if (String(p[0]).length > maxLab) maxLab = String(p[0]).length; });
-    var labelW = Math.min(Math.max(76, Math.round(maxLab * 6.3) + 8), Math.round(W * 0.62));
+    var baseCap = Math.round(W * 0.62);
+    // 显式上限仍受 62% 宽度约束：窄屏下不让标签列吃掉条形区。
+    var cap = (labelCap == null) ? baseCap : Math.min(labelCap, baseCap);
+    var labelW = (fixedLabelW == null)
+      ? Math.min(Math.max(76, Math.round(maxLab * 6.3) + 8), cap)
+      : Math.min(fixedLabelW, cap);
     var trackX = labelW + 12, trackW = Math.max(40, W - trackX - 54);
     var h = padT + pairs.length * rowH + padB;
     var svg = document.createElementNS(NS, 'svg');
@@ -498,7 +417,55 @@
     box.appendChild(svg);
   }
 
-  // PII 专用绘制：聚合后走平坦 drawBars，悬停/无障碍文本为 `kind: 合计`
+  // 同分区三图的共享标签列宽：由 renderDist 在绘制前预计算写入（0 表示未设置，
+  // 回落为逐图自适应）。取三图各自 Top-12 标签中的最长者套同一公式，使三图左边界
+  // 逐像素对齐——spec 要求三图标签列宽对齐，逐图按自身 maxLab 计算会得出不同宽度。
+  // 不设固定上限：长模型 id 必须完整显示；画布内的宽度上限由 drawBarsH 的
+  // `W * 0.62` 比例约束兜住，不会让标签列吃掉条形区。
+  var distLabelW = 0;
+
+  function distTopLabels(data) {
+    var keys = Object.keys(data || {});
+    return keys
+      .map(function (k) { return [String(k), countOf(data[k])]; })
+      .filter(function (p) { return p[1] > 0; })
+      .sort(function (a, b) { return b[1] - a[1]; })
+      .slice(0, 12)
+      .map(function (p) { return p[0]; });
+  }
+
+  function sharedDistLabelW(piiStats, protoData, modelData) {
+    var piiLabs = Object.keys(piiStats || {})
+      .filter(function (k) { return piiStats[k] && piiStats[k].total > 0; })
+      .sort(function (a, b) { return piiStats[b].total - piiStats[a].total; })
+      .slice(0, 12);
+    var labs = piiLabs.concat(distTopLabels(protoData), distTopLabels(modelData));
+    var maxLab = 0;
+    labs.forEach(function (s) {
+      if (String(s).length > maxLab) maxLab = String(s).length;
+    });
+    return Math.max(76, Math.round(maxLab * 6.3) + 8);
+  }
+
+  // 分布类图表的统一入口：keys → countOf → 丢零 → 降序 → Top-12，**始终**走横向条，
+  // 并套用三图共享标签列宽。不得回退为按标签长度在纵向柱/横向条之间切换。
+  function drawDistBars(boxId, data, tips) {
+    var box = $(boxId);
+    box.textContent = '';
+    var keys = Object.keys(data || {});
+    var pairs = keys.map(function (k) { return [k, countOf(data[k])]; })
+      .filter(function (p) { return p[1] > 0; });
+    if (!pairs.length) {
+      box.innerHTML = '<span class="empty">暂无数据</span>';
+      return;
+    }
+    pairs.sort(function (a, b) { return b[1] - a[1]; });
+    pairs = pairs.slice(0, 12);
+    var max = pairs[0][1] || 1;
+    drawBarsH(box, pairs, tips, SVGNS, max, 'barg-' + boxId, null, distLabelW || null);
+  }
+
+  // PII 专用绘制：聚合后转调 drawDistBars，悬停/无障碍文本为 `kind: 合计`
   // 加该 kind 的 Top-3 掩码样本（`mask xcount`，count 降序）。
   function drawPiiBars(boxId, stats) {
     var data = {}, tips = {};
@@ -512,13 +479,14 @@
         aria: rows.length ? head + '；' + rows.join('；') : head
       };
     });
-    drawBars(boxId, data, tips);
+    drawDistBars(boxId, data, tips);
   }
 
   function renderDist(m) {
     m = m || {};
     var piiStats = piiKindStats(m.pii_value_samples);
     var hasSamples = Object.keys(piiStats).length > 0;
+    distLabelW = sharedDistLabelW(piiStats, m.per_protocol, m.per_model);
     drawPiiBars('pii-box', piiStats);
     var hint = $('pii-hint');
     var mode = (m.pii_scope && m.pii_scope.mode) || '—';
@@ -530,8 +498,8 @@
     ];
     if (hasSamples && m.is_precise !== true) parts.push('全局指标近似窗口。');
     hint.textContent = parts.join(' ');
-    drawBars('proto-box', m.per_protocol || {});
-    drawBars('model-box', m.per_model || {});
+    drawDistBars('proto-box', m.per_protocol || {});
+    drawDistBars('model-box', m.per_model || {});
     // 分布面板口径：模型分布优先取逐请求窗口投影，投影不可用时为环内采样
     // （`per_model_partial`），须显式标注；覆盖时长仅在快照给出 `coverage_secs` 时展示。
     var mh = $('model-hint');
@@ -1348,5 +1316,17 @@
       }
     });
     window.addEventListener('scroll', function () { hideEvTooltip(); }, true);
+    // 窗口宽度变化后重绘依赖 clientWidth 的图表：drawBarsH / renderTrend 生成的 <svg>
+    // 没有 viewBox，max-width:100% 只会裁切而不会等比缩放，不重绘则条形右端的数值被
+    // 截掉直到下一次 metrics 帧（≤15s）。只重绘当前可见分区——隐性分区 clientWidth 为
+    // 0，会算出兜底宽度并留下错误的 SVG。
+    window.addEventListener('resize', function () {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function () {
+        resizeTimer = 0;
+        if (!$('sec-redaction').hidden && state.metrics) renderDist(state.metrics);
+        if (!$('sec-overview').hidden && state.series) renderTrend(state.series);
+      }, 300);
+    });
   });
 })();

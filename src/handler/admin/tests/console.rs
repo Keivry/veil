@@ -573,10 +573,142 @@ fn console_html_pii_samples_aggregation_and_top3_wiring() {
         !CONSOLE_HTML.contains("drawBars('pii-box'"),
         "PII 面板不得把原始嵌套对象直传仅支持平坦数值的 drawBars"
     );
-    // 协议/模型分布的调用点保持原样（逐字未变），不受 PII 适配影响。
+    // 协议/模型分布改走统一的横向条入口（形态与 PII 面板一致），调用点逐字锁定。
     for needle in [
-        "drawBars('proto-box', m.per_protocol || {});",
-        "drawBars('model-box', m.per_model || {});",
+        "drawDistBars('proto-box', m.per_protocol || {});",
+        "drawDistBars('model-box', m.per_model || {});",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_layout_toolbar_grouping_and_pager_baseline() {
+    // 工具栏改为「筛选组 + 分页组」语义分组：折行只发生在组边界，分页信息不再复用
+    // 带 margin-top 的 .hintline（否则基线比相邻按钮低 13px）。
+    for needle in [
+        ".tb-group { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }",
+        ".tb-pager { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; margin-left: auto; }",
+        ".pager-info { font-size: 11px; color: var(--faint); margin-top: 0;",
+        "font-variant-numeric: tabular-nums; }",
+        "class=\"tb-group\"",
+        "class=\"tb-group tb-pager\"",
+        "<span class=\"pager-info\" id=\"req-page-info\">—</span>",
+        "<span class=\"pager-info\" id=\"cmd-page-info\">—</span>",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    // .toolbar 外层仍须保留折行能力：#range-bar 也复用该类，不能被改成 nowrap。
+    assert!(
+        CONSOLE_HTML
+            .contains(".toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;"),
+        "外层 .toolbar 须保留 flex-wrap:wrap"
+    );
+}
+
+#[test]
+fn console_html_layout_narrow_viewport_fallback() {
+    // 1024px 下筛选组 min-content ≈764px 而工具栏内宽仅 ≈682px：不放开组内折行必横向溢出。
+    for needle in [
+        "@media (max-width: 1100px) {",
+        ".tb-group { flex-wrap: wrap; }",
+        ".tb-pager { flex-wrap: nowrap; flex-basis: 100%; }",
+        ".tb-group, .tb-pager { flex-wrap: wrap; }",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_layout_dist_panel_equal_height() {
+    // 同排面板等高：.grid2 由 start 改 stretch，分布面板内部为纵向弹性布局。
+    for needle in [
+        ".grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: stretch; }",
+        ".dist-panel { display: flex; flex-direction: column; }",
+        ".dist-panel .dist-body { flex: 1; display: flex; flex-direction: column; }",
+        ".dist-panel .dist-body > .empty { flex: 1; }",
+        ".dist-panel #model-box { flex: 1; }",
+        "class=\"panel dist-panel\"",
+        "class=\"dist-body\" id=\"pii-box\"",
+        "class=\"dist-body\" id=\"proto-box\"",
+        "class=\"dist-body\" id=\"model-box\"",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_layout_summary_column_is_elastic() {
+    // 摘要列上限随视口弹性收缩；定长 + white-space:nowrap 的组合是上限生效的前提。
+    assert!(
+        CONSOLE_HTML.contains("td.sum { max-width: clamp(140px, 20vw, 420px);"),
+        "摘要列须为 clamp 弹性上限"
+    );
+    assert!(
+        !CONSOLE_HTML.contains("td.sum { max-width: 420px;"),
+        "固定 420px 上限会让表格在 1280px 下超出容器"
+    );
+    assert!(
+        CONSOLE_HTML.contains("overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"),
+        "摘要列的省略号截断与 nowrap 须保留"
+    );
+}
+
+#[test]
+fn console_html_layout_command_status_is_enum_select() {
+    // 命令页审批状态由自由文本改为枚举下拉，消除 placeholder 截断与非法取值。
+    for needle in [
+        "<select id=\"cmd-status\" aria-label=\"审批状态过滤\">",
+        "<option value=\"\">审批状态：全部</option>",
+        "<option value=\"approved\">approved</option>",
+        "<option value=\"denied\">denied</option>",
+        "<option value=\"timeout\">timeout</option>",
+        "<option value=\"not_required\">not_required</option>",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    assert!(
+        !CONSOLE_HTML.contains("<input id=\"cmd-status\""),
+        "审批状态过滤器不得再为自由文本输入"
+    );
+    // 空值（全部）不拼参数：守卫与读取点均不变。
+    for needle in [
+        "state.cmdStatus = $('cmd-status').value.trim();",
+        "if (state.cmdStatus) q += '&approval_status=' + encodeURIComponent(state.cmdStatus);",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_layout_dist_bars_unified_horizontal() {
+    // 三张分布图统一走横向条入口；drawPiiBars 保留为薄封装（测试锚点）。
+    for needle in [
+        "function drawDistBars(boxId, data, tips) {",
+        "function drawPiiBars(boxId, stats) {",
+        "drawPiiBars('pii-box', piiStats);",
+        "drawDistBars(boxId, data, tips);",
+        "drawBarsH(box, pairs, tips, SVGNS, max, 'barg-' + boxId, null, distLabelW || null);",
+        // 三图标签列宽须共享同一取值，逐图按自身 maxLab 计算会导致左边界不对齐。
+        "function sharedDistLabelW(piiStats, protoData, modelData) {",
+        "distLabelW = sharedDistLabelW(piiStats, m.per_protocol, m.per_model);",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_layout_resize_redraw_visible_only() {
+    // 无 viewBox 的横向条在窗口变窄后只被裁切：须 300ms 去抖重绘，且只重绘可见分区
+    // （隐性分区 clientWidth 为 0，会算出兜底宽度）。
+    for needle in [
+        "var resizeTimer = 0;",
+        "window.addEventListener('resize', function () {",
+        "if (resizeTimer) clearTimeout(resizeTimer);",
+        "resizeTimer = setTimeout(function () {",
+        "}, 300);",
+        "if (!$('sec-redaction').hidden && state.metrics) renderDist(state.metrics);",
+        "if (!$('sec-overview').hidden && state.series) renderTrend(state.series);",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
     }

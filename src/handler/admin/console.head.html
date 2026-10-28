@@ -151,7 +151,18 @@
   .kpi.primary { background: linear-gradient(180deg, var(--accent-soft), transparent 64%), var(--panel); border-color: var(--accent-line); }
   .kpi.primary .label { color: var(--accent); font-weight: 600; }
   .kpi.primary .value { font-size: 27px; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: stretch; }
+  /* 同排分布面板等高：由布局拉伸（stretch + 内部弹性区）实现，不用固定 min-height ——
+     条目数在 Top-12 上限内浮动，固定高会在 12 条时溢出、1 条时留大片空白。
+     ≤860px 单列断点下 stretch 自然退化为按内容高度，无需额外规则。 */
+  .dist-panel { display: flex; flex-direction: column; }
+  .dist-panel .dist-body { flex: 1; display: flex; flex-direction: column; }
+  /* 空态虚线框也填满图表区，否则「一侧有数据、一侧空」时短框会贴在很高区域的顶部。 */
+  .dist-panel .dist-body > .empty { flex: 1; }
+  /* 右面板有两个图表区（#proto-box / #model-box）：.dist-body 的 flex:1 会让两者平分
+     余量，中间多出两段不明所以的空白。故前者退回按内容高度，只让后者吸收余量。 */
+  .dist-panel #proto-box { flex: 0 0 auto; }
+  .dist-panel #model-box { flex: 1; }
   .panel {
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 16px 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
@@ -169,7 +180,17 @@
   .sub-h { color: var(--dim); font-size: 11px; margin: 12px 0 6px; }
   .sub-h:first-of-type { margin-top: 0; }
   .hintline { color: var(--faint); font-size: 11px; margin-top: 10px; line-height: 1.6; }
+  /* 工具栏内的分页信息：位于 flex 行内，不得复用 .hintline（其 margin-top:10px 会把
+     基线压低 13px）。.hintline 本身不改，块级上下文仍在使用。
+     align-self:stretch 覆盖 .tb-pager 的 align-items:center，使本元素盒高等于同行
+     按钮（内容纵向居中）——否则纯文本盒只有 11px 高，其 top 会比按钮低约 11px，
+     视觉上看似与分页按钮错位。 */
+  .pager-info { font-size: 11px; color: var(--faint); margin-top: 0; display: flex; align-items: center; align-self: stretch; line-height: 1; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; position: relative; }
+  /* 工具栏语义分组：折行只可能发生在组与组之间，不再由剩余宽度任意决定。外层
+     .toolbar 保留 flex-wrap:wrap 以维持换行能力（#range-bar 也复用该类）。 */
+  .tb-group { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+  .tb-pager { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; margin-left: auto; }
   .toolbar button, .toolbar input {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--radius-sm); padding: 7px 12px; font-size: 12px; font-family: inherit;
@@ -210,7 +231,10 @@
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--dim); font-weight: 600; font-size: 11px; letter-spacing: .02em; }
   td.num, th.num { text-align: right; font-family: var(--mono); }
-  td.sum { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 摘要列上限 MUST 保持「定长值 + white-space:nowrap」这一组合：百分比相对 auto-layout
+     的表格宽度解析，会与内容驱动的列宽形成循环依赖而静默失效；去掉 nowrap 同理。
+     预算（1280px 实测）：滚动容器 924 − 其余八列 640 = 284px；20vw@1280 = 256px。 */
+  td.sum { max-width: clamp(140px, 20vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #req-table th { white-space: nowrap; }
   #req-table td.num { white-space: nowrap; }
   tr.clickable { cursor: pointer; transition: background .12s; }
@@ -302,9 +326,14 @@
   .nav button:focus-visible { outline-offset: -2px; }
   @media (max-width: 860px) {
     .layout { grid-template-columns: 1fr; }
+    /* `min-width: 0` 必填：`.side` 是 grid 项，默认 `min-width: auto` 会以其
+       min-content 为下限——横向导航按钮 `white-space: nowrap`，该下限可达 ≈565px，
+       从而把单列 `1fr` 轨道撑出视口（520px 视口实测溢出 60px）。
+       归零后 `.nav` 的 `overflow-x: auto` 才真正接管横向滚动。 */
     .side {
       position: static; height: auto; flex-direction: row; align-items: center; flex-wrap: wrap;
       border-right: none; border-bottom: 1px solid var(--border); padding: 12px 14px; gap: 10px;
+      min-width: 0;
     }
     .brand { padding: 0; flex: none; }
     .brand small { display: none; }
@@ -314,10 +343,19 @@
     .main { padding: 18px 16px 36px; }
     .grid2 { grid-template-columns: 1fr; }
   }
+  /* 窄视口兜底：>860px 时 .layout 仍有 250px 侧栏，1024px 下面板内工具栏仅 ≈668–682px，
+     而请求页筛选组 min-content ≈764px（#req-model / #req-session 各有 min-width:150px
+     且 nowrap 下不可压缩）。不放开组内折行必致工具栏横向溢出、页面横向滚动。
+     注意：本块 MUST 位于 ≤560px 块之前——后者要覆盖 .tb-pager 的 flex-wrap。 */
+  @media (max-width: 1100px) {
+    .tb-group { flex-wrap: wrap; }
+    .tb-pager { flex-wrap: nowrap; flex-basis: 100%; }
+  }
   @media (max-width: 560px) {
     .kpi-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
     .topbar h1 { font-size: 17px; }
     .brow { grid-template-columns: 70px 1fr 54px 40px; gap: 7px; }
+    .tb-group, .tb-pager { flex-wrap: wrap; }
   }
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
@@ -387,17 +425,17 @@
 
       <section class="sec" id="sec-redaction" hidden>
         <div class="grid2">
-          <div class="panel">
+          <div class="panel dist-panel">
             <h2>PII 采样分布</h2>
-            <div id="pii-box"><span class="empty">等待实时快照…</span></div>
+            <div class="dist-body" id="pii-box"><span class="empty">等待实时快照…</span></div>
             <div class="hintline" id="pii-hint"></div>
           </div>
-          <div class="panel">
+          <div class="panel dist-panel">
             <h2>协议 / 模型分布</h2>
             <div class="sub-h">按协议</div>
-            <div id="proto-box"><span class="empty">等待实时快照…</span></div>
+            <div class="dist-body" id="proto-box"><span class="empty">等待实时快照…</span></div>
             <div class="sub-h">按模型</div>
-            <div id="model-box"><span class="empty">等待实时快照…</span></div>
+            <div class="dist-body" id="model-box"><span class="empty">等待实时快照…</span></div>
             <div class="hintline" id="model-hint" hidden></div>
           </div>
         </div>
@@ -436,12 +474,22 @@
         <div class="panel">
           <h2>命令调用日志 <span class="h2-sub">每次调用的审批与执行状态</span></h2>
           <div class="toolbar" style="margin-bottom:12px">
-            <input id="cmd-command" placeholder="命令 id 过滤（空=全部）">
-            <input id="cmd-status" placeholder="审批状态（approved/denied/timeout/not_required）">
-            <button id="cmd-apply">筛选</button>
-            <button id="cmd-prev">上一页</button>
-            <button id="cmd-next">下一页</button>
-            <span class="hintline" id="cmd-page-info">—</span>
+            <div class="tb-group">
+              <input id="cmd-command" placeholder="命令 id 过滤（空=全部）">
+              <select id="cmd-status" aria-label="审批状态过滤">
+                <option value="">审批状态：全部</option>
+                <option value="approved">approved</option>
+                <option value="denied">denied</option>
+                <option value="timeout">timeout</option>
+                <option value="not_required">not_required</option>
+              </select>
+              <button id="cmd-apply">筛选</button>
+            </div>
+            <div class="tb-group tb-pager">
+              <button id="cmd-prev">上一页</button>
+              <button id="cmd-next">下一页</button>
+              <span class="pager-info" id="cmd-page-info">—</span>
+            </div>
           </div>
           <div style="overflow:auto">
             <table id="cmd-table">
@@ -459,36 +507,40 @@
         <div class="panel">
           <h2>逐请求记录 <span class="h2-sub">悬停摘要列查看全文</span></h2>
           <div class="toolbar" style="margin-bottom:12px">
-            <input id="req-model" placeholder="模型（空=全部）">
-            <select id="req-protocol" aria-label="协议过滤">
-              <option value="">协议：全部</option>
-              <option value="chat">chat</option>
-              <option value="responses">responses</option>
-              <option value="anthropic">messages</option>
-              <option value="passthrough">other</option>
-            </select>
-            <select id="req-status" aria-label="状态过滤">
-              <option value="">状态：全部</option>
-              <option value="2xx">2xx</option>
-              <option value="4xx">4xx</option>
-              <option value="5xx">5xx</option>
-              <option value="error">error</option>
-            </select>
-            <input id="req-session" placeholder="会话前缀（≥4 字符）">
-            <select id="req-scope" aria-label="作用域过滤">
-              <option value="">作用域：全部</option>
-              <option value="session">会话</option>
-              <option value="user">用户</option>
-            </select>
-            <select id="req-limit" aria-label="每页条数">
-              <option value="50">每页 50</option>
-              <option value="100">每页 100</option>
-              <option value="200">每页 200</option>
-            </select>
-            <button id="req-apply">筛选</button>
-            <button id="req-prev" disabled>上一页</button>
-            <button id="req-next" disabled>下一页</button>
-            <span class="hintline" id="req-page-info">—</span>
+            <div class="tb-group">
+              <input id="req-model" placeholder="模型（空=全部）">
+              <select id="req-protocol" aria-label="协议过滤">
+                <option value="">协议：全部</option>
+                <option value="chat">chat</option>
+                <option value="responses">responses</option>
+                <option value="anthropic">messages</option>
+                <option value="passthrough">other</option>
+              </select>
+              <select id="req-status" aria-label="状态过滤">
+                <option value="">状态：全部</option>
+                <option value="2xx">2xx</option>
+                <option value="4xx">4xx</option>
+                <option value="5xx">5xx</option>
+                <option value="error">error</option>
+              </select>
+              <input id="req-session" placeholder="会话前缀（≥4 字符）">
+              <select id="req-scope" aria-label="作用域过滤">
+                <option value="">作用域：全部</option>
+                <option value="session">会话</option>
+                <option value="user">用户</option>
+              </select>
+              <select id="req-limit" aria-label="每页条数">
+                <option value="50">每页 50</option>
+                <option value="100">每页 100</option>
+                <option value="200">每页 200</option>
+              </select>
+              <button id="req-apply">筛选</button>
+            </div>
+            <div class="tb-group tb-pager">
+              <button id="req-prev" disabled>上一页</button>
+              <button id="req-next" disabled>下一页</button>
+              <span class="pager-info" id="req-page-info">—</span>
+            </div>
           </div>
           <div class="hintline" id="req-session-hint" hidden>会话前缀至少 4 个字符才生效</div>
           <div class="hintline" id="req-partial" hidden></div>
