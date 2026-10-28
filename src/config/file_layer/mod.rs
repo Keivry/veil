@@ -13,6 +13,10 @@
 //! `observability_admin_token`/`veilctl_secret`/`veilctl_binary_hash`/
 //! `value_sample_hmac_key`）时，Unix 下要求 `mode & 0o077 == 0`，否则拒启动；
 //! env 覆盖不豁免（密钥文本已落盘）。
+//!
+//! 拆分：`[storage]` 分节的 schema（[`StorageSection`]）、两个文件枚举与该分节的
+//! 逐键映射条目移至 `file_layer/storage.rs`，本文件 `pub use` 重导出同一路径
+//! （`crate::config::file_layer::{StorageSection, FileEntryMode, FileAutoApprove}` 不变）。
 
 use {
     super::{
@@ -30,6 +34,10 @@ use {
         path::{Path, PathBuf},
     },
 };
+
+mod storage;
+
+pub use storage::{FileAutoApprove, FileEntryMode, RequestLogFileConfig, StorageSection};
 
 /// 引导变量：唯一文件路径入口，仅从进程 env 读取，不作为文件内可声明键。
 pub(crate) const BOOTSTRAP_VAR: &str = "VEIL_CONFIG_FILE";
@@ -64,28 +72,6 @@ pub enum FileAuditMode {
     Block,
     #[serde(rename = "approve")]
     Approve,
-}
-
-/// `[storage].entry_mode` 文件取值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FileEntryMode {
-    #[serde(rename = "full")]
-    Full,
-    #[serde(rename = "credential-only")]
-    CredentialOnly,
-    #[serde(rename = "llm-only")]
-    LlmOnly,
-}
-
-/// `[storage].auto_approve` 文件取值（映射为 env 令牌 `true/false/pending`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FileAutoApprove {
-    #[serde(rename = "allow")]
-    Allow,
-    #[serde(rename = "deny")]
-    Deny,
-    #[serde(rename = "pending")]
-    Pending,
 }
 
 /// `[pii_scope].mode` 文件取值。
@@ -178,22 +164,6 @@ pub struct AuditSection {
     pub policy_file: Option<String>,
 }
 
-/// `[storage]`：存储/入口域。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StorageSection {
-    pub data_dir: Option<String>,
-    pub db_dir: Option<String>,
-    pub tpm_dir: Option<String>,
-    pub caller_registry_path: Option<String>,
-    pub veilctl_secret: Option<String>,
-    pub veilctl_binary_hash: Option<String>,
-    pub auto_approve: Option<FileAutoApprove>,
-    pub entry_mode: Option<FileEntryMode>,
-    pub credential_block_wait: Option<bool>,
-    pub authorization_ttl_secs: Option<u64>,
-}
-
 /// `[redaction]`：脱敏域。
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -244,11 +214,13 @@ pub struct KeepassSection {
     pub backend: Option<FileKeepassBackend>,
 }
 
-/// 映射目标：静态规范 env 名，或端口表（`[llm.upstreams]` 逐端口展开为
-/// `LLM_<port>`，目标名按端口动态生成）。
+/// 映射目标：静态规范 env 名、端口表（`[llm.upstreams]` 逐端口展开为
+/// `LLM_<port>`，目标名按端口动态生成），或**文件专属标量键**（无 env 对应源，
+/// 值不进 env map，由 `FileLayerOutcome` 直达 `Config`）。
 enum MappingTarget {
     Env(&'static str),
     PortTable,
+    FileOnly,
 }
 
 /// 规范化口径：标量按 serde 类型直译；`AutoApprove` 做 env 令牌重映射
@@ -323,45 +295,18 @@ const MAPPINGS: &[MappingDef] = &[
         "AUDIT_POLICY_FILE",
         &["AUDIT_POLICY_FILE"],
     ),
-    env("storage.data_dir", "DATA_DIR", &["DATA_DIR"]),
-    env("storage.db_dir", "DB_DIR", &["DB_DIR"]),
-    env("storage.tpm_dir", "TPM_DIR", &["TPM_DIR"]),
-    env(
-        "storage.caller_registry_path",
-        "CALLER_REGISTRY_PATH",
-        &["CALLER_REGISTRY_PATH"],
-    ),
-    env(
-        "storage.veilctl_secret",
-        "VEILCTL_SECRET",
-        &["VEILCTL_SECRET"],
-    ),
-    env(
-        "storage.veilctl_binary_hash",
-        "VEILCTL_BINARY_HASH",
-        &["VEILCTL_BINARY_HASH"],
-    ),
-    MappingDef {
-        key: "storage.auto_approve",
-        target: MappingTarget::Env("AUTO_APPROVE"),
-        env_explicit_names: &["AUTO_APPROVE"],
-        coercion: Coercion::AutoApprove,
-    },
-    env(
-        "storage.entry_mode",
-        "VEIL_ENTRY_MODE",
-        &["VEIL_ENTRY_MODE"],
-    ),
-    env(
-        "storage.credential_block_wait",
-        "CREDENTIAL_BLOCK_WAIT",
-        &["CREDENTIAL_BLOCK_WAIT"],
-    ),
-    env(
-        "storage.authorization_ttl_secs",
-        "AUTHORIZATION_TTL_SECS",
-        &["AUTHORIZATION_TTL_SECS"],
-    ),
+    storage::STORAGE_DATA_DIR,
+    storage::STORAGE_DB_DIR,
+    storage::STORAGE_TPM_DIR,
+    storage::STORAGE_CALLER_REGISTRY_PATH,
+    storage::STORAGE_VEILCTL_SECRET,
+    storage::STORAGE_VEILCTL_BINARY_HASH,
+    storage::STORAGE_AUTO_APPROVE,
+    storage::STORAGE_ENTRY_MODE,
+    storage::STORAGE_CREDENTIAL_BLOCK_WAIT,
+    storage::STORAGE_AUTHORIZATION_TTL_SECS,
+    storage::STORAGE_REQUEST_LOG_ENABLED,
+    storage::STORAGE_REQUEST_LOG_RETENTION_DAYS,
     env(
         "redaction.enabled",
         "REDACTION_ENABLED",
@@ -487,10 +432,11 @@ const MAPPINGS: &[MappingDef] = &[
 ];
 
 /// 一条已解析的文件声明：规范 env 目标 + 规范字符串 + env 显式名集合。
+/// 文件专属标量键的 `canonical_env` 为 `None`（无 env 对应源，不进逐键合并）。
 #[derive(Debug)]
 struct ResolvedEntry {
     key: String,
-    canonical_env: String,
+    canonical_env: Option<String>,
     env_explicit_names: Vec<String>,
     value: String,
 }
@@ -501,6 +447,7 @@ pub struct FileLayerOutcome {
     pub llm_targets: LlmTargets,
     pub command: CommandConfig,
     pub server_bind: Option<SocketAddr>,
+    pub request_log: RequestLogFileConfig,
 }
 
 /// 文件补充层入口：引导读取 → fail-closed 解析 → 密钥权限门禁 → 覆盖字段校验 →
@@ -520,11 +467,13 @@ pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<FileLayerO
     )?;
     let command = validate_command(cfg.command.as_ref())?;
     let server_bind = cfg.server.as_ref().and_then(|section| section.bind);
+    let request_log = RequestLogFileConfig::from_storage(cfg.storage.as_ref());
     merge_entries(env, resolve_entries(&cfg)?);
     Ok(FileLayerOutcome {
         llm_targets,
         command,
         server_bind,
+        request_log,
     })
 }
 
@@ -643,7 +592,7 @@ fn resolve_entries(cfg: &FileConfig) -> Result<Vec<ResolvedEntry>> {
             let value = coerce_value(&key, &leaf, Coercion::Plain)?;
             out.push(ResolvedEntry {
                 key,
-                canonical_env: canonical.clone(),
+                canonical_env: Some(canonical.clone()),
                 env_explicit_names: vec![canonical],
                 value,
             });
@@ -663,11 +612,21 @@ fn resolve_entries(cfg: &FileConfig) -> Result<Vec<ResolvedEntry>> {
                     &format!("文件键 {key} 端口表形态非法，拒绝启动"),
                 ));
             }
+            MappingTarget::FileOnly => {
+                let value = coerce_value(&key, &leaf, mapping.coercion)?;
+                out.push(ResolvedEntry {
+                    key,
+                    canonical_env: None,
+                    env_explicit_names: Vec::new(),
+                    value,
+                });
+                continue;
+            }
         };
         let value = coerce_value(&key, &leaf, mapping.coercion)?;
         out.push(ResolvedEntry {
             key,
-            canonical_env: canonical_env.to_string(),
+            canonical_env: Some(canonical_env.to_string()),
             env_explicit_names: mapping
                 .env_explicit_names
                 .iter()
@@ -734,7 +693,10 @@ fn merge_entries(env: &mut HashMap<String, String>, entries: Vec<ResolvedEntry>)
             );
             continue;
         }
-        env.insert(entry.canonical_env, entry.value);
+        let Some(canonical_env) = entry.canonical_env else {
+            continue;
+        };
+        env.insert(canonical_env, entry.value);
     }
 }
 

@@ -73,6 +73,7 @@ async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetric
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     };
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     server.abort();
@@ -306,6 +307,7 @@ async fn pump_sse_with_vault_minted(
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     };
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     server.abort();
@@ -844,6 +846,7 @@ async fn pump_raw_sse_with_metrics(
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     };
     let (_outcome, frames) = collect_pump(upstream, ctx).await;
     server.abort();

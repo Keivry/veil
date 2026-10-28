@@ -107,7 +107,7 @@ async fn serve_and_client(app: Router) -> (String, tokio::task::JoinHandle<()>) 
 }
 
 #[tokio::test]
-async fn seven_routes_paths_and_status_codes() {
+async fn admin_and_credential_routes_paths_and_status_codes() {
     let (base, handle) = serve_and_client(test_app(&[])).await;
     let client = reqwest::Client::new();
 
@@ -265,7 +265,14 @@ async fn admin_exact_routes_before_wildcard_unknown_404() {
         .unwrap();
     assert_eq!(index.status().as_u16(), 200);
     let body: serde_json::Value = index.json().await.unwrap();
-    assert_eq!(body["routes"].as_array().unwrap().len(), 7);
+    let routes = body["routes"].as_array().expect("routes 须数组");
+    assert_eq!(routes.len(), 8, "索引须列八路由: {body}");
+    assert!(
+        routes
+            .iter()
+            .any(|r| r.as_str() == Some("/_admin/requests")),
+        "索引须含 /_admin/requests: {body}"
+    );
 
     let health = client
         .get(format!("{base}/_admin/health"))
@@ -288,6 +295,24 @@ async fn admin_exact_routes_before_wildcard_unknown_404() {
         .await
         .unwrap();
     assert_eq!(query_non_sse.status().as_u16(), 401);
+
+    // 第八条路由真实可达（未鉴权 401，鉴权后 200），不被通配吞没。
+    let req_no_auth = client
+        .get(format!("{base}/_admin/requests"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(req_no_auth.status().as_u16(), 401);
+    let req_auth = client
+        .get(format!("{base}/_admin/requests?limit=5"))
+        .header("X-Admin-Token", token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(req_auth.status().as_u16(), 200);
+    let req_body: serde_json::Value = req_auth.json().await.unwrap();
+    assert_eq!(req_body["ok"], true, "{req_body}");
+    assert_eq!(req_body["limit"], 5, "{req_body}");
 
     let unknown = client
         .get(format!("{base}/_admin/nope"))

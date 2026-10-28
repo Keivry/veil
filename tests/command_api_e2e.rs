@@ -631,6 +631,25 @@ async fn admin_commands_requires_auth_and_clamps_limit() {
         .unwrap();
     assert_eq!(body["limit"], 200);
     assert_eq!(body["total"], 1);
+    // 无 range：不出现 range 键，但仍带覆盖观测（新增 additive 字段）。
+    assert!(body.get("range").is_none(), "{body}");
+    assert_eq!(body["partial"], false, "{body}");
+    assert!(body["coverage_secs"].is_u64(), "{body}");
+
+    // `range=24h`：按下界过滤（该调用刚发生，必在范围内）并回显范围键。
+    let ranged: Value = client
+        .get(format!("{base}/_admin/commands?range=24h"))
+        .header("X-Admin-Token", ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ranged["total"], 1, "{ranged}");
+    assert_eq!(ranged["range"], "24h", "{ranged}");
+    assert_eq!(ranged["boundary_slack_secs"], 0, "{ranged}");
+    assert!(ranged["since_ts"].as_i64().is_some(), "{ranged}");
 
     let events: Value = client
         .get(format!("{base}/_admin/events?kind=command"))

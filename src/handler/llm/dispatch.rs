@@ -12,12 +12,21 @@ use {
         build_sse_response,
         forward_headers,
         is_event_stream,
-        serve_nondialog_passthrough,
-        serve_nonstream,
+        serve_detailed,
+        serve_nondialog_detailed,
         spawn_stream_pump,
+        trace::{
+            NonstreamDetail,
+            Outcome,
+            RequestTrace,
+            StreamLog,
+            record_row,
+            upstream_authority as trace_authority,
+        },
     },
     crate::{
         error::VeilError,
+        router::{RequestId, generated_request_id},
         service::{
             json_walk,
             llm_gateway::{self, Protocol, resolve_protocol, resolve_target},
@@ -251,6 +260,18 @@ pub(crate) fn build_request_scope(
     )
 }
 
+/// 非流落行参数：响应 + 终态详情（`gateway_serve` 在此之外唯一落行）。
+struct NonStreamServed {
+    resp: Response,
+    detail: NonstreamDetail,
+}
+
+/// 分发结果：流式行已由 `StreamGuard` 承接（终态在泵内落），非流待外层落行。
+enum Served {
+    NonStream(NonStreamServed),
+    Streamed(Response),
+}
+
 pub(crate) async fn gateway_serve(
     state: &AppState,
     parts: &mut axum::http::request::Parts,
@@ -268,8 +289,6 @@ pub(crate) async fn gateway_serve(
     // `count_tokens` 的 redact-only 语义由等价 sibling 判定产出（不新增
     // `Protocol` 变体），在下方 RequestCtx 单一装配点写入；`is_passthrough` 仍只认
     // `NonDialog`，故此处置位后 `count_tokens` 走对话臂（请求侧脱敏、跳过四类后处理）。
-    let redact_only = llm_gateway::redact_only_protocol(path).is_some();
-    let is_chat = !llm_gateway::is_passthrough(protocol);
     // 入口宿主机端口（entry-transport）：`Host` 经 `parse_ingress_port` 解析
     //（方括号 IPv6/裸 IPv6/非法一律有定义），缺失/非法回退 None（缺省上游），不猜测。
     let ingress_port: Option<u16> = parts
@@ -277,18 +296,69 @@ pub(crate) async fn gateway_serve(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_ingress_port);
+    // 请求日志追踪点（design §1.1）：`req_start` 之后、`resolve_target` 与 NonDialog
+    // 分支之前创建，保证后续所有早退都被记录；读取请求体前中断/`payload_too_large`
+    // 不进入本函数，故不产生行（与 spec 一致）。
+    let request_id = parts
+        .extensions
+        .get::<RequestId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_else(generated_request_id);
+    let mut trace = RequestTrace::new(
+        request_id,
+        protocol,
+        ingress_port,
+        state.config.redaction_enabled,
+        req_start,
+    );
+    let served = serve_inner(state, parts, path, body_bytes, &mut trace).await;
+    match served {
+        Served::Streamed(resp) => resp,
+        Served::NonStream(served) => {
+            let outcome = served.detail.outcome.clone().unwrap_or(Outcome::NoUpstream);
+            record_row(&state.request_log, trace.finish(&outcome, &served.detail));
+            served.resp
+        }
+    }
+}
+
+/// 分发主体（不含落行）：流式把追踪快照交 `StreamGuard`，非流把终态详情交回外层。
+async fn serve_inner(
+    state: &AppState,
+    parts: &mut axum::http::request::Parts,
+    path: &str,
+    body_bytes: Vec<u8>,
+    trace: &mut RequestTrace,
+) -> Served {
+    let protocol = trace.protocol();
+    let ingress_port = trace.ingress_port();
+    let is_chat = trace.is_chat();
+    let redact_only = llm_gateway::redact_only_protocol(path).is_some();
+    if redact_only {
+        // `count_tokens` 复用 Anthropic 协议线走对话臂（请求侧脱敏），但它不是
+        // 对话请求——落行判别位须显式置 `false`，不随协议默认值。
+        trace.set_is_chat(false);
+    }
+    let req_start = trace.req_start();
     // 单次目标解析（design D3）：URL 与覆盖同源取得，三路径共用同一结果，
     // 不存在第二条覆盖查询路径。
     let target = match resolve_target(&state.config, ingress_port) {
         Some(target) => target,
         None => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error":{"code":"E_EMPTY_BODY","message":"上游未配置"}})),
-            )
-                .into_response();
+            return Served::NonStream(NonStreamServed {
+                resp: (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":{"code":"E_EMPTY_BODY","message":"上游未配置"}})),
+                )
+                    .into_response(),
+                detail: NonstreamDetail {
+                    outcome: Some(Outcome::NoUpstream),
+                    ..NonstreamDetail::default()
+                },
+            });
         }
     };
+    trace.set_upstream(trace_authority(target.base_url));
     let url = build_upstream_url(target.base_url, path, parts.uri.query());
     // 动态头值展开上下文（design D3）：原始入站头 + 会话键头生效名。
     // 原始 `parts.headers` 不受下方转发剔除（会话键头/hop 头）影响。
@@ -325,7 +395,9 @@ pub(crate) async fn gateway_serve(
         // 上游意外回 SSE 亦按字节透传，类型即契约。传已剔除会话键头的转发头。
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
-        return serve_nondialog_passthrough(
+        // 非对话请求体不做脱敏，故摘要恒 `NULL`（design §6）；会话标识仍按显式头派生。
+        trace.attach_identity(None, &parts.headers, &state.config);
+        let (resp, detail) = serve_nondialog_detailed(
             client,
             upstream_method,
             &url,
@@ -339,6 +411,7 @@ pub(crate) async fn gateway_serve(
             },
         )
         .await;
+        return Served::NonStream(NonStreamServed { resp, detail });
     }
 
     let req_value = parse_request_json(&body_bytes);
@@ -350,6 +423,7 @@ pub(crate) async fn gateway_serve(
         .filter(|m| !m.is_empty())
         .unwrap_or("")
         .to_string();
+    trace.attach_identity(req_value.as_ref(), &parts.headers, &state.config);
     // 作用域选择：`request` 逐请求、
     // `conversation` 取存储共享的 `Arc<PiiScope>`；脱敏前 `req_value` 供键推导。
     let scope = build_request_scope(
@@ -389,8 +463,19 @@ pub(crate) async fn gateway_serve(
     .await;
     // 请求侧脱敏链熵源/内部故障 fail-closed——MUST NOT 转发未脱敏正文上游。
     if let Some(resp) = pii_fail_closed(scope.as_ref()) {
-        return resp;
+        return Served::NonStream(NonStreamServed {
+            resp,
+            detail: NonstreamDetail {
+                outcome: Some(Outcome::PiiUnavailable),
+                ..NonstreamDetail::default()
+            },
+        });
     }
+    // 摘要取自请求侧**已脱敏**正文（design §6）：`rw.body` 是脱敏后的最终字节，
+    // 失败回退为 `None`（宁可无摘要也不落原文）。
+    let redacted_value = parse_request_json(&rw.body);
+    trace.attach_summary(redacted_value.as_ref());
+    trace.mark_stream(rw.stream_flag && !redact_only);
     let dialog_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
     // 单一装配点构造共享请求上下文，流式/非流路径复用。
@@ -423,6 +508,7 @@ pub(crate) async fn gateway_serve(
         sse_frame_hard_bytes,
         init_conv: rw.init_conv.clone(),
         req_model: req_model.clone(),
+        stream_log: None,
     };
     // redact-only 变体（count_tokens）恒走非流有界读路径（受
     // `NONSTREAM_MAX_BYTES` 约束），不因请求体 stream 意图误入 SSE 泵。
@@ -457,7 +543,7 @@ pub(crate) async fn gateway_serve(
                 // 不得改写为 200 SSE 假流（客户端会误判为流式成功）。谓词与
                 // `should_pump_stream` 共用同一实现（`;` 前段 + trim + 大小写不敏感）。
                 if status_u16 >= 400 || !is_event_stream(&resp_ct) {
-                    return stream_upstream_passthrough(
+                    let resp = stream_upstream_passthrough(
                         up,
                         rw.normalized_out,
                         protocol,
@@ -465,38 +551,80 @@ pub(crate) async fn gateway_serve(
                         &state.gateway_metrics,
                     )
                     .await;
+                    return Served::NonStream(NonStreamServed {
+                        detail: NonstreamDetail {
+                            outcome: Some(Outcome::Passthrough {
+                                status: resp.status().as_u16(),
+                                is_chat: true,
+                            }),
+                            ..NonstreamDetail::default()
+                        },
+                        resp,
+                    });
                 }
                 let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
                 // 不 detach 泵任务——JoinHandle 交响应体持有，客户端断开
                 // 时由响应体 drop 触发 abort 回收（避免上游连接与任务泄漏）。
-                let pump = spawn_stream_pump(up, tx, pump_ctx());
-                build_sse_response(rx, rw.normalized_out, pump, upstream_status)
-            }
-            Err(_) => super::empty_body_response(protocol),
-        }
-    } else {
-        let nctx = NonstreamCtx {
-            req: req.clone(),
-            stream_flag: false,
-            nonstream_max_bytes: state.config.nonstream_max_bytes,
-            overrides: target.overrides,
-            expand,
-        };
-        match serve_nonstream(client, dialog_method, &url, fwd_headers, rw.body, nctx).await {
-            NonstreamOutcome::Responded(resp) => resp,
-            // 客户端未要求流但上游回 SSE 时，转字节泵保证终止闭合。
-            // 泵 conv 首选透传的请求会话（与 `rw.init_conv` 同源），
-            // 缺失才用改写输出的会话。
-            NonstreamOutcome::Stream(up, req_conv) => {
-                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
                 let mut pctx = pump_ctx();
-                if req_conv.is_some() {
-                    pctx.init_conv = req_conv;
-                }
-                let upstream_status = up.status();
+                pctx.stream_log = Some(StreamLog {
+                    guard: state.request_log.stream_guard(trace.into_row()),
+                    request_log: state.request_log.clone(),
+                    upstream_status: status_u16,
+                });
                 let pump = spawn_stream_pump(up, tx, pctx);
-                build_sse_response(rx, rw.normalized_out, pump, upstream_status)
+                return Served::Streamed(build_sse_response(
+                    rx,
+                    rw.normalized_out,
+                    pump,
+                    upstream_status,
+                ));
             }
+            Err(_) => {
+                return Served::NonStream(NonStreamServed {
+                    resp: super::empty_body_response(protocol),
+                    detail: NonstreamDetail {
+                        outcome: Some(Outcome::NoUpstream),
+                        ..NonstreamDetail::default()
+                    },
+                });
+            }
+        }
+    }
+    let nctx = NonstreamCtx {
+        req: req.clone(),
+        stream_flag: false,
+        nonstream_max_bytes: state.config.nonstream_max_bytes,
+        overrides: target.overrides,
+        expand,
+    };
+    let (outcome, detail) =
+        serve_detailed(client, dialog_method, &url, fwd_headers, rw.body, nctx).await;
+    match outcome {
+        NonstreamOutcome::Responded(resp) => Served::NonStream(NonStreamServed { resp, detail }),
+        // 客户端未要求流但上游回 SSE 时，转字节泵保证终止闭合。
+        // 泵 conv 首选透传的请求会话（与 `rw.init_conv` 同源），
+        // 缺失才用改写输出的会话。
+        NonstreamOutcome::Stream(up, req_conv) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+            let mut pctx = pump_ctx();
+            if req_conv.is_some() {
+                pctx.init_conv = req_conv;
+            }
+            // 客户端未要求流但上游回 SSE，实际按流式收尾——行须标 `stream`。
+            trace.mark_stream(true);
+            let upstream_status = up.status();
+            pctx.stream_log = Some(StreamLog {
+                guard: state.request_log.stream_guard(trace.into_row()),
+                request_log: state.request_log.clone(),
+                upstream_status: upstream_status.as_u16(),
+            });
+            let pump = spawn_stream_pump(up, tx, pctx);
+            Served::Streamed(build_sse_response(
+                rx,
+                rw.normalized_out,
+                pump,
+                upstream_status,
+            ))
         }
     }
 }

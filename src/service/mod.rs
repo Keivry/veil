@@ -20,6 +20,7 @@ pub mod matrix;
 pub mod metrics;
 pub mod pii;
 pub mod redaction;
+pub mod request_log;
 pub mod sse;
 pub mod tpm;
 

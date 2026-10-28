@@ -12,6 +12,7 @@ use {
             admin::ADMIN_RATE_SWEEP_SECS,
             audit::AuditPolicy,
             metrics::METRICS_FLUSH_INTERVAL_SECS,
+            request_log::FLUSH_INTERVAL_SECS,
             tpm::{
                 TPM_HEALTH_REFRESH_SECS,
                 TpmHealth,
@@ -214,6 +215,12 @@ async fn main() -> ExitCode {
     if let Some(msg) = veil::config::entry_mode_notice(config.entry_mode) {
         eprintln!("警告: {msg}");
     }
+    // 缺 HMAC 键时会话列留空（不写可被离线字典反查的弱摘要）；属功能降级，走可抑制的 tracing 告警。
+    if config.request_log_enabled && config.pii_value_sample_hmac_key.is_none() {
+        tracing::warn!(
+            "逐请求记录已启用但未设 PII_VALUE_SAMPLE_HMAC_KEY：/_admin/requests 的会话列将留空（不写入可被字典反查的弱摘要）"
+        );
+    }
     // 极短授权窗口是可跑但高摩擦的误配：每轮取用都建票并阻塞至 300s 超时。
     // 走 tracing（可抑制），与不可抑制的安全降级告警区分。
     if let Some(ttl) = config.authorization_ttl
@@ -299,6 +306,10 @@ async fn main() -> ExitCode {
         .admin
         .metrics
         .spawn_flush_driver(std::time::Duration::from_secs(METRICS_FLUSH_INTERVAL_SECS));
+    // 请求日志刷盘驱动（2s 或积压 ≥64 行；design §3）；关闭路径另由 `flush_blocking` 兜底。
+    let _request_log_flush = state
+        .request_log
+        .spawn_flush_driver(std::time::Duration::from_secs(FLUSH_INTERVAL_SECS));
     // 管理面限流周期清扫生产接线（与容量驱逐共同构成有界策略）。
     let _admin_rate_sweep = state
         .admin
@@ -371,6 +382,10 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let _ = flush_on_shutdown(state.admin.metrics.clone()).await;
+    // 请求日志同步兜底刷盘：排空队列写库 + 保留期清理，避免 2s 窗口内未落盘的行丢失。
+    if let Err(err) = state.request_log.flush_blocking() {
+        tracing::warn!("请求日志关闭刷盘失败（已周期落盘的行不受影响）: {err:#}");
+    }
     // 优雅停机——abort 通知消费者（剩余队列 best-effort 丢弃）。
     state.notify.shutdown();
     ExitCode::SUCCESS

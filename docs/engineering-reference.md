@@ -43,8 +43,9 @@
   文件值并入后复用与 env 完全相同的 `Config::load_from` 校验链，不因来源为文件而放宽。
 - 合并优先级：每个**白名单**概念按 **env 显式名集合**（规范名 ∪ 存活别名）判定，集合内任一变量非空（trim 后）
   即 env 胜并记一条冲突 warn；否则取文件声明值；两处皆缺取内建默认。**文件专属**概念的进程 env 面恒空，文件恒胜。
-  文件不引入新概念：下表每个键都对应一个白名单 env 名或一个文件专属概念；例外仅三处声明式结构化分节
-  ——`[llm.upstreams]`（按端口展开为 `LLM_<port>`）、`[llm.targets]`（文件专属上游目标覆盖，无 env 对应源，见下）与 `[command]`（文件专属下游命令配置，见 command-api 规格）。
+  文件不引入新概念：下表每个键都对应一个白名单 env 名或一个文件专属概念；例外为三处声明式结构化分节
+  ——`[llm.upstreams]`（按端口展开为 `LLM_<port>`）、`[llm.targets]`（文件专属上游目标覆盖，无 env 对应源，见下）与 `[command]`（文件专属下游命令配置，见 command-api 规格）
+  ——以及两个文件专属标量键 `storage.request_log_enabled`/`storage.request_log_retention_days`（无 env 对应源，进程 env 置位不生效）。
 - 过滤边界：白名单过滤只作用于 `Config::from_env` 收集到的**进程 env**；`Config::load_from(&HashMap)` 与文件层
   「映射为规范名后注入」的通道**保持不变**（文件值到达 `Config` 的唯一路径即该注入），故测试/脚本经 map
   注入的键不受过滤影响。
@@ -59,8 +60,8 @@
   审计 `$VAR`/`~/` 展开仍快照进程 env，不注入文件值。
 - 示例：`examples/veil.toml`（各分节代表键 + 中文注释；不含密钥类键，`0644` 权限即可加载）。
 
-文件 schema 键表（TOML 分节写法；键集由锁步测试与 `src/config/file_layer.rs` 的封闭映射表逐项绑定，
-`llm.targets` 与 `command` 为文件专属键根、无 env 对应源，增删须同步本表）：
+文件 schema 键表（TOML 分节写法；键集由锁步测试与 `src/config/file_layer/mod.rs` 的封闭映射表逐项绑定，
+`llm.targets`/`command`/`server` 为文件专属键根，`storage.request_log_enabled`/`storage.request_log_retention_days` 为文件专属标量键（均无 env 对应源，增删须同步本表）：
 
 | 文件键 | 规范 env 名 | TOML 类型 | 说明 |
 |:--|:--|:--|:--|
@@ -86,6 +87,8 @@
 | `storage.entry_mode` | `VEIL_ENTRY_MODE` | enum `full`/`credential-only`(已废弃,=full)/`llm-only` | 入口语义模式；不改变审批口径 |
 | `storage.credential_block_wait` | `CREDENTIAL_BLOCK_WAIT` | bool | 凭据审批 300s 阻塞双模开关 |
 | `storage.authorization_ttl_secs` | `AUTHORIZATION_TTL_SECS` | u64，`0`=无期限 | 授权窗口长度（秒）；到期转审批，不自动吊销 |
+| `storage.request_log_enabled` | `（文件专属）` | bool | 请求记录总开关（文件专属，无 env 对应源）；缺省 `true` |
+| `storage.request_log_retention_days` | `（文件专属）` | u64，`0`=不清理 | 请求记录保留天数（文件专属，无 env 对应源）；缺省 `7`，`0` 表示不清理 |
 | `redaction.enabled` | `REDACTION_ENABLED` | bool | 脱敏总开关；env 别名 `PII_REDACTION_ENABLED` |
 | `redaction.fuzzy_restore` | `PII_FUZZY_RESTORE` | bool | 残缺占位符按序号回查还原 |
 | `redaction.detection_hardening` | `PII_DETECTION_HARDENING` | bool | 严格边界复核（丢弃 ASCII 粘连与前导零 IPv4） |
@@ -184,18 +187,20 @@
   首个 `LLM_<port>` 并 warn，序确定不依赖 `HashMap` 迭代），不按端口猜测；`LLM_8878`/`LLM_8879`
   仅在携带入口宿主机端口上下文时生效。当前行为由 `resolve_upstream` 单测锁定。
 
-### 管理控制台说明（`admin.html` 范围）
+### 管理控制台说明（三段静态资产）
 
 - 接入方式：浏览器直接访问 `/_admin/`（或 `/_admin`）即得控制台 HTML（入口按 `Accept` 协商；脚本/`curl` 仍得 JSON 索引）；控制台自身**未鉴权**（壳内无数据）。
 - 登录方式：页面向 `/_admin/health` 提交 `X-Admin-Token`，成功后由服务端 `Set-Cookie` 持久化（Cookie 模式后续免重复提交）；token 不落任何浏览器存储。
 - 缓存语义：管理面统一 `Cache-Control: no-store`；不返回 `ETag`，不参与 304 协商。
-- 数据来源：复用既有管理面七路由（含 `/_admin/commands`）；实时大盘走 `/_admin/events/stream` 的 SSE 快照事件 `event: metrics`（15s 周期，与 `/_admin/metrics` 同字段集）；审计事件事件名为 `event`，并含 `done` 终止帧。
+- 数据来源：复用管理面八路由（含 `/_admin/commands` 与 `/_admin/requests`）；实时大盘走 `/_admin/events/stream` 的 SSE 快照事件 `event: metrics`（15s 周期，与 `/_admin/metrics` 同字段集）；审计事件事件名为 `event`，并含 `done` 终止帧。
 - 图表：仅内联 SVG 渲染，不加载 Chart.js，无任何外部资源。
-- 界面结构：单文件控制台采用左侧分区导航（概览 / 脱敏 / 性能 / 事件 / 命令调用）与明暗双主题——首屏默认跟随系统 `prefers-color-scheme`，侧栏按钮手动切换并以 `veil_theme` Cookie 记忆（不写 `localStorage`/`sessionStorage`）；窄屏（<860px）下侧栏折叠为顶部横排。
+- 资产形态：控制台 HTML 由三段片段在**编译期**拼接（`src/handler/admin/console.rs::CONSOLE_HTML` 的 `concat!` + 三处 `include_str!`：`console.head.html` 骨架与样式、`console.app.js` 脚本、`console.tail.html` 收尾）；对外仍是**一个响应、一个 URL、零外部引用**，运行期无文件读取、无 `OnceLock`、无 `String` 分配。
+- 界面结构：控制台采用左侧分区导航（概览 / 脱敏 / 性能 / 事件 / 命令调用 / LLM 请求）与明暗双主题。首屏默认跟随系统 `prefers-color-scheme`，侧栏按钮手动切换并以 `veil_theme` Cookie 记忆（不写 `localStorage`/`sessionStorage`）；窄屏（<860px）下侧栏折叠为顶部横排。
 - 事件过滤：按 `kind`（可附 `since`）与 `limit`（默认 50、上限 200）；不提供 `model`/`upstream` 过滤。
-- 范围切换：`?range=1h|24h|7d|30d`。
+- 范围切换：`?range=1h|24h|7d|30d`，同时作用于 SSE 重连与当前分区的数据请求。
+- 「LLM 请求」分区：消费 `/_admin/requests`，九列（时间 / 模型 / 协议 / 会话 / 状态 / 输入·输出 / 命中率 / 耗时 / 摘要）；会话列展示前 12 位加作用域与链徽标，`null` 一律渲染 `—`；分页并给出「共 N 条」，空态区分「记录功能未启用」与「范围内无请求」。全部单元格先经 `esc()` 转义再拼接（含 `title` 属性位），不对未转义文本直接拼 `innerHTML`。
 - 数据绑定（时间轴与 KPI）：图表 X 轴与 tooltip 以 series 点的 `ts_start`（窗口起始 Unix 秒）按浏览器本地时间渲染，`window` 仅作内部键、不作可读标签；KPI 总量取自 `/_admin/metrics` 与 SSE `metrics` 快照的 `pii_hits`/`pii_miss`/`cred_hits` 三个 additive 字段（命中率 = `pii_hits/(pii_hits+pii_miss)`，分母为 0 显示 `—`）。
-- 指标字段兼容：上述新增字段只增不改；控制台不要求新增管理路由，也不依赖任何字段的移除或改名，旧调用方可忽略新字段。
+- 指标字段兼容：上述新增字段只增不改；控制台不依赖任何字段的移除或改名，旧调用方可忽略新字段。新增的「LLM 请求」分区消费 `/_admin/requests`，不改变既有分区的取数路径。
 - 事件空态说明：事件表为空且 `[audit].mode` 为默认 `off` 时，页面展示说明性空态文案——审计默认关闭时事件环仅承载截断/故障类事件，属设计语义而非故障。
 - `[auth].observability_disable = true` 时 `/_admin/` 与其余管理面路由一致返回 404。
 - `GET /_admin`（无尾斜杠）与 `GET /_admin/` 注册为同一 handler，均按 `Accept` 协商（浏览器得控制台 HTML、
@@ -293,7 +298,7 @@ curl -fsS http://127.0.0.1:8877/credential \
   自动放行仅对已注册调用方生效。
 - `caller_hash == VEILCTL_BINARY_HASH`（终端直调而非脚本调用）拒绝 403。
 - 自动放行三态（`[storage].auto_approve` 文件枚举）：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（哈希不一致走 `pending` 分支）；
-  三态取值由配置文件承载，非法值拒启动（`src/config/env_parse.rs::AutoApprove`）。
+  三态取值由配置文件承载，非法值拒启动（`src/config/env_parse/mod.rs::AutoApprove`）。
 - 管理面鉴权优先级：`X-Admin-Token` 头 > `__Host-admin_token` Cookie > `?access_token`（仅 SSE 回退）；
   非 SSE 接口以 query 携带 token 恒 401。
 - 写端点部署密钥强制：`POST /approve-hash-change`、`POST /register-caller`、
@@ -309,7 +314,7 @@ curl -fsS http://127.0.0.1:8877/credential \
   **声明清单**（仅作声明/测试与文档用途，不被生产路径消费，故非运行时真源）：
   `/_admin` 与 `/_admin/`（控制台壳，`router.rs` 两条注册指向同一 handler）、
   `/_admin/health`（存活探针）、`/_admin/events/stream`（长连接）。四路不占通用限流桶；
-  `metrics`/`series`/`events` 数据接口的 `10/min` 阈值不变。豁免的**真实实现**是对应
+  `metrics`/`series`/`events`/`commands`/`requests` 数据接口的 `10/min` 阈值不变。豁免的**真实实现**是对应
   handler 不调用 `admin::check_admin_rate`，每个豁免 handler 以 `debug_assert!` 锁步，
   防止被当作"漏限流"回填。
 - `/_admin/events/stream` 按 IP 限制并发 `5`，超限拒绝新连接（`429 + Retry-After: 60`，固定 60 秒）
@@ -406,21 +411,25 @@ done
 
 | 符号 | 取值 | 来源 |
 |:-----|:-----|:-----|
-| `CREDENTIAL_RATE_WINDOW_SECS` | `2` | `src/config/env_parse.rs` |
-| `REGISTER_RATE_WINDOW_SECS` | `1` | `src/config/env_parse.rs` |
+| `CREDENTIAL_RATE_WINDOW_SECS` | `2` | `src/config/env_parse/mod.rs` |
+| `REGISTER_RATE_WINDOW_SECS` | `1` | `src/config/env_parse/mod.rs` |
 | `PENDING_TTL_SECS` | `60` | `src/approval.rs` |
 | `OLD_HASH_GRACE_SECS` | `3600` | `src/registry/entry.rs` |
 | `RateTable::MAX_ENTRIES` | `4096` | `src/service/credential/ratelimit.rs` |
 | `RateTable::SWEEP_LEN` | `1000` | `src/service/credential/ratelimit.rs` |
 | `RateTable::SWEEP_SECS` | `60` | `src/service/credential/ratelimit.rs` |
-| `SSE_FRAME_SOFT_BYTES` | `1MiB` | `src/config/env_parse.rs` |
-| `SSE_FRAME_HARD_BYTES` | `8MiB`（默认；配置文件可覆写，解析值运行时注入解析器） | `src/config/env_parse.rs` |
-| `EVENT_IDLE_TIMEOUT` | `30s` | `src/config/env_parse.rs` |
-| `KEEPALIVE_INTERVAL` | `10s` | `src/config/env_parse.rs` |
+| `SSE_FRAME_SOFT_BYTES` | `1MiB` | `src/config/env_parse/mod.rs` |
+| `SSE_FRAME_HARD_BYTES` | `8MiB`（默认；配置文件可覆写，解析值运行时注入解析器） | `src/config/env_parse/mod.rs` |
+| `EVENT_IDLE_TIMEOUT` | `30s` | `src/config/env_parse/mod.rs` |
+| `KEEPALIVE_INTERVAL` | `10s` | `src/config/env_parse/mod.rs` |
 | `RING_CAP` | `10000` | `src/service/metrics/aggregate.rs` |
 | `METRICS_FLUSH_INTERVAL_SECS` | `60` | `src/service/metrics/store.rs` |
 | `AGGS_MAX_ENTRIES` | `4096` | `src/service/metrics/aggregate.rs` |
-| `AGGS_DAILY_KEEP` / `AGGS_HOURLY_KEEP` / `AGGS_FIVE_MIN_KEEP` | `32` / `170` / `1` | `src/service/metrics/aggregate.rs` |
+| `AGGS_DAILY_KEEP` / `AGGS_HOURLY_KEEP` / `AGGS_FIVE_MIN_KEEP` | `32` / `170` / `13` | `src/service/metrics/aggregate.rs` |
+| `REQUEST_QUEUE_CAP` | `4096` | `src/service/request_log/store.rs` |
+| `FLUSH_BATCH_ROWS` | `64` | `src/service/request_log/store.rs` |
+| `FLUSH_INTERVAL_SECS` / `PURGE_INTERVAL_SECS` | `2` / `60` | `src/service/request_log/store.rs` |
+| `ROLLUP_KEEP` | `d 32` / `h 170` / `m 13` | `src/service/request_log/store.rs` |
 | `ADMIN_RATE_MAX_ENTRIES` | `4096` | `src/service/admin/ratelimit.rs` |
 
 ## 5. Go 客户端对接指引
@@ -439,8 +448,19 @@ done
 | 命令目录 | `GET /commands` | 三因子写口径（头携带 `X-Veilctl-Binary-Hash`、`X-Veilctl-Secret`、`X-Caller-Hash`、`X-Caller-Path`） |
 | 命令调用 | `POST /commands/{id}/invoke` | 三因子写口径 + `downstreams.allow_commands` 授权 |
 | 命令调用日志 | `GET /_admin/commands` | 管理面鉴权（同其余 `/_admin` 路由） |
+| 逐请求明细 | `GET /_admin/requests` | 管理面鉴权（通用 `10/min`/IP 限流，**不**豁免；响应统一 `Cache-Control: no-store`） |
 | LLM 代理透传 | 任意 `/{tail}`（含 `GET`；未知 admin 子路径除外） | 无（上游透传） |
 | 存活探针 | `GET /health` | 无 |
+
+`GET /_admin/requests` 是管理面第八条路由，读 `metrics.sqlite` 的 `llm_requests` 表（口径与字段语义见 §7.14）。参数：
+
+- `range`（`1h|24h|7d|30d`）：按 `ts_secs` **精确**过滤，不做窗口对齐，故 `boundary_slack_secs` 恒 `0`；下界即 `now - span`。
+- `model` / `protocol`：等值匹配；空串视为不过滤。`status` 取 `2xx|4xx|5xx|error`，其中 `error` = `status IS NULL OR status >= 400`，其余取值 `400`。
+- `session`：`session_id` **前缀**匹配，少于 4 字符 `400`（`%`/`_`/`\` 已转义，不作通配）。`scope` 取 `session|user|any`，`any` 等同不过滤。
+- `limit`：默认 `50`，取值收敛到 `1..=200`（`limit=500` 得 200、`limit=0` 得 1，均不报错）；`offset`：默认 `0`，上限 `10000`，超出 `400`。响应回显收敛后的 `limit`/`offset`。
+- 无 `range` 时响应**省略** `range`/`since_ts`/`boundary_slack_secs` 三个键（不以 `null` 冒充全局口径），`coverage_secs` 取 `now - 该 WHERE 下最早记录 ts`，`partial=false`。
+- 记录功能关闭（`[storage].request_log_enabled = false`）时短路为 `{"ok":true,"enabled":false,"rows":[],"total":0}`，不解析其余参数。
+- 顶层 `sum_cached_read`/`sum_cache_input_tokens`/`hit_rate` 与 `rows` **同 WHERE**（`total` 也是），`hit_rate` 为 `SUM/SUM`，分母 `0` 时为 `null`。
 
 ```bash
 # 取用（脱敏值，默认）
@@ -661,6 +681,8 @@ Responses 取数顶层优先：非流按顶层 `usage` → `response.usage` → 
 `input_tokens_details.cached_tokens`，Chat 取
 `prompt_tokens_details.cached_tokens`（细节对象 `null`/缺失归零；
 非 Anthropic 的 `cached_write` 恒零）。`model` 分桶与缓存列只加不改旧列。
+这三列也是输入缓存命中率的分子/分母输入，命中率的分母按协议不同（Anthropic 须把缓存读写加回
+`input_tokens`），逐请求记录与范围级求和口径见 §7.14。
 
 Chat 显式 false 即放弃流式用量，按 key 合并保留不覆写：Chat 请求自带
 `stream_options={"include_usage":false}` 时转发体保留 `false`，不覆写为 `true`
@@ -1132,6 +1154,72 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
   clippy，因此无需 nightly、不触发构建期下载）；base tag 须 ≥ 该下限，改动任一侧须
   重跑 `docker build` 验证，不得改用滚动 tag。
 
+### 7.14 逐请求记录与 `range` 口径
+
+`[storage].request_log_enabled`（默认 `true`）开启时，每个 LLM 请求落一行到
+`metrics.sqlite` 的 `llm_requests` 表（与指标同库、不同表），并由 `counted_metrics=1` 的行
+聚合出 `request_model_rollup` 投影（粒度/窗口/协议/模型四键）。写入路径为有界队列
+（`REQUEST_QUEUE_CAP` = 4096，满则丢最旧并计 `dropped`）+ 2 秒或积压 ≥64 行的单事务批量写，
+关闭路径 `flush_blocking` 兜底。`llm_requests` 按 `[storage].request_log_retention_days`
+（默认 `7`，`0` = 不清理）删除；`request_model_rollup` 随窗口数驱逐（`d` 32 / `h` 170 / `m` 13）。
+本表只存元数据与脱敏摘要，不存请求/响应正文；`upstream` 只记 `host:port`。
+
+`session_id` 取九档优先级中首个命中的会话锚点做 HMAC 摘要（保留 16 hex），来源依次为显式头
+（`[pii_scope].key_header`）、Responses `conversation`、`previous_response_id`、
+`diagnostics.previous_message_id`、`prompt_cache_key`、`metadata.user_id`、`safety_identifier`、
+`user`、无；原始值不落库。摘要域串与 `conversation_key` 不同，同一原文两条路径结果不等。
+未设 `PII_VALUE_SAMPLE_HMAC_KEY` 时该列为 `NULL`、`session_scope` 为 `none`，不退化为无密钥哈希。
+`session_scope` 区分会话级（前五档）与用户级（第六至八档），供 `/_admin/requests?scope=` 过滤。
+
+**`range` 分档**（`/_admin/metrics`、`/_admin/requests`、`/_admin/events`、`/_admin/commands`
+及 SSE 快照共用；`/_admin/series` 只把 `range` 折算为窗口键 `since`）：
+
+| `range` | 取数路径 | `boundary_slack_secs` |
+|:--|:--|:--|
+| `1h` | 内存环最早样本 ≤ `now-3600` 时按 `ts_secs` 秒级过滤；否则退回 `five_min` 窗口求和（`AGGS_FIVE_MIN_KEEP` = 13 窗 = 当前窗 + 12 个完整窗，恰好覆盖 60 分钟），并置 `partial=true` | 环路径 `0`，兜底 `300` |
+| `24h` | `hourly` 窗口求和（`AGGS_HOURLY_KEEP` = 170） | `3600` |
+| `7d` / `30d` | `daily` 窗口求和（`AGGS_DAILY_KEEP` = 32） | `86400` |
+
+窗口路径的下界是**窗口对齐**的：`since_ts` 取包含 `now - span` 的窗口起点，最多比 `now - span`
+早一个粒度跨度；当前窗尚未走完，其计数同样不完整。这两个方向合起来由 `boundary_slack_secs`
+声明为一个粒度跨度的误差上界。环路径的 `since_ts` 精确为 `now - span`。
+`/_admin/requests`/`events`/`commands` 按 `ts_secs` 精确过滤（无窗口对齐），其
+`boundary_slack_secs` 恒 `0`。`/_admin/events` 同时给出 `range` 与显式 `since` 时取较晚
+（更大）的那个下界；`/_admin/series` 的 `range` 只折算为 `[dhm]<整数>` 形态的 `since`，
+显式 `since` 优先（两者跨粒度数值不可比，故不取 max）。
+
+**覆盖与精度**：
+
+- `coverage_secs = now - max(下界, earliest_available_ts)`。`earliest_available_ts` 取环内最早
+  样本（环路径）或最早保留窗口起点（窗口路径）；下界对范围快照取**未对齐**的 `now - span`
+  （`src/service/metrics/aggregate/range.rs::snapshot_in_range`），对
+  `/_admin/requests`/`events`/`commands` 取响应里的 `since_ts`。无可回答数据时为 `0`。
+- 范围快照（`/_admin/metrics`）的 `partial` = `coverage_secs < span`，或 `1h` 档未能走环而退回窗口
+  兜底（精度必然降级）。`/_admin/requests`/`events`/`commands` 只有前者一个条件。
+- `all_samples_precise`：环路径取范围内各样本 `MetricSample.is_precise` 的与；窗口路径只能
+  判「覆盖是否满整段」（`coverage_secs >= span`）。
+- `is_precise = !partial && span >= 3600 && samples >= 100 && coverage_secs >= span && all_samples_precise`。
+  故 `partial` 与 `is_precise` 互斥；刚启动 10 分钟查 `1h` 必为 `false`。
+- 未给 `range` 时 `/_admin/metrics` 输出既有全局快照，**不出现** `range`/`since_ts`/
+  `boundary_slack_secs`/`coverage_secs`/`partial` 任何一键（全局口径不冒充范围口径）。
+  `/_admin/requests`/`events`/`commands` 未给 `range` 时同样省略前三键，但仍回
+  `coverage_secs`（`now - 最早记录 ts`）与 `partial=false`。SSE `data` 恒为六键，
+  `data.range` 缺失时为 `null`，范围字段只进 `data.metrics`。
+
+**`per_model` 来源**：范围快照的模型分布读 `request_model_rollup`，即请求表 `llm_requests` 中
+`counted_metrics=1` 行的投影（与 KPI `requests` 同集合）。按请求下界推算粒度（≤1h 取 `m`、
+≤24h 取 `h`、否则 `d`）后 `SUM(count) GROUP BY model`。记录功能关闭或读数失败时退化为空分布并置
+`per_model_partial=true`，**不**回退为含失败请求的环内口径（宁缺勿错：宁可标空，不给不可对账的数）。
+
+**输入缓存命中率**：分母按协议物化到 `cache_input_tokens`（`src/service/request_log/store.rs::cache_input_tokens`）。Chat/Responses 的
+`prompt_tokens` 已含缓存，直接用；Anthropic 的 `input_tokens` 不含缓存读写，须
+`prompt_tokens + cached_read + cached_write` 加回。于是：
+
+- 行级：`cache_hit_rate = cached_read / cache_input_tokens`（写比率同理 `cached_write / cache_input_tokens`）。
+- 范围级：`hit_rate = sum_cached_read / sum_cache_input_tokens`，即先分别求和再相除，
+  **绝不对逐请求比率取平均**（分母为零的行会让平均失真，且求和口径才与计费侧可对账）。
+- 分母为 `0` 时比率为 `null`，由调用方/前端渲染为 `—`。
+
 ## 8. 遗留决策记录
 
 本节锁定遗留决策与口径，后续变更不得静默漂移。
@@ -1219,6 +1307,13 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
   增加版本字符串比较（会把本可成功的环境误判失败）。
   跳过语义：缺前置条件默认显式报错并非零退出；`GATE_SKIP_CONFORMANCE=1`（第 6 步）与
   `GATE_SKIP_GO=1`（第 7 步）为显式跳过并打印跳过理由与文档位置，不出现无输出的静默跳过。
+- 第 5 步文件大小门禁（`python3 scripts/check_file_sizes.py`，budget rule v2，纯路径分类零解析）：
+  生产 `.rs`（非测试）限 800 行、测试 `.rs` 限 1200 行，静态资产 `src/**/*.html` **与
+  `src/**/*.js`** 同为 1600 行。`.js` 单列分类是本版新增的红线：控制台脚本拆出为独立片段后
+  不再借 HTML 的预算池；超线即非零退出并列文件、类别、行数与红线，无白名单（全仓强制）。
+  控制台资产三段（`console.head.html` / `console.app.js` / `console.tail.html`）各自受
+  1600 行约束，编译期由 `src/handler/admin/console.rs::CONSOLE_HTML` 的 `concat!` 拼成一个响应，
+  对外仍是一个 URL、零外部引用。
 
 ### 8.6 空流三协议语义
 

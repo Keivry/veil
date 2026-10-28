@@ -1,453 +1,8 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>veil · 管理控制台</title>
-<link rel="icon" href="data:,">
-<script>
-(function () { try {
-  var m = document.cookie.match(/(?:^|;\s*)veil_theme=(dark|light)/);
-  var sys = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
-  document.documentElement.dataset.theme = m ? m[1] : (sys ? 'light' : 'dark');
-} catch (e) {} })();
-</script>
-<style>
-  :root {
-    --bg: #0e1016;
-    --bg2: #12151f;
-    --panel: #161a25;
-    --panel2: #1d2231;
-    --panel3: #232a3a;
-    --border: #252b3a;
-    --border2: #333b4e;
-    --text: #e4e9f5;
-    --dim: #8b94ab;
-    --faint: #5c6478;
-    --accent: #5cc8ff;
-    --accent-2: #7c9cff;
-    --accent-ink: #05121d;
-    --accent-soft: rgba(92, 200, 255, .14);
-    --accent-line: rgba(92, 200, 255, .32);
-    --ok: #3ddc97;
-    --warn: #f7c04a;
-    --err: #ff7b72;
-    --ok-soft: rgba(61, 220, 151, .16);
-    --warn-soft: rgba(247, 192, 74, .13);
-    --err-soft: rgba(255, 123, 114, .14);
-    --ring: rgba(92, 200, 255, .55);
-    --radius: 14px;
-    --radius-sm: 9px;
-    --shadow: 0 1px 2px rgba(0, 0, 0, .28), 0 10px 30px -14px rgba(0, 0, 0, .55);
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .24);
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    --sans: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
-  }
-  :root[data-theme="light"] {
-    --bg: #f4f6fb;
-    --bg2: #ffffff;
-    --panel: #ffffff;
-    --panel2: #f4f6fb;
-    --panel3: #eaeef7;
-    --border: #e4e8f2;
-    --border2: #ccd5e5;
-    --text: #1a2233;
-    --dim: #5d6883;
-    --faint: #96a1b8;
-    --accent: #0d8be0;
-    --accent-2: #5b6cff;
-    --accent-ink: #ffffff;
-    --accent-soft: rgba(13, 139, 224, .10);
-    --accent-line: rgba(13, 139, 224, .30);
-    --ok: #0f9d63;
-    --warn: #b98200;
-    --err: #d64a45;
-    --ok-soft: rgba(15, 157, 99, .13);
-    --warn-soft: rgba(185, 130, 0, .11);
-    --err-soft: rgba(214, 74, 69, .12);
-    --ring: rgba(13, 139, 224, .45);
-    --shadow: 0 1px 2px rgba(20, 30, 60, .06), 0 12px 32px -20px rgba(20, 30, 60, .34);
-    --shadow-sm: 0 1px 2px rgba(20, 30, 60, .06);
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  [hidden] { display: none !important; }
-  body {
-    background: var(--bg); color: var(--text);
-    font: 14px/1.55 var(--sans);
-    -webkit-font-smoothing: antialiased;
-  }
-  #app { min-height: 100vh; }
-  .layout { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh; }
-  .side {
-    position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column;
-    gap: 6px; padding: 20px 14px; background: var(--bg2);
-    border-right: 1px solid var(--border);
-  }
-  .brand { display: flex; align-items: center; gap: 11px; padding: 4px 8px 16px; }
-  .brand .mark {
-    width: 34px; height: 34px; border-radius: 10px; flex: none; display: grid; place-items: center;
-    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    color: var(--accent-ink); box-shadow: var(--shadow-sm);
-  }
-  .brand .mark svg { width: 19px; height: 19px; }
-  .brand .bt { font-size: 15px; font-weight: 700; letter-spacing: .2px; line-height: 1.25; }
-  .brand small { display: block; color: var(--faint); font-size: 11px; font-weight: 500; margin-top: 3px; }
-  .nav { display: flex; flex-direction: column; gap: 3px; }
-  .nav button {
-    appearance: none; border: 1px solid transparent; background: transparent; color: var(--dim);
-    text-align: left; padding: 9px 12px; border-radius: var(--radius-sm); font-size: 13px;
-    font-family: inherit; cursor: pointer; display: flex; align-items: center; gap: 10px;
-    transition: background .16s, color .16s, border-color .16s, transform .12s;
-  }
-  .nav button:hover { background: var(--panel2); color: var(--text); }
-  .nav button:active { transform: scale(.985); }
-  .nav button.active {
-    background: linear-gradient(180deg, var(--accent-soft), transparent), var(--panel);
-    color: var(--accent); font-weight: 600; border-color: var(--accent-line); box-shadow: var(--shadow-sm);
-  }
-  .nav button svg { width: 16px; height: 16px; flex: none; }
-  .side-foot {
-    margin-top: auto; display: flex; align-items: center; justify-content: space-between;
-    gap: 8px; padding: 12px 6px 2px; border-top: 1px solid var(--border);
-  }
-  .theme-btn {
-    display: inline-flex; align-items: center; gap: 7px; background: var(--panel2);
-    color: var(--dim); border: 1px solid var(--border); border-radius: var(--radius-sm);
-    padding: 7px 11px; font-size: 12px; font-family: inherit; cursor: pointer;
-    transition: color .16s, border-color .16s, background .16s;
-  }
-  .theme-btn:hover { color: var(--text); border-color: var(--border2); background: var(--panel3); }
-  .theme-btn svg { width: 14px; height: 14px; }
-  :root[data-theme="dark"] .ico-moon { display: none; }
-  :root[data-theme="light"] .ico-sun { display: none; }
-  .main { min-width: 0; padding: 24px 28px 44px; }
-  .topbar {
-    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-    margin-bottom: 18px; position: relative;
-  }
-  .topbar h1 { font-size: 20px; font-weight: 700; margin-right: auto; letter-spacing: -.2px; }
-  .banner {
-    display: none; padding: 10px 14px; border-radius: var(--radius-sm); margin-bottom: 16px;
-    background: var(--warn-soft); border: 1px solid rgba(247, 192, 74, .4); color: var(--warn);
-  }
-  .banner.show { display: block; }
-  .kpis { display: flex; flex-direction: column; gap: 18px; margin-bottom: 18px; }
-  .kpi-group { display: flex; flex-direction: column; gap: 9px; }
-  .kpi-group-h {
-    font-size: 11px; font-weight: 700; letter-spacing: .09em; color: var(--faint);
-    display: flex; align-items: center; gap: 10px;
-  }
-  .kpi-group-h::after { content: ''; flex: 1; height: 1px; background: var(--border); }
-  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-  .kpi {
-    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 13px 15px; box-shadow: var(--shadow-sm);
-    transition: border-color .18s, transform .18s, box-shadow .18s;
-  }
-  .kpi:hover { border-color: var(--border2); transform: translateY(-1px); box-shadow: var(--shadow); }
-  .kpi .label { color: var(--dim); font-size: 12px; margin-bottom: 7px; }
-  .kpi .value { font-size: 22px; font-weight: 700; font-family: var(--mono); letter-spacing: -.5px; line-height: 1.1; overflow-wrap: anywhere; word-break: break-word; }
-  .kpi .hint { color: var(--faint); font-size: 11px; margin-top: 5px; }
-  .kpi.primary { background: linear-gradient(180deg, var(--accent-soft), transparent 64%), var(--panel); border-color: var(--accent-line); }
-  .kpi.primary .label { color: var(--accent); font-weight: 600; }
-  .kpi.primary .value { font-size: 27px; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
-  }
-  .panel h2 {
-    font-size: 13px; font-weight: 650; margin-bottom: 14px; letter-spacing: .01em;
-    display: flex; align-items: center; gap: 9px;
-  }
-  .panel h2::before {
-    content: ''; width: 7px; height: 7px; border-radius: 2px; flex: none;
-    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    box-shadow: 0 0 0 3px var(--accent-soft);
-  }
-  .h2-sub { color: var(--dim); font-weight: 400; font-size: 11.5px; margin-left: auto; }
-  .sub-h { color: var(--dim); font-size: 11px; margin: 12px 0 6px; }
-  .sub-h:first-of-type { margin-top: 0; }
-  .hintline { color: var(--faint); font-size: 11px; margin-top: 10px; line-height: 1.6; }
-  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; position: relative; }
-  .toolbar button, .toolbar input {
-    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
-    border-radius: var(--radius-sm); padding: 7px 12px; font-size: 12px; font-family: inherit;
-    cursor: pointer; transition: border-color .16s, background .16s, color .16s;
-  }
-  .toolbar input { cursor: text; min-width: 150px; }
-  .toolbar button:hover { border-color: var(--border2); }
-  .toolbar input:disabled, .toolbar button:disabled { opacity: .5; cursor: not-allowed; }
-  .toolbar button.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
-  #range-bar { background: var(--panel); border: 1px solid var(--border); border-radius: 11px; padding: 3px; gap: 2px; box-shadow: var(--shadow-sm); }
-  #range-bar button { border: none; background: transparent; border-radius: 8px; padding: 6px 14px; font-variant-numeric: tabular-nums; }
-  #range-bar button:hover { background: var(--panel2); border-color: transparent; }
-  #range-bar button.active { background: var(--accent); color: var(--accent-ink); box-shadow: var(--shadow-sm); }
-  .rt-tip {
-    position: absolute; top: calc(100% + 8px); left: 50%; transform: translateX(-50%);
-    background: var(--err); color: #fff; padding: 6px 12px; border-radius: 6px;
-    font-size: 11px; white-space: nowrap; box-shadow: var(--shadow);
-    display: none; z-index: 140; pointer-events: none;
-  }
-  .rt-tip.show { display: block; }
-  .rt-tip::before {
-    content: ''; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
-    border: 5px solid transparent; border-bottom-color: var(--err);
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--dim); font-weight: 600; font-size: 11px; letter-spacing: .02em; }
-  td.num, th.num { text-align: right; font-family: var(--mono); }
-  td.sum { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  tr.clickable { cursor: pointer; transition: background .12s; }
-  tr.clickable:hover { background: var(--panel2); }
-  tr.clickable:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
-  tbody tr:last-child td { border-bottom: none; }
-  .tooltip {
-    position: fixed; z-index: 150; max-width: 480px; max-height: 60vh; overflow: auto;
-    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius-sm);
-    padding: 11px 13px; font-size: 12px; box-shadow: 0 14px 44px rgba(0, 0, 0, .5);
-  }
-  .tooltip pre { white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 11px; margin: 0; }
-  .login { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: var(--bg); z-index: 200; }
-  .login.show { display: flex; }
-  .login-box { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 30px; width: 368px; box-shadow: var(--shadow); }
-  .login-box h2 { font-size: 17px; margin-bottom: 16px; }
-  .login-box input {
-    width: 100%; padding: 11px; border-radius: var(--radius-sm); border: 1px solid var(--border);
-    background: var(--panel2); color: var(--text); margin-bottom: 10px; font-size: 14px; font-family: inherit;
-    transition: border-color .16s;
-  }
-  .login-box input:focus { outline: none; border-color: var(--accent); }
-  .login-box button {
-    width: 100%; padding: 11px; border-radius: var(--radius-sm); border: none; cursor: pointer;
-    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--accent-ink);
-    font-weight: 700; font-size: 14px; font-family: inherit; transition: filter .16s;
-  }
-  .login-box button:hover { filter: brightness(1.08); }
-  .login-box button:disabled { opacity: .5; cursor: not-allowed; }
-  .login-box .note { color: var(--faint); font-size: 11px; margin-top: 12px; line-height: 1.55; }
-  .login-err { color: var(--err); font-size: 12px; min-height: 18px; margin-bottom: 6px; }
-  .live-ind { display: inline-flex; align-items: center; gap: 7px; color: var(--ok); font-size: 12px; white-space: nowrap; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; box-shadow: 0 0 0 3px var(--ok-soft); }
-  .dot.off { background: var(--faint); box-shadow: 0 0 0 3px var(--panel2); }
-  .live-ind .dot:not(.off) { animation: pulse 2.4s ease-in-out infinite; }
-  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 3px var(--ok-soft); } 50% { box-shadow: 0 0 0 6px transparent; } }
-  svg text { fill: var(--dim); font-size: 10px; }
-  svg text.v { fill: var(--text); font-weight: 700; font-size: 10.5px; }
-  svg .axis { stroke: var(--border2); stroke-width: 1; }
-  svg .grid { stroke: var(--border); stroke-width: 0.5; }
-  svg .bar-rect { stroke: var(--accent-line); stroke-width: 1; transition: filter .15s; }
-  svg .bar-rect:hover, svg .bar-rect:focus { filter: brightness(1.18); }
-  svg .trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-  svg .pt { fill: var(--accent); stroke: var(--panel); stroke-width: 1.5; pointer-events: none; }
-  svg .hit { fill: transparent; cursor: pointer; }
-  svg .track { fill: var(--panel2); }
-  svg .axis-lab { fill: var(--dim); }
-  svg rect[tabindex="0"]:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .tokens4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 10px; margin-bottom: 16px; }
-  .tok { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 11px 13px; box-shadow: var(--shadow-sm); transition: border-color .18s, transform .18s; }
-  .tok:hover { border-color: var(--border2); transform: translateY(-1px); }
-  .tok .l { color: var(--dim); font-size: 11px; }
-  .tok .v { font-family: var(--mono); font-size: 17px; font-weight: 650; margin-top: 3px; }
-  .brow { display: grid; grid-template-columns: 84px 1fr 64px 46px; align-items: center; gap: 10px; font-size: 11px; margin: 5px 0; }
-  .brow .bl { color: var(--dim); font-family: var(--mono); text-align: right; }
-  .brow .track { height: 12px; background: var(--panel2); border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
-  .brow .bar { display: block; height: 100%; border-radius: 7px; min-width: 2px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .4s cubic-bezier(.2, .8, .2, 1); }
-  .brow .bv { font-family: var(--mono); color: var(--text); text-align: right; }
-  .brow .bp { font-family: var(--mono); color: var(--faint); text-align: right; }
-  .health-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
-  .health-label { color: var(--dim); font-size: 12px; }
-  .health-chip {
-    display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap;
-    padding: 6px 13px; border-radius: 999px; font-size: 11.5px; font-family: var(--mono);
-    background: var(--panel); border: 1px solid var(--border); color: var(--dim);
-    box-shadow: var(--shadow-sm); transition: border-color .18s;
-  }
-  .health-chip.ok { border-color: rgba(61, 220, 151, .4); }
-  .health-chip.err { border-color: rgba(255, 123, 114, .45); }
-  .health-chip .hc-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
-  .health-chip.ok .hc-dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
-  .health-chip.err .hc-dot { background: var(--err); box-shadow: 0 0 0 3px var(--err-soft); }
-  .health-chip b { color: var(--text); font-weight: 600; }
-  .health-chip .hc-sep { width: 1px; height: 12px; background: var(--border2); }
-  .empty {
-    display: flex; align-items: center; justify-content: center; gap: 9px;
-    color: var(--faint); font-size: 12px; padding: 30px 14px; text-align: center;
-    border: 1px dashed var(--border2); border-radius: var(--radius-sm); background: var(--panel2);
-  }
-  .empty::before {
-    content: ''; width: 22px; height: 22px; flex: none; border-radius: 6px;
-    border: 1px dashed var(--border2); background: linear-gradient(135deg, var(--panel3), var(--panel2));
-  }
-  td .empty { padding: 16px 12px; border: none; background: transparent; }
-  td .empty::before { display: none; }
-  .sec { animation: fade .2s ease; }
-  @keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-  .nav button:focus-visible { outline-offset: -2px; }
-  @media (max-width: 860px) {
-    .layout { grid-template-columns: 1fr; }
-    .side {
-      position: static; height: auto; flex-direction: row; align-items: center; flex-wrap: wrap;
-      border-right: none; border-bottom: 1px solid var(--border); padding: 12px 14px; gap: 10px;
-    }
-    .brand { padding: 0; flex: none; }
-    .brand small { display: none; }
-    .nav { flex-direction: row; flex: 1; overflow-x: auto; }
-    .nav button { white-space: nowrap; }
-    .side-foot { margin-top: 0; border-top: none; padding: 0; margin-left: auto; }
-    .main { padding: 18px 16px 36px; }
-    .grid2 { grid-template-columns: 1fr; }
-  }
-  @media (max-width: 560px) {
-    .kpi-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
-    .topbar h1 { font-size: 17px; }
-    .brow { grid-template-columns: 70px 1fr 54px 40px; gap: 7px; }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
-  }
-</style>
-</head>
-<body>
-<div class="login show" id="login">
-  <div class="login-box">
-    <h2>veil · 管理员登录</h2>
-    <div class="login-err" id="login-err"></div>
-    <input type="password" id="pass" autocomplete="current-password" placeholder="OBSERVABILITY_ADMIN_TOKEN">
-    <button id="login-btn">进入大盘</button>
-    <div class="note">登录请求发往探针端点，服务端签发 Cookie 后持久化；令牌仅保留在当前页面内存中，不写入任何持久化存储，不拼接到地址栏。</div>
-  </div>
-</div>
-
-<div id="app" style="display:none">
-  <div class="layout">
-    <aside class="side">
-      <div class="brand">
-        <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.4-3 8.2-7 10-4-1.8-7-5.6-7-10V6z"/></svg></span>
-        <span class="bt">veil · 管理控制台<small>脱敏网关可观测性大盘</small></span>
-      </div>
-      <nav class="nav" id="nav">
-        <button data-sec="overview" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>概览</button>
-        <button data-sec="redaction"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.4-3 8.2-7 10-4-1.8-7-5.6-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>脱敏</button>
-        <button data-sec="performance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>性能</button>
-        <button data-sec="events"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>事件</button>
-        <button data-sec="commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>命令调用</button>
-      </nav>
-      <div class="side-foot">
-        <span class="live-ind"><span class="dot off" id="live-dot"></span><span id="live-txt">连接中</span></span>
-        <button class="theme-btn" id="theme-btn" aria-label="切换明暗主题">
-          <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-          <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
-          <span id="theme-lbl">浅色</span>
-        </button>
-      </div>
-    </aside>
-    <main class="main">
-      <header class="topbar">
-        <h1 id="sec-title">概览</h1>
-        <div class="toolbar" id="range-bar">
-          <span class="rt-tip" id="rt-tip">管理面限流（10/分钟），请稍候再试…</span>
-          <button data-range="1h" class="active">1h</button>
-          <button data-range="24h">24h</button>
-          <button data-range="7d">7d</button>
-          <button data-range="30d">30d</button>
-        </div>
-      </header>
-      <div class="banner" id="banner"></div>
-
-      <section class="sec" id="sec-overview">
-        <div class="kpis" id="kpis"></div>
-        <div class="panel">
-          <h2>时序趋势（请求数 / 窗口）</h2>
-          <div id="trend-box"><span class="empty">等待实时快照…</span></div>
-          <div class="hintline">切换范围仅重建实时通道，不额外发请求；粒度由服务端按范围映射。</div>
-        </div>
-        <div class="health-bar">
-          <span class="health-label">健康状态</span>
-          <span class="health-chip" id="health-line"><span class="hc-dot"></span><span class="hc-txt">—</span></span>
-        </div>
-      </section>
-
-      <section class="sec" id="sec-redaction" hidden>
-        <div class="grid2">
-          <div class="panel">
-            <h2>PII 采样分布</h2>
-            <div id="pii-box"><span class="empty">等待实时快照…</span></div>
-            <div class="hintline" id="pii-hint"></div>
-          </div>
-          <div class="panel">
-            <h2>协议 / 模型分布</h2>
-            <div class="sub-h">按协议</div>
-            <div id="proto-box"><span class="empty">等待实时快照…</span></div>
-            <div class="sub-h">按模型</div>
-            <div id="model-box"><span class="empty">等待实时快照…</span></div>
-          </div>
-        </div>
-      </section>
-
-      <section class="sec" id="sec-performance" hidden>
-        <div class="tokens4" id="tokens4"></div>
-        <div class="panel">
-          <h2>延迟分桶（毫秒）</h2>
-          <div id="bucket-box"><span class="empty">等待实时快照…</span></div>
-          <div class="hintline">12 桶边界：10 / 25 / 50 / 100 / 200 / 400 / 800 / 1500 / 3000 / 5000 / 10000 ms，末桶为 +∞。</div>
-        </div>
-      </section>
-
-      <section class="sec" id="sec-events" hidden>
-        <div class="panel">
-          <h2>最近事件 <span class="h2-sub">悬停行查看摘要</span></h2>
-          <div class="toolbar" style="margin-bottom:12px">
-            <input id="ev-kind" placeholder="kind 过滤（空=全部）">
-            <input id="ev-since" placeholder="since 秒（可选）" inputmode="numeric">
-            <button id="ev-apply">筛选</button>
-            <button id="ev-live" class="active">Live</button>
-          </div>
-          <div style="overflow:auto">
-            <table id="ev-table">
-              <thead><tr>
-                <th>时间</th><th>ID</th><th>kind</th><th>协议</th><th>摘要</th>
-              </tr></thead>
-              <tbody><tr><td colspan="5"><div class="empty">当前无事件：审计默认关闭时仅记录截断/故障类事件</div></td></tr></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <section class="sec" id="sec-commands" hidden>
-        <div class="panel">
-          <h2>命令调用日志 <span class="h2-sub">每次调用的审批与执行状态</span></h2>
-          <div class="toolbar" style="margin-bottom:12px">
-            <input id="cmd-command" placeholder="命令 id 过滤（空=全部）">
-            <input id="cmd-status" placeholder="审批状态（approved/denied/timeout/not_required）">
-            <button id="cmd-apply">筛选</button>
-            <button id="cmd-prev">上一页</button>
-            <button id="cmd-next">下一页</button>
-            <span class="hintline" id="cmd-page-info">—</span>
-          </div>
-          <div style="overflow:auto">
-            <table id="cmd-table">
-              <thead><tr>
-                <th>时间</th><th>下游</th><th>命令</th><th>host</th>
-                <th>审批</th><th>执行</th><th>退出码</th><th>耗时(ms)</th>
-              </tr></thead>
-              <tbody><tr><td colspan="8"><div class="empty">暂无命令调用记录（[command].enabled = false 时不产生日志）</div></td></tr></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-    </main>
-  </div>
-</div>
-
-<div class="tooltip" id="ev-tooltip" hidden></div>
-
-<script>
 (function () {
   'use strict';
-  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null, cmdLimit: 50, cmdOffset: 0, cmdTotal: 0, cmdCommand: '', cmdStatus: '', lastCmdReload: 0 };
+  var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null, cmdLimit: 50, cmdOffset: 0, cmdTotal: 0, cmdCommand: '', cmdStatus: '', lastCmdReload: 0,
+    // 「LLM 请求」分区状态：分页偏移、筛选值与最后一次响应体。
+    requests: { limit: 50, offset: 0, total: 0, model: '', protocol: '', status: '', session: '', scope: '', last: null } };
 
   // 回退轮询间隔：管理面通用桶 10 次/分钟，断线后单端点每 15 秒轮询一次，
   // 仅占约 4 次/分钟；剩余预算留给登录探针与手动操作，恢复后立即停轮询。
@@ -542,7 +97,7 @@
   }
 
   // ── 分区导航与明暗主题（新增，不动既有数据逻辑）──
-  var SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用' };
+  var SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用', requests: 'LLM 请求' };
 
   function showSection(sec) {
     var i;
@@ -556,6 +111,11 @@
     if (sec === 'redaction' && state.metrics) renderDist(state.metrics);
     if (sec === 'overview' && state.series) renderTrend(state.series);
     if (sec === 'commands') reloadCommands(true);
+    if (sec === 'requests') {
+      // 先回放上一页避免闪空，再拉取一次（分区打开即取数）。
+      if (state.requests.last) renderRequests(state.requests.last);
+      reloadRequests();
+    }
   }
 
   // 主题：persist 为真时写 veil_theme Cookie（仅用户手动切换），否则只更新 UI。
@@ -972,6 +532,16 @@
     hint.textContent = parts.join(' ');
     drawBars('proto-box', m.per_protocol || {});
     drawBars('model-box', m.per_model || {});
+    // 分布面板口径：模型分布优先取逐请求窗口投影，投影不可用时为环内采样
+    // （`per_model_partial`），须显式标注；覆盖时长仅在快照给出 `coverage_secs` 时展示。
+    var mh = $('model-hint');
+    if (mh) {
+      var mparts = [];
+      if (m.per_model_partial === true) mparts.push('模型分布为环内样本，非范围全量。');
+      if (m.coverage_secs != null) mparts.push('分布样本覆盖 ' + fmtCoverage(m.coverage_secs) + '。');
+      mh.textContent = mparts.join(' ');
+      mh.hidden = mparts.length === 0;
+    }
   }
 
   // ── 延迟分桶：12 桶横向条（含占比）──
@@ -1387,7 +957,11 @@
     state.fallbackTimer = setInterval(function () {
       // 退避窗口内不轮询：限流时按服务端 retry-after 让路，不持续占桶。
       if (Date.now() < state.retryAt || Date.now() < state.streamRetryAt) return;
-      // 每次只打一个端点：偶数拍拉指标，奇数拍拉当前可见的命令分区。
+      // 每次只打一个端点：请求分区可见时优先它，否则偶数拍拉指标、奇数拍拉命令分区。
+      if (!$('sec-requests').hidden) {
+        reloadRequests();
+        return;
+      }
       var commandsVisible = !$('sec-commands').hidden;
       if (commandsVisible && (tick++ % 2 === 1)) {
         reloadCommands(true);
@@ -1460,7 +1034,8 @@
     var now = Date.now();
     if (!force && now - state.lastCmdReload < CMD_RELOAD_MIN_MS) return;
     state.lastCmdReload = now;
-    var q = '/_admin/commands?limit=' + state.cmdLimit + '&offset=' + state.cmdOffset;
+    var q = '/_admin/commands?range=' + encodeURIComponent(state.range) +
+      '&limit=' + state.cmdLimit + '&offset=' + state.cmdOffset;
     if (state.cmdCommand) q += '&command=' + encodeURIComponent(state.cmdCommand);
     if (state.cmdStatus) q += '&approval_status=' + encodeURIComponent(state.cmdStatus);
     api(q).then(function (d) {
@@ -1479,9 +1054,177 @@
     });
   }
 
-  // ── 事件筛选：用户动作单次只打一个端点 ──
+  // ── LLM 请求：逐请求记录分页/过滤查询（`/_admin/requests` 为唯一端点）──
+  /* @veil-testable:start */
+  function fmtPct(v) {
+    if (v == null) return '—';
+    var n = Number(v);
+    if (!isFinite(n)) return '—';
+    return (n * 100).toFixed(1) + '%';
+  }
+
+  // 覆盖时长文案：把服务端秒数换成「天/小时/分钟」，不表达未发生的部分。
+  function fmtCoverage(secs) {
+    var s = Number(secs);
+    if (!isFinite(s) || s <= 0) return '0 秒';
+    s = Math.floor(s);
+    if (s < 60) return s + ' 秒';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + ' 分钟';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + ' 小时 ' + (m % 60) + ' 分钟';
+    return Math.floor(h / 24) + ' 天 ' + (h % 24) + ' 小时';
+  }
+
+  function requestRowModel(item) {
+    var it = item || {};
+    var sid = it.session_id == null ? '' : String(it.session_id);
+    var scope = it.session_scope === 'session' ? '会话' :
+      (it.session_scope === 'user' ? '用户' : '');
+    var io = (it.prompt_tokens == null ? '—' : Number(it.prompt_tokens).toLocaleString('en-US')) + ' · ' +
+      (it.completion_tokens == null ? '—' : Number(it.completion_tokens).toLocaleString('en-US'));
+    return {
+      ts: fmtFullTs(it.ts_secs),
+      model: it.model == null ? '' : String(it.model),
+      protocol: it.protocol == null ? '' : String(it.protocol),
+      session: sid ? sid.slice(0, 12) : '',
+      scope: scope,
+      source: it.session_source == null ? '' : String(it.session_source),
+      status: it.status == null ? (it.error_kind ? String(it.error_kind) : '—') : String(it.status),
+      io: io,
+      hit: fmtPct(it.cache_hit_rate),
+      hitTitle: '缓存写比率 ' + fmtPct(it.cache_write_rate),
+      latency: fmtMs(it.latency_ms),
+      summary: it.summary == null ? '' : String(it.summary)
+    };
+  }
+  /* @veil-testable:end */
+
+  var REQ_EMPTY_COLS = 9;
+  // 与服务端 `request_log::MAX_OFFSET` 一致：超出即 400，故不发出该页请求。
+  var REQ_MAX_OFFSET = 10000;
+  var REQ_OFF_DISABLED = '逐请求记录已关闭（[storage].request_log_enabled = false）';
+  var REQ_EMPTY_RANGE = '当前范围内无请求';
+  var REQ_NEXT_LIMIT = '已到最后可翻页位置（offset 上限 ' + REQ_MAX_OFFSET + '）';
+
+  function reqSessionHint(input) {
+    var v = input ? input.value.trim() : '';
+    var hint = $('req-session-hint');
+    if (!hint) return;
+    hint.hidden = !(v.length > 0 && v.length < 4);
+  }
+
+  function setReqTbody(html) {
+    var tbody = document.querySelector('#req-table tbody');
+    if (tbody) tbody.innerHTML = html;
+  }
+
+  function reqEmptyRow(text) {
+    return '<tr><td colspan="' + REQ_EMPTY_COLS + '"><div class="empty">' + esc(text) + '</div></td></tr>';
+  }
+
+  function updateReqPager(rowCount) {
+    var r = state.requests;
+    var info = $('req-page-info');
+    if (info) info.textContent = '共 ' + r.total + ' 条';
+    var prev = $('req-prev'), next = $('req-next');
+    if (prev) prev.disabled = r.offset <= 0;
+    if (next) next.disabled = rowCount === 0 || r.offset + rowCount >= r.total;
+    // 服务端对 offset > 10000 直接 400：不发出必然失败的下一页请求。
+    if (next && r.offset + r.limit > REQ_MAX_OFFSET) next.disabled = true;
+  }
+
+  // 三态区分：记录关闭 / 范围内无请求 / 正常行；`partial` 只作非阻塞提示。
+  function renderRequests(d) {
+    var r = state.requests;
+    d = d || {};
+    r.total = Number(d.total) || 0;
+    if (d.limit) r.limit = Number(d.limit) || r.limit;
+    var hint = $('req-partial');
+    if (d.enabled === false) {
+      setReqTbody(reqEmptyRow(REQ_OFF_DISABLED));
+      if (hint) { hint.hidden = true; hint.textContent = ''; }
+      updateReqPager(0);
+      return;
+    }
+    if (hint) {
+      if (d.partial === true) {
+        hint.hidden = false;
+        hint.textContent = '记录覆盖不足：实际覆盖 ' + fmtCoverage(d.coverage_secs) + '，超出部分无记录。';
+      } else {
+        hint.hidden = true;
+        hint.textContent = '';
+      }
+    }
+    var rows = Array.isArray(d.rows) ? d.rows.map(requestRowModel) : [];
+    if (!rows.length) {
+      setReqTbody(reqEmptyRow(REQ_EMPTY_RANGE));
+      updateReqPager(0);
+      return;
+    }
+    setReqTbody(rows.map(function (x) {
+      return '<tr>' +
+        '<td>' + esc(x.ts) + '</td>' +
+        '<td>' + esc(x.model) + '</td>' +
+        '<td>' + esc(x.protocol) + '</td>' +
+        '<td>' + esc(x.session) +
+          (x.scope ? '<span class="badge" title="' + esc(x.source) + '">' + esc(x.scope) + '</span>' : '') +
+        '</td>' +
+        '<td>' + esc(x.status) + '</td>' +
+        '<td class="num">' + esc(x.io) + '</td>' +
+        '<td class="num" title="' + esc(x.hitTitle) + '">' + esc(x.hit) + '</td>' +
+        '<td class="num">' + esc(x.latency) + '</td>' +
+        '<td class="sum" title="' + esc(x.summary) + '">' + esc(x.summary) + '</td>' +
+        '</tr>';
+    }).join(''));
+    updateReqPager(rows.length);
+  }
+
+  function reloadRequests() {
+    var r = state.requests;
+    var q = '/_admin/requests?range=' + encodeURIComponent(state.range) +
+      '&limit=' + r.limit + '&offset=' + r.offset;
+    if (r.model) q += '&model=' + encodeURIComponent(r.model);
+    if (r.protocol) q += '&protocol=' + encodeURIComponent(r.protocol);
+    if (r.status) q += '&status=' + encodeURIComponent(r.status);
+    if (r.session.length >= 4) q += '&session=' + encodeURIComponent(r.session);
+    if (r.scope) q += '&scope=' + encodeURIComponent(r.scope);
+    if (!r.last) setReqTbody(reqEmptyRow('加载中…'));
+    api(q).then(function (d) {
+      r.last = d;
+      renderRequests(d);
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') {
+        state.token = '';
+        showLogin('会话失效，请重新登录');
+      } else if (err && err.message === 'ratelimited') {
+        if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
+        showRateLimit();
+      } else {
+        // 非阻塞提示：保留上一页内容，不静默吞掉 400/5xx。
+        setBanner('请求列表加载失败：' + (err && err.message ? err.message : '未知错误'));
+      }
+    });
+  }
+
+  // ── 指标快照单次补取（脱敏/性能面板的非 SSE 兜底）──
+  function reloadMetricsOnce() {
+    api('/_admin/metrics?range=' + encodeURIComponent(state.range)).then(function (m) {
+      onMetricsTree(m);
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') {
+        state.token = '';
+        showLogin('会话失效，请重新登录');
+      } else if (err && err.message === 'ratelimited') {
+        if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
+        showRateLimit();
+      }
+    });
+  }
+
   function reloadEventsOnce() {
-    var q = '/_admin/events?limit=' + EVENT_LIMIT;
+    var q = '/_admin/events?range=' + encodeURIComponent(state.range) +
+      '&limit=' + EVENT_LIMIT;
     if (state.kind) q += '&kind=' + encodeURIComponent(state.kind);
     if (state.since) q += '&since=' + encodeURIComponent(state.since);
     api(q).then(function (d) {
@@ -1519,8 +1262,22 @@
         Array.prototype.forEach.call(btns, function (x) { x.className = ''; });
         b.className = 'active';
         state.range = b.getAttribute('data-range');
-        // 范围切换仅重建实时通道，不打回退端点。
+        // 范围切换：重建实时通道后，按当前可见分区补取一页（SSE 只驱动概览与
+        // 分布类面板，事件/命令/请求三个分页端点不随快照推送）。
         restartStream();
+        if (!$('sec-requests').hidden) {
+          state.requests.offset = 0;
+          reloadRequests();
+        } else if (!$('sec-events').hidden) {
+          reloadEventsOnce();
+        } else if (!$('sec-commands').hidden) {
+          state.cmdOffset = 0;
+          reloadCommands(true);
+        } else if (!$('sec-redaction').hidden || !$('sec-performance').hidden) {
+          // 脱敏/性能面板的数据源是指标快照：实时通道在跑时由建连首帧刷新，
+          // 停掉 Live 时补取一次同源快照，避免切换范围后仍显示旧窗口。
+          if (!state.live) reloadMetricsOnce();
+        }
       });
     });
     $('cmd-apply').addEventListener('click', function () {
@@ -1536,6 +1293,35 @@
     $('cmd-next').addEventListener('click', function () {
       state.cmdOffset += state.cmdLimit;
       reloadCommands(true);
+    });
+    $('req-apply').addEventListener('click', function () {
+      var r = state.requests;
+      r.model = $('req-model').value.trim();
+      r.protocol = $('req-protocol').value;
+      r.status = $('req-status').value;
+      r.session = $('req-session').value.trim();
+      r.scope = $('req-scope').value;
+      r.limit = Number($('req-limit').value) || 50;
+      r.offset = 0;
+      reqSessionHint($('req-session'));
+      reloadRequests();
+    });
+    $('req-session').addEventListener('input', function () {
+      reqSessionHint(this);
+    });
+    $('req-prev').addEventListener('click', function () {
+      var r = state.requests;
+      r.offset = Math.max(0, r.offset - r.limit);
+      reloadRequests();
+    });
+    $('req-next').addEventListener('click', function () {
+      var r = state.requests;
+      if (r.offset + r.limit > REQ_MAX_OFFSET) {
+        setBanner(REQ_NEXT_LIMIT);
+        return;
+      }
+      r.offset += r.limit;
+      reloadRequests();
     });
     $('ev-apply').addEventListener('click', function () {
       state.kind = $('ev-kind').value.trim();
@@ -1564,6 +1350,3 @@
     window.addEventListener('scroll', function () { hideEvTooltip(); }, true);
   });
 })();
-</script>
-</body>
-</html>

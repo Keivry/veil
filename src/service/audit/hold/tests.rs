@@ -962,6 +962,7 @@ async fn pending_tool_frames_same_index_zero_byte_flood_bounded() {
         sse_frame_hard_bytes: crate::config::SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     let outcome = spawn_stream_pump(upstream, tx, ctx)

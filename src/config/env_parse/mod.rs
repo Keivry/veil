@@ -7,6 +7,9 @@
 //!
 //! 跨子模块引用：自定义文件经 `super::custom_file`，校验器经
 //! `super::validate`（同级 `use` 成环无碍，Rust 允许）。
+//!
+//! 再拆分：存储/入口域（`StorageParts`/`load_storage`/授权窗口解析）移至
+//! `env_parse/storage.rs`，父模块按原调用位置引用，行为与错误顺序不变。
 
 use {
     super::{
@@ -28,11 +31,13 @@ use {
     },
     crate::error::{Result, VeilError},
     std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration},
+    storage::StorageParts,
 };
 
 mod entry_mode;
 mod keepass;
 pub(crate) mod pii_scope;
+mod storage;
 pub use {
     entry_mode::{EntryMode, entry_mode_notice},
     keepass::KeepassBackendKind,
@@ -246,6 +251,11 @@ pub struct Config {
     /// 默认保持 202 抛单（建单 + best-effort 发送即返回）。
     /// 接线：`service::credential::approval_dual_mode` 唯一读取方（接线已复核，保留）。
     pub credential_block_wait: bool,
+    /// 请求日志总开关（文件专属 `[storage].request_log_enabled`，缺省 `true`）。
+    pub request_log_enabled: bool,
+    /// 请求记录保留天数（文件专属 `[storage].request_log_retention_days`，缺省 `7`；
+    /// `0` = 不清理）。
+    pub request_log_retention_days: u64,
 }
 
 /// 遗留兼容声明：`CREDENTIAL_MASTER_PASSWORD`/`CREDENTIAL_PORT` 为遗留变量名，
@@ -282,6 +292,7 @@ impl Config {
             outcome.llm_targets,
             outcome.command,
             outcome.server_bind,
+            outcome.request_log,
         )
     }
 
@@ -291,7 +302,13 @@ impl Config {
         env: &HashMap<String, String>,
         llm_targets: LlmTargets,
     ) -> Result<Self> {
-        Self::load_from_parts(env, llm_targets, CommandConfig::default(), None)
+        Self::load_from_parts(
+            env,
+            llm_targets,
+            CommandConfig::default(),
+            None,
+            crate::config::file_layer::RequestLogFileConfig::default(),
+        )
     }
 
     fn load_from_parts(
@@ -299,6 +316,7 @@ impl Config {
         llm_targets: LlmTargets,
         command: CommandConfig,
         server_bind: Option<SocketAddr>,
+        request_log: crate::config::file_layer::RequestLogFileConfig,
     ) -> Result<Self> {
         let get = |name: &str| env.get(name).map(|v| v.trim().to_string());
         for name in super::validate::legacy_ignored_detected(env) {
@@ -346,7 +364,7 @@ impl Config {
             tpm_dir,
             credential_block_wait,
             authorization_ttl,
-        } = load_storage(&get)?;
+        } = storage::load_storage(&get)?;
         let RedactionParts {
             redaction_enabled,
             pii_fuzzy_restore,
@@ -430,6 +448,8 @@ impl Config {
             keepass_backend,
             authorization_ttl,
             credential_block_wait,
+            request_log_enabled: request_log.enabled,
+            request_log_retention_days: request_log.retention_days,
         })
     }
 }
@@ -581,77 +601,6 @@ fn load_audit(get: &dyn Fn(&str) -> Option<String>) -> Result<AuditParts> {
         approval_whitelist,
         audit_policy_file,
     })
-}
-
-/// 存储/入口域：目录派生、三因子密钥、入口三态与审批双模开关。
-struct StorageParts {
-    data_dir: PathBuf,
-    veilctl_secret: Option<String>,
-    veilctl_binary_hash: Option<String>,
-    auto_approve: AutoApprove,
-    entry_mode: EntryMode,
-    registry_path: PathBuf,
-    db_dir: PathBuf,
-    tpm_dir: PathBuf,
-    credential_block_wait: bool,
-    authorization_ttl: Option<u64>,
-}
-
-fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageParts> {
-    let data_dir = get("DATA_DIR")
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| PathBuf::from("/data"), PathBuf::from);
-    let veilctl_secret = get("VEILCTL_SECRET").filter(|v| !v.is_empty());
-    let veilctl_binary_hash = get("VEILCTL_BINARY_HASH").filter(|v| !v.is_empty());
-    let auto_approve: AutoApprove = match get("AUTO_APPROVE") {
-        Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-            var: "AUTO_APPROVE".to_string(),
-            message,
-        })?,
-        _ => AutoApprove::Allow,
-    };
-    let entry_mode: EntryMode = match get("VEIL_ENTRY_MODE") {
-        Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
-            var: "VEIL_ENTRY_MODE".to_string(),
-            message,
-        })?,
-        _ => EntryMode::Full,
-    };
-    let registry_path = get("CALLER_REGISTRY_PATH")
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| data_dir.join("caller_registry.json"), PathBuf::from);
-    let db_dir = get("DB_DIR")
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| data_dir.join("db"), PathBuf::from);
-    let tpm_dir = get("TPM_DIR")
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| data_dir.join("tpm"), PathBuf::from);
-    let credential_block_wait = parse_bool_off(get, "CREDENTIAL_BLOCK_WAIT");
-    let authorization_ttl = parse_authorization_ttl(get)?;
-    Ok(StorageParts {
-        data_dir,
-        veilctl_secret,
-        veilctl_binary_hash,
-        auto_approve,
-        entry_mode,
-        registry_path,
-        db_dir,
-        tpm_dir,
-        credential_block_wait,
-        authorization_ttl,
-    })
-}
-
-/// 授权窗口长度解析：缺省 `0`（无期限）；非数字/负数拒启动，`0` 归一为 `None`。
-fn parse_authorization_ttl(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<u64>> {
-    let raw = get("AUTHORIZATION_TTL_SECS")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "0".to_string());
-    let ttl: u64 = raw.parse().map_err(|_| VeilError::Config {
-        var: "AUTHORIZATION_TTL_SECS".to_string(),
-        message: format!("AUTHORIZATION_TTL_SECS 非法整数: {raw:?}"),
-    })?;
-    Ok(crate::registry::normalize_ttl(Some(ttl)))
 }
 
 /// 脱敏域：总开关/语义开关/自定义文件/值级采样/占位符说明。

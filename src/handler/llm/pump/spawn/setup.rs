@@ -46,6 +46,8 @@ pub(super) struct PumpEnv {
     pub redaction_tally: RedactionTally,
     /// 保活任务句柄（持有即存活），仅供生命周期持有。
     pub _keepalive: RequestKeepalive,
+    /// 请求日志落行凭据（`None` = 单测直调泵，不落行）。
+    pub stream_log: Option<crate::handler::llm::trace::StreamLog>,
 }
 
 /// 循环可变状态（setup 构造，主循环与单事件处理共享）。
@@ -72,6 +74,9 @@ pub(super) struct PumpLoopState {
     pub responses_seq_cursor: Option<u64>,
     /// Chat 已见非空 `finish_reason`（干净收尾信号）。
     pub chat_finish_seen: bool,
+    /// 流内首个结束原因（Chat `finish_reason` / Anthropic `stop_reason` /
+    /// Responses `incomplete_details.reason`），供请求日志落行。
+    pub stream_finish_reason: Option<String>,
 }
 
 /// setup 构造器——解构 `StreamPumpCtx`，钳位配置，装配环境、循环状态与解析器。
@@ -85,6 +90,7 @@ pub(super) fn setup(
         sse_frame_hard_bytes,
         init_conv,
         req_model,
+        stream_log,
     } = ctx;
     let RequestCtx {
         protocol,
@@ -127,6 +133,7 @@ pub(super) fn setup(
         terminator: StreamTerminator::new(),
         responses_seq_cursor: None,
         chat_finish_seen: false,
+        stream_finish_reason: None,
     };
     let env = PumpEnv {
         protocol,
@@ -147,6 +154,7 @@ pub(super) fn setup(
         req_model,
         redaction_tally,
         _keepalive: keepalive,
+        stream_log,
     };
     (env, state, SseParser::with_hard_bytes(sse_frame_hard_bytes))
 }

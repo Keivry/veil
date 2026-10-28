@@ -8,7 +8,7 @@
   - 末段名为 `tests.rs`；
   - 末段名以 `_tests.rs` 结尾；
   - 任一路径段名等于 `tests`。
-- `src/**/*.html`：限 1600 行（单文件资产受规格「不可拆分」约束，给更宽预算）。
+- 前端资产（`src/**/*.html` 与 `src/**/*.js`）：限 1600 行（静态资产按片段拆分后共享同一预算）。
 
 分线理由：测试套件外置到同级 `tests.rs` / `tests/` 后仍计入文件总行，测试文件里
 更长的编排与断言代码并不代表生产复杂度，故给出 1200 行预算；生产文件维持 800 行
@@ -29,7 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 PROD_LIMIT = 800
 TEST_LIMIT = 1200
-HTML_LIMIT = 1600
+ASSET_LIMIT = 1600
+ASSET_GLOBS = ("*.html", "*.js")
 
 
 def line_count(path: Path) -> int:
@@ -62,15 +63,20 @@ def main() -> int:
         if lines > limit:
             rs_offenders.append((str(path.relative_to(ROOT)), lines, class_label(path), limit))
 
-    html_offenders: list[tuple[str, int]] = []
-    html_checked = 0
-    for path in sorted(SRC.rglob("*.html")):
-        html_checked += 1
-        lines = line_count(path)
-        if lines > HTML_LIMIT:
-            html_offenders.append((str(path.relative_to(ROOT)), lines))
+    asset_offenders: dict[str, list[tuple[str, int]]] = {}
+    asset_checked: dict[str, int] = {}
+    for pattern in ASSET_GLOBS:
+        offenders: list[tuple[str, int]] = []
+        checked = 0
+        for path in sorted(SRC.rglob(pattern)):
+            checked += 1
+            lines = line_count(path)
+            if lines > ASSET_LIMIT:
+                offenders.append((str(path.relative_to(ROOT)), lines))
+        asset_offenders[pattern] = offenders
+        asset_checked[pattern] = checked
 
-    if rs_offenders or html_offenders:
+    if rs_offenders or any(asset_offenders.values()):
         if rs_offenders:
             print(
                 f"FAIL: {len(rs_offenders)} 个 .rs 文件超过本类红线"
@@ -78,17 +84,23 @@ def main() -> int:
             )
             for rel, lines, label, limit in rs_offenders:
                 print(f"  {rel}: {lines} 行（{label}，红线 {limit}）")
-        if html_offenders:
+        for pattern in ASSET_GLOBS:
+            offenders = asset_offenders[pattern]
+            if not offenders:
+                continue
+            suffix = pattern.lstrip("*")
             print(
-                f"FAIL: {len(html_offenders)} 个 .html 文件超过 {HTML_LIMIT} 行（共扫描 {html_checked} 个）："
+                f"FAIL: {len(offenders)} 个 {suffix} 文件超过 {ASSET_LIMIT} 行"
+                f"（共扫描 {asset_checked[pattern]} 个）："
             )
-            for rel, lines in html_offenders:
-                print(f"  {rel}: {lines} 行（HTML，红线 {HTML_LIMIT}）")
+            for rel, lines in offenders:
+                print(f"  {rel}: {lines} 行（{suffix.upper().lstrip('.')}，红线 {ASSET_LIMIT}）")
         return 1
     print(
         f"OK: {rs_checked} 个 src/**/*.rs 文件均 ≤ 本类红线"
         f"（生产文件 {PROD_LIMIT} / 测试文件 {TEST_LIMIT}），"
-        f"{html_checked} 个 src/**/*.html 文件均 ≤{HTML_LIMIT} 行。"
+        f"{asset_checked['*.html']} 个 src/**/*.html 与 "
+        f"{asset_checked['*.js']} 个 src/**/*.js 文件均 ≤{ASSET_LIMIT} 行。"
     )
     return 0
 

@@ -70,6 +70,7 @@ pub(super) fn pump_ctx(
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     }
 }
 
@@ -205,6 +206,7 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"argu
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     };
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     assert!(!outcome.block_injected, "截断丢弃非阻断，不得注阻断帧");
@@ -275,6 +277,7 @@ data: [DONE]
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
+        stream_log: None,
     };
     let (outcome, frames) = collect_pump(upstream, ctx).await;
     assert!(!outcome.block_injected, "良性工具调用不得阻断");

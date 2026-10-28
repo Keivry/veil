@@ -61,9 +61,9 @@ async fn c2_json_accept_without_credentials_401() {
     handle.abort();
 }
 
-// 有效头凭证 + 通配 Accept → 200 JSON 索引，七路由齐备。
+// 有效头凭证 + 通配 Accept → 200 JSON 索引，八路由齐备。
 #[tokio::test]
-async fn c3_valid_token_serves_json_index_seven_routes() {
+async fn c3_valid_token_serves_json_index_eight_routes() {
     let (base, handle) = serve(test_app_router(&[])).await;
     let client = reqwest::Client::new();
     let resp = client
@@ -76,7 +76,13 @@ async fn c3_valid_token_serves_json_index_seven_routes() {
     assert_eq!(resp.status().as_u16(), 200);
     let v: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(v["ok"], true, "{v}");
-    assert_eq!(v["routes"].as_array().unwrap().len(), 7, "{v}");
+    assert_eq!(v["routes"].as_array().unwrap().len(), 8, "{v}");
+    assert!(
+        v["routes"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|r| r.as_str() == Some("/_admin/requests"))),
+        "索引须含 /_admin/requests: {v}"
+    );
     handle.abort();
 }
 
@@ -236,5 +242,60 @@ async fn c11_vary_accept_only_on_index() {
         !metrics.headers().contains_key("vary"),
         "非入口路由不得携带 Vary"
     );
+    handle.abort();
+}
+
+// 第八条路由 `/_admin/requests` 端到端可达：未鉴权 401、鉴权后 200 且带安全头。
+#[tokio::test]
+async fn c8_requests_route_requires_auth_and_returns_json() {
+    let (base, handle) = serve(test_app_router(&[])).await;
+    let client = reqwest::Client::new();
+    let no_auth = client
+        .get(format!("{base}/_admin/requests"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status().as_u16(), 401);
+    assert!(header_value(&no_auth, "cache-control").contains("no-store"));
+
+    let resp = client
+        .get(format!("{base}/_admin/requests?range=24h&limit=5"))
+        .header("X-Admin-Token", ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(header_value(&resp, "cache-control").contains("no-store"));
+    // 管理面不得出现 `Vary: Accept`（仅入口双路由携带）。
+    assert_eq!(header_value(&resp, "vary"), "");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["limit"], 5, "{v}");
+    assert_eq!(v["range"], "24h", "{v}");
+    assert_eq!(v["boundary_slack_secs"], 0, "{v}");
+    assert!(v["rows"].as_array().is_some(), "{v}");
+    handle.abort();
+}
+
+// 非法 `range` 与 `offset` 越界均 400，且错误码统一 `E_BAD_REQUEST`。
+#[tokio::test]
+async fn c9_requests_invalid_params_bad_request() {
+    let (base, handle) = serve(test_app_router(&[])).await;
+    let client = reqwest::Client::new();
+    for path in [
+        "/_admin/requests?range=2h",
+        "/_admin/requests?offset=20000",
+        "/_admin/requests?session=abc",
+    ] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .header("X-Admin-Token", ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("E_BAD_REQUEST"), "{path}: {body}");
+    }
     handle.abort();
 }

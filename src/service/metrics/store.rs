@@ -441,12 +441,6 @@ fn buckets_encode(b: &[u64; super::aggregate::LATENCY_BUCKETS]) -> String {
 
 /// 覆盖式 UPSERT（`excluded.*` 全覆盖，重复 flush 不翻倍）。
 fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::Result<()> {
-    if aggs.is_empty() {
-        let conn = open_wal(db_path)?;
-        ensure_tables(&conn)?;
-        ensure_0600(db_path);
-        return Ok(());
-    }
     let conn = open_wal(db_path)?;
     ensure_tables(&conn)?;
     for (key, agg) in aggs {
@@ -493,18 +487,27 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
             ],
         )?;
     }
-    // `five_min` 只留最新窗口（每 protocol 最大 window，按整数序比较）。
-    conn.execute_batch(
-        "DELETE FROM metrics_five_min WHERE rowid NOT IN \
-         (SELECT m.rowid FROM metrics_five_min AS m WHERE CAST(substr(m.window, 2) AS INTEGER) = \
-          (SELECT MAX(CAST(substr(x.window, 2) AS INTEGER)) FROM metrics_five_min AS x \
-           WHERE x.protocol = m.protocol));",
-    )?;
+    prune_five_min_blocking(&conn)?;
     ensure_0600(db_path);
     drop(conn);
     if let Err(err) = wal_checkpoint_truncate(db_path) {
         tracing::warn!("wal_checkpoint(TRUNCATE) 失败（刷盘不受影响）: {err:#}");
     }
+    Ok(())
+}
+
+/// `five_min` 每协议只留最新 `AGGS_FIVE_MIN_KEEP`（13）个窗口，按 `window_ord`
+/// 整数序比较（字符串序在 m9/m10 进位处失真）。空批刷盘同样执行，避免旧窗长期滞留。
+fn prune_five_min_blocking(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(&format!(
+        "DELETE FROM metrics_five_min WHERE rowid NOT IN \
+         (SELECT node.rowid FROM metrics_five_min AS node \
+          WHERE (SELECT COUNT(*) FROM metrics_five_min AS newer \
+                 WHERE newer.protocol = node.protocol \
+                   AND CAST(substr(newer.window, 2) AS INTEGER) \
+                       > CAST(substr(node.window, 2) AS INTEGER)) < {keep});",
+        keep = super::aggregate::AGGS_FIVE_MIN_KEEP
+    ))?;
     Ok(())
 }
 

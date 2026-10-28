@@ -46,6 +46,8 @@ pub struct LogFilter {
     pub command: Option<String>,
     pub caller_path: Option<String>,
     pub approval_status: Option<String>,
+    /// `range` 折算的时间下界（epoch 秒，含；`None` = 全部保留期）。
+    pub since_ts: Option<i64>,
 }
 
 impl LogFilter {
@@ -65,6 +67,8 @@ pub struct LogPage {
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
+    /// 同 WHERE 范围内最早 `ts_secs`（无行则 `None`，供 `range` 的 `coverage_secs`）。
+    pub earliest_ts: Option<i64>,
 }
 
 /// 日志存储（无常驻连接，每次 `spawn_blocking` 内打开）。
@@ -174,16 +178,20 @@ fn query_blocking(path: &Path, filter: LogFilter) -> anyhow::Result<LogPage> {
         clauses.push("approval_status = ?");
         values.push(Value::Text(status.to_string()));
     }
+    if let Some(since) = filter.since_ts {
+        clauses.push("ts_secs >= ?");
+        values.push(Value::Integer(since));
+    }
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", clauses.join(" AND "))
     };
 
-    let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM command_invocations{where_sql}"),
+    let (total, earliest_ts): (i64, Option<i64>) = conn.query_row(
+        &format!("SELECT COUNT(*), MIN(ts_secs) FROM command_invocations{where_sql}"),
         params_from_iter(values.iter()),
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
     let limit = filter.limit();
@@ -225,6 +233,7 @@ fn query_blocking(path: &Path, filter: LogFilter) -> anyhow::Result<LogPage> {
         total: total as usize,
         limit,
         offset,
+        earliest_ts,
     })
 }
 
@@ -318,6 +327,42 @@ mod tests {
         let failed = page.items.iter().find(|item| item["id"] == "id-a").unwrap();
         assert_eq!(failed["approval_status"], "approved");
         assert_eq!(failed["exec_status"], "failed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn since_ts_filters_and_reports_earliest() {
+        let dir = temp_dir("since");
+        let store = CommandLogStore::open(&dir).unwrap();
+        for (id, ts) in [("old", 1_600_000_000_i64), ("new", 1_700_000_000)] {
+            let mut log = record(id, "not_required", "executed", Some(0));
+            log.ts_secs = ts;
+            store.insert(log).await.unwrap();
+        }
+        let all = store.query(LogFilter::default()).await.unwrap();
+        assert_eq!(all.total, 2);
+        assert_eq!(all.earliest_ts, Some(1_600_000_000), "无下界时取全表最早");
+        // `range` 下界：只保留较新的那行，`earliest_ts` 同步收敛。
+        let ranged = store
+            .query(LogFilter {
+                since_ts: Some(1_650_000_000),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ranged.total, 1, "早于下界的行须被排除");
+        assert_eq!(ranged.items[0]["id"], "new");
+        assert_eq!(ranged.earliest_ts, Some(1_700_000_000));
+        // 下界晚于全部行：空页且 `earliest_ts` 为 `None`（覆盖为 0）。
+        let empty = store
+            .query(LogFilter {
+                since_ts: Some(1_800_000_000),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.earliest_ts, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

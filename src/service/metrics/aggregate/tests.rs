@@ -510,6 +510,43 @@ fn aggs_retention_eviction() {
 }
 
 #[test]
+fn five_min_memory_keeps_newest_13_by_window_ord() {
+    let store = MetricsStore::new(tmp_db("five-min-mem-13"));
+    let base = 300 * 1_000;
+    for i in 0..14 {
+        store.record_chat(chat_rec(
+            Protocol::Chat,
+            "m",
+            5,
+            None,
+            None,
+            true,
+            base + i * 300,
+        ));
+    }
+    let aggs = store.aggs.lock().expect("聚合锁无毒");
+    let windows: Vec<String> = aggs
+        .keys()
+        .filter(|k| k.granularity == Granularity::FiveMin)
+        .map(|k| k.window.clone())
+        .collect();
+    assert_eq!(
+        windows.len(),
+        AGGS_FIVE_MIN_KEEP,
+        "内存每协议留 13 窗: {windows:?}"
+    );
+    let oldest = five_min_key(base);
+    assert!(
+        !windows.contains(&oldest),
+        "最旧窗口须按 window_ord 驱逐: {windows:?}"
+    );
+    assert!(
+        windows.contains(&five_min_key(base + 13 * 300)),
+        "最新窗口须保留: {windows:?}"
+    );
+}
+
+#[test]
 fn aggs_hard_cap_lru() {
     let store = MetricsStore::new(tmp_db("aggs-cap"));
     {

@@ -8,6 +8,7 @@ use {
         protocol_header_value,
         pump::{RequestCtx, now_secs},
         should_pump_stream,
+        trace::{NonstreamDetail, Outcome, finish_reason_of},
         with_protocol_header,
     },
     crate::{
@@ -82,6 +83,21 @@ pub async fn serve_nonstream(
     body: Vec<u8>,
     ctx: NonstreamCtx<'_>,
 ) -> NonstreamOutcome {
+    serve_detailed(client, method, url, headers, body, ctx)
+        .await
+        .0
+}
+
+/// 带终态枚举的一发一收（`gateway_serve` 用它取落行输入）。
+pub async fn serve_detailed(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    ctx: NonstreamCtx<'_>,
+) -> (NonstreamOutcome, NonstreamDetail) {
+    let mut detail = NonstreamDetail::default();
     let fwd_headers = forward_headers(
         &headers,
         &ctx.req.gateway_metrics,
@@ -101,16 +117,30 @@ pub async fn serve_nonstream(
         .await
     {
         Ok(up) => up,
-        Err(_) => return NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol)),
+        Err(_) => {
+            detail.set_outcome(Outcome::NoUpstream);
+            return (
+                NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol)),
+                detail,
+            );
+        }
     };
     if llm_gateway::is_passthrough(ctx.req.protocol) {
         // 非对话臂保持字节透传（直通语义：无用量/
         // 审计/还原），记 `nondialog_passthrough` 供流量验证；专用入口
         // `serve_nondialog_passthrough` 与之共用本装配函数。
-        return NonstreamOutcome::Responded(passthrough_upstream_response(
-            up,
-            &ctx.req.gateway_metrics,
-        ));
+        let status = up.status().as_u16();
+        detail.set_outcome(Outcome::Passthrough {
+            status,
+            is_chat: false,
+        });
+        return (
+            NonstreamOutcome::Responded(passthrough_upstream_response(
+                up,
+                &ctx.req.gateway_metrics,
+            )),
+            detail,
+        );
     }
     // 502/401 不再早返原始字节，走完整后处理链（用量记录 +
     // 审计判定 + 凭据/PII 还原，还原失败回退原文）；所有 4xx/5xx 的非 JSON
@@ -134,7 +164,7 @@ pub async fn serve_nonstream(
     if looks_sse && status_u16 < 400 && !ctx.req.redact_only {
         // 转泵时透传请求会话标识（泵内终端帧复用，不断审计链）；
         // 缺失则为 None，由调用方回退合成并记 `conv_missing`。
-        return NonstreamOutcome::Stream(up, req_conv);
+        return (NonstreamOutcome::Stream(up, req_conv), detail);
     }
     let resp_headers = snapshot_downstream_headers(&up, &ctx.req.gateway_metrics);
     // `content-length` 预检（仅 `status<400`）——声明值严格超限时立即 502
@@ -144,7 +174,11 @@ pub async fn serve_nonstream(
             .content_length()
             .is_some_and(|n| n > ctx.nonstream_max_bytes as u64)
     {
-        return NonstreamOutcome::Responded(oversize_response(ctx.req.protocol));
+        detail.set_outcome(Outcome::Oversize);
+        return (
+            NonstreamOutcome::Responded(oversize_response(ctx.req.protocol)),
+            detail,
+        );
     }
     // 无 `content-length`/分块场景改用有界累计读取，累计超限即停读并 502；
     // `status>=400` 错误体同样有界读——累计超限时转为**流式转发**
@@ -154,21 +188,32 @@ pub async fn serve_nonstream(
         match read_bounded_body(up, ctx.nonstream_max_bytes, &ctx.req.gateway_metrics).await {
             BoundedBody::Complete(b) => b,
             BoundedBody::Oversize => {
-                return NonstreamOutcome::Responded(oversize_response(ctx.req.protocol));
+                detail.set_outcome(Outcome::Oversize);
+                return (
+                    NonstreamOutcome::Responded(oversize_response(ctx.req.protocol)),
+                    detail,
+                );
             }
         }
     } else {
         match read_error_body_bounded(up, ctx.nonstream_max_bytes, &ctx.req.gateway_metrics).await {
             ErrorBody::Complete(b) => b,
             ErrorBody::Oversize { prefix, head, rest } => {
-                return NonstreamOutcome::Responded(error_streaming_response(
-                    status_u16,
-                    &resp_headers,
-                    prefix,
-                    head,
-                    rest,
-                    ctx.req.protocol,
-                ));
+                detail.set_outcome(Outcome::Passthrough {
+                    status: status_u16,
+                    is_chat: true,
+                });
+                return (
+                    NonstreamOutcome::Responded(error_streaming_response(
+                        status_u16,
+                        &resp_headers,
+                        prefix,
+                        head,
+                        rest,
+                        ctx.req.protocol,
+                    )),
+                    detail,
+                );
             }
         }
     };
@@ -180,7 +225,16 @@ pub async fn serve_nonstream(
     // 本处仅保留空体分类判序。
     let empty_action = classify_empty(true, bytes.len(), is_json, status_u16);
     if empty_action == EmptyAction::NonStreamTo502 {
-        return NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol));
+        // 200 空体与非 JSON 体同归 502，但成因不同（`error_kind` 区分）。
+        detail.set_outcome(if bytes.is_empty() {
+            Outcome::EmptyBody
+        } else {
+            Outcome::NonJson { status: status_u16 }
+        });
+        return (
+            NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol)),
+            detail,
+        );
     }
     // redact-only 变体（Anthropic `count_tokens`）——请求侧脱敏已在
     // `request_rewrite` 完成；此处**显式跳过**四类后处理：① 用量记账（`record_chat`/
@@ -189,14 +243,18 @@ pub async fn serve_nonstream(
     // ④ 阻断合成（`blocked` → `block_body`）。
     // 保留 hop 过滤与有界读（体量受 `NONSTREAM_MAX_BYTES` 约束），按上游字节保真透传。
     if ctx.req.redact_only {
-        return NonstreamOutcome::Responded(build_downstream_response(
-            StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
-            &resp_headers,
-            bytes,
-            ctx.req.protocol,
-            ctx.req.normalized_out,
-            is_json.then_some("application/json"),
-        ));
+        detail.set_outcome(Outcome::RedactOnly { status: status_u16 });
+        return (
+            NonstreamOutcome::Responded(build_downstream_response(
+                StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK),
+                &resp_headers,
+                bytes,
+                ctx.req.protocol,
+                ctx.req.normalized_out,
+                is_json.then_some("application/json"),
+            )),
+            detail,
+        );
     }
     if let Some(v) = parse_json_bytes(&bytes) {
         let usage = extract_usage_nonstream(ctx.req.protocol, &v);
@@ -206,7 +264,7 @@ pub async fn serve_nonstream(
             .and_then(|m| m.as_str())
             .filter(|m| !m.is_empty())
             .unwrap_or(req_model);
-        ctx.req.admin_metrics.record_chat(ChatRecord {
+        detail.counted_metrics = ctx.req.admin_metrics.record_chat(ChatRecord {
             protocol: ctx.req.protocol,
             model: upstream_model,
             latency_ms: ctx.req.req_start.elapsed().as_millis() as u64,
@@ -215,6 +273,9 @@ pub async fn serve_nonstream(
             is_precise: ctx.req.sqlite_precise,
             ts_secs: now_secs(),
         });
+        detail.model = Some(upstream_model.to_string());
+        detail.upstream_id = llm_gateway::extract_conv_id(&v);
+        detail.finish_reason = finish_reason_of(ctx.req.protocol, &v);
         // 非流 tool 提取 + 审计：阻断时返回协议正确的 block 体代替上游响应。
         // 非流逐 tool verdict 命中/放行经单例落盘（与流式同口径；
         // `Block` 即止，与紧随的 `evaluate_nonstream` 决策一致）。
@@ -297,7 +358,8 @@ pub async fn serve_nonstream(
                     PROTOCOL_HEADER_NAME,
                     header::HeaderValue::from_static(protocol_header_value(ctx.req.protocol)),
                 );
-                return NonstreamOutcome::Responded(resp);
+                detail.set_outcome(Outcome::Ok { status: 200, usage });
+                return (NonstreamOutcome::Responded(resp), detail);
             }
             // 错误状态（4xx/5xx）不合成阻断体，保留上游状态与正文，审计照记
             // （日志 + 指标）；危险调用落入错误响应不构成实际执行，合成 200 会掩盖
@@ -350,14 +412,21 @@ pub async fn serve_nonstream(
         // 还原/脱敏路径内已带剥离，此处幂等兜底响应侧关闭等旁路。
         let restored = crate::service::redaction::strip_partials(&restored);
         let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
-        return NonstreamOutcome::Responded(build_downstream_response(
-            status,
-            &resp_headers,
-            restored.into_bytes(),
-            ctx.req.protocol,
-            ctx.req.normalized_out,
-            Some("application/json"),
-        ));
+        detail.set_outcome(Outcome::Ok {
+            status: status_u16,
+            usage,
+        });
+        return (
+            NonstreamOutcome::Responded(build_downstream_response(
+                status,
+                &resp_headers,
+                restored.into_bytes(),
+                ctx.req.protocol,
+                ctx.req.normalized_out,
+                Some("application/json"),
+            )),
+            detail,
+        );
     }
     // 显式豁免：`status>=400` 的非 JSON 错误体（含空体）走此透传
     //（无用量/工具调用可提取，按设计备选路径原样透传，状态码与正文字节保留，
@@ -366,30 +435,48 @@ pub async fn serve_nonstream(
     // 非字节等价为有意行为。
     if is_error_status {
         let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
-        return NonstreamOutcome::Responded(build_downstream_response(
+        detail.set_outcome(Outcome::Passthrough {
+            status: status_u16,
+            is_chat: true,
+        });
+        return (
+            NonstreamOutcome::Responded(build_downstream_response(
+                status,
+                &resp_headers,
+                bytes.to_vec(),
+                ctx.req.protocol,
+                false,
+                None,
+            )),
+            detail,
+        );
+    }
+    // 非 200 非错误状态（201/204/304 等）空体/非 JSON 不被 502 门控改写——
+    // 按原状态码与正文字节透传（仅 `status==200` 走空体门控）。
+    // `status==200` 不可达此（上方空体分类已 502 早返），保留兜底防御。
+    if status_u16 == 200 {
+        detail.set_outcome(Outcome::EmptyBody);
+        return (
+            NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol)),
+            detail,
+        );
+    }
+    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
+    detail.set_outcome(Outcome::Passthrough {
+        status: status_u16,
+        is_chat: true,
+    });
+    (
+        NonstreamOutcome::Responded(build_downstream_response(
             status,
             &resp_headers,
             bytes.to_vec(),
             ctx.req.protocol,
             false,
             None,
-        ));
-    }
-    // 非 200 非错误状态（201/204/304 等）空体/非 JSON 不被 502 门控改写——
-    // 按原状态码与正文字节透传（仅 `status==200` 走空体门控）。
-    // `status==200` 不可达此（上方空体分类已 502 早返），保留兜底防御。
-    if status_u16 == 200 {
-        return NonstreamOutcome::Responded(empty_body_response(ctx.req.protocol));
-    }
-    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
-    NonstreamOutcome::Responded(build_downstream_response(
-        status,
-        &resp_headers,
-        bytes.to_vec(),
-        ctx.req.protocol,
-        false,
-        None,
-    ))
+        )),
+        detail,
+    )
 }
 
 /// NonDialog 忽略 `params` 的告警去重（同进程至多一次；热路径去噪，
@@ -415,6 +502,21 @@ pub async fn serve_nondialog_passthrough(
     body: Vec<u8>,
     ctx: NondialogCtx<'_>,
 ) -> Response {
+    serve_nondialog_detailed(client, method, url, headers, body, ctx)
+        .await
+        .0
+}
+
+/// 带终态枚举的 NonDialog 透传（`gateway_serve` 用它取落行输入）。
+pub async fn serve_nondialog_detailed(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    ctx: NondialogCtx<'_>,
+) -> (Response, NonstreamDetail) {
+    let mut detail = NonstreamDetail::default();
     if ctx.overrides.is_some_and(|o| !o.params.is_empty())
         && !NONDIALOG_PARAMS_IGNORED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
@@ -427,9 +529,16 @@ pub async fn serve_nondialog_passthrough(
         .await
     {
         Ok(up) => up,
-        Err(_) => return empty_body_response(ctx.protocol),
+        Err(_) => {
+            detail.set_outcome(Outcome::NoUpstream);
+            return (empty_body_response(ctx.protocol), detail);
+        }
     };
-    passthrough_upstream_response(up, ctx.metrics)
+    detail.set_outcome(Outcome::Passthrough {
+        status: up.status().as_u16(),
+        is_chat: false,
+    });
+    (passthrough_upstream_response(up, ctx.metrics), detail)
 }
 
 /// NonDialog 透传上下文：协议标识 + 网关度量 + 单次 `resolve_target` 命中的覆盖

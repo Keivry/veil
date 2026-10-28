@@ -730,7 +730,7 @@ async fn window_cross_digit_ordering() {
         }
         assert!(!windows.contains(&"d8".to_string()), "最旧 d8 须被驱逐");
     }
-    // five_min 只留最新：内存含 m10，库中另注 m9，flush 后应只留 m10。
+    // five_min 保留最新 13 个窗口：内存含 m10，库中另注 m9，flush 后两窗均在。
     store.record_aux_counts(Protocol::Chat, 10 * 300, 0, 0, 1);
     {
         let conn = open_wal(&db).unwrap();
@@ -743,10 +743,47 @@ async fn window_cross_digit_ordering() {
     }
     store.flush().await.unwrap();
     let pts = store.query_series("five_min", None, None).await.unwrap();
-    assert_eq!(pts.len(), 1, "five_min 每协议只留最新窗口: {pts:?}");
-    assert_eq!(
-        pts[0].window, "m10",
-        "跨位数最新窗口须为 m10（字符串 MAX 会错误保留 m9）"
+    assert_eq!(pts.len(), 2, "five_min 保留 13 窗内两窗均在: {pts:?}");
+    let windows: Vec<&str> = pts.iter().map(|p| p.window.as_str()).collect();
+    assert!(
+        windows.contains(&"m9"),
+        "m9 在 13 窗保留范围内: {windows:?}"
     );
+    assert!(
+        windows.contains(&"m10"),
+        "跨位数 m10 须与 m9 同序保留（字符串比较无影响）: {windows:?}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn five_min_retains_newest_13_windows_by_window_ord() {
+    // 14 个 five_min 窗口 → 只留最新 13 个，最旧一个按 `window_ord` 整数序被驱逐。
+    let db = tmp_db("five-min-keep-13");
+    let _ = std::fs::remove_file(&db);
+    let store = MetricsStore::new(db.clone());
+    {
+        let conn = open_wal(&db).unwrap();
+        ensure_tables(&conn).unwrap();
+        for i in 1..=14 {
+            conn.execute(
+                "INSERT INTO metrics_five_min(window, protocol, requests) \
+                 VALUES (?1, 'chat/completions', 1)",
+                rusqlite::params![format!("m{i}")],
+            )
+            .unwrap();
+        }
+    }
+    store.flush().await.unwrap();
+    let pts = store.query_series("five_min", None, None).await.unwrap();
+    assert_eq!(pts.len(), 13, "five_min 每协议只留最新 13 窗: {pts:?}");
+    let windows: Vec<&str> = pts.iter().map(|p| p.window.as_str()).collect();
+    assert!(!windows.contains(&"m1"), "最旧 m1 须被驱逐: {windows:?}");
+    for i in 2..=14 {
+        assert!(
+            windows.contains(&format!("m{i}").as_str()),
+            "须保留 m{i}（按 window_ord 整数序）: {windows:?}"
+        );
+    }
     let _ = std::fs::remove_file(&db);
 }

@@ -27,6 +27,7 @@ pub mod dispatch;
 pub mod nonstream;
 pub mod pump;
 pub mod rewrite;
+pub mod trace;
 
 #[cfg(test)]
 mod tests;
@@ -202,11 +203,14 @@ pub use {
         NondialogCtx,
         NonstreamCtx,
         NonstreamOutcome,
+        serve_detailed,
+        serve_nondialog_detailed,
         serve_nondialog_passthrough,
         serve_nonstream,
     },
     pump::{PumpOutcome, RequestCtx, StreamPumpCtx, build_sse_response, spawn_stream_pump},
     rewrite::{RewriteOutput, request_rewrite, request_rewrite_with_overrides},
+    trace::{NonstreamDetail, Outcome, RequestTrace, StreamLog},
 };
 
 /// 网关集成单测共享夹具：`tests` 各用例组 / `nonstream::tests` / `rewrite::tests`

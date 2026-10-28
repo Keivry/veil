@@ -12,6 +12,7 @@ use {
 
 mod console;
 mod observability;
+mod requests;
 
 fn test_ip() -> IpAddr { IpAddr::from([127, 0, 0, 1]) }
 
@@ -179,12 +180,39 @@ fn unknown_subpath_returns_404() {
     });
 }
 
-#[test]
-fn admin_index_lists_seven_routes() {
-    let body = json!({
-        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream", "/_admin/commands"],
-    });
-    assert_eq!(body["routes"].as_array().unwrap().len(), 7);
+#[tokio::test]
+async fn admin_index_lists_eight_routes() {
+    // 索引由真实 handler 输出（非本地构造 `json!`），路由集合须与唯一表恰八条一致。
+    let dir = metrics_test_dir("index-routes");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let resp = admin_index(
+        State(state),
+        PeerIp(Some(test_ip())),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(HashMap::new()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let routes = body["routes"].as_array().expect("routes 须数组");
+    assert_eq!(routes.len(), 8, "索引须列八路由: {body}");
+    for want in [
+        "/_admin/",
+        "/_admin/health",
+        "/_admin/metrics",
+        "/_admin/series",
+        "/_admin/events",
+        "/_admin/events/stream",
+        "/_admin/commands",
+        "/_admin/requests",
+    ] {
+        assert!(
+            routes.iter().any(|r| r.as_str() == Some(want)),
+            "索引缺路由 {want}: {body}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]

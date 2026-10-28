@@ -13,14 +13,20 @@ use {
     },
 };
 
+mod range;
+
+pub use range::{RANGE_LABELS, RangeGranularity, RangeSpec, series_since_for_range};
+
 /// 内存环容量（最近 10k 样本）。
 pub const RING_CAP: usize = 10_000;
 /// `aggs` retention 保留窗数（与 `purge_retention_blocking` 同口径）。
 pub(crate) const AGGS_DAILY_KEEP: usize = 32;
 /// `aggs` retention 保留窗数（hourly）。
 pub(crate) const AGGS_HOURLY_KEEP: usize = 170;
-/// `aggs` retention 保留窗数（five_min 每协议只留最新窗口）。
-pub(crate) const AGGS_FIVE_MIN_KEEP: usize = 1;
+/// `aggs` retention 保留窗数（five_min：当前窗 + 12 个完整窗，共覆盖 60 分钟）。
+/// 1 → 13 使 `range=1h` 的窗口兜底路径有整段 `5min` 聚合可求和
+/// （canonical「sqlite 用量口径与 is_precise」）。
+pub(crate) const AGGS_FIVE_MIN_KEEP: usize = 13;
 /// `aggs` 硬上限（LRU 驱逐兜底，防异常键无界膨胀）。
 pub(crate) const AGGS_MAX_ENTRIES: usize = 4096;
 /// 延迟桶边界（毫秒）；11 条边界 → 12 桶（含上溢桶）。
@@ -201,6 +207,17 @@ pub(crate) enum Granularity {
     FiveMin,
 }
 
+impl Granularity {
+    /// 粒度跨度（秒）：窗口起点折算与窗口对齐误差上界。
+    pub(crate) const fn span_secs(self) -> u64 {
+        match self {
+            Self::Daily => 86_400,
+            Self::Hourly => 3_600,
+            Self::FiveMin => 300,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AggKey {
     pub(crate) granularity: Granularity,
@@ -231,7 +248,7 @@ pub(crate) struct WindowAgg {
 }
 
 /// 窗口键 `d{days}`/`h{hours}`/`m{win}` 的整数序（解析失败视为最旧）。
-fn window_ord(window: &str) -> i64 {
+pub(crate) fn window_ord(window: &str) -> i64 {
     window
         .get(1..)
         .and_then(|s| s.parse::<i64>().ok())
@@ -332,6 +349,22 @@ pub struct MetricsSnapshot {
     pub dropped: u64,
     /// `aggs` 驱逐累计（retention + LRU，可观测）。
     pub aggs_evicted: u64,
+    /// 生效范围（`1h|24h|7d|30d`）；无范围快照为 `None`。
+    pub range: Option<String>,
+    /// 窗口对齐后的范围下界（epoch 秒）；无范围快照为 `None`。
+    pub since_ts: Option<i64>,
+    /// `now - max(since_ts, earliest_available_ts)`，最小 0。
+    pub coverage_secs: u64,
+    /// 实际覆盖短于所选范围（或粒度保留不足）时为真。
+    pub partial: bool,
+    /// 窗口对齐误差上界（粒度跨度；ring 秒级路径为 0）。
+    pub boundary_slack_secs: u64,
+    /// 模型分布未取自 rollup 投影（回退 ring 或未提供）时为真。
+    pub per_model_partial: bool,
+    /// 请求日志队列丢弃累计（关闭/未装配时为 0）。
+    pub requests_dropped: u64,
+    /// 请求日志未完成（`Drop` 收尾）累计（关闭/未装配时为 0）。
+    pub requests_aborted: u64,
 }
 
 /// 时序点（`/_admin/series` 行）。
@@ -449,6 +482,14 @@ impl MetricsStore {
             ring_len: count as usize,
             dropped: self.dropped_total(),
             aggs_evicted: self.aggs_evicted_total(),
+            range: None,
+            since_ts: None,
+            coverage_secs: 0,
+            partial: false,
+            boundary_slack_secs: 0,
+            per_model_partial: false,
+            requests_dropped: 0,
+            requests_aborted: 0,
         }
     }
 

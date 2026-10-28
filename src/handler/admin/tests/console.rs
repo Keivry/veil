@@ -101,14 +101,343 @@ fn console_html_command_section_wired() {
         "data-sec=\"commands\"",
         "id=\"sec-commands\"",
         "id=\"cmd-table\"",
-        "SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用' }",
-        "'/_admin/commands?limit='",
+        "SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用', requests: 'LLM 请求' }",
+        "'/_admin/commands?range='",
         "approval_status=",
         "parsed.kind === 'command'",
         "function commandRowModel",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
     }
+}
+
+#[test]
+fn console_html_request_section_wired() {
+    // 五处触点：nav / 分区 / SEC_TITLES（上条逐字锁定）/ showSection 分支 / state.requests。
+    for needle in [
+        "data-sec=\"requests\"",
+        "id=\"sec-requests\"",
+        "id=\"req-table\"",
+        "if (sec === 'requests') {",
+        "reloadRequests();",
+        "requests: { limit: 50, offset: 0, total: 0,",
+        "function renderRequests(d)",
+        "function reloadRequests()",
+        "function requestRowModel(item)",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_request_table_columns_and_filters() {
+    // 9 列顺序与 design §8.2 逐项一致（时间/模型/协议/会话/状态/输入·输出/命中率/耗时/摘要）。
+    assert!(
+        CONSOLE_HTML.contains(
+            "<th>时间</th><th>模型</th><th>协议</th><th>会话</th><th>状态</th>\n                <th class=\"num\">输入·输出</th><th class=\"num\">命中率</th><th class=\"num\">耗时</th><th>摘要</th>"
+        ),
+        "请求表头须为 9 列且顺序固定"
+    );
+    // 过滤器取值：protocol 有 chat/responses/messages/other，status 有
+    // 2xx/4xx/5xx/error，session 前缀 ≥4 字符提示，scope 有 会话/用户，limit 有 50/100/200。
+    for needle in [
+        "id=\"req-model\"",
+        "id=\"req-protocol\"",
+        "<option value=\"chat\">chat</option>",
+        "<option value=\"responses\">responses</option>",
+        "<option value=\"anthropic\">messages</option>",
+        "<option value=\"passthrough\">other</option>",
+        "id=\"req-status\"",
+        "<option value=\"2xx\">2xx</option>",
+        "<option value=\"4xx\">4xx</option>",
+        "<option value=\"5xx\">5xx</option>",
+        "<option value=\"error\">error</option>",
+        "id=\"req-session\"",
+        "会话前缀至少 4 个字符才生效",
+        "id=\"req-scope\"",
+        "<option value=\"session\">会话</option>",
+        "<option value=\"user\">用户</option>",
+        "id=\"req-limit\"",
+        "<option value=\"50\">每页 50</option>",
+        "<option value=\"100\">每页 100</option>",
+        "<option value=\"200\">每页 200</option>",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    // 会话前缀不足 4 字符不生效（源码级：只在 ≥4 时拼进查询）。
+    assert!(
+        CONSOLE_HTML.contains("if (r.session.length >= 4) q += '&session='"),
+        "会话前缀须在 ≥4 字符时才作为查询参数发送"
+    );
+}
+
+#[test]
+fn console_html_request_states_pagination_and_range() {
+    // 三态文案互不相同：记录关闭 / 范围内无请求 / partial 覆盖提示。
+    for needle in [
+        "逐请求记录已关闭（[storage].request_log_enabled = false）",
+        "当前范围内无请求",
+        "记录覆盖不足：实际覆盖 ",
+        "if (d.partial === true) {",
+        "id=\"req-partial\"",
+        "id=\"req-prev\"",
+        "id=\"req-next\"",
+        "info.textContent = '共 ' + r.total + ' 条';",
+        "prev.disabled = r.offset <= 0;",
+        "next.disabled = rowCount === 0 || r.offset + rowCount >= r.total;",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    // 全局范围恒随查询发送；SSE 与回退轮询的分区刷新沿用同一端点。
+    assert!(
+        CONSOLE_HTML.contains("'/_admin/requests?range=' + encodeURIComponent(state.range)"),
+        "请求分区查询须恒带 range"
+    );
+    assert!(
+        CONSOLE_HTML.contains("if (!$('sec-requests').hidden) {\n        reloadRequests();"),
+        "断线回退时请求分区须以 /_admin/requests 为单端点"
+    );
+}
+
+#[test]
+fn console_html_all_data_requests_carry_range() {
+    // 范围切换须落到每一次取数：SSE 建连、指标/时序回退，以及事件/命令/请求三个
+    // 分页端点全部携带当前 `range`（否则切换后仍展示旧窗口数据）。
+    for needle in [
+        "return '/_admin/events/stream?range=' + encodeURIComponent(state.range);",
+        "api('/_admin/metrics?range=' + encodeURIComponent(state.range))",
+        "var q = '/_admin/events?range=' + encodeURIComponent(state.range) +\n      '&limit=' + EVENT_LIMIT;",
+        "var q = '/_admin/commands?range=' + encodeURIComponent(state.range) +\n      '&limit=' + state.cmdLimit + '&offset=' + state.cmdOffset;",
+        "var q = '/_admin/requests?range=' + encodeURIComponent(state.range) +",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    assert_eq!(
+        CONSOLE_HTML.matches("/_admin/events?range=").count(),
+        1,
+        "`/_admin/events` 的取数点须唯一且带 range"
+    );
+    assert_eq!(
+        CONSOLE_HTML.matches("/_admin/commands?range=").count(),
+        1,
+        "`/_admin/commands` 的取数点须唯一且带 range"
+    );
+}
+
+#[test]
+fn console_html_range_change_refetches_visible_section() {
+    // 范围切换后：overview 仅靠 SSE 快照（不额外取数），事件/命令/请求各按当前分区
+    // 重取一页，且分页偏移归零避免旧窗口的越界页。
+    for needle in [
+        "} else if (!$('sec-events').hidden) {\n          reloadEventsOnce();",
+        "} else if (!$('sec-commands').hidden) {\n          state.cmdOffset = 0;\n          reloadCommands(true);",
+        "restartStream();\n        if (!$('sec-requests').hidden) {\n          state.requests.offset = 0;\n          reloadRequests();",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_distribution_coverage_and_partial_hint() {
+    // 模型分布：`per_model_partial` 为真时标注环内样本（非范围全量），
+    // `coverage_secs` 存在时展示覆盖时长；PII 采样面板的既有文案保持不变。
+    for needle in [
+        "id=\"model-hint\"",
+        "if (m.per_model_partial === true) mparts.push('模型分布为环内样本，非范围全量。');",
+        "if (m.coverage_secs != null) mparts.push('分布样本覆盖 ' + fmtCoverage(m.coverage_secs) + '。');",
+        "mh.hidden = mparts.length === 0;",
+        "样本为进程内 TopN 采样（非全量）、不随 range 变化。",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_requests_next_page_respects_offset_cap_and_surfaces_errors() {
+    // offset > 10000 服务端 400：按钮先禁用，点击处再兜底提示，请求失败给非阻塞横幅。
+    for needle in [
+        "var REQ_MAX_OFFSET = 10000;",
+        "if (next && r.offset + r.limit > REQ_MAX_OFFSET) next.disabled = true;",
+        "if (r.offset + r.limit > REQ_MAX_OFFSET) {\n        setBanner(REQ_NEXT_LIMIT);\n        return;\n      }",
+        "setBanner('请求列表加载失败：' + (err && err.message ? err.message : '未知错误'));",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
+fn console_html_request_cells_use_escaping_helper() {
+    // 每个单元格都经 esc()：模型/摘要/会话等均为不可信输入，不拼接原始值。
+    for needle in [
+        "'<td>' + esc(x.ts) + '</td>'",
+        "'<td>' + esc(x.model) + '</td>'",
+        "'<td>' + esc(x.protocol) + '</td>'",
+        "'<td>' + esc(x.session) +",
+        "'<td>' + esc(x.status) + '</td>'",
+        "'<td class=\"num\">' + esc(x.io) + '</td>'",
+        "'<td class=\"num\" title=\"' + esc(x.hitTitle) + '\">' + esc(x.hit) + '</td>'",
+        "'<td class=\"num\">' + esc(x.latency) + '</td>'",
+        "'<td class=\"sum\" title=\"' + esc(x.summary) + '\">' + esc(x.summary) + '</td>'",
+        "'<span class=\"badge\" title=\"' + esc(x.source) + '\">' + esc(x.scope) + '</span>'",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    assert!(
+        !CONSOLE_HTML.contains("+ x.summary +") && !CONSOLE_HTML.contains("+ x.model +"),
+        "摘要与模型不得以原始值拼接进 HTML"
+    );
+    // 该端点的取数点唯一：全部集中在 reloadRequests 内，分区外不得另立请求。
+    assert_eq!(
+        CONSOLE_HTML.matches("'/_admin/requests?range='").count(),
+        1,
+        "`/_admin/requests` 的取数点须唯一"
+    );
+    assert!(
+        CONSOLE_HTML.contains("function reqEmptyRow(text) {\n    return '<tr><td colspan=\"' + REQ_EMPTY_COLS + '\"><div class=\"empty\">' + esc(text) + '</div></td></tr>';"),
+        "请求表空态文案也须经 esc()"
+    );
+}
+
+#[test]
+fn console_request_row_model_executes_in_node() {
+    const START: &str = "/* @veil-testable:start */";
+    const END: &str = "/* @veil-testable:end */";
+    let fn_pos = CONSOLE_HTML
+        .find("function requestRowModel")
+        .expect("壳须含 requestRowModel");
+    let start = CONSOLE_HTML[..fn_pos]
+        .rfind(START)
+        .expect("requestRowModel 须位于 @veil-testable 块内")
+        + START.len();
+    let rest = &CONSOLE_HTML[start..];
+    let end = rest.find(END).expect("壳须含 @veil-testable:end 标记");
+    let helpers = &rest[..end];
+    // `esc` 位于该测试块之外：按函数头切出源码，配合最小 DOM 垫片在 node 中求值，
+    // 锁定「先 textContent 再由 innerHTML 读出」的转义语义（而不是只断言符号存在）。
+    let esc_pos = CONSOLE_HTML
+        .find("function esc(s) {")
+        .expect("壳须含 esc 转义助手");
+    let esc_rest = &CONSOLE_HTML[esc_pos..];
+    let esc_end = esc_rest.find("\n  }\n").expect("esc 函数须以标准缩进收尾") + "\n  }\n".len();
+    let esc_src = &esc_rest[..esc_end];
+
+    let node_ready = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !node_ready {
+        return;
+    }
+
+    let harness = format!(
+        r#"
+function makeDoc() {{
+    return {{
+        createElement: function () {{
+            var el = {{}}, text = '';
+            Object.defineProperty(el, 'textContent', {{
+                set: function (v) {{ text = v == null ? '' : String(v); }},
+                get: function () {{ return text; }}
+            }});
+            Object.defineProperty(el, 'innerHTML', {{
+                get: function () {{
+                    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }}
+            }});
+            return el;
+        }}
+    }};
+}}
+var document = makeDoc();
+{esc_src}
+function fmtNum(n) {{
+    if (n == null || n === '') return '—';
+    var x = Number(n);
+    if (!isFinite(x)) return '—';
+    return String(x);
+}}
+function fmtMs(v) {{
+    if (v == null) return '—';
+    var x = Number(v);
+    if (!isFinite(x)) return '—';
+    return Math.round(x) + ' ms';
+}}
+function fmtFullTs(ts) {{
+    if (ts == null || ts === '') return '';
+    var d = new Date(Number(ts) * 1000);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleString('zh-CN', {{ hour12: false }});
+}}
+var out = {{}};
+var r = requestRowModel({{ ts_secs: 1700000000, model: '<img src=x onerror=alert(1)>', protocol: 'chat',
+  prompt_tokens: 1024, completion_tokens: 256, cache_hit_rate: 0.75, cache_write_rate: 0.125,
+  latency_ms: 812, session_id: '9f2c8a1b4d5e6f70', session_source: 'cache_key', session_scope: 'session',
+  summary: '<script>x</script>' }});
+out.model = r.model;
+out.session = r.session;
+out.scope = r.scope;
+out.source = r.source;
+out.io = r.io;
+out.hit = r.hit;
+out.hitTitle = r.hitTitle;
+out.latency = r.latency;
+out.summary = r.summary;
+var nul = requestRowModel({{ ts_secs: 1, cache_hit_rate: null, status: null, error_kind: 'upstream_unreachable',
+  prompt_tokens: 0, completion_tokens: 0, latency_ms: 0, session_id: null, session_scope: 'none' }});
+out.null_hit = nul.hit;
+out.null_status = nul.status;
+out.null_session = nul.session;
+out.null_scope = nul.scope;
+var escModel = esc('<img src=x onerror=alert(1)>');
+out.esc_model = escModel;
+out.esc_has_img = escModel.indexOf('<img') >= 0;
+out.esc_has_script = esc('<' + 'script>x</' + 'script>').indexOf('<script') >= 0;
+out.esc_quotes = esc('a"b\'c');
+console.log(JSON.stringify(out));
+"#
+    );
+    let script = format!("{helpers}\n{harness}\n");
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .expect("spawn `node -e` 失败");
+    assert!(
+        output.status.success(),
+        "node 执行失败（status={}）：{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verdict: serde_json::Value = serde_json::from_str(
+        String::from_utf8(output.stdout)
+            .expect("node stdout 须为 UTF-8")
+            .trim(),
+    )
+    .expect("node 须输出 JSON");
+    assert_eq!(verdict["model"], "<img src=x onerror=alert(1)>");
+    assert_eq!(verdict["session"], "9f2c8a1b4d5e");
+    assert_eq!(verdict["scope"], "会话");
+    assert_eq!(verdict["source"], "cache_key");
+    assert_eq!(verdict["io"], "1,024 · 256");
+    assert_eq!(verdict["hit"], "75.0%");
+    assert_eq!(verdict["hitTitle"], "缓存写比率 12.5%");
+    assert_eq!(verdict["latency"], "812 ms");
+    assert_eq!(verdict["summary"], "<script>x</script>");
+    assert_eq!(verdict["null_hit"], "—");
+    assert_eq!(verdict["null_status"], "upstream_unreachable");
+    assert_eq!(verdict["null_session"], "");
+    assert_eq!(verdict["null_scope"], "");
+    // XSS：模型原文可流出模型层，但经 esc() 后不得再含可执行的标签起始。
+    assert_eq!(verdict["esc_has_img"], false, "esc 输出不得含 <img");
+    assert_eq!(verdict["esc_has_script"], false, "esc 输出不得含 <script");
+    assert_eq!(
+        verdict["esc_model"], "&lt;img src=x onerror=alert(1)&gt;",
+        "esc 须把标签起始/结束转为实体"
+    );
+    assert_eq!(
+        verdict["esc_quotes"], "a&quot;b&#39;c",
+        "esc 须同时转义双引号与单引号（属性位安全）"
+    );
 }
 
 #[test]

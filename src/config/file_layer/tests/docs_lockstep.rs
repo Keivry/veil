@@ -3,7 +3,14 @@
 //! `examples/veil.toml` ↔ schema 与密钥门禁。任一侧漂移即 `cargo test` 失败。
 
 use {
-    super::{ENV_PARSE_SRC, PII_SCOPE_SRC, TempFile, VALIDATE_SRC, flattened_keys},
+    super::{
+        ENV_PARSE_SRC,
+        PII_SCOPE_SRC,
+        STORAGE_ENV_SRC,
+        TempFile,
+        VALIDATE_SRC,
+        flattened_keys,
+    },
     crate::config::{
         AutoApprove,
         Config,
@@ -39,7 +46,8 @@ const CONTAINER_EXAMPLE_TOML: &str = include_str!("../../../../examples/veil.con
 /// 文档侧子节标题（§1 内，非顶级 §N）。
 const SUBSECTION_HEADING: &str = "### 配置文件层（TOML）";
 
-/// 文件专属键在 schema 表第二列的标注（与 `FILE_ONLY_KEYS` 一一对应）。
+/// 文件专属键在 schema 表第二列的标注：覆盖 `FILE_ONLY_KEYS` 的结构键根与
+/// `MappingTarget::FileOnly` 的标量键（二者均无 env 对应源）。
 const FILE_ONLY_ENV_LABEL: &str = "（文件专属）";
 
 /// design D6「别名概念的 env 显式名集合」表（静态部分）。`AUDIT_ENABLED` 真值
@@ -331,6 +339,7 @@ fn doc_env_names_match_mapping_targets() {
         let want: &str = match &mapping.target {
             MappingTarget::Env(name) => name,
             MappingTarget::PortTable => "LLM_<port>",
+            MappingTarget::FileOnly => FILE_ONLY_ENV_LABEL,
         };
         assert_eq!(doc_env, want, "文档键 {key} 的规范 env 名须与映射目标一致");
     }
@@ -348,7 +357,7 @@ fn mapping_targets_are_env_read_names() {
     for mapping in MAPPINGS {
         let name = match &mapping.target {
             MappingTarget::Env(name) => *name,
-            MappingTarget::PortTable => continue,
+            MappingTarget::PortTable | MappingTarget::FileOnly => continue,
         };
         assert!(
             whitelist.contains(name) || migrated.contains(name),
@@ -362,8 +371,9 @@ fn mapping_targets_are_env_read_names() {
         assert!(
             ENV_PARSE_SRC.contains(&needle)
                 || PII_SCOPE_SRC.contains(&needle)
+                || STORAGE_ENV_SRC.contains(&needle)
                 || VALIDATE_SRC.contains(&needle),
-            "映射目标 {name} 须在 loader 源码（env_parse/pii_scope/validate）中以字面量出现：防死键"
+            "映射目标 {name} 须在 loader 源码（env_parse/pii_scope/storage/validate）中以字面量出现：防死键"
         );
     }
 }
@@ -387,7 +397,7 @@ fn alias_env_explicit_sets_match_design_d6() {
         }
         let want: &[&str] = match &mapping.target {
             MappingTarget::Env(name) => std::slice::from_ref(name),
-            MappingTarget::PortTable => &[],
+            MappingTarget::PortTable | MappingTarget::FileOnly => &[],
         };
         assert_eq!(
             mapping.env_explicit_names, want,

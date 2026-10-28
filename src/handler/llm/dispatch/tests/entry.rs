@@ -41,6 +41,7 @@ fn shared_ctx_equivalence() {
         sse_frame_hard_bytes: crate::config::SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: "m".to_string(),
+        stream_log: None,
     };
     let nonstream = NonstreamCtx {
         req,

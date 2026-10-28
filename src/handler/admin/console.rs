@@ -7,8 +7,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// 单文件控制台静态壳（`include_str!` 进二进制，无运行时文件依赖，Dockerfile 零改动）。
-pub const CONSOLE_HTML: &str = include_str!("console.html");
+/// 控制台静态壳（三段 `include_str!` 编译期拼接进二进制，无运行时文件依赖，Dockerfile 零改动）：
+/// `console.head.html`（doctype/head/style/markup + 起始 `<script>`）、`console.app.js`（脚本正文）
+/// 与 `console.tail.html`（`</script>` 与收尾 markup）依次拼接。拼接结果与拆分前单文件逐字节一致，
+/// 仍是一次响应、一个 URL、零外部 URL 的 `&'static str` 常量（编译期拼接，无运行时构造）。
+pub const CONSOLE_HTML: &str = concat!(
+    include_str!("console.head.html"),
+    include_str!("console.app.js"),
+    include_str!("console.tail.html")
+);
 
 /// 词法级 `Accept` 协商：仅精确 `text/html` / `application/xhtml+xml` 命中
 /// （不匹配 `text/*`、`*/*` 等通配）；条目参数 `q=`（键名大小写不敏感）解析值

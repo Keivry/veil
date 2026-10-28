@@ -17,8 +17,12 @@ fn empty_targets_extension_matches_public_load_from() {
 #[test]
 fn file_len_redline() {
     crate::test_support::file_len_under_800_or_split(
-        "env_parse.rs",
-        include_str!("../env_parse.rs"),
+        "env_parse/mod.rs",
+        include_str!("../env_parse/mod.rs"),
+    );
+    crate::test_support::file_len_under_800_or_split(
+        "env_parse/storage.rs",
+        include_str!("../env_parse/storage.rs"),
     );
 }
 

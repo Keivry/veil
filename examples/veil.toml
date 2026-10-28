@@ -54,6 +54,9 @@ authorization_ttl_secs = 0           # 授权窗口（秒）；0 = 无期限（�
 # 非 0 时授权到期即转审批（建票 + 阻塞至 300s 超时），无人值守脚本必须配置审批人；
 # 每次到期或续期都会写一次注册表。设过小（<60）会在启动期 warn。
 credential_block_wait = false
+# 请求日志（文件专属，无 env 对应源）：逐请求落 metrics.sqlite 的 llm_requests 表
+# request_log_enabled = true        # 缺省 true
+# request_log_retention_days = 7    # 缺省 7 天；0 = 不清理
 # 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
 # veilctl_secret = "..."
 # veilctl_binary_hash = "..."

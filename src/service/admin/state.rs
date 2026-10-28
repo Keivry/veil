@@ -138,6 +138,15 @@ impl AdminState {
             .map(|ring| ring.iter().any(|e| e.kind == kind))
             .unwrap_or(false)
     }
+
+    /// 环内最早事件的 `ts_secs`（`range` 响应的 `coverage_secs` 依据）；
+    /// 空环返回 `None`（覆盖为 0，必然 `partial`）。
+    pub fn earliest_ts(&self) -> Option<i64> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|ring| ring.iter().map(|e| e.ts_secs).min())
+    }
 }
 
 /// 跨子模块测试共享（其它子模块测试经

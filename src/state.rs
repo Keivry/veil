@@ -52,6 +52,9 @@ pub struct AppState {
     pub register_hits: Arc<tokio::sync::Mutex<crate::service::RateTable>>,
     pub gateway_metrics: Arc<crate::service::llm_gateway::GatewayMetrics>,
     pub admin: Arc<crate::service::admin::AdminState>,
+    /// 逐请求日志（`llm_requests` + `request_model_rollup`）：与 `admin.metrics`
+    /// 同库不同表；有界队列 + 2s 周期刷盘，关闭路径由 `flush_blocking` 兜底。
+    pub request_log: Arc<crate::service::request_log::RequestLog>,
     /// `AuditLogger` 启动期单例（`audit_sink` 持同一 `Arc` 写盘）。
     pub audit_logger: Arc<crate::service::audit::AuditLogger>,
     /// 审计落盘 + 事件环接线单例（`DATA_DIR/audit.log`，`spawn_blocking` 写盘）。
@@ -101,6 +104,7 @@ impl std::fmt::Debug for AppState {
             .field("register_hits", &self.register_hits)
             .field("gateway_metrics", &self.gateway_metrics)
             .field("admin", &self.admin)
+            .field("request_log", &self.request_log)
             .field("audit_logger", &self.audit_logger)
             .field("audit_sink", &self.audit_sink)
             .field("audit_policy", &self.audit_policy)
@@ -140,6 +144,12 @@ impl AppState {
         let admin = Arc::new(crate::service::admin::AdminState::new(
             outcome.db_path.clone(),
             PiiSamplerConfig::from_config(&config),
+        ));
+        // 与 metrics 同库同文件（`metrics.sqlite`）不同表：`llm_requests` 会话/请求行。
+        let request_log = Arc::new(crate::service::request_log::RequestLog::new(
+            outcome.db_path.clone(),
+            config.request_log_enabled,
+            config.request_log_retention_days,
         ));
         let approval = Arc::new(crate::service::matrix::MatrixApproval::new(
             config.approval_whitelist.clone(),
@@ -232,6 +242,7 @@ impl AppState {
             register_hits: Arc::new(tokio::sync::Mutex::new(crate::service::RateTable::new())),
             gateway_metrics,
             admin,
+            request_log,
             audit_logger,
             audit_sink,
             audit_policy: Arc::new(crate::service::audit::AuditPolicy::default_policy()),

@@ -74,6 +74,9 @@ pub struct StreamPumpCtx {
     pub init_conv: Option<String>,
     /// 请求侧 `model`；响应帧缺失有效 model 时回退分桶。
     pub req_model: String,
+    /// 请求日志落行凭据（守卫 + 存储句柄 + 真实上游状态）；`None` 表示本次
+    /// 调用不记录（单测直调泵时零副作用）。终态补全点见 `spawn/finish.rs`。
+    pub stream_log: Option<crate::handler::llm::trace::StreamLog>,
 }
 
 /// 流泵结束时的可观测结果（单测断言用）。

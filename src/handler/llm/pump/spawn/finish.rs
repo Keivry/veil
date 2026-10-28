@@ -6,7 +6,11 @@ use {
         setup::{PumpEnv, PumpLoopState},
         terminal::{self, TerminalCtx},
     },
-    crate::service::{metrics::ChatRecord, sse::SseParser},
+    crate::service::{
+        metrics::ChatRecord,
+        request_log::StreamOutcome,
+        sse::{SseParser, TruncatedMode},
+    },
     std::sync::atomic::Ordering,
 };
 
@@ -44,7 +48,7 @@ pub(super) async fn finish(
     })
     .await;
     env.hold_gate.store(false, Ordering::Relaxed);
-    env.admin_metrics.record_chat(ChatRecord {
+    let counted = env.admin_metrics.record_chat(ChatRecord {
         protocol: env.protocol,
         model: state.stream_model.as_deref().unwrap_or(""),
         latency_ms: env.req_start.elapsed().as_millis() as u64,
@@ -62,10 +66,37 @@ pub(super) async fn finish(
         tally.cred_hits,
         u64::from(state.terminator.audit_blocked()),
     );
+    record_request_row(env, &state, counted);
     PumpOutcome {
         forwarded: state.forwarded,
         block_injected: state.terminator.block_injected(),
         terminal_injected: state.meta.terminal_injected,
         blocked_index,
+    }
+}
+
+/// 流式请求的「恰好一行」落点（design §1.2）：真实上游状态 + 终态字段一次补全，
+/// 由 [`StreamGuard::finish`] 取走待写行后交 `RequestLog::record`（幂等，只写一行）。
+/// `counted` 取 `record_chat` 返回值——与 KPI `requests` 按构造同集合（design §2）。
+fn record_request_row(env: &PumpEnv, state: &PumpLoopState, counted: bool) {
+    let Some(log) = env.stream_log.as_ref() else {
+        return;
+    };
+    let outcome = StreamOutcome {
+        status: Some(log.upstream_status),
+        error_kind: (log.upstream_status >= 400).then_some("upstream_status"),
+        upstream_id: state.stream_first_id.as_deref(),
+        finish_reason: state.stream_finish_reason.as_deref(),
+        truncated_mode: state
+            .meta
+            .truncated_mode
+            .as_ref()
+            .map(TruncatedMode::as_str),
+        usage: state.stream_usage.as_ref(),
+        latency_ms: Some(env.req_start.elapsed().as_millis() as u64),
+        counted_metrics: Some(counted),
+    };
+    if let Some(row) = log.guard.finish(&outcome) {
+        log.request_log.record(row);
     }
 }

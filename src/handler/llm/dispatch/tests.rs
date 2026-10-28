@@ -17,6 +17,7 @@ use {
 };
 
 mod entry;
+mod request_log;
 
 fn unique_temp_dir() -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

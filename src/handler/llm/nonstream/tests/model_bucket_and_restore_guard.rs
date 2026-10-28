@@ -162,6 +162,7 @@ async fn model_bucket_fallback_stream_and_nonstream() {
         sse_frame_hard_bytes: crate::config::SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: "req-model-x".to_string(),
+        stream_log: None,
     };
     let _ = collect_pump(upstream, ctx_stream).await;
     server3.abort();

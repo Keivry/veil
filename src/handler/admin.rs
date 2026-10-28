@@ -2,22 +2,23 @@
 //!
 //! 层归属：实现 `State<AppState>`、读 `HeaderMap`/`Query`、构造 `Response`
 //! 的 web 层逻辑归本文件；`service::admin` 仅留守数据源与纯逻辑（限流表、
-//! SSE 并发守卫与过滤、事件环、兼容映射、HMAC 等长比较）。七路由经
+//! SSE 并发守卫与过滤、事件环、兼容映射、HMAC 等长比较）。八路由经
 //! `router.rs` 注册，路径与状态码不变（精确注册先于通配，MUST NOT 被
 //! `/{*tail}` 吞没）：`/_admin/`、`/_admin/health`、`/_admin/metrics`、
-//! `/_admin/series`、`/_admin/events`、`/_admin/events/stream`；未知子路径 404。
+//! `/_admin/series`、`/_admin/events`、`/_admin/events/stream`、
+//! `/_admin/commands`、`/_admin/requests`；未知子路径 404。
 //!
 //! 鉴权优先级 `X-Admin-Token` > `__Host-admin_token` Cookie >
 //! `?access_token`（仅 SSE）；非 SSE 带 query 恒 401。限流按直连对端 IP
 //! （`PeerIp`，不读代理头）：通用 10/min/IP 429 + `Retry-After`；
 //! SSE 5 并发/IP + 60s ping + 5min 强制重连。限流契约见 `service::admin`
-//! 模块文档。
+//! 模块文档。`range` 口径（解析、时间下界、覆盖时长）见 `query` 子模块。
 
 use {
     crate::{
         error::VeilError,
         handler::PeerIp,
-        service::{admin, credential::AppStateParts},
+        service::{admin, credential::AppStateParts, metrics::RangeSpec},
         state::AppState,
     },
     axum::{
@@ -89,81 +90,6 @@ fn classify_sse_recv(recv: Result<String, tokio::sync::broadcast::error::RecvErr
         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => SseRecv::Skip(n),
         Err(tokio::sync::broadcast::error::RecvError::Closed) => SseRecv::Closed,
     }
-}
-
-/// 值级采样样本转嵌套 dict：`{kind: {mask: {count, hash}}}`。
-fn pii_value_samples_json(samples: &[crate::service::metrics::SampleView]) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for s in samples {
-        let entry = out
-            .entry(s.kind.clone())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(by_mask) = entry.as_object_mut() {
-            by_mask.insert(s.mask.clone(), json!({"count": s.hits, "hash": s.hash}));
-        }
-    }
-    serde_json::Value::Object(out)
-}
-
-/// 指标快照体（`/_admin/metrics` 与 SSE `metrics` 快照共用，字段集一致）：
-/// 含运行时可靠性三计数、值级采样嵌套字段与审批决策表观测。
-fn admin_metrics_body(state: &AppState) -> serde_json::Value {
-    let snap = state.admin_state().metrics.snapshot();
-    let gm = state.gateway_metrics();
-    // 审批决策表软上限只读观测；锁中毒时按零降级，不影响其余指标。
-    let (decision_overflow, decision_size) = state
-        .decisions
-        .lock()
-        .map(|t| (t.overflow_count(), t.entry_count()))
-        .unwrap_or((0, 0));
-    let samples = state.admin_state().sampler.top_n(20);
-    json!({
-        "ok": true,
-        "is_precise": snap.is_precise,
-        "requests": snap.requests,
-        "pii_hits": snap.pii_hits,
-        "pii_miss": snap.pii_miss,
-        "cred_hits": snap.cred_hits,
-        "tokens": {"prompt": snap.prompt_tokens, "completion": snap.completion_tokens, "total": snap.total_tokens, "cached_read": snap.cached_read, "cached_write": snap.cached_write, "unknown": snap.unknown},
-        "per_protocol": snap.per_protocol,
-        "per_model": snap.per_model,
-        "latency_buckets": snap.latency_buckets,
-        "p95_ms": snap.p95_ms,
-        "truncated": {
-            "silent_discard": snap.truncated_silent_discard,
-            "open_ended": snap.truncated_open_ended,
-            "synthesized_failed": snap.truncated_synthesized_failed,
-            "upstream_error": snap.truncated_upstream_error,
-        },
-        // 超软限观测（只增项，键名对齐 `GatewayMetrics` 同名计数器）：
-        // 超软限但完整交付的帧数/字节数。`truncated` 四态保留——fail-closed
-        // 收尾仍经 `record_truncated` 落账（`OpenEnded`/`SynthesizedFailed`），
-        // 二者是互补口径而非新旧替换。
-        "oversize_frames": gm.oversize_frames_count(),
-        "oversize_frame_bytes": gm.oversize_frame_bytes_count(),
-        "chat_tail_lenient": {
-            "chat/completions": gm.lenient_count("chat/completions"),
-            "v1/messages": gm.lenient_count("v1/messages"),
-            "v1/responses": gm.lenient_count("v1/responses"),
-        },
-        "sse_events": gm.sse_event_total(),
-        "ring_len": snap.ring_len,
-        "dropped": snap.dropped,
-        "approval_decision_overflow_total": decision_overflow,
-        "decision_table_size": decision_size,
-        "upstream_read_errors": gm.upstream_read_error_count(),
-        "admin_rate_evicted": gm.admin_rate_evicted_count(),
-        "aggs_evicted": snap.aggs_evicted,
-        "pii_value_samples": pii_value_samples_json(&samples),
-        // 只读会话作用域观测——模式 + 三计数。计数为无锁原子读，恒可用
-        // （缺失/锁不可用即降级为 0，绝不使请求失败）；既有键名与语义不变。
-        "pii_scope": {
-            "mode": if state.config.pii_scope_mode.is_conversation() { "conversation" } else { "request" },
-            "conversation_reuse": gm.conversation_reuse_count(),
-            "conversation_eviction": gm.conversation_eviction_count(),
-            "request_fallback": gm.request_fallback_count(),
-        },
-    })
 }
 
 /// 未鉴权响应（401 + `E_UNAUTHORIZED`；调用方不区分失败细节，防探测）。
@@ -363,8 +289,8 @@ pub async fn admin_index(
     let body = Json(json!({
         "ok": true,
         "admin": "veil observability",
-        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream", "/_admin/commands"],
-        "note": "JSON 索引占位：七路由 API + SSE 流已就绪；浏览器访问同路径可获控制台 HTML（Accept 协商）",
+        "routes": ["/_admin/", "/_admin/health", "/_admin/metrics", "/_admin/series", "/_admin/events", "/_admin/events/stream", "/_admin/commands", "/_admin/requests"],
+        "note": "JSON 索引占位：八路由 API + SSE 流已就绪；浏览器访问同路径可获控制台 HTML（Accept 协商）",
     }))
     .into_response();
     with_vary_accept(with_admin_cookie(body, &headers, expected))
@@ -406,6 +332,7 @@ pub async fn admin_health(
 /// `GET /_admin/metrics`：指标快照（聚合环 + 网关只读计数合并）。
 /// 兼容旧查询 `?model=&upstream=`：仅弃用标注回显，不做过滤（快照为全局口径，
 /// 过滤会返回空结果误导；调用方应改用 `series?protocol=` 按协议查询）。
+/// `?range=` 为范围口径分派（非法值 400）；未给 `range` 时输出与既有全局快照一致。
 pub async fn admin_metrics(
     State(state): State<AppState>,
     addr: PeerIp,
@@ -426,7 +353,19 @@ pub async fn admin_metrics(
     ) {
         return r;
     }
-    let mut body = admin_metrics_body(&state);
+    if let Err(message) = query::parse_range(&query) {
+        return query::bad_request(message);
+    }
+    let range = query.get("range").cloned();
+    let snapshot_state = state.clone();
+    let mut body = match tokio::task::spawn_blocking(move || {
+        admin_metrics_body(&snapshot_state, range.as_deref())
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(err) => return VeilError::internal(err).into_response(),
+    };
     let compat: HashMap<&str, &String> = ["model", "upstream"]
         .into_iter()
         .filter_map(|k| query.get(k).map(|v| (k, v)))
@@ -469,11 +408,7 @@ pub async fn admin_series(
     let granularity = match query.get("granularity") {
         Some(g) if matches!(g.as_str(), "daily" | "hourly" | "five_min" | "5min") => g.clone(),
         Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "granularity 取值 daily/hourly/five_min"}})),
-            )
-                .into_response();
+            return query::bad_request("granularity 取值 daily/hourly/five_min");
         }
         None => match range
             .as_deref()
@@ -481,11 +416,9 @@ pub async fn admin_series(
         {
             Some(g) => g.to_string(),
             None if range.is_some() => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "range 取值 1h/24h/7d/30d（或改用 granularity=daily/hourly/five_min）"}})),
-                )
-                    .into_response();
+                return query::bad_request(
+                    "range 取值 1h/24h/7d/30d（或改用 granularity=daily/hourly/five_min）",
+                );
             }
             None => "hourly".to_string(),
         },
@@ -496,12 +429,42 @@ pub async fn admin_series(
     if let Some(s) = since.as_deref()
         && !valid_since_shape(s)
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": {"code": "E_BAD_REQUEST", "message": "since 取值 [dhm]<整数>（如 d10/h36/m720，与 day_key/hour_key/five_min_key 同形）"}})),
-        )
-            .into_response();
+        return query::bad_request(
+            "since 取值 [dhm]<整数>（如 d10/h36/m720，与 day_key/hour_key/five_min_key 同形）",
+        );
     }
+    // `range` 折算为窗口键下界（`[dhm]<整数>` 同形）：否则 24h/7d/30d 会返回全部
+    // 保留窗。显式 `since` 优先（两者同为下界，跨粒度数值不可比，故不取 max）；
+    // 折算不扩大 `since` 的合法形态集合。
+    //
+    // 冲突口径选择「下界按最终生效粒度折算」而非 400 拒绝：`granularity` 显式
+    // 覆盖时（如 `range=1h&granularity=daily`），若仍按 `range` 自带粒度出 `m…`
+    // 键，就会与 `d…` 窗口做字符串序比较（`m` > `d` 恒真/恒假），返回空点集。
+    // 折算键取「包含 `range` 下界的最终粒度窗口」，与 `query_series` 的 `>=`
+    // 判据配套，既保留 `range` 的时间下界语义，又不拒绝合法组合。
+    let since = match (range.as_deref(), since) {
+        (Some(raw), None) => match RangeSpec::parse(raw) {
+            Ok(spec) => Some(query::series_since_for_range_with(
+                spec,
+                &granularity,
+                query::now_secs(),
+            )),
+            Err(()) => {
+                return query::bad_request(
+                    "range 取值 1h/24h/7d/30d（或改用 granularity=daily/hourly/five_min）",
+                );
+            }
+        },
+        (Some(raw), explicit) => {
+            if RangeSpec::parse(raw).is_err() {
+                return query::bad_request(
+                    "range 取值 1h/24h/7d/30d（或改用 granularity=daily/hourly/five_min）",
+                );
+            }
+            explicit
+        }
+        (None, explicit) => explicit,
+    };
     let protocol = query.get("protocol").cloned();
     let mut compat: HashMap<&str, &String> = HashMap::new();
     if let Some(r) = range.as_ref() {
@@ -554,6 +517,11 @@ pub async fn admin_commands(
     ) {
         return r;
     }
+    let now = query::now_secs();
+    let spec = match query::parse_range(&query) {
+        Ok(spec) => spec,
+        Err(message) => return query::bad_request(message),
+    };
     if !state.config().command.enabled {
         let body = Json(json!({
             "ok": true,
@@ -572,19 +540,35 @@ pub async fn admin_commands(
         command: query.get("command").cloned(),
         caller_path: query.get("caller_path").cloned(),
         approval_status: query.get("approval_status").cloned(),
+        since_ts: spec.map(|s| s.range_start(now)),
     };
     let limit = filter.limit();
     let offset = filter.offset();
     match state.command().log.query(filter).await {
         Ok(page) => {
-            let body = Json(json!({
+            let mut body = json!({
                 "ok": true,
                 "items": page.items,
                 "total": page.total,
                 "limit": page.limit,
                 "offset": page.offset,
-            }))
-            .into_response();
+            });
+            match spec {
+                Some(spec) => query::attach_range(
+                    &mut body,
+                    spec,
+                    spec.range_start(now),
+                    page.earliest_ts,
+                    now,
+                    0,
+                ),
+                None => query::attach_unranged_coverage(
+                    &mut body,
+                    page.earliest_ts,
+                    now,
+                ),
+            }
+            let body = Json(body).into_response();
             with_admin_cookie(body, &headers, &state.config().observability_admin_token)
         }
         Err(err) => with_security_headers(
@@ -633,7 +617,20 @@ pub async fn admin_events(
         (None, Some(v)) if state.admin_state().has_kind(v) => Some(v.to_string()),
         _ => None,
     };
-    let since: Option<i64> = query.get("since").and_then(|s| s.parse().ok());
+    let now = query::now_secs();
+    let spec = match query::parse_range(&query) {
+        Ok(spec) => spec,
+        Err(message) => return query::bad_request(message),
+    };
+    let explicit_since: Option<i64> = query.get("since").and_then(|s| s.parse().ok());
+    // 同时给出 `range` 与 `since` 时取较晚的时间下界（design §7.5）。
+    let since = match spec {
+        Some(spec) => Some(explicit_since.map_or_else(
+            || spec.range_start(now),
+            |explicit| explicit.max(spec.range_start(now)),
+        )),
+        None => explicit_since,
+    };
     let limit: usize = query
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -661,56 +658,19 @@ pub async fn admin_events(
         body["deprecated"] = "verdict/model/upstream 已弃用：请改用 kind/since/limit 新口径".into();
         body["compat"] = json!(compat);
     }
+    let earliest_ts = state.admin_state().earliest_ts();
+    match spec {
+        // 事件环按 `ts_secs` 精确过滤（无窗口对齐），故误差上界为 0。
+        // 回显的 `since_ts` 必须是**实际生效**的下界：同时给出 `range` 与更晚的
+        // 显式 `since` 时，过滤用的是较晚者，回显也须是较晚者。
+        Some(spec) => {
+            let effective_since = since.unwrap_or_else(|| spec.range_start(now));
+            query::attach_range(&mut body, spec, effective_since, earliest_ts, now, 0)
+        }
+        None => query::attach_unranged_coverage(&mut body, earliest_ts, now),
+    }
     let resp = Json(body).into_response();
     with_admin_cookie(resp, &headers, &state.config().observability_admin_token)
-}
-
-/// SSE 周期快照 payload 六键 `{range, model, upstream, metrics, series, health}`。
-/// 取数复用 `/_admin/metrics`、`/_admin/series`、`/_admin/health` 服务口径；
-/// `series` 取数失败降级 `{"error":"series_unavailable"}`，不中断事件推送与 60s ping。
-pub(crate) async fn build_metrics_sse_payload(
-    state: &AppState,
-    filter: &admin::SseFilter,
-    range: Option<&str>,
-    granularity: &str,
-) -> serde_json::Value {
-    let metrics = admin_metrics_body(state);
-    let series = match state
-        .admin_state()
-        .metrics
-        .query_series(granularity, None, None)
-        .await
-    {
-        Ok(points) => json!(points),
-        Err(e) => {
-            tracing::warn!("SSE metrics 快照 series 取数失败，降级为 series_unavailable: {e}");
-            json!({"error": "series_unavailable"})
-        }
-    };
-    let health = crate::service::health_status(state);
-    let health = json!({
-        "ok": true,
-        "sqlite_ok": health.sqlite_ok,
-        "sqlite_error": health.sqlite_error,
-        "pii_custom_disabled": state.detector.disabled_snapshot().len(),
-    });
-    json!({
-        "range": range,
-        "model": filter.model.clone(),
-        "upstream": filter.upstream.clone(),
-        "metrics": metrics,
-        "series": series,
-        "health": health,
-    })
-}
-
-/// 生产 15s 周期；单测缩短以在快速窗口验证周期推送（集成测试走非 test lib，恒 15s）。
-fn sse_metrics_interval() -> std::time::Duration {
-    if cfg!(test) {
-        std::time::Duration::from_millis(80)
-    } else {
-        admin::SSE_METRICS_INTERVAL
-    }
 }
 
 /// 未知 admin 子路径 404（精确路由之后、通配之前注册）。
@@ -726,9 +686,14 @@ pub async fn admin_not_found() -> Response {
 
 pub mod console;
 
+mod metrics;
+mod query;
+mod requests;
 mod stream;
 
-pub use stream::admin_events_stream;
+use metrics::{admin_metrics_body, sse_metrics_interval};
+pub use requests::admin_requests;
+pub(crate) use {metrics::build_metrics_sse_payload, stream::admin_events_stream};
 
 #[cfg(test)]
 mod tests;

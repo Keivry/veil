@@ -620,6 +620,33 @@ fn app_state_debug_redacts_conversation_secret() {
 }
 
 #[test]
+fn request_log_shares_metrics_db_path() {
+    // 请求日志与 metrics 同库同文件（不同表），且沿用配置面的开关与保留期。
+    let dir = unique_temp_dir();
+    let state = AppState::try_new(
+        Config::load_from(&minimal_env()).unwrap(),
+        outcome_for(&dir),
+    )
+    .expect("AppState 装配须成功");
+    assert_eq!(
+        state.request_log.db_path(),
+        state.db_path.as_path(),
+        "请求日志须与 metrics 共用 metrics.sqlite"
+    );
+    assert_eq!(
+        state.request_log.enabled(),
+        state.config.request_log_enabled,
+        "启用值须取自配置"
+    );
+    assert_eq!(
+        state.request_log.retention_days(),
+        state.config.request_log_retention_days,
+        "保留期须取自配置"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn conversation_secret_fallback_is_full_nonzero_32_bytes() {
     // SysRng 失败回退须产出完整 32 字节且无零填充（不留半成键）。
     let (buf, os_ok) = conversation_secret_bytes(|_| false);

@@ -469,8 +469,9 @@ fn blocked_placeholder_does_not_retrigger_audit() {
 #[test]
 fn approve_empty_whitelist_direct_call_downgrades_to_block() {
     // approve + 空白名单直调 → Block 降级（与流式同口径）。
-    // 生产不可达：启动门禁拒绝 approve 空白名单（`src/config/env_parse.rs:493`
-    // 的 `validate_approve_whitelist` 与 `src/main.rs:46` 的 `preflight_whitelist`），
+    // 生产不可达：启动门禁拒绝 approve 空白名单
+    // （`src/config/env_parse/mod.rs::validate_approve_whitelist` 与
+    // `src/main.rs::preflight_whitelist`），
     // 本用例锁定降级语义本身。
     use {
         super::super::{audit::AuditPolicy, llm_gateway::Protocol},

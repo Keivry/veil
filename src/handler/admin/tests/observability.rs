@@ -600,3 +600,372 @@ async fn admin_metrics_scope_no_secret_leak() {
     assert!(!text.contains(key.as_str()), "指标不得含会话键: {text}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn admin_metrics_dispatches_range_and_rejects_invalid() {
+    // `/_admin/metrics` 的 range 分派：合法四档回显窗口字段，非法值 400 且不返回快照。
+    let dir = metrics_test_dir("metrics-range-dispatch");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let mut ip = 140u8;
+    for (label, slack) in [
+        ("1h", 300_u64),
+        ("24h", 3_600),
+        ("7d", 86_400),
+        ("30d", 86_400),
+    ] {
+        ip += 1;
+        let resp = crate::handler::admin::admin_metrics(
+            State(state.clone()),
+            PeerIp(Some(std::net::IpAddr::from([127, 0, 0, ip]))),
+            headers_with(Some(ADMIN_TOKEN_T), None),
+            Query(HashMap::from([("range".to_string(), label.to_string())])),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "{label}");
+        let body = body_json(resp).await;
+        assert_eq!(body["range"], label, "{label}: {body}");
+        assert!(body["since_ts"].as_i64().is_some(), "{label}: {body}");
+        // 空环时 1h 会走窗口兜底（slack=300），其余档位按映射粒度。
+        assert_eq!(body["boundary_slack_secs"], slack, "{label}: {body}");
+        assert_eq!(body["partial"], true, "空环必然覆盖不足: {label}");
+        assert!(body["coverage_secs"].is_u64(), "{label}: {body}");
+    }
+    // 非法 range：400 + E_BAD_REQUEST，且响应体不含快照键。
+    let resp = crate::handler::admin::admin_metrics(
+        State(state.clone()),
+        PeerIp(Some(std::net::IpAddr::from([127, 0, 0, 150]))),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(HashMap::from([("range".to_string(), "2h".to_string())])),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "E_BAD_REQUEST", "{body}");
+    assert!(body.get("requests").is_none(), "非法参数不返回快照: {body}");
+    // 无 range：保持旧全局口径（既有键集不变，不出现 range/partial 等范围键）。
+    let plain = metrics_body(state.clone()).await;
+    for absent in [
+        "range",
+        "since_ts",
+        "coverage_secs",
+        "partial",
+        "boundary_slack_secs",
+    ] {
+        assert!(
+            plain.get(absent).is_none(),
+            "无 range 不得出现 {absent}: {plain}"
+        );
+    }
+    assert!(plain["requests_dropped"].is_u64(), "{plain}");
+    assert!(plain["requests_aborted"].is_u64(), "{plain}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_series_range_folds_into_since_window() {
+    // `range` 折算 `[dhm]<整数>` 窗口键下界：与显式 since 同口径等价；
+    // 非法 range 400，且不改变 since 的合法形态集合。
+    let dir = metrics_test_dir("series-range-since");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let call_series = |ip: u8, q: Vec<(&str, &str)>| {
+        let map: HashMap<String, String> = q
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let state = state.clone();
+        async move {
+            let resp = admin_series(
+                State(state),
+                PeerIp(Some(std::net::IpAddr::from([127, 0, 0, ip]))),
+                headers_with(Some(ADMIN_TOKEN_T), None),
+                Query(map),
+            )
+            .await
+            .into_response();
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    let (status, ranged) = call_series(160, vec![("range", "24h")]).await;
+    assert_eq!(status, StatusCode::OK, "{ranged}");
+    assert_eq!(ranged["granularity"], "hourly");
+    let (status, found) = call_series(161, vec![("granularity", "hourly")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ranged["points"], found["points"],
+        "range=24h 须与全量 hourly 在空库上等价（下界不排除未来窗口）: {ranged}"
+    );
+    // 非法 range：400，且与非法 granularity 同错误码。
+    let (status, body) = call_series(162, vec![("range", "90d")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "E_BAD_REQUEST");
+    // `since` 的合法形态集合未变：epoch 形态仍被拒。
+    let (status, _) = call_series(163, vec![("since", "1730000000")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "epoch 形态须仍被拒");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_events_echoes_effective_later_since() {
+    // `range` + 更晚的显式 `since`：过滤用较晚者，响应 `since_ts` 必须回显同一
+    // 生效下界（不得回显 `range_start`）。
+    let dir = metrics_test_dir("events-effective-since");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    state.admin_state().push_event("audit", "刚刚的事件", None);
+    let q = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let future = now + 3_600;
+    let body = events_body(
+        state.clone(),
+        q(&[("range", "1h"), ("since", &future.to_string())]),
+    )
+    .await;
+    assert_eq!(
+        body["since_ts"].as_i64(),
+        Some(future),
+        "since_ts 须回显实际生效的较晚下界: {body}"
+    );
+    assert_ne!(
+        body["since_ts"].as_i64(),
+        Some(now - 3_600),
+        "不得回显 range_start: {body}"
+    );
+    assert_eq!(
+        body["coverage_secs"].as_u64(),
+        Some(0),
+        "下界在未来时覆盖为 0: {body}"
+    );
+    // 仅 range（无 since）：仍回显 range 推导下界。
+    let body = events_body(state.clone(), q(&[("range", "1h")])).await;
+    let since_ts = body["since_ts"].as_i64().expect("since_ts");
+    assert!(
+        (now - 3_600 - 5..=now - 3_600 + 5).contains(&since_ts),
+        "仅 range 时 since_ts = now - span: {body}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_series_range_granularity_conflict_uses_final_granularity() {
+    // `range=1h&granularity=daily`：下界键须按**最终**粒度（`d…`）折算，
+    // 否则与 `d…` 窗口做字符串序比较恒空。
+    let dir = metrics_test_dir("series-range-gran-conflict");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    assert!(
+        state
+            .admin_state()
+            .metrics
+            .record_chat(crate::service::metrics::ChatRecord {
+                protocol: crate::service::llm_gateway::Protocol::Chat,
+                model: "gran-conflict",
+                latency_ms: 5,
+                usage: None,
+                truncated_mode: None,
+                is_precise: true,
+                ts_secs: now,
+            })
+    );
+    state.admin_state().metrics.flush().await.expect("刷盘");
+    let call = |ip: u8, q: Vec<(&str, &str)>| {
+        let map: HashMap<String, String> = q
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let state = state.clone();
+        async move {
+            let resp = admin_series(
+                State(state),
+                PeerIp(Some(std::net::IpAddr::from([127, 0, 0, ip]))),
+                headers_with(Some(ADMIN_TOKEN_T), None),
+                Query(map),
+            )
+            .await
+            .into_response();
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    let (status, body) = call(172, vec![("range", "1h"), ("granularity", "daily")]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["granularity"], "daily", "{body}");
+    assert!(
+        !body["points"].as_array().unwrap().is_empty(),
+        "range+granularity 冲突不得返回空点集: {body}"
+    );
+    for p in body["points"].as_array().unwrap() {
+        let window = p["window"].as_str().unwrap_or("");
+        assert!(
+            window.starts_with('d'),
+            "daily 口径的窗口键须为 d…: {window}"
+        );
+    }
+    // 同参数基线：仅 granularity=daily 也必须返回同一组点。
+    let (status, baseline) = call(173, vec![("granularity", "daily")]).await;
+    assert_eq!(status, StatusCode::OK, "{baseline}");
+    assert_eq!(
+        body["points"], baseline["points"],
+        "range=1h 的窗口下界不排除当天的 daily 窗口: {body} vs {baseline}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_series_bad_requests_carry_security_headers() {
+    // series 的每一条 400 分支都须经统一 helper，带上 `Cache-Control: no-store`。
+    let dir = metrics_test_dir("series-400-headers");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let cases: [Vec<(&str, &str)>; 4] = [
+        vec![("granularity", "bogus")],
+        vec![("range", "90d")],
+        vec![("since", "1730000000")],
+        vec![("range", "5d")],
+    ];
+    let mut ip = 180u8;
+    for case in cases {
+        ip += 1;
+        let map: HashMap<String, String> = case
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let resp = admin_series(
+            State(state.clone()),
+            PeerIp(Some(std::net::IpAddr::from([127, 0, 0, ip]))),
+            headers_with(Some(ADMIN_TOKEN_T), None),
+            Query(map),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{case:?}");
+        assert!(
+            cache_control(&resp).contains("no-store"),
+            "400 响应须带 no-store: {case:?}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "400 响应须带统一安全头: {case:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn sse_replay_respects_connection_range() {
+    // 回放：`since` 由连接 `range` 导出，越界事件不得回放；
+    // 实时：`event_within_since` 丢弃早于下界的事件。
+    use crate::{handler::admin::stream::replay_backlog, service::admin::SseFilter};
+    let dir = metrics_test_dir("sse-replay-range");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let admin_state = state.admin_state();
+    // 两条事件：一条 ts 远早于 1h 下界，一条就在当下（直接落环以控制时间戳）。
+    {
+        let mut ring = admin_state.events.lock().unwrap();
+        ring.push_back(crate::service::admin::AdminEvent {
+            id: 1,
+            ts_secs: now - 7_200,
+            kind: "audit".to_string(),
+            summary: "旧事件".to_string(),
+            protocol: None,
+        });
+        ring.push_back(crate::service::admin::AdminEvent {
+            id: 2,
+            ts_secs: now,
+            kind: "audit".to_string(),
+            summary: "新事件".to_string(),
+            protocol: None,
+        });
+    }
+    let since = now - 3_600;
+    let back = replay_backlog(admin_state, &SseFilter::default(), Some(since));
+    assert_eq!(back.len(), 1, "越界旧事件不得回放: {back:?}");
+    assert!(back[0].contains("新事件"), "{back:?}");
+    // 无 since：两条都回放。
+    let all = replay_backlog(admin_state, &SseFilter::default(), None);
+    assert_eq!(all.len(), 2, "{all:?}");
+    // 实时过滤：早于下界丢弃，晚于下界放行，无 ts 直通。
+    let stale = serde_json::json!({"ts_secs": now - 7_200, "summary": "old"}).to_string();
+    let fresh = serde_json::json!({"ts_secs": now, "summary": "new"}).to_string();
+    assert!(
+        !crate::handler::admin::stream::event_within_since(&stale, Some(since)),
+        "早于下界的实时事件须丢弃"
+    );
+    assert!(crate::handler::admin::stream::event_within_since(
+        &fresh,
+        Some(since)
+    ));
+    assert!(
+        crate::handler::admin::stream::event_within_since("not-json", Some(since)),
+        "形态不符直通不丢事件"
+    );
+    assert!(crate::handler::admin::stream::event_within_since(
+        &stale, None
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn admin_events_range_takes_later_bound_and_reports_coverage() {
+    // `range` 与显式 `since`（epoch 秒）同给时取较晚下界；响应带覆盖字段。
+    let dir = metrics_test_dir("events-range");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    state.admin_state().push_event("audit", "刚刚的事件", None);
+    let two_hours_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - 7_200;
+    let q = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    // range=1h 的推导下界（now-3600）晚于 2 小时前的 since → 保留该事件。
+    let body = events_body(
+        state.clone(),
+        q(&[("range", "1h"), ("since", &two_hours_ago.to_string())]),
+    )
+    .await;
+    assert_eq!(body["events"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["range"], "1h", "{body}");
+    assert_eq!(body["boundary_slack_secs"], 0, "{body}");
+    assert_eq!(body["partial"], true, "事件环仅覆盖数秒: {body}");
+    assert!(body["coverage_secs"].is_u64(), "{body}");
+    // 显式 since 更晚（未来时刻）→ 取 since，结果为空。
+    let future = (two_hours_ago + 86_400 * 365).to_string();
+    let body = events_body(state.clone(), q(&[("range", "1h"), ("since", &future)])).await;
+    assert_eq!(body["events"].as_array().unwrap().len(), 0, "{body}");
+    // 无 range：不出现 range 键，仍带 coverage/partial 观测。
+    let body = events_body(state.clone(), HashMap::new()).await;
+    assert!(body.get("range").is_none(), "{body}");
+    assert_eq!(body["partial"], false, "{body}");
+    // 非法 range → 400。
+    let resp = crate::handler::admin::admin_events(
+        State(state.clone()),
+        PeerIp(Some(std::net::IpAddr::from([127, 0, 0, 170]))),
+        headers_with(Some(ADMIN_TOKEN_T), None),
+        Query(q(&[("range", "3d")])),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "E_BAD_REQUEST", "{body}");
+    std::fs::remove_dir_all(&dir).ok();
+}

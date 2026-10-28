@@ -201,6 +201,8 @@ auto_approve = "pending"
 entry_mode = "credential-only"
 credential_block_wait = true
 authorization_ttl_secs = 3600
+request_log_enabled = true
+request_log_retention_days = 7
 
 [redaction]
 enabled = true
@@ -237,7 +239,7 @@ pool_idle_timeout_secs = 90
 backend = "mock"
 "#;
 
-const EXPECTED_KEYS: [&str; 45] = [
+const EXPECTED_KEYS: [&str; 47] = [
     "auth.homeserver",
     "auth.room_id",
     "auth.matrix_access_token",
@@ -260,6 +262,8 @@ const EXPECTED_KEYS: [&str; 45] = [
     "storage.entry_mode",
     "storage.credential_block_wait",
     "storage.authorization_ttl_secs",
+    "storage.request_log_enabled",
+    "storage.request_log_retention_days",
     "redaction.enabled",
     "redaction.fuzzy_restore",
     "redaction.detection_hardening",
@@ -285,8 +289,9 @@ const EXPECTED_KEYS: [&str; 45] = [
     "keepass.backend",
 ];
 
-const ENV_PARSE_SRC: &str = include_str!("../env_parse.rs");
+const ENV_PARSE_SRC: &str = include_str!("../env_parse/mod.rs");
 const PII_SCOPE_SRC: &str = include_str!("../env_parse/pii_scope.rs");
+const STORAGE_ENV_SRC: &str = include_str!("../env_parse/storage.rs");
 const VALIDATE_SRC: &str = include_str!("../validate.rs");
 
 #[test]
@@ -491,12 +496,13 @@ fn mapping_targets_are_env_read_names() {
     for mapping in MAPPINGS {
         let name = match mapping.target {
             MappingTarget::Env(name) => name,
-            MappingTarget::PortTable => continue,
+            MappingTarget::PortTable | MappingTarget::FileOnly => continue,
         };
         let needle = format!("\"{name}\"");
         assert!(
             ENV_PARSE_SRC.contains(&needle)
                 || PII_SCOPE_SRC.contains(&needle)
+                || STORAGE_ENV_SRC.contains(&needle)
                 || VALIDATE_SRC.contains(&needle),
             "映射目标 {name} 须为 env_parse 读取的 env 名"
         );
@@ -602,7 +608,15 @@ fn resolve_expands_upstream_ports() {
     let entries = resolve_entries(&cfg).expect("解析条目");
     let mut pairs: Vec<(String, String)> = entries
         .iter()
-        .map(|entry| (entry.canonical_env.clone(), entry.value.clone()))
+        .map(|entry| {
+            (
+                entry
+                    .canonical_env
+                    .clone()
+                    .expect("端口表条目须有规范 env 名"),
+                entry.value.clone(),
+            )
+        })
         .collect();
     pairs.sort();
     assert_eq!(
@@ -613,7 +627,15 @@ fn resolve_expands_upstream_ports() {
         ]
     );
     for entry in &entries {
-        assert_eq!(entry.env_explicit_names, vec![entry.canonical_env.clone()]);
+        assert_eq!(
+            entry.env_explicit_names,
+            vec![
+                entry
+                    .canonical_env
+                    .clone()
+                    .expect("端口表条目须有规范 env 名")
+            ]
+        );
     }
 }
 
@@ -1164,14 +1186,8 @@ fn file_value_bounds_reuse_env_validation() {
     );
 }
 
-#[test]
-fn file_len_redline() {
-    crate::test_support::file_len_under_800_or_split(
-        "file_layer.rs",
-        include_str!("../file_layer.rs"),
-    );
-}
-
 mod docs_lockstep;
 mod env_read_surface;
+mod redline;
 mod server_bind;
+mod storage;

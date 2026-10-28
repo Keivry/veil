@@ -247,7 +247,12 @@ pub(super) async fn handle_event(
         if env.protocol.is_chat() && AuditHold::chat_finish_reason_present(v) {
             state.chat_finish_seen = true;
         }
-        // 上游错误即终端（Chat 顶层 `error` 无 `choices`；Anthropic
+        // 末值胜出：Responses 每帧都带 `status`（`in_progress` → `completed`），
+        // 取首值会停在中间态；Chat/Anthropic 的 `finish_reason`/`stop_reason`
+        // 只出现一次，末值与首值等价。
+        if let Some(reason) = crate::handler::llm::trace::finish_reason_of(env.protocol, v) {
+            state.stream_finish_reason = Some(reason);
+        } // 上游错误即终端（Chat 顶层 `error` 无 `choices`；Anthropic
         // `type:"error"`）——观测记 `upstream_error`（区别于 `open_ended`）；本帧仍作
         // 终端帧透出，其后数据帧由终端守卫丢弃，流末不再补合成终端。
         if is_upstream_error_terminal(env.protocol, v) && !state.terminator.terminal_sent() {

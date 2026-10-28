@@ -48,7 +48,7 @@ fn is_valid_request_id(value: &str) -> bool {
 }
 
 /// 生成缺省 `request_id`：启动以来纳秒数 + 进程内单调序号（均十六进制，无新依赖）。
-fn generated_request_id() -> String {
+pub(crate) fn generated_request_id() -> String {
     static START: OnceLock<SystemTime> = OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let start = *START.get_or_init(SystemTime::now);
@@ -57,12 +57,16 @@ fn generated_request_id() -> String {
     format!("{elapsed_nanos:x}-{seq:x}")
 }
 
+/// 请求标识（进 `Request` extensions 供 LLM 分发读取落库，不下发响应头）。
+#[derive(Debug, Clone)]
+pub struct RequestId(pub String);
+
 /// 请求作用域日志上下文：为每个已匹配路由建一个 ERROR 级 `http` span。
 ///
 /// `error_span!` 而非 `info_span!`：默认 `RUST_LOG=warn` 下 span 须仍启用。`route` 只取
 /// `MatchedPath` 静态模式（缺失为 `-`），MUST NOT 回退 `uri().path()`（用户可控且高基数）。
 /// 不写任何响应头。
-async fn request_context(req: Request, next: Next) -> Response {
+async fn request_context(mut req: Request, next: Next) -> Response {
     let request_id = req
         .headers()
         .get(REQUEST_ID_HEADER)
@@ -79,6 +83,7 @@ async fn request_context(req: Request, next: Next) -> Response {
         method = %req.method(),
         route = %route,
     );
+    req.extensions_mut().insert(RequestId(request_id));
     next.run(req).instrument(span).await
 }
 
@@ -115,6 +120,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/_admin/events", get(admin::admin_events))
         .route("/_admin/events/stream", get(admin::admin_events_stream))
         .route("/_admin/commands", get(admin::admin_commands))
+        .route("/_admin/requests", get(admin::admin_requests))
         .route("/_admin/{*rest}", any(admin::admin_not_found))
         .route("/health", get(handler::health_handler))
         .route("/credential", post(handler::credential_handler))

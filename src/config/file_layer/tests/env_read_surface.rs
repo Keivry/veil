@@ -40,7 +40,7 @@ fn site(file: &str, kind: ReadKind, name: Option<&str>) -> CallSite {
 
 /// 期望的生产读取面：白名单名 + 两处已登记例外。
 ///
-/// - `env_parse.rs`：`Config::from_env` 的**唯一**全量收集点，收集后立即交白名单过滤；
+/// - `env_parse/mod.rs`：`Config::from_env` 的**唯一**全量收集点，收集后立即交白名单过滤；
 /// - `logging.rs`：`RUST_LOG` 日志层直读（早于配置加载，分层所限）；
 /// - `service/tpm.rs`：`VEIL_ALLOW_MOCK_TPM` TPM 层直读；
 /// - `service/audit/policy.rs`：**审计快照例外**——`capture_process_env` 于策略加载时 快照 `HOME`
@@ -48,7 +48,7 @@ fn site(file: &str, kind: ReadKind, name: Option<&str>) -> CallSite {
 ///   例外①）。
 fn expected_sites() -> BTreeSet<CallSite> {
     [
-        site("src/config/env_parse.rs", ReadKind::Vars, None),
+        site("src/config/env_parse/mod.rs", ReadKind::Vars, None),
         site("src/logging.rs", ReadKind::Var, Some("RUST_LOG")),
         site(
             "src/service/tpm.rs",

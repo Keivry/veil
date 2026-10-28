@@ -25,7 +25,9 @@ pub mod verdict;
 pub use {hold::*, log::*, normalize::*, policy::*, rules::*, sink::*, verdict::*};
 
 /// 单测专用：非空审批白名单（调用点统一口径；空白名单降级用例显式传 `&[]`，
-/// 生产不可达由启动门禁保证，见 `src/config/env_parse.rs:493` 与 `src/main.rs:46`）。
+/// 生产不可达由启动门禁保证，见
+/// `src/config/env_parse/mod.rs::validate_approve_whitelist` 与
+/// `src/main.rs::preflight_whitelist`）。
 #[cfg(test)]
 pub(crate) fn test_whitelist() -> &'static [String] {
     static TEST_WHITELIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();

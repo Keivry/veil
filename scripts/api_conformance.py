@@ -740,7 +740,7 @@ def free_port():
 
 # 部署/迁移键 → TOML 分节 + 文件键（类型）映射：这些键在「env 面收敛」后不再从
 # 进程 env 读取，注入 env 会静默降级；故经临时 TOML + `VEIL_CONFIG_FILE` 注入。类型与
-# `src/config/file_layer.rs` 的 `FileConfig` 一致（字符串 / 整数）；`LLM_<port>`
+# `src/config/file_layer/mod.rs` 的 `FileConfig` 一致（字符串 / 整数）；`LLM_<port>`
 # 端口键不在此表，由 `_toml_document` 展开进 `[llm.upstreams]`。
 _MIGRATED_TOML_KEYS = {
     "HOMESERVER": ("auth", "homeserver", "str"),
