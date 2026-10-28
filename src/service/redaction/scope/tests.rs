@@ -2,6 +2,9 @@
 
 mod conversation_scope;
 mod redaction_tally;
+mod strip_partials_hardening;
+mod strip_partials_limits;
+mod strip_partials_reorder_differential;
 
 use {
     super::{test_support::mint_cred, *},

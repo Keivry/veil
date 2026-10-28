@@ -1,6 +1,14 @@
 #[test]
 fn file_len_redline() {
     crate::test_support::file_len_under_800_or_split("chunk.rs", include_str!("../chunk.rs"));
+    crate::test_support::file_len_under_800_or_split(
+        "chunk/scan.rs",
+        include_str!("../chunk/scan.rs"),
+    );
+    crate::test_support::file_len_under_800_or_split(
+        "chunk/strip.rs",
+        include_str!("../chunk/strip.rs"),
+    );
     crate::test_support::file_len_under_800_or_split("chunk/tests.rs", include_str!("tests.rs"));
 }
 
@@ -396,4 +404,228 @@ fn pii_partial_narrowed() {
         strip_pii_partials("完整 __PII_1_ab12cd34__ 保留"),
         "完整 __PII_1_ab12cd34__ 保留"
     );
+}
+
+/// 长叶节点尾部 PII 定向用例（tasks 1.2）。
+///
+/// `Err` 阈值有两套口径，勿混用：
+///
+/// - **历史实测（默认 100 万步上界，即改造前）**：`'a'` ≈66K 字符、CJK ≈50K， `@` / `_` 类低至
+///   **10K–50K 字符**。当时 `.flatten()` 静默吞掉 `Err`，
+///   这些输入一律**零命中**——即向上游送出未脱敏 PII，这是本模块存在的证据。
+/// - **当前构建（上界 `1MiB + 8n`）**：`@` / `_` 类 ≈512KiB 才 `Err`，`x` / `1` 类 ≈1MiB，CJK 在
+///   1MiB 内不 `Err`。注意此处的 ≈512KiB 是**按精确长度标定**（`for_len = n`）时的阈值；而 `n ≤
+///   BACKTRACK_CACHE_MAX_LEN`（1MiB）的输入实际复用**1MiB 缓存档**实例，上界为 `1M + 8×1MiB ≈
+///   9.39M` 步，故真实 `Err` 阈值更高（实测落在 600K–940K 区间）。 下面统一用 600K `@`
+///   填充并在每个用例 **前置断言整段确实 `Err`**；该断言在运行时自证，
+///   不依赖任何标定算式，因此上界口径变化也不会让它空转通过。
+///
+/// 断言用「命中存在 + span 贴尾」而非耗时（耗时是门禁用例的职责）。
+mod long_leaf_tail_tests {
+    use {
+        super::scan_builtin_sync,
+        crate::service::{
+            json_walk::SCAN_INPUT_LIMIT,
+            pii::detector::{combined_re, test_support::empty_cred},
+        },
+    };
+
+    /// 600K `@` 填充：整段扫描必 `Err`（`n ≤ 1MiB` 走 1MiB 缓存档，真实阈值 ≈600K–940K），
+    /// 且 < `SCAN_INPUT_LIMIT` 保证不经外层分块——只有单区间才谈得上「同一区间的重扫」。
+    const FILLER: usize = 600_000;
+
+    /// 前置事实（防假绿）：整段一次性扫描确实 `Err`，否则用例根本没走到重扫分支。
+    fn at_filler_tail(tail: &str) -> String {
+        let text = format!("{}{tail}", "@".repeat(FILLER));
+        assert!(text.len() < SCAN_INPUT_LIMIT, "须单区间，不经外层分块");
+        assert!(
+            matches!(
+                combined_re(text.len()).captures_iter(&text).next(),
+                Some(Err(_))
+            ),
+            "整段扫描须 `Err` 才进入重扫路径（600K `@` 在 1MiB 缓存档上界 ≈9.39M 下仍越过）"
+        );
+        text
+    }
+
+    #[test]
+    fn at_filler_tail_email_hit() {
+        // `@` 不属邮箱本地部字符集，故命中值恰为尾部字面量。
+        let tail = "a@b.co";
+        let text = at_filler_tail(tail);
+        let hits = scan_builtin_sync(&text, &empty_cred());
+        let emails: Vec<_> = hits.iter().filter(|h| h.0 == "email").collect();
+        assert_eq!(emails.len(), 1, "600K `@` 填充后置邮箱须唯一命中: {hits:?}");
+        assert_eq!(emails[0].1, tail, "取值须精确");
+        assert_eq!(
+            (emails[0].2, emails[0].3),
+            (text.len() - tail.len(), text.len()),
+            "span 须落在全文末尾"
+        );
+    }
+
+    #[test]
+    fn at_filler_tail_phone_hit() {
+        let tail = "13800138000";
+        let text = at_filler_tail(tail);
+        let hits = scan_builtin_sync(&text, &empty_cred());
+        let phones: Vec<_> = hits.iter().filter(|h| h.0 == "phone").collect();
+        assert_eq!(
+            phones.len(),
+            1,
+            "600K `@` 填充后置手机号须唯一命中: {hits:?}"
+        );
+        assert_eq!(phones[0].1, tail, "取值须精确");
+        assert_eq!(
+            (phones[0].2, phones[0].3),
+            (text.len() - tail.len(), text.len()),
+            "span 须落在全文末尾"
+        );
+    }
+
+    #[test]
+    fn at_filler_tail_bank_card_hit() {
+        // Luhn 合法（同 `multibyte_boundary_tests::LUHN_CARDS` 的 62 段首项）。
+        let tail = "6200000000000005";
+        let text = at_filler_tail(tail);
+        let hits = scan_builtin_sync(&text, &empty_cred());
+        let cards: Vec<_> = hits.iter().filter(|h| h.0 == "bank_card").collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "600K `@` 填充后置银行卡须唯一命中: {hits:?}"
+        );
+        assert_eq!(cards[0].1, tail, "取值须精确");
+        assert_eq!(
+            (cards[0].2, cards[0].3),
+            (text.len() - tail.len(), text.len()),
+            "span 须落在全文末尾"
+        );
+    }
+}
+
+/// 重扫等价性与上下文正确性（tasks 3.4）。
+mod rescan_equivalence_tests {
+    use {
+        super::scan_builtin_sync,
+        crate::service::{
+            json_walk::SCAN_INPUT_LIMIT,
+            pii::{
+                chunk::{
+                    scan::{RawMatch, SCAN_WINDOW_FLOOR, scan_range},
+                    split_chunk_ranges,
+                },
+                detector::{PiiHit, combined_re, test_support::empty_cred},
+            },
+        },
+    };
+
+    /// 走生产路径（分块 + [`scan_range`] 的整段优先 + `Err` 时递归缩窗）。
+    fn hits_via_production(text: &str) -> Vec<PiiHit> { scan_builtin_sync(text, &empty_cred()) }
+
+    /// 强制多窗口路径：把区间切成 `window` 字节的小窗口逐个扫描，绕过生产路径
+    /// 的「整段优先」次序，用于证明缩窗本身不改变结论。
+    fn hits_via_forced_windows(text: &str, window: usize) -> Vec<RawMatch> {
+        let re = combined_re(text.len());
+        let mut out = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = split_chunk_ranges(text, SCAN_INPUT_LIMIT, 0);
+        ranges.sort_unstable();
+        for (base, end) in ranges {
+            let mut start = base;
+            while start < end {
+                let stop = text.floor_char_boundary((start + window).min(end));
+                let len = stop - start;
+                if len == 0 {
+                    break;
+                }
+                // 窗口 ≤ 默认 `Err` 阈值，`scan_range` 必走「整段成功」分支。
+                let ok = scan_range(text, start, len, &re, &mut out);
+                assert!(ok, "子窗口 {start}..{stop} 仍 Err（窗口 {len} 已小于地板）");
+                if stop >= end {
+                    break;
+                }
+                start = stop;
+            }
+        }
+        out
+    }
+
+    fn sorted(v: Vec<PiiHit>) -> Vec<PiiHit> {
+        let mut v = v;
+        v.sort();
+        v
+    }
+
+    /// `@` 填充长度：精确长度标定下 `Err` 阈值约 512KiB，而 `n ≤ 1MiB` 实际走 1MiB 缓存档
+    /// （上界 ≈9.39M 步），真实阈值更高；600K 实测仍越过，且 < `SCAN_INPUT_LIMIT`（不触发
+    /// 外层分块，保证是**同一区间**的重扫）。
+    const RESCAN_FILLER: usize = 600_000;
+
+    #[test]
+    fn rescan_matches_single_window_hits() {
+        // 600K `@` 填充后接邮箱：整段扫描必 `Err`，故生产路径必然走递归缩窗；
+        // 手工按地板窗口切分的路径作为独立基准。二者命中集合须完全一致
+        // （取值与**绝对**偏移均一致）——任何「相对子窗口」的偏移算术都会在
+        // 尾部命中上暴露（尾部命中的绝对终点恒为全文长）。
+        let text = format!("{}a@b.co", "@".repeat(RESCAN_FILLER));
+        assert!(text.len() < SCAN_INPUT_LIMIT, "须单区间，不经外层分块");
+        let expected_start = text.len() - "a@b.co".len();
+
+        // 前置事实（防假绿）：整段一次性扫描确实 `Err`，否则本用例根本没走到
+        // `scan_range` 的重扫分支。实测 `@` 类阈值约 512KiB，故取 600K。
+        let whole = combined_re(text.len()).captures_iter(&text).next();
+        assert!(
+            matches!(whole, Some(Err(_))),
+            "整段扫描须 `Err` 才进入重扫路径（实测阈值约 512KiB）"
+        );
+
+        let prod = sorted(hits_via_production(&text));
+        let prod_email: Vec<&PiiHit> = prod.iter().filter(|h| h.0 == "email").collect();
+        assert_eq!(
+            prod_email.len(),
+            1,
+            "生产路径须唯一命中邮箱: {prod_email:?}"
+        );
+        let (_, value, start, end) = prod_email[0];
+        assert_eq!(value, "a@b.co", "`@` 不属本地部字符集，取值须精确");
+        assert_eq!((*start, *end), (expected_start, text.len()));
+
+        let raw = hits_via_forced_windows(&text, SCAN_WINDOW_FLOOR);
+        let raw_email: Vec<&RawMatch> = raw.iter().filter(|m| m.kind == "email").collect();
+        assert_eq!(raw_email.len(), 1, "强制窗口路径须唯一命中邮箱");
+        assert_eq!(
+            (raw_email[0].start, raw_email[0].end),
+            (*start, *end),
+            "两条路径的命中偏移须逐字节一致"
+        );
+        assert_eq!(
+            &text[raw_email[0].start..raw_email[0].end],
+            value.as_str(),
+            "绝对偏移须精确指向原文"
+        );
+    }
+
+    #[test]
+    fn rescan_bank_card_context_from_full_text() {
+        // 卡号候选的前 64 字节含 URL 查询参数形态、且整段落在子窗口之外：
+        // 上下文 MUST 取自全文，否则 `url_query_param_re` 判定翻转 → 误命中。
+        let card = "4532015112830366";
+        let url_ctx = format!("https://pay.example.com/order?id={card}");
+        let pad = "🍡".repeat(3_000);
+        assert!(pad.len() > SCAN_WINDOW_FLOOR);
+        let text = format!("{url_ctx}{pad}");
+        let hits = scan_builtin_sync(&text, &empty_cred());
+        assert!(
+            hits.iter().all(|h| h.0 != "bank_card"),
+            "URL 参数上下文在子窗口之外时仍须抑制 bank_card: {hits:?}"
+        );
+        // 阳性对照：同卡号脱离 URL 上下文即命中（守卫是上下文抑制，非漏报）。
+        let bare = format!("卡号 {card} 付款");
+        assert!(
+            scan_builtin_sync(&bare, &empty_cred())
+                .iter()
+                .any(|h| h.0 == "bank_card" && h.1 == card),
+            "裸卡号须命中"
+        );
+    }
 }

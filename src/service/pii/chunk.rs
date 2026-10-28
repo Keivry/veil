@@ -1,23 +1,14 @@
 //! 分块扫描：超长输入 `char` 边界分块 + 内置联合一次扫描 + 重叠仲裁 + 位置化替换。
+//!
+//! 引擎错误不再静默（见 `scan` 子模块）：`captures_iter` 的 `Err` 显式分支，
+//! 以 ≤[`scan::SCAN_WINDOW_MAX`] 窗口递归对半重扫至 `Ok` 或地板；
+//! 窗口内 `bank_card` 的 64 / 16 字节上下文恒取自**原始全文**，命中偏移恒为
+//! 相对全额的绝对下标。
 
 use {
     super::{
         super::json_walk::SCAN_INPUT_LIMIT,
-        detector::{
-            PiiHit,
-            cached_id_ok,
-            cached_luhn,
-            cached_reserved,
-            data_url_re,
-            id_card_ok,
-            is_reserved_ip,
-            is_valid_ipv4,
-            is_valid_ipv6,
-            luhn_ok,
-            protected_token_re,
-            strip_ip_trailing,
-            url_query_param_re,
-        },
+        detector::{PiiHit, data_url_re, protected_token_re},
     },
     std::{
         collections::{HashMap, HashSet},
@@ -25,20 +16,32 @@ use {
     },
 };
 
+pub(crate) mod scan;
+pub(crate) mod strip;
+use scan::{
+    RawMatch,
+    SCAN_CHUNK_OVERLAP,
+    check_hit_async,
+    check_hit_sync,
+    normalize_hit,
+    scan_range,
+};
+pub use strip::strip_pii_partials;
+
 pub(crate) fn overlaps_any(spans: &[(usize, usize)], s: usize, e: usize) -> bool {
     spans
         .iter()
         .any(|(a, b)| *a <= s && s < *b || *a < e && e <= *b || s <= *a && *b <= e)
 }
 
-/// 超长输入分块：`char` 边界安全切分，`overlap` 字节交叠防跨界切断。
-/// 短输入返回单块 `(0, 全文)`；空输入返回空。
-pub(crate) fn split_chunks(text: &str, limit: usize, overlap: usize) -> Vec<(usize, String)> {
+/// 超长输入分块区间：`char` 边界安全切分，`overlap` 字节交叠防跨界切断。
+/// 短输入返回单块 `(0, 全文长)`；空输入返回空。
+pub(crate) fn split_chunk_ranges(text: &str, limit: usize, overlap: usize) -> Vec<(usize, usize)> {
     if text.is_empty() {
         return Vec::new();
     }
     if text.len() <= limit {
-        return vec![(0, text.to_string())];
+        return vec![(0, text.len())];
     }
     let step = limit.saturating_sub(overlap).max(1);
     let mut out = Vec::new();
@@ -54,7 +57,7 @@ pub(crate) fn split_chunks(text: &str, limit: usize, overlap: usize) -> Vec<(usi
                 end += 1;
             }
         }
-        out.push((off, text[off..end].to_string()));
+        out.push((off, end));
         if end == text.len() {
             break;
         }
@@ -68,6 +71,15 @@ pub(crate) fn split_chunks(text: &str, limit: usize, overlap: usize) -> Vec<(usi
         off = next;
     }
     out
+}
+
+/// 超长输入分块（带内容副本）：`char` 边界安全切分，`overlap` 字节交叠。
+/// 短输入返回单块 `(0, 全文)`；空输入返回空。
+pub(crate) fn split_chunks(text: &str, limit: usize, overlap: usize) -> Vec<(usize, String)> {
+    split_chunk_ranges(text, limit, overlap)
+        .into_iter()
+        .map(|(s, e)| (s, text[s..e].to_string()))
+        .collect()
 }
 
 /// 文本中凭据值的位置区间（位置化优先：落入则 PII 跳过）。
@@ -105,140 +117,52 @@ pub fn protected_spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// PII 残缺形态，对标 `_PII_PARTIAL_TOKEN_RE`：
-/// `__PI` 后负向前瞻排除完整形态，使完整 token 不被误剥；
-/// 剥离口径收窄至确证残缺续段（`__PI` + 可选 `I` + 可选 `_数字_hex`）且后随边界
-/// （空白/标点/串尾）时剥离；后续为合法单词字符的正文（如 `__PIXEL`/`__PII_DATA`）
-/// 与无序号数字段的 hex-only 形态（如 `__PII_AB`）一律不剥离。
-///
-/// 跨族闭合豁免：`__PI` 的两条 `_` 若实为**前一完整 token 的闭合界定**
-/// （前文恰为完整 CRED `__CRED_\d{4,}` 或完整 PII `__PII_\d+_[0-9a-fA-F]{8}`），
-/// 则其后的 `__PI`（如 `__CRED_000123__PI`）不得判为残缺——否则会腐蚀前一
-/// 完整 token 并吞掉字面 `PI`。故在 `__PI` 前施加跨族负向后顾。
-fn pii_partial_re() -> &'static fancy_regex::Regex {
-    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        fancy_regex::Regex::new(
-            r"(?<!__CRED_\d{4,})(?<!__PII_\d+_[0-9a-fA-F]{8})__PI(?!I_\d+_[0-9a-f]{8}__)(?:I(?:_\d+(?:_[0-9a-fA-F]*)?)?)?(?:_*$|(?=\s|[^\w]))",
-        )
-        .expect("PII 残缺正则恒合法")
-    })
-}
-
-/// 清理 PII 残缺前缀（完整 `__PII_<seq>_<rand8>__` 原样保留）。
-pub fn strip_pii_partials(text: &str) -> String {
-    pii_partial_re().replace_all(text, "").into_owned()
-}
-
 pub(crate) fn coarse_hit(text: &str) -> bool {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"[\dA-Za-z@.\-]").expect("粗筛正则恒合法"))
         .is_match(text)
 }
 
-/// 联合正则命中分类：按命名组顺序返回 `(kind, 原文)`，未命中任一组返回 `None`。
-pub(crate) fn classify_hit<'t>(
-    caps: &fancy_regex::Captures<'t, str>,
-) -> Option<(&'static str, &'t str)> {
-    const ORDER: [&str; 7] = [
-        "email",
-        "phone",
-        "id_card",
-        "bank_card",
-        "ipv4",
-        "ipv6",
-        "api_key",
-    ];
-    ORDER
-        .iter()
-        .find_map(|kind| caps.name(kind).map(|m| (*kind, m.as_str())))
-}
-
-/// 内置联合正则一次扫描（同步版，供 json-walk 叶回调）。
+/// 全量扫描（同步版，供 json-walk 叶回调）。
 /// 返回位置化命中；凭据区间/保护区间落入跳过（凭据优先）。
-/// 超长输入按 1MB 分块（交叠 256，`char` 边界安全），边界重复命中去重。
+/// 超长输入按 1MB 分块（交叠 [`SCAN_CHUNK_OVERLAP`]，`char` 边界安全），
+/// 边界重复命中去重。
 pub fn scan_builtin_sync(text: &str, credential_p2t: &HashMap<String, String>) -> Vec<PiiHit> {
     if text.is_empty() || !coarse_hit(text) {
         return Vec::new();
     }
     let protected = protected_spans(text);
     let cred = credential_spans(text, credential_p2t);
+    let re = super::detector::combined_re(text.len());
+    let mut raw: Vec<RawMatch> = Vec::new();
+    for (base, end) in split_chunk_ranges(text, SCAN_INPUT_LIMIT, SCAN_CHUNK_OVERLAP) {
+        scan_range(text, base, end - base, &re, &mut raw);
+    }
     let mut out = Vec::new();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
-    for (base, chunk) in split_chunks(text, SCAN_INPUT_LIMIT, 256) {
-        for (kind, value, s, e) in builtin_chunk_sync(&chunk) {
-            let (abs_s, abs_e) = (base + s, base + e);
-            if !seen.insert((abs_s, abs_e)) {
-                continue;
-            }
-            if overlaps_any(&protected, abs_s, abs_e) || overlaps_any(&cred, abs_s, abs_e) {
-                continue;
-            }
-            if credential_p2t.contains_key(&value) {
-                continue;
-            }
-            out.push((kind, value, abs_s, abs_e));
+    for m in raw {
+        let Some(m) = normalize_hit(m) else { continue };
+        let (abs_s, abs_e) = (m.start, m.end);
+        if !check_hit_sync(m.kind, text, abs_s, abs_e, &m.value) {
+            continue;
         }
+        if !seen.insert((abs_s, abs_e)) {
+            continue;
+        }
+        if overlaps_any(&protected, abs_s, abs_e) || overlaps_any(&cred, abs_s, abs_e) {
+            continue;
+        }
+        if credential_p2t.contains_key(&m.value) {
+            continue;
+        }
+        out.push((m.kind.to_string(), m.value, abs_s, abs_e));
     }
     out
 }
 
-fn builtin_chunk_sync(chunk: &str) -> Vec<(String, String, usize, usize)> {
-    let mut out = Vec::new();
-    for caps in super::detector::combined_re()
-        .captures_iter(chunk)
-        .flatten()
-    {
-        let Some((kind, raw)) = classify_hit(&caps) else {
-            continue;
-        };
-        let mut value = raw.to_string();
-        let mut end = caps.get(0).map(|m| m.end()).unwrap_or(0);
-        let start = end.saturating_sub(raw.len());
-        match kind {
-            "ipv6" => {
-                let core = strip_ip_trailing(raw);
-                if !core.is_empty() && is_valid_ipv6(core) {
-                    value = core.to_string();
-                    end = start + value.len();
-                } else if !is_valid_ipv6(raw) {
-                    continue;
-                }
-            }
-            "ipv4" => {
-                let core = strip_ip_trailing(raw);
-                if !core.is_empty() && is_valid_ipv4(core) {
-                    value = core.to_string();
-                    end = start + value.len();
-                } else if !is_valid_ipv4(raw) {
-                    continue;
-                }
-            }
-            "bank_card" => {
-                // 上下文窗口按字符边界安全切片，避免多字节 UTF-8 毗邻窗口时
-                // 裸字节切片 panic；窗口语义（前 64 / 后 16）与 Luhn 位置不变。
-                let cs = chunk.floor_char_boundary(start.saturating_sub(64));
-                let ce = chunk.ceil_char_boundary((end + 16).min(chunk.len()));
-                if url_query_param_re().is_match(&chunk[cs..ce]) {
-                    continue;
-                }
-                if !luhn_ok(&value) {
-                    continue;
-                }
-            }
-            "id_card" if !id_card_ok(&value) => continue,
-            _ => {}
-        }
-        if matches!(kind, "ipv4" | "ipv6") && is_reserved_ip(&value, kind) {
-            continue;
-        }
-        out.push((kind.to_string(), value, start, end));
-    }
-    out
-}
-
-/// 内置联合正则一次扫描（异步版，走全局 moka 校验 LRU）。
-/// 超长输入按 1MB 分块（交叠 256，`char` 边界安全），边界重复命中去重。
+/// 全量扫描（异步版，走全局 moka 校验 LRU）。
+/// 超长输入按 1MB 分块（交叠 [`SCAN_CHUNK_OVERLAP`]，`char` 边界安全），
+/// 边界重复命中去重。
 /// 本函数仅由 `detector.rs` 的 `#[cfg(test)] scan_spans` 调用，
 /// 但收敛可见性会使 `detector.rs` 的 `cached_*` 助手在生产构建死代码告警
 /// （该文件不在本批白名单），故暂保留 `pub`（阻塞项已上报）。
@@ -248,67 +172,29 @@ pub async fn scan_builtin(text: &str, credential_p2t: &HashMap<String, String>) 
     }
     let protected = protected_spans(text);
     let cred = credential_spans(text, credential_p2t);
+    let re = super::detector::combined_re(text.len());
+    let mut raw: Vec<RawMatch> = Vec::new();
+    for (base, end) in split_chunk_ranges(text, SCAN_INPUT_LIMIT, SCAN_CHUNK_OVERLAP) {
+        scan_range(text, base, end - base, &re, &mut raw);
+    }
     let mut out = Vec::new();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
-    for (base, chunk) in split_chunks(text, SCAN_INPUT_LIMIT, 256) {
-        for caps in super::detector::combined_re()
-            .captures_iter(chunk.as_str())
-            .flatten()
-        {
-            let Some((kind, raw)) = classify_hit(&caps) else {
-                continue;
-            };
-            let mut value = raw.to_string();
-            let mut end = caps.get(0).map(|m| m.end()).unwrap_or(0);
-            let start = end.saturating_sub(raw.len());
-            match kind {
-                "ipv6" => {
-                    let core = strip_ip_trailing(raw);
-                    if !core.is_empty() && is_valid_ipv6(core) {
-                        value = core.to_string();
-                        end = start + value.len();
-                    } else if !is_valid_ipv6(raw) {
-                        continue;
-                    }
-                }
-                "ipv4" => {
-                    let core = strip_ip_trailing(raw);
-                    if !core.is_empty() && is_valid_ipv4(core) {
-                        value = core.to_string();
-                        end = start + value.len();
-                    } else if !is_valid_ipv4(raw) {
-                        continue;
-                    }
-                }
-                "bank_card" => {
-                    // 同同步路径，上下文窗口按字符边界安全切片（窗口语义不变）。
-                    let cs = chunk.floor_char_boundary(start.saturating_sub(64));
-                    let ce = chunk.ceil_char_boundary((end + 16).min(chunk.len()));
-                    if url_query_param_re().is_match(&chunk[cs..ce]) {
-                        continue;
-                    }
-                    if !cached_luhn(&value).await {
-                        continue;
-                    }
-                }
-                "id_card" if !cached_id_ok(&value).await => continue,
-                _ => {}
-            }
-            if matches!(kind, "ipv4" | "ipv6") && cached_reserved(&value, kind).await {
-                continue;
-            }
-            let (abs_s, abs_e) = (base + start, base + end);
-            if !seen.insert((abs_s, abs_e)) {
-                continue;
-            }
-            if overlaps_any(&protected, abs_s, abs_e) || overlaps_any(&cred, abs_s, abs_e) {
-                continue;
-            }
-            if credential_p2t.contains_key(&value) {
-                continue;
-            }
-            out.push((kind.to_string(), value, abs_s, abs_e));
+    for m in raw {
+        let Some(m) = normalize_hit(m) else { continue };
+        let (abs_s, abs_e) = (m.start, m.end);
+        if !check_hit_async(m.kind, text, abs_s, abs_e, &m.value).await {
+            continue;
         }
+        if !seen.insert((abs_s, abs_e)) {
+            continue;
+        }
+        if overlaps_any(&protected, abs_s, abs_e) || overlaps_any(&cred, abs_s, abs_e) {
+            continue;
+        }
+        if credential_p2t.contains_key(&m.value) {
+            continue;
+        }
+        out.push((m.kind.to_string(), m.value, abs_s, abs_e));
     }
     out
 }

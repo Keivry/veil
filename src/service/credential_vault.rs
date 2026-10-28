@@ -46,19 +46,29 @@ fn token_re() -> &'static regex::Regex {
 /// （前文恰为完整 PII `__PII_\d+_[0-9a-fA-F]{8}` 或完整 CRED `__CRED_\d{4,}`），
 /// 则其后的 `__C`（如 `__PII_1_ab12cd34__C`）不得判为残缺——否则会腐蚀前一
 /// 完整 token 并吞掉字面 `C`。故在 `__C` 前施加跨族负向后顾。
-fn cred_partial_re() -> &'static fancy_regex::Regex {
+///
+/// 字面量前置（`harden-partial-strip-regex` design Decision 1）：字面 `__C` 提到
+/// 两条后顾之前，后顾尾部各追加 `__C`——「位置 `p` 之前不以 `A` 结尾」≡
+/// 「位置 `p+3` 之前不以 `A__C` 结尾」，语义逐字等价（`A` 的定长部分只多 3 字节），
+/// 但引擎可建立字面量锚点，消除逐位置全串回溯的 O(n²)。
+pub(crate) const CRED_PARTIAL_PATTERN: &str = r"__C(?<!__PII_\d+_[0-9a-fA-F]{8}__C)(?<!__CRED_\d{4,}__C)(?!RED_\d{4,}__)(?:R(?:E(?:D(?:_?\d*)?)?)?)?(?:_*$|(?=\s|[^\w]))";
+
+/// 小输入共用实例（编译为 `BACKTRACK_CACHE_MAX_LEN` 档上界）。
+fn cred_partial_cache() -> &'static OnceLock<fancy_regex::Regex> {
     static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        fancy_regex::Regex::new(
-            r"(?<!__PII_\d+_[0-9a-fA-F]{8})(?<!__CRED_\d{4,})__C(?!RED_\d{4,}__)(?:R(?:E(?:D(?:_?\d*)?)?)?)?(?:_*$|(?=\s|[^\w]))",
-        )
-        .expect("凭据残缺正则恒合法")
-    })
+    &RE
 }
 
 /// 清理凭据残缺前缀（流分片切断的 `__C` / `__CRED_000` 等半截形态）。
+/// 引擎 `Err` 时原样返回输入并限流告警（`try_replacen`，绝不触达内部 `unwrap`）。
 pub fn strip_cred_partials(text: &str) -> String {
-    cred_partial_re().replace_all(text, "").into_owned()
+    super::pii::chunk::strip::strip_with(
+        cred_partial_cache(),
+        CRED_PARTIAL_PATTERN,
+        "凭据残缺正则恒合法",
+        super::pii::chunk::strip::WarnScene::CredPartialStrip,
+        text,
+    )
 }
 
 /// 注册拒绝原因：值命中内部 token 形态或前缀。

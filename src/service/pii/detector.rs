@@ -68,9 +68,42 @@ const COMBINED_PATTERN: &str = concat!(
     r"|(?P<api_key>(?<![0-9A-Za-z-])(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pous]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})(?![0-9A-Za-z-]))",
 );
 
-pub(crate) fn combined_re() -> &'static fancy_regex::Regex {
+/// 内置联合正则，回溯上界与两条残缺剥离模式同一构建口径
+/// （[`super::chunk::strip::backtrack_limit_for`]）：随输入长度线性增长、受硬上限
+/// 封顶，`OnceLock` 缓存常见尺寸实例、超限才按本次长度重编译。
+///
+/// 上界取值理由：联合正则的 `Err` 来自**扫描宽度**而非步数策略，故
+/// `chunk::scan::scan_range` 另有 ≤8KiB 递归缩窗兜底；这里的上界只保证
+/// 「窗口内本应成功的扫描不会因默认 100 万步而被误判为引擎错误」。
+///
+/// 由此得出的一条**设计内**行为：联合正则实测需 ~10–15 步/字节。上界分两档：`n ≤ 1MiB`
+/// 复用 1MiB 缓存档实例（上界 `1M + 8×1MiB ≈ 9.39M` 步），故该区间真实 `Err` 阈值高于
+/// 「按精确长度标定」时的 ≈512KiB、实测落在 ≈600K–940K；超过 1MiB 则按本次长度标定为
+/// `1MiB + 8×n`。两档下大叶节点都会首扫 `Err` 并改走缩窗重扫一次，代价约 2×（重扫窗口
+/// 用 [`combined_re_window`] 的常数上界，总量仍 O(n)）。
+/// 这不是缺陷，而是「上界必须随叶长线性增长」与「重扫预算必须为常数」两条
+/// 约束的共同结果。
+pub(crate) fn combined_re(input_len: usize) -> std::borrow::Cow<'static, fancy_regex::Regex> {
     static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| fancy_regex::Regex::new(COMBINED_PATTERN).expect("内置联合正则恒合法"))
+    super::chunk::strip::regex_for_len(&RE, COMBINED_PATTERN, "内置联合正则恒合法", input_len)
+}
+
+/// 重扫窗口专用实例：上界按 [`super::chunk::scan::SCAN_WINDOW_MAX`] 标定
+/// （≈1MiB + 8×8KiB ≈ 1.07M 步），与整叶实例无关。
+///
+/// 动机（DoS）：整叶上界是 `1MiB + 8×叶长`，若重扫沿用整叶实例，一个 8KiB 窗口
+/// 在 10MiB 叶里会拿到 ≈81M 步预算，递归叠乘后最坏 ≈#窗口 × 8 × 叶长；改用窗口
+/// 标定后每个窗口 + 每轮递归的预算都是常数，总量回到 O(n)。模式串仍只取
+/// [`COMBINED_PATTERN`]（单一源），系数仍只取 `strip::build_regex`。
+pub(crate) fn combined_re_window() -> &'static fancy_regex::Regex {
+    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        super::chunk::strip::build_regex(
+            COMBINED_PATTERN,
+            super::chunk::scan::SCAN_WINDOW_MAX,
+            "内置联合正则恒合法",
+        )
+    })
 }
 
 pub(crate) fn pii_token_re() -> &'static regex::Regex {
