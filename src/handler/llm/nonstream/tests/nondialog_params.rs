@@ -28,6 +28,7 @@ fn overrides_with_params() -> UpstreamOverrides {
         params: BTreeMap::from([(ParamProtocol::Chat, rules)]),
         override_existing: true,
         user_agent: None,
+        drop_headers: Vec::new(),
     }
 }
 

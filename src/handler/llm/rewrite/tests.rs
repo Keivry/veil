@@ -36,6 +36,7 @@ fn params_for(
         params: BTreeMap::from([(protocol, rules)]),
         override_existing: true,
         user_agent: None,
+        drop_headers: Vec::new(),
     }
 }
 

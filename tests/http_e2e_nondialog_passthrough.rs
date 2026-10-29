@@ -462,9 +462,9 @@ async fn count_tokens_redact_only() {
 }
 
 #[tokio::test]
-async fn nondialog_custom_conversation_header_not_forwarded() {
-    // 会话键头 MUST NOT 转发上游：`conversation` 模式下
-    // 自定义（非 `x-veil-*`）会话键头在 NonDialog 透传路径同样必须剔除，不得达上游。
+async fn nondialog_custom_conversation_header_is_forwarded() {
+    // D1 出站基线：自定义（非 `x-veil-*`）会话键头在 NonDialog 透传路径按客户端
+    // 原值转发上游——不再被隐式剔除；显式剔除须由目标 `drop_headers` 声明。
     let captured = Arc::new(Mutex::new(Vec::new()));
     let (upstream, uhandle) = mock_upstream(captured.clone()).await;
     let (app, _state) = test_app(&[
@@ -488,12 +488,10 @@ async fn nondialog_custom_conversation_header_not_forwarded() {
     assert_eq!(seen.len(), 1, "上游须收到 1 次");
     let headers = &seen[0].headers;
     assert!(
-        !headers.iter().any(|(k, _)| k == "x-custom-conv-key"),
-        "自定义会话键头名不得转发上游: {headers:?}"
-    );
-    assert!(
-        headers.iter().all(|(_, v)| !v.contains("conv-abc-secret")),
-        "自定义会话键头值不得转发上游: {headers:?}"
+        headers
+            .iter()
+            .any(|(k, v)| k == "x-custom-conv-key" && v == "conv-abc-secret"),
+        "自定义会话键头须按客户端原值转发上游: {headers:?}"
     );
 
     uhandle.abort();

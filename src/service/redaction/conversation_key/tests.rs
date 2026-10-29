@@ -2,10 +2,7 @@
 
 use {
     super::*,
-    crate::{
-        handler::llm::dispatch::strip_conversation_header,
-        service::{json_walk, llm_gateway::Protocol},
-    },
+    crate::service::{json_walk, llm_gateway::Protocol},
     axum::http::{HeaderMap, HeaderValue},
     serde_json::json,
 };
@@ -688,25 +685,6 @@ fn fallback_header_yields_same_conversation_bucket_as_configured_header() {
         from_fallback, from_configured,
         "回退头与配置头须落到同一会话桶"
     );
-}
-
-#[test]
-fn conversation_key_header_not_forwarded_upstream() {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-veil-conversation-id", HeaderValue::from_static("conv-1"));
-    headers.insert("x-my-conv", HeaderValue::from_static("conv-2"));
-    headers.insert("authorization", HeaderValue::from_static("Bearer x"));
-    assert!(strip_conversation_header(
-        &mut headers,
-        "x-veil-conversation-id"
-    ));
-    assert!(
-        strip_conversation_header(&mut headers, "X-My-Conv"),
-        "自定义头名须大小写不敏感剔除"
-    );
-    assert!(headers.get("x-veil-conversation-id").is_none());
-    assert!(headers.get("x-my-conv").is_none());
-    assert!(headers.get("authorization").is_some(), "其他头不受影响");
 }
 
 #[test]

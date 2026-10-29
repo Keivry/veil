@@ -228,7 +228,8 @@ pub struct Config {
     /// 会话条目上限（`PII_SCOPE_MAX_CONVERSATIONS`，默认 1024；非正整数拒启动）。
     pub pii_scope_max_conversations: usize,
     /// 显式会话键请求头名（`PII_SCOPE_KEY_HEADER`，默认
-    /// `x-veil-conversation-id`；该头 MUST NOT 转发上游；保留鉴权/传输头名拒启动）。
+    /// `x-veil-conversation-id`；缺省值属 `x-veil-*` 内部命名空间故装配期恒被剔除，
+    /// 自定义非该前缀头名则按出站透传基线原样转发上游；保留鉴权/传输头名拒启动）。
     pub pii_scope_key_header: String,
     /// `previous_response_id` 映射容量（`PII_SCOPE_PREV_ID_MAX_ENTRIES`；未设置时取
     /// `PII_SCOPE_MAX_CONVERSATIONS` 的生效值，非正整数拒启动）。

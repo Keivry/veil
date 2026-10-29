@@ -1,5 +1,5 @@
 //! `dispatch.rs` 入口单元测试（`entry`）：URL 拼接、入口端口解析、协议分派、
-//! 与会话键头剔除等子模块测试（`dispatch/tests/` 目录约定）。
+//! 与出站头透传基线等子模块测试（`dispatch/tests/` 目录约定）。
 
 use super::super::{
     super::super::{
@@ -204,60 +204,46 @@ fn body_limits_tiered_values_match_spec() {
 }
 
 #[test]
-fn strip_session_headers_removes_whole_fallback_chain() {
-    // 回退链头是内部会话标识：配置头 + 五个内置名须一并剔除，无关键保留；
-    // 返回值仍只反映「配置头是否被剔除」（既有调用方/日志信号不变）。
-    let configured = "x-veil-conversation-id";
-    let mut headers = HeaderMap::new();
-    headers.insert(configured, axum::http::HeaderValue::from_static("conv"));
+fn forward_headers_baseline_preserves_whole_session_chain() {
+    // D1 出站基线：不再隐式剔除会话头链——客户端五个回退链头与自定义会话键头
+    // 均原样转发上游（含多值）；仅协议必要头与 `x-veil-*` 内部命名空间被剔除。
+    let mut client = HeaderMap::new();
     for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
-        headers.insert(name, axum::http::HeaderValue::from_static("leak"));
+        client.insert(name, axum::http::HeaderValue::from_static("client-leak"));
     }
-    headers.insert("x-unrelated", axum::http::HeaderValue::from_static("keep"));
-    assert!(
-        super::super::strip_session_headers(&mut headers, configured),
-        "配置头确实存在并已剔除时须返回 true"
+    client.insert(
+        "x-custom-conv",
+        axum::http::HeaderValue::from_static("custom-keep"),
     );
-    assert!(headers.get(configured).is_none(), "配置头须被剔除");
+    client.insert(
+        "x-veil-conversation-id",
+        axum::http::HeaderValue::from_static("internal"),
+    );
+    client.insert("host", axum::http::HeaderValue::from_static("example.com"));
+    let metrics = llm_gateway::GatewayMetrics::default();
+    let fwd = forward_headers(
+        &client,
+        &metrics,
+        None,
+        &crate::handler::llm::test_support::no_expand(),
+    );
     for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
-        assert!(headers.get(name).is_none(), "回退头 {name} 须被剔除");
+        assert_eq!(
+            fwd.get(name).and_then(|v| v.to_str().ok()),
+            Some("client-leak"),
+            "回退链头 {name} 须原样转发上游"
+        );
     }
     assert_eq!(
-        headers.get("x-unrelated").and_then(|v| v.to_str().ok()),
-        Some("keep"),
-        "无关键须保留"
-    );
-
-    // 仅回退头在场、配置头缺席：仍须全部剔除，但返回 false（未剔除配置头）。
-    let mut only_fallback = HeaderMap::new();
-    only_fallback.insert(
-        "x-session-affinity",
-        axum::http::HeaderValue::from_static("aff"),
+        fwd.get("x-custom-conv").and_then(|v| v.to_str().ok()),
+        Some("custom-keep"),
+        "自定义会话键头须原样转发上游"
     );
     assert!(
-        !super::super::strip_session_headers(&mut only_fallback, configured),
-        "配置头缺席时返回值须为 false"
+        fwd.get("x-veil-conversation-id").is_none(),
+        "x-veil-* 内部头须剔除"
     );
-    assert!(only_fallback.is_empty(), "回退头须仍被剔除");
-}
-
-#[test]
-fn strip_conversation_header_custom_name_case_insensitive() {
-    // 自定义会话键头名（非 x-veil-*）亦须剔除，大小写不敏感；幂等。
-    let mut headers = HeaderMap::new();
-    headers.insert("x-custom-conv", axum::http::HeaderValue::from_static("v1"));
-    assert!(super::super::strip_conversation_header(
-        &mut headers,
-        "X-Custom-Conv"
-    ));
-    assert!(
-        !headers.contains_key("x-custom-conv"),
-        "自定义会话键头须被剔除"
-    );
-    assert!(
-        !super::super::strip_conversation_header(&mut headers, "x-custom-conv"),
-        "缺头时返回 false（未剔除）"
-    );
+    assert!(fwd.get("host").is_none(), "host 属协议必要剔除项");
 }
 
 #[tokio::test]

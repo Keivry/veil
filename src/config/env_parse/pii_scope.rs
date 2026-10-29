@@ -63,8 +63,10 @@ const RESERVED_KEY_HEADERS: [&str; 7] = [
     "accept-encoding",
 ];
 
-/// 会话键头保留名判定：命中即拒启动——无条件剔除会令 `request`
-/// 模式亦删除真实鉴权/传输头转发上游而静默断链。
+/// 会话键头保留名判定：命中即拒启动——保留名不作会话键的双重理由：
+/// (a) hop/传输头在出站装配期被移除，其值不稳定，作为跨轮会话键不可靠；
+/// (b) 鉴权头作 PII 会话键会把凭据卷入键派生，并令共享同一凭据的请求坍缩为
+/// 单一 PII 作用域。
 fn is_reserved_key_header(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     RESERVED_KEY_HEADERS.contains(&lower.as_str())
@@ -96,7 +98,8 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
             var: "PII_SCOPE_KEY_HEADER".to_string(),
             message: format!(
                 "PII_SCOPE_KEY_HEADER 取值 {key_header:?} 与保留鉴权/传输头名冲突，拒绝启动\
-                （会话键头无条件剔除，保留名会在转发上游前删除真实头）"
+                （hop/传输头在装配期被移除故不适合作会话键；鉴权头作 PII 会话键会把凭据\
+                卷入键派生并使共享同一凭据的请求坍缩为单一 PII 作用域）"
             ),
         });
     }

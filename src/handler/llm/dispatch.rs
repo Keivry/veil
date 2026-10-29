@@ -188,30 +188,6 @@ pub fn resolve_ingress_port(
 /// 租户指纹可区分凭据头（可选次判别项）：Authorization / api-key。
 const CREDENTIAL_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-key"];
 
-/// 转发前剔除会话键头（含自定义头名，大小写不敏感）；返回是否确实剔除。
-pub(crate) fn strip_conversation_header(headers: &mut HeaderMap, header_name: &str) -> bool {
-    let name = header_name.to_ascii_lowercase();
-    headers.remove(name.as_str()).is_some()
-}
-
-/// 转发前剔除整条会话头链：配置头 + [`crate::service::request_log::SESSION_HEADER_FALLBACKS`]
-/// 全部五个内置名（含大小写不敏感的自定义配置名）。
-///
-/// 回退链头是**内部会话标识**，MUST NOT 泄漏给上游 provider（`x-opencode-*` 会暴露
-/// 客户端会话拓扑，`x-session-affinity`/`x-session-id` 会暴露内部路由键）。剔除范围
-/// 恒为全链，独立于当前请求实际命中了哪个头——否则「配置头命中时回退头被转发」会
-/// 形成按请求形状变化的泄漏路径。
-///
-/// 返回值语义与 [`strip_conversation_header`] 对齐：仅当**配置头**确实存在并已被剔除
-/// 时返回 `true`（既有调用方/日志的「配置头已剔除」信号不变），回退头被剔除不计入。
-pub(crate) fn strip_session_headers(headers: &mut HeaderMap, configured: &str) -> bool {
-    let configured_stripped = strip_conversation_header(headers, configured);
-    for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
-        headers.remove(name);
-    }
-    configured_stripped
-}
-
 /// 作用域选择：`request` 逐请求 `PiiScope`；`conversation` 按四级推导
 /// 会话键并从共享存储取 `Arc<PiiScope>`，键不可推导时回退逐请求（缓存失配、不报错）。
 /// `conversation` 模式下的逐请求回退计入 `request_fallback`（`request` 模式不计）。
@@ -422,7 +398,7 @@ async fn serve_inner(
     trace.set_upstream(trace_authority(target.base_url));
     let url = build_upstream_url(target.base_url, path, parts.uri.query());
     // 动态头值展开上下文（design D3）：原始入站头 + 会话键头生效名。
-    // 原始 `parts.headers` 不受下方转发剔除（会话键头/hop 头）影响。
+    // 原始 `parts.headers` 不受下游出站装配剔除（协议必要头/hop 头/`drop_headers`）影响。
     let expand = ExpandCtx {
         inbound: &parts.headers,
         conversation_key_header: &state.config.pii_scope_key_header,
@@ -447,16 +423,15 @@ async fn serve_inner(
     let audit_policy = state.audit_policy.clone();
     let approval_whitelist = state.config.approval_whitelist.clone();
 
-    // 会话键头由网关消费且 MUST NOT 转发上游（含自定义非 `x-veil-` 头名），
-    // 剔除为**无条件**——独立于 `PII_SCOPE_MODE`（默认 `request` 模式同样剔除），覆盖
-    // NonDialog 透传与对话臂两条路径。键推导（`build_request_scope`）仍读原始
-    // `parts.headers`，故此处只改转发克隆体。
-    let mut fwd_headers = parts.headers.clone();
-    let _ = strip_session_headers(&mut fwd_headers, &state.config.pii_scope_key_header);
+    // 出站头基线：客户端入站头原样透传，仅剔除协议必要头与 `x-veil-*` 内部命名空间
+    // （由 `forward_headers` 统一装配）。会话键头/回退链头不再被隐式剔除——需剔除时
+    // 由目标 `drop_headers` 显式声明。键推导（`build_request_scope`）读原始
+    // `parts.headers`，故此处克隆体仅供下游装配，不改入站语义。
+    let fwd_headers = parts.headers.clone();
 
     if !is_chat {
         // NonDialog 走专用透传入口（返回 `Response`，无 `Stream` 死臂）；
-        // 上游意外回 SSE 亦按字节透传，类型即契约。传已剔除会话键头的转发头。
+        // 上游意外回 SSE 亦按字节透传，类型即契约。传客户端入站头的克隆体。
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
         // 非对话请求体不做脱敏，故摘要恒 `NULL`（design §6）；会话标识仍按显式头派生。

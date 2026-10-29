@@ -1,5 +1,5 @@
 //! dispatch 入口集成单测（`mod tests`，见 `dispatch.rs` 声明）：
-//! 会话键头无条件剔除与会话键可判定降级计数。
+//! 出站头透传基线（会话头链不再隐式剔除）与会话键可判定降级计数。
 
 use {
     crate::{
@@ -76,7 +76,7 @@ fn test_app_state_with_targets(
     (state, dir)
 }
 
-/// 捕获请求字节的回环上游：可断言转发头集合（无条件剔除）。
+/// 捕获请求字节的回环上游：可断言转发头集合（透传基线）。
 async fn capture_loopback(
     body: Vec<u8>,
 ) -> (String, Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>) {
@@ -118,9 +118,9 @@ async fn capture_loopback(
 }
 
 #[tokio::test]
-async fn request_mode_custom_conversation_header_not_forwarded() {
-    // 默认 `request` 模式下自定义非 `x-veil-` 会话键头（`x-my-conv`）
-    // 亦须在转发前无条件剔除；键推导仍读原始头，不因剔除而失效。
+async fn request_mode_custom_conversation_header_is_forwarded() {
+    // D1 出站基线：自定义非 `x-veil-` 会话键头（`x-my-conv`）按客户端原值转发上游
+    // ——不再被隐式剔除；键推导仍读原始头，不因透传而失效。
     let up_body = br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
     let (url, captured, server) = capture_loopback(up_body).await;
     let (state, dir) = test_app_state(&[
@@ -146,8 +146,9 @@ async fn request_mode_custom_conversation_header_not_forwarded() {
     let raw = String::from_utf8_lossy(&captured.lock().expect("捕获锁不得中毒")).to_string();
     assert!(raw.contains("content-type"), "请求须确实到达上游: {raw}");
     assert!(
-        !raw.to_ascii_lowercase().contains("x-my-conv"),
-        "会话键头须无条件剔除（request 模式亦剔除）: {raw}"
+        raw.to_ascii_lowercase()
+            .contains("x-my-conv: conv-secret-value"),
+        "自定义会话键头须按客户端原值转发上游: {raw}"
     );
     server.abort();
     std::fs::remove_dir_all(&dir).ok();
@@ -502,8 +503,8 @@ async fn dialog_stream_receives_configured_header() {
 async fn dialog_nonstream_missing_conversation_source_skips_dynamic_header() {
     // task 3.1：声明了 `$conversation` 模板但客户端未提供会话键头时，该动态头
     // 须整条跳过（不写不改不删）——静态头照常注入。
-    // 同时锁定内部会话标识不外泄：客户端自带的 `x-opencode-session` 属回退链，
-    // 转发前已被无条件剔除，不得因「动态头跳过」而原样透传上游。
+    // D1 出站基线：客户端自带的 `x-opencode-session` 不再被隐式剔除，动态头跳过
+    // 后按客户端原值转发上游。
     let up_body = br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
     let (url, captured, server) = capture_loopback_complete("application/json", up_body).await;
     let (state, dir) = test_app_state_with_targets(
@@ -533,8 +534,12 @@ async fn dialog_nonstream_missing_conversation_source_skips_dynamic_header() {
         "静态头不受动态跳过影响: {text}"
     );
     assert!(
-        !text.contains("x-opencode-session") && !text.contains("client-dyn"),
-        "缺源动态头须整条跳过，且客户端回退链头须被剔除（不泄漏内部会话标识）: {text}"
+        text.contains("x-opencode-session: client-dyn"),
+        "缺源动态头须整条跳过，客户端同名头按原值转发: {text}"
+    );
+    assert!(
+        !text.contains("$conversation"),
+        "未展开的模板字面量不得上行: {text}"
     );
     server.abort();
     std::fs::remove_dir_all(&dir).ok();

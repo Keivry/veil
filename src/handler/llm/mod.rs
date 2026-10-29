@@ -42,8 +42,8 @@ pub(crate) fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SUBLI
 /// 头值插值展开的只读上下文（design D3）：原始入站头 + 会话键头生效名。
 ///
 /// `$conversation` / `$header(名)` / `$request-id` 三种来源均从 `inbound` 读取——
-/// 原始 `parts.headers` 不受既有转发剔除（会话键头/hop 头）影响；`$header(名)`
-/// 来源限入站请求自身，与透传同信任边界。
+/// 原始 `parts.headers` 不受出站装配剔除（协议必要头/hop 头/`drop_headers`）影响；
+/// `$header(名)` 来源限入站请求自身，与透传同信任边界。
 pub struct ExpandCtx<'a> {
     /// 原始入站请求头（`parts.headers`）。
     pub inbound: &'a HeaderMap,
@@ -51,10 +51,16 @@ pub struct ExpandCtx<'a> {
     pub conversation_key_header: &'a str,
 }
 
-/// 上游转发头：剥 `host`/`content-length`/`content-encoding` 与下游
-/// `accept-encoding`（reqwest 仅在其请求头缺席时注入网关支持集
-/// `gzip/br/deflate`，从而保证上游只回可解码编码），再做 hop 头过滤并计数；
-/// 过滤全部完成后注入目标配置头（design D3/D4），两态策略：
+/// 上游转发头：透传客户端入站头——仅剔除协议必要项（`host`/`content-length`/
+/// `content-encoding` 与下游 `accept-encoding`，reqwest 仅在其请求头缺席时注入网关
+/// 支持集 `gzip/br/deflate`，从而保证上游只回可解码编码）与 `x-veil-*` 内部命名空间，
+/// 再做 hop 头过滤并计数；随后按目标 `drop_headers` 显式剔除，最后注入目标配置头
+/// （design D3/D4）。
+///
+/// 会话键头（含 `SESSION_HEADER_FALLBACKS` 五名回退链）不再被隐式剔除：客户端动态
+/// 身份头按 D1 原样上游，需剔除时由操作者显式声明 `drop_headers`。
+///
+/// 配置头注入两态策略：
 /// - `override_existing == true`（缺省）：`insert` 恒胜客户端同名头（`HeaderName`
 ///   大小写不敏感），保证供应商契约不被客户端破坏；
 /// - `override_existing == false`（合并模式）：仅当客户端未发送同名头时 `insert`，
@@ -68,7 +74,8 @@ pub struct ExpandCtx<'a> {
 /// 恒胜、单值，与 `override_existing` 两态及客户端是否发送均无关（design D3）；
 /// `None` 时 UA 装配零变化。
 ///
-/// 配置头已过加载期硬拒清单，故此处不再二次过滤。
+/// 配置头与 `drop_headers` 已过加载期校验（同名互斥、`x-veil-*` 拒绝等），故此处
+/// 不再二次过滤。
 pub fn forward_headers(
     incoming: &HeaderMap,
     metrics: &GatewayMetrics,
@@ -89,6 +96,11 @@ pub fn forward_headers(
         Some(metrics),
     );
     if let Some(overrides) = overrides {
+        // 显式剔除先于配置头注入：`drop_headers` 命中的客户端头（含全部值）在此移除，
+        // 随后两态注入照常生效（故「剔除 UA + 声明 user_agent」最终为配置值）。
+        for name in &overrides.drop_headers {
+            fwd.remove(name);
+        }
         let config_wins = overrides.override_existing;
         for (name, value) in overrides.headers.iter() {
             // 恒胜模式直接覆盖；合并模式仅当客户端未发送同名头时新增。

@@ -2,8 +2,9 @@
 //!
 //! 目标键：可解析为 `u16` 的入口端口字符串，或指代缺省上游的保留键 `default`。
 //! 每个目标仅接受 `headers`（出站头表，值支持 `$` 插值或静态）、`params`（按协议
-//! 分表的请求体参数覆盖）、`override`（冲突策略开关）与 `user_agent`（出站 UA
-//! 恒胜覆盖值）；全层 `deny_unknown_fields`。强类型产物（[`LlmTargets`]）并入
+//! 分表的请求体参数覆盖）、`override`（冲突策略开关）、`user_agent`（出站 UA
+//! 恒胜覆盖值）与 `drop_headers`（显式剔除的出站头名）；全层
+//! `deny_unknown_fields`。强类型产物（[`LlmTargets`]）并入
 //! `Config::llm_targets`，由装载路径在 env / 文件合并后做孤儿目标与 `default`
 //! 依赖校验（[`validate_target_upstreams`]）。本模块无 env 对应源：未声明时为空表，
 //! 逐项零行为变化（覆盖 schema 与目标键 / 目标解析与上游选路同源）。
@@ -40,8 +41,8 @@ impl TargetKey {
 /// `[llm.targets]` 分节原始 schema：键为 TOML 字符串（校验后转 [`TargetKey`]）。
 pub type RawTargets = BTreeMap<String, TargetSection>;
 
-/// 单个目标声明：仅 `headers` / `params` / `override_existing` / `user_agent`，未知键
-/// （含错误嵌套层级）拒启动。
+/// 单个目标声明：仅 `headers` / `params` / `override_existing` / `user_agent` /
+/// `drop_headers`，未知键（含错误嵌套层级）拒启动。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetSection {
@@ -56,6 +57,9 @@ pub struct TargetSection {
     /// 出站 `User-Agent` 恒胜覆盖值（与 `r#override` 开关正交；值校验与
     /// `headers."user-agent"` 互斥规则见 [`validate_target`]）。
     pub user_agent: Option<String>,
+    /// 显式剔除的出站头名列表（装配期在内部头/逐跳头过滤之后、配置头注入之前
+    /// 逐名删除，两态均生效；合法性与冲突规则见 [`validate_drop_headers`]）。
+    pub drop_headers: Option<Vec<String>>,
 }
 
 /// `params` 协议子表：协议键集合受限，其余键拒启动。
@@ -103,6 +107,9 @@ pub struct UpstreamOverrides {
     /// 出站 `User-Agent` 恒胜覆盖值（独立于 `override_existing` 两态；
     /// `None` 时 UA 装配逐项零变化）。
     pub user_agent: Option<HeaderValue>,
+    /// 显式剔除的出站头名（装配期在内部头/逐跳头过滤之后、配置头注入之前删除，
+    /// 两态均生效）；空表 = 未声明。已过加载期合法性与冲突校验，故装配期不再判定。
+    pub drop_headers: Vec<HeaderName>,
 }
 
 impl Default for UpstreamOverrides {
@@ -116,6 +123,7 @@ impl Default for UpstreamOverrides {
             params: BTreeMap::new(),
             override_existing: true,
             user_agent: None,
+            drop_headers: Vec::new(),
         }
     }
 }
@@ -276,15 +284,70 @@ fn parse_target_key(raw: &str) -> Result<TargetKey> {
     })
 }
 
-/// 单目标全量校验：头表 + 协议参数表 + 冲突策略 + UA 恒胜覆盖。
+/// 单目标全量校验：头表 + 协议参数表 + 冲突策略 + UA 恒胜覆盖 + 显式剔除头。
 fn validate_target(key: TargetKey, section: &TargetSection) -> Result<UpstreamOverrides> {
     let headers = validate_headers(key, section.headers.as_ref())?;
     Ok(UpstreamOverrides {
         user_agent: validate_user_agent(key, section.user_agent.as_deref(), &headers)?,
+        drop_headers: validate_drop_headers(key, section.drop_headers.as_deref(), &headers)?,
         headers,
         params: validate_params(key, section.params.as_ref())?,
         override_existing: section.override_existing.unwrap_or(true),
     })
+}
+
+/// `drop_headers` 校验（错误消息指名完整键路径）：头名须合法、归一后唯一、
+/// 不与同目标 `headers` 键重复（注入与剔除同名即歧义）、不属 `x-veil-*` 内部命名空间
+/// （该命名空间在装配期恒被剔除，配置无意义）。空数组合法，等同未声明。
+///
+/// 允许剔除 `user-agent`：与 `user_agent` 字段并存时不报错——装配期剔除先于配置头
+/// 注入与 UA 字段写入，后者恒胜（与 `override_existing` 无关）。
+fn validate_drop_headers(
+    key: TargetKey,
+    raw: Option<&[String]>,
+    headers: &HeaderMap<HeaderValueSpec>,
+) -> Result<Vec<HeaderName>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let prefix = key.path_prefix();
+    let path = format!("{prefix}.drop_headers");
+    let mut dropped: Vec<HeaderName> = Vec::with_capacity(raw.len());
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for name in raw {
+        let parsed_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            config_error(
+                BOOTSTRAP_VAR,
+                &format!("{path} 元素 {name:?} 头名非法（不符合 http 头名语义），拒绝启动"),
+            )
+        })?;
+        let normalized = parsed_name.as_str().to_string();
+        if let Some(previous) = seen.get(&normalized) {
+            return Err(config_error(
+                BOOTSTRAP_VAR,
+                &format!("{path} 元素 {name:?} 与 {previous:?} 大小写归一后重复，拒绝启动"),
+            ));
+        }
+        if normalized.starts_with(VEIL_INTERNAL_PREFIX) {
+            return Err(config_error(
+                BOOTSTRAP_VAR,
+                &format!(
+                    "{path} 元素 {name:?} 属 x-veil-* 内部命名空间（装配期恒被剔除，配置无意义），拒绝启动"
+                ),
+            ));
+        }
+        if headers.contains_key(&parsed_name) {
+            return Err(config_error(
+                BOOTSTRAP_VAR,
+                &format!(
+                    "{path} 元素 {name:?} 与 {prefix}.headers 同名（同一目标既注入又剔除即歧义），拒绝启动"
+                ),
+            ));
+        }
+        seen.insert(normalized, name.clone());
+        dropped.push(parsed_name);
+    }
+    Ok(dropped)
 }
 
 /// `user_agent` 值校验与互斥判定：空/全空白/含首尾空白拒启动；与 `headers` 归一后
@@ -608,7 +671,13 @@ fn reserved_key_error(path: &str, name: &str) -> VeilError {
 pub(crate) const TARGETS_STRUCTURAL_KEYS: &[(&str, &[&str])] = &[
     (
         "目标内",
-        &["headers", "params", "override_existing", "user_agent"],
+        &[
+            "headers",
+            "params",
+            "override_existing",
+            "user_agent",
+            "drop_headers",
+        ],
     ),
     ("params 内", &["chat", "anthropic", "responses"]),
     ("协议段内", &["default", "override", "drop"]),

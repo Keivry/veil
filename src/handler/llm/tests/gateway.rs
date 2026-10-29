@@ -1135,3 +1135,82 @@ fn forward_headers_template_present_empty_source_injects_empty_value() {
         "混排模板中字面段照常呈现"
     );
 }
+
+#[test]
+fn forward_headers_drop_headers_removes_listed_headers_in_both_modes() {
+    // D3：`drop_headers` 在配置头注入前逐名删除（两态一致）；未列名的客户端头
+    // 仍原样透传，配置头按各态语义注入。
+    use axum::http::{HeaderValue, header};
+    let metrics = GatewayMetrics::default();
+    for config_wins in [true, false] {
+        let mut client = HeaderMap::new();
+        client.insert(
+            "x-opencode-session",
+            HeaderValue::from_static("ses_client_should_drop"),
+        );
+        client.append("x-drop-multi", HeaderValue::from_static("a"));
+        client.append("x-drop-multi", HeaderValue::from_static("b"));
+        client.insert("x-keep-me", HeaderValue::from_static("kept"));
+        let mut overrides = UpstreamOverrides {
+            override_existing: config_wins,
+            ..UpstreamOverrides::default()
+        };
+        overrides.drop_headers = vec![
+            header::HeaderName::from_static("x-opencode-session"),
+            header::HeaderName::from_static("x-drop-multi"),
+        ];
+        overrides.headers.insert(
+            "x-config".parse::<header::HeaderName>().expect("合法头名"),
+            HeaderValue::from_static("injected").into(),
+        );
+        let fwd = super::super::forward_headers(&client, &metrics, Some(&overrides), &no_expand());
+        assert!(
+            fwd.get("x-opencode-session").is_none(),
+            "override_existing = {config_wins}：列名头须被删除"
+        );
+        assert!(
+            fwd.get("x-drop-multi").is_none(),
+            "override_existing = {config_wins}：多值列名头须整体删除（含全部值）"
+        );
+        assert_eq!(
+            fwd.get("x-keep-me").and_then(|v| v.to_str().ok()),
+            Some("kept"),
+            "override_existing = {config_wins}：未列名的客户端头须原样保留"
+        );
+        assert_eq!(
+            fwd.get("x-config").and_then(|v| v.to_str().ok()),
+            Some("injected"),
+            "override_existing = {config_wins}：配置头注入不受剔除影响"
+        );
+    }
+}
+
+#[test]
+fn forward_headers_drop_user_agent_yields_configured_user_agent() {
+    // D3：剔除 `user-agent` 合法；同目标声明 `user_agent` 时字段写入在剔除与表注入
+    // 之后，最终仍为配置单值（两态一致）。
+    use axum::http::{HeaderValue, header};
+    let metrics = GatewayMetrics::default();
+    for config_wins in [true, false] {
+        let mut client = HeaderMap::new();
+        client.append("user-agent", HeaderValue::from_static("client-ua/1.0"));
+        client.append("user-agent", HeaderValue::from_static("client-ua/2.0"));
+        let mut overrides = UpstreamOverrides {
+            override_existing: config_wins,
+            ..UpstreamOverrides::default()
+        };
+        overrides.drop_headers = vec![header::USER_AGENT];
+        overrides.user_agent = Some(HeaderValue::from_static("opencode/1.18.33"));
+        let fwd = super::super::forward_headers(&client, &metrics, Some(&overrides), &no_expand());
+        let values: Vec<&str> = fwd
+            .get_all("user-agent")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["opencode/1.18.33"],
+            "override_existing = {config_wins}：剔除 UA 后仍须由 user_agent 字段写入配置单值"
+        );
+    }
+}

@@ -953,8 +953,8 @@ fn structural_key_set_matches_schema_field_sets() {
     );
     assert_eq!(
         probed.iter().map(BTreeSet::len).collect::<Vec<_>>(),
-        vec![4, 3, 3],
-        "结构性键分组规模须为 4/3/3（目标内 / params 内 / 协议段内）"
+        vec![5, 3, 3],
+        "结构性键分组规模须为 5/3/3（目标内 / params 内 / 协议段内）"
     );
     for (group, (layer, closed)) in TARGETS_STRUCTURAL_KEYS.iter().enumerate() {
         let want: BTreeSet<String> = closed.iter().map(|key| (*key).to_string()).collect();
@@ -963,4 +963,140 @@ fn structural_key_set_matches_schema_field_sets() {
             "「{layer}」结构性键集须与 schema 字段集逐项相等（增删改须同步闭集）"
         );
     }
+}
+
+/// 构造仅含 `drop_headers` 声明的 TOML。
+fn drop_headers_toml(port: &str, array_literal: &str) -> String {
+    format!("[llm.targets.\"{port}\"]\ndrop_headers = {array_literal}\n")
+}
+
+#[test]
+fn drop_headers_legal_declaration_loads_into_typed_payload() {
+    // D3：合法声明进入强类型载荷（按书写序保留、已解析为 HeaderName）。
+    let targets = validated(&drop_headers_toml(
+        "8878",
+        r#"["x-opencode-session", "User-Agent"]"#,
+    ))
+    .expect("合法 drop_headers 须加载通过");
+    let dropped = &targets
+        .get(&TargetKey::Port(8878))
+        .expect("端口目标须在")
+        .drop_headers;
+    let names: Vec<&str> = dropped.iter().map(|name| name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["x-opencode-session", "user-agent"],
+        "头名须按书写序保留且归一为小写"
+    );
+}
+
+#[test]
+fn drop_headers_empty_array_is_legal_and_equivalent_to_absent() {
+    // D3：空数组合法，等同未声明（空表，不影响装配）。
+    let targets = validated(&drop_headers_toml("8878", "[]")).expect("空数组须加载通过");
+    assert!(
+        targets
+            .get(&TargetKey::Port(8878))
+            .expect("端口目标须在")
+            .drop_headers
+            .is_empty(),
+        "空数组须产出空剔除表"
+    );
+}
+
+#[test]
+fn drop_headers_invalid_header_name_rejected_naming_path() {
+    // D3 a)：头名不符合 http 头名语义即拒启动，错误指名完整键路径。
+    for literal in [r#"["x bad"]"#, r#"["x:colon"]"#, r#"[""]"#, r#"["x/y"]"#] {
+        let msg = err_msg(&drop_headers_toml("8878", literal));
+        assert!(
+            msg.contains("llm.targets.\"8878\".drop_headers") && msg.contains("拒绝启动"),
+            "非法头名 {literal} 须拒启动并指名完整键路径：{msg}"
+        );
+    }
+}
+
+#[test]
+fn drop_headers_case_insensitive_duplicate_rejected() {
+    // D3 b)：大小写归一后重复即拒启动。
+    let msg = err_msg(&drop_headers_toml(
+        "8878",
+        r#"["x-opencode-session", "X-OpenCode-Session"]"#,
+    ));
+    assert!(
+        msg.contains("llm.targets.\"8878\".drop_headers")
+            && msg.contains("归一后重复")
+            && msg.contains("拒绝启动"),
+        "大小写归一重复须拒启动并指名：{msg}"
+    );
+}
+
+#[test]
+fn drop_headers_overlapping_headers_map_rejected() {
+    // D3 c)：同目标 `headers` 已注入又剔除即歧义，拒启动（含大小写变体）。
+    let text = "[llm.targets.\"8878\"]\ndrop_headers = [\"X-Provider-Version\"]\n\
+                [llm.targets.\"8878\".headers]\nx-provider-version = \"v1\"\n";
+    let msg = err_msg(text);
+    assert!(
+        msg.contains("llm.targets.\"8878\".drop_headers")
+            && msg.contains("既注入又剔除")
+            && msg.contains("拒绝启动"),
+        "与 headers 同名须拒启动并指名歧义：{msg}"
+    );
+}
+
+#[test]
+fn drop_headers_veil_internal_namespace_rejected() {
+    // D3 d)：`x-veil-*` 属内部命名空间，装配期恒剔除，配置即拒启动。
+    for name in ["x-veil-conversation-id", "X-Veil-Anything"] {
+        let msg = err_msg(&drop_headers_toml("8878", &format!("[{name:?}]")));
+        assert!(
+            msg.contains("llm.targets.\"8878\".drop_headers")
+                && msg.contains("x-veil-*")
+                && msg.contains("拒绝启动"),
+            "x-veil-* 名 {name} 须拒启动并指名：{msg}"
+        );
+    }
+}
+
+#[test]
+fn drop_headers_user_agent_with_user_agent_field_is_legal() {
+    // D3：`drop_headers` 可含 `user-agent`；同目标声明 `user_agent` 不报错
+    // （剔除先于字段写入，最终值为配置 UA）。
+    let targets = validated(
+        "[llm.targets.\"8878\"]\ndrop_headers = [\"user-agent\"]\n\
+         user_agent = \"opencode/1.18.33\"\n",
+    )
+    .expect("drop user-agent 与 user_agent 并存须合法");
+    let target = targets.get(&TargetKey::Port(8878)).expect("端口目标须在");
+    assert_eq!(
+        target
+            .user_agent
+            .as_ref()
+            .and_then(|value| value.to_str().ok()),
+        Some("opencode/1.18.33")
+    );
+    assert_eq!(target.drop_headers.len(), 1);
+}
+
+#[test]
+fn drop_headers_non_string_array_rejected_by_schema() {
+    // D3 e)：值非字符串数组由 serde 拒绝并回显键名。
+    for literal in ["\"x-opencode-session\"", "[1, 2]", "true"] {
+        let msg = parse_err_msg(&drop_headers_toml("8878", literal));
+        assert!(
+            msg.contains("drop_headers"),
+            "非字符串数组 {literal} 须由 schema 拒绝并回显键名：{msg}"
+        );
+    }
+}
+
+#[test]
+fn drop_headers_error_messages_name_default_target_path() {
+    // D3：`default` 目标同样以 path_prefix 指名（端口键带引号、default 不带）。
+    let msg = err_msg("[llm.targets.default]\ndrop_headers = [\"x bad\"]\n");
+    assert!(
+        msg.contains("llm.targets.default.drop_headers"),
+        "default 目标错误须指名完整键路径：{msg}"
+    );
 }

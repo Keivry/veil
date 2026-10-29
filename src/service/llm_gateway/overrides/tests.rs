@@ -29,6 +29,7 @@ fn target_with(protocol: ParamProtocol, rules: ParamOverrides) -> UpstreamOverri
         params,
         override_existing: true,
         user_agent: None,
+        drop_headers: Vec::new(),
     }
 }
 
