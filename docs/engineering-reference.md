@@ -102,11 +102,11 @@
 | `llm.nonstream_max_bytes` | `NONSTREAM_MAX_BYTES` | u64 | 非流对话响应体上限（软限，严格 `len >` 即 502）；须 ≥1，默认 8MiB |
 | `llm.sse_frame_hard_bytes` | `SSE_FRAME_HARD_BYTES` | u64 | SSE 单帧/单行硬上限；须 ≥1，默认 8MiB，超限 fail-closed 并合成终止帧 |
 | `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16；每个端口键各派生一条专用监听（见「端口语义」子节） |
-| `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标键、硬拒清单、保留键与三段语义见下 |
+| `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标内键为 `headers`/`params`/`override_existing`/`user_agent`/`drop_headers`；目标键、硬拒清单、保留键与三段语义见下 |
 | `pii_scope.mode` | `PII_SCOPE_MODE` | enum `request`/`conversation` | 会话级关联开关 |
 | `pii_scope.ttl_secs` | `PII_SCOPE_TTL_SECS` | u64 | 会话条目空闲 TTL 秒；须 ≥1（`0` 拒启动） |
 | `pii_scope.max_conversations` | `PII_SCOPE_MAX_CONVERSATIONS` | usize | 会话条目上限；须 ≥1 |
-| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名（最高优先；其后**PII 专用窄链** `x-opencode-session` → `x-opencode-session-id`，刻意不含 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，见 §6）；保留名拒启动 |
+| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名（最高优先；其后**PII 专用窄链** `x-opencode-session` → `x-opencode-session-id`，刻意不含 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，见 §6）；仅用于推导会话作用域与展开 `$conversation`，**不因配置而隐式从上游请求剔除**（普通客户端头名原样转发；`x-veil-*` 仍按内部命名空间规则移除，需剔除普通名时用目标级 `drop_headers`）；保留名拒启动 |
 | `pii_scope.prev_id_max_entries` | `PII_SCOPE_PREV_ID_MAX_ENTRIES` | usize | `previous_response_id` 映射上限；缺省联动 `max_conversations` |
 | `redaction.enabled` | `REDACTION_ENABLED` | bool | 脱敏总开关；env 别名 `PII_REDACTION_ENABLED` |
 | `redaction.fuzzy_restore` | `PII_FUZZY_RESTORE` | bool | 残缺占位符按序号回查还原 |
@@ -127,13 +127,17 @@
 
 - 目标键：入口端口字符串（须为合法 `u16`，且存在对应上游——env `LLM_<port>` 或本文件 `[llm.upstreams]`；无对应上游拒启动）或保留键
   `default`（缺省上游的回退覆盖；缺省上游未定义拒启动）。不同写法归一后重复的目标（如 `"0078"` 与 `"78"`）拒启动。
-- 覆盖语义：出站请求头在保留头剔除、`x-veil-*` 剥离与逐跳过滤之后注入，配置值恒胜客户端同名头（大小写不敏感），
-  客户端其余头原样保留；`params` 仅对对话协议按协议子表（`chat`/`anthropic`/`responses`）生效，每协议三段
+- 覆盖语义：客户端请求头默认**逐值原样转发**上游；唯一隐式移除是 `host`/`content-length`/`content-encoding`/`accept-encoding`、
+  逐跳头与 `x-veil-*` 内部命名空间，显式移除由目标级 `drop_headers` 声明。出站请求头在上述隐式过滤与 `drop_headers` 删除之后注入配置头，
+  配置值按 `override_existing` 语义与客户端同名头（大小写不敏感）合并，客户端其余头原样保留；`params` 仅对对话协议按协议子表（`chat`/`anthropic`/`responses`）生效，每协议三段
   `default`（缺则补）→ `override`（恒写）→ `drop`（删顶层键，缺失静默），注入在脱敏与占位符说明之后，参数值为配置原文；
   实际发生改写时响应带 `x-veil-normalized: json-whitespace`。
+- `drop_headers` 出站头删除清单（目标级字符串数组，缺省不删除）：命中头名（大小写不敏感、删除全部值）在隐式过滤之后、`headers` 注入之前移除，
+  `override_existing` 两态均生效。用于「客户端带某个头但上游不应看到」的场景（例如抑制 `x-opencode-session`）；空数组等价于未声明。
+  启动期拒启动：非法头名、大小写归一后重复、与同目标 `headers` 中的头名冲突、以及任何 `x-veil-*` 名（内部命名空间已隐式移除，无需也不许重复声明）。
 - `override_existing` 冲突策略（目标级布尔，缺省 `true`；旧键名 `override` 已在 0.2.0 移除）：`true` = 恒胜（上述语义）；`false` = 合并模式——headers 仅当客户端
-  未发送同名头时新增，`params` 的 `default` 与 `override` 两段均仅在请求体原文缺失该顶层键时写入（客户端已有值恒保留），
-     `drop` 不受开关影响（两态均删除所列顶层键）；合并模式下同一键跨段仍「后段生效」，但仅限配置段之间，绝不覆盖客户端值。
+  未发送同名头时新增，客户端自带的同名头（如 opencode 的动态 `x-opencode-session`）逐值保留，`params` 的 `default` 与 `override` 两段均仅在请求体原文缺失该顶层键时写入（客户端已有值恒保留），
+    `drop` 不受开关影响（两态均删除所列顶层键）；合并模式下同一键跨段仍「后段生效」，但仅限配置段之间，绝不覆盖客户端值。
 - 头值动态插值（仅 `headers` 表的值；`user_agent` 恒为字面值、不参与插值）：值内 `$` 触发展开，三种来源——
   `$conversation`（展开为会话键请求头首值，头名取 `pii_scope.key_header`，默认 `x-veil-conversation-id`）、
   `$request-id`（入站 `x-request-id` 首值）、`$header(<入站头名>)`（镜像任意入站头首值，头名大小写不敏感）；
@@ -145,6 +149,7 @@
   未闭合/嵌套 `$header(`、空或非法头名、含 `$` 的镜像名、`$header(x-veil-*)` 内部命名空间引用。
   opencode 动态 session 配方：`headers` 写 `x-opencode-session = "$conversation"`——客户端携带会话键头时
   动态透传其首值（会话粘性随键头走），缺失时跳过（不注入伪造值）；合并模式下客户端自带该头时原样保留。
+  若相反地希望上游完全看不到该头（连客户端自带的动态身份头一并抑制），在同目标 `drop_headers` 中列出该头名即可。
 - `user_agent` 出站 `User-Agent` 恒胜覆盖（目标级字符串，与 `override_existing` 正交）：声明后出站 UA 恒为该单一配置值——
   与 `override_existing` 取值及客户端是否发送 UA 均无关；未声明时 UA 装配逐项零变化（客户端值透传、未发送则不含该头）。
   对话与 NonDialog 透传路径一致生效。值须为合法 HTTP 头值（禁 CR/LF），空/全空白/含首尾空白拒启动（不做静默修剪）；同一目标与 `headers` 中
@@ -167,6 +172,7 @@
 | `params` | 目标内 | 按协议分表的请求体参数覆盖容器 |
 | `override_existing` | 目标内 | 冲突策略：`true`（缺省）= 恒胜；`false` = 合并模式（仅补缺，`drop` 不受影响）。原键名 `override` 已随 0.2.0 移除（出现即拒启动），与协议段 `params.<proto>.override` 表的命名碰撞随之消失 |
 | `user_agent` | 目标内 | 出站 `User-Agent` 恒胜覆盖值（与 `override_existing` 正交；未声明零变化；与 `headers."user-agent"` 归一后互斥） |
+| `drop_headers` | 目标内 | 出站头删除清单（数组；在隐式过滤之后、`headers` 注入之前按名删除全部值，大小写不敏感，`override_existing` 两态均生效；空数组等价于未声明） |
 | `chat` | params 内 | OpenAI Chat Completions 协议规则 |
 | `anthropic` | params 内 | Anthropic Messages 协议规则 |
 | `responses` | params 内 | OpenAI Responses 协议规则 |
@@ -956,19 +962,22 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   （`src/handler/llm/rewrite.rs` 经 `src/service/llm_gateway/placeholder.rs::has_placeholder_tokens` 判定），
   故「同会话两轮前缀字节一致」仅对**两轮均含 token**成立；token 首次出现的那一轮 SHALL 允许头部新增
   说明、前缀字节较前一轮增长（合法增长，非缓存失稳缺陷）。与 §7.7 同口径。
-- 会话键头剔除与保留名校验：会话键头的剔除为**无条件**——独立于 `[pii_scope].mode`
-  （默认 `request` 模式同样剔除）且覆盖任意自定义非 `x-veil-` 头名
-  （`src/handler/llm/dispatch.rs::strip_session_headers`）；其名与值 MUST NOT 转发上游或入日志。
-  剔除范围是**整条会话头链**：配置头 + 五个内置回退名（`x-opencode-session`、
-  `x-opencode-session-id`、`x-opencode-parent-session-id`、`x-session-affinity`、`x-session-id`，
-  大小写不敏感），与前文 PII 窄链是否命中无关——否则按请求形状会形成变化的泄漏路径。
-  单名剔除函数 `strip_conversation_header` 保留给单独剔除自定义头的调用点，返回值仍只反映
-  「配置头是否被剔除」（既有调用方/日志信号不变）。
-  `[pii_scope].key_header` 在启动期做**保留名校验**（fail-closed）：命中真实鉴权/传输头名
+- 会话键头转发与保留名校验：客户端请求头默认**逐值原样转发上游**——包括整个会话头链
+  （`x-opencode-session`、`x-opencode-session-id`、`x-opencode-parent-session-id`、
+  `x-session-affinity`、`x-session-id`）与普通客户端头名形态的 `[pii_scope].key_header`，
+  行为与 `[pii_scope].mode` 取值无关（默认 `request` 模式同样转发）。
+  仅有的隐式移除是传输层口径：逐跳头（§7.1）、`host`/`content-length`/`content-encoding`/`accept-encoding`
+  与 `x-veil-*` 内部命名空间（默认键头 `x-veil-conversation-id` 属该命名空间，故恒被移除）。
+  需要上游看不到某个头时，由**目标级 `drop_headers` 显式声明**（大小写不敏感、删除全部值，
+  在隐式过滤之后、`headers` 注入之前生效，`override_existing` 两态均生效）。
+  `override_existing` 只决定配置头与客户端同名头冲突时的取舍（`true` = 配置恒胜，`false` = 保留客户端副本、仅补缺），
+  不删除任何客户端头。
+  `[pii_scope].key_header` 仅用于推导会话作用域与展开 `$conversation`；其名与值 MUST NOT 出现在任何日志行
+  （与是否转发无关，日志隐私口径不变）。该键在启动期做**保留名校验**（fail-closed）：命中真实鉴权/传输头名
   （`authorization`/`x-api-key`/`api-key`/HOP 集/`host`/`content-length`/`content-encoding`/
-  `accept-encoding`，大小写不敏感）拒启动；除保留名外的任意自定义名 SHALL 被接受，安全性由**无条件剔除**保证（转发前剥离、不入上游请求头与日志，无需额外 allow-list）。
-  内置回退链头名（`x-opencode-session` 等五个）仅为**读取**来源，不改变转发剔除以外的
-  既有转发语义；它们不参与保留名校验（配置里写这些名仍被接受）。
+  `accept-encoding`，大小写不敏感）拒启动；除保留名外的任意自定义名 SHALL 被接受。
+  内置回退链头名（`x-opencode-session` 等五个）仅为**读取**来源，不改变转发语义；它们不参与保留名校验
+  （配置里写这些名仍被接受）。
 - 熵源故障 fail-closed：PII 注册失败区分两类——待注册值**本身即 token 形态/保留前缀**时
   静默跳过（既有语义，不替换、不改写、不失败）；`rand8` 的 `OsRng` **熵源/内部故障**时记 `warn!`
   （不含明文/token/键/头值）并计入指标，且**拒绝以未脱敏正文转发上游**：请求以 HTTP `502` + 错误码

@@ -125,9 +125,10 @@ mode = "request"
 ttl_secs = 3600
 # 会话条目数上限（≥1）。
 max_conversations = 1024
-# 会话键请求头名（最高优先）；保留鉴权/传输头名拒启动。其后内置回退链：
-# x-opencode-session -> x-opencode-session-id ->
-# x-opencode-parent-session-id -> x-session-affinity -> x-session-id
+# 会话键请求头名（最高优先）；保留鉴权/传输头名拒启动。仅用于推导会话作用域与展开 `$conversation`，
+# 不因此从上游请求剔除（普通头名原样转发）。PII 会话作用域回退窄链（仅两名）：
+# x-opencode-session -> x-opencode-session-id
+# 遥测 session_id 另用五名宽链（x-opencode-parent-session-id / x-session-affinity / x-session-id），见工程参考 §6。
 key_header = "x-veil-conversation-id"
 # previous_response_id 映射上限（≥1）；缺省联动 max_conversations 生效值。
 # prev_id_max_entries = 1024
@@ -160,8 +161,10 @@ nonstream_max_bytes = 8388608
 # 上游请求覆盖（文件专属，无 env 对应源）：目标键为入口端口（须有对应上游）或保留键 default（须有缺省上游）。
 # 目标级 override_existing 布尔（缺省 true）：true = 配置恒胜客户端同名头/同键参数；false = 合并模式
 # （headers 与 params 的 default/override 两段均仅补缺，客户端已有值保留；drop 不受开关影响）。
-# 出站头在保留头剔除/逐跳过滤之后注入；硬拒 host、content-length、content-encoding、accept-encoding、
-# transfer-encoding、逐跳头、x-veil-* 前缀、authorization、x-api-key、api-key、cookie；头值禁 CR/LF，归一重复头名拒启动。
+# 客户端请求头逐值原样转发上游；唯一隐式移除是 host/content-length/content-encoding/accept-encoding、
+# 逐跳头与 x-veil-* 内部命名空间。出站头在隐式过滤与目标级 drop_headers 删除之后注入。
+# 硬拒 host、content-length、content-encoding、accept-encoding、transfer-encoding、逐跳头、x-veil-* 前缀、
+# authorization、x-api-key、api-key、cookie；头值禁 CR/LF，归一重复头名拒启动。
 # params 仅对话协议生效，按 chat | anthropic | responses 分表，每协议三段：
 # default（缺则补）→ override（恒写）→ drop（删顶层键，缺失静默）；
 # 保留键 model/stream/messages/input/instructions/system/stream_options 任一段出现即拒启动。
@@ -215,6 +218,8 @@ override_existing = false
 user_agent = "opencode/1.18.33"
 # 缺项补齐：静态客户端标记头 + `$conversation` 动态展开的会话头（未携带会话键头时跳过）。
 headers = { x-opencode-client = "cli", x-opencode-session = "$conversation" }
+# 可选：若要抑制该头（让上游完全看不到）而非补齐，改用删除清单——与上面 headers 的同名键二者择一：
+# drop_headers = ["x-opencode-session"]
 
 # ── 下游命令执行（文件专属；enabled = false 时端点 404、零行为差异）──
 [command]
