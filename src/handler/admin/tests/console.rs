@@ -806,27 +806,66 @@ fn console_html_layout_request_filter_group_nowrap_above_1100() {
         !CONSOLE_HTML.contains("max-width: 1440px)"),
         "不得保留任何在 >1100px 放开组内折行的媒体查询"
     );
-    // 动作控件移入分页组：`#req-apply` / `#req-live` 须位于 `.tb-group.tb-pager` 之内，
+    // 动作控件独立成组并左对齐：`#req-apply` / `#req-live` 须位于筛选组与分页组之间的
+    // 普通 `.tb-group` 内，否则会被 `.tb-pager { margin-left: auto }` 推到右侧；
     // 筛选组只剩 6 个过滤控件（组内 min-content 不再含按钮宽度）。
-    let pager = CONSOLE_HTML
-        .find("id=\"req-apply\"")
-        .and_then(|pos| CONSOLE_HTML[..pos].rfind("<div class=\"tb-group tb-pager\">"))
-        .expect("`#req-apply` 须位于请求分页组内");
+    for id in ["id=\"req-apply\"", "id=\"req-live\""] {
+        let pos = CONSOLE_HTML
+            .find(id)
+            .unwrap_or_else(|| panic!("请求动作控件须存在: {id}"));
+        let plain = CONSOLE_HTML[..pos].rfind("<div class=\"tb-group\">");
+        let pager = CONSOLE_HTML[..pos].rfind("<div class=\"tb-group tb-pager\">");
+        let group_start = [plain, pager]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or_else(|| panic!("请求动作控件 {id} 须位于某个 tb-group 内"));
+        let opener_end = group_start + CONSOLE_HTML[group_start..].find('>').unwrap() + 1;
+        assert_eq!(
+            &CONSOLE_HTML[group_start..opener_end],
+            "<div class=\"tb-group\">",
+            "动作控件 {id} 须位于左对齐的普通 tb-group 内，而非 tb-pager"
+        );
+        // 该组 MUST NOT 是筛选组本身：组首到下一个分组开标签之间不得出现任何过滤控件，
+        // 否则按钮宽度重新计入筛选组 min-content，>1100px 组内 nowrap 的余量会被吃掉。
+        let next_group = [
+            CONSOLE_HTML[pos..].find("<div class=\"tb-group\">"),
+            CONSOLE_HTML[pos..].find("<div class=\"tb-group tb-pager\">"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|offset| pos + offset)
+        .unwrap_or(CONSOLE_HTML.len());
+        let body = &CONSOLE_HTML[group_start..next_group];
+        assert!(
+            !body.contains("<select") && !body.contains("<input"),
+            "动作控件 {id} 须与筛选组分离，不得与过滤控件同组: {body:?}"
+        );
+    }
+    // 分页组只承载分页控件，不得再容纳动作按钮。
+    let sec_start = CONSOLE_HTML
+        .find("id=\"sec-requests\"")
+        .expect("壳须含请求分区");
+    let pager = sec_start
+        + CONSOLE_HTML[sec_start..]
+            .find("<div class=\"tb-group tb-pager\">")
+            .expect("请求分区须含分页组");
     let pager_block = &CONSOLE_HTML[pager..];
     let pager_end = pager_block
         .find("</div>\n          </div>")
         .expect("分页组须以闭合标签收尾");
     let pager_html = &pager_block[..pager_end];
-    for needle in [
-        "id=\"req-apply\"",
-        "id=\"req-live\"",
-        "id=\"req-prev\"",
-        "id=\"req-next\"",
-        "id=\"req-page-info\"",
-    ] {
+    for needle in ["id=\"req-prev\"", "id=\"req-next\"", "id=\"req-page-info\""] {
         assert!(
             pager_html.contains(needle),
             "请求分页组须含 {needle:?}: {pager_html}"
+        );
+    }
+    for needle in ["id=\"req-apply\"", "id=\"req-live\""] {
+        assert!(
+            !pager_html.contains(needle),
+            "请求分页组不得含 {needle:?}: {pager_html}"
         );
     }
 }

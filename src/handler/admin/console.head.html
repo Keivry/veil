@@ -193,7 +193,8 @@
   .tb-pager { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; margin-left: auto; }
   /* 请求分区筛选组须在 >1100px 保持组内 nowrap：面板内宽 1280px 时 ≈936px、1101px 时 ≈757px。
      两个输入框 110px + 四个下拉 120px + 5 个 8px 间距 = 740px，在 1101px 处仍留 17px 余量。
-     动作按钮（筛选 / Live）移入分页组，不再计入筛选组 min-content。 */
+     动作按钮（筛选 / Live）独立成组，位于筛选组与分页组之间并保持左对齐，既不计入筛选组
+     min-content，也不会被分页组的 margin-left: auto 推到右侧。 */
   #sec-requests .tb-group:not(.tb-pager) input,
   #sec-requests .tb-group:not(.tb-pager) select { min-width: 0; }
   #sec-requests .tb-group:not(.tb-pager) input { width: 110px; }
@@ -558,9 +559,11 @@
                 <option value="200">每页 200</option>
               </select>
             </div>
-            <div class="tb-group tb-pager">
+            <div class="tb-group">
               <button id="req-apply">筛选</button>
               <button id="req-live" class="active">Live</button>
+            </div>
+            <div class="tb-group tb-pager">
               <button id="req-prev" disabled>上一页</button>
               <button id="req-next" disabled>下一页</button>
               <span class="pager-info" id="req-page-info">—</span>
