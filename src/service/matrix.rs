@@ -1,12 +1,12 @@
 //! 审批流转（Matrix pending/超时）+ Matrix Bot。
 //!
 //! - 白名单 MXID 精确匹配 + 发送者校验 + event id 精确匹配 + 幂等。
-//! - 超时：凭据 300s / 审计 90s（`AUDIT_TIMEOUT` 禁 110-130 沿用 config 校验，默认拒绝）。
+//! - 超时：凭据 300s / 审计 90s（`AUDIT_TIMEOUT_SECS` 禁 110-130 沿用 config 校验，默认拒绝）。
 //! - `_ask` 返回 None 即 rejected 并清理；孤儿 pending 60s 清扫 tokio 任务。
 //! - Bot 经 `reqwest` 长轮询 sync 实现，不引入 matrix-sdk 重依赖；建单分支为 注册/凭据/命令/吊销 +
 //!   ✅❎♾️ 映射 + 摘要脱敏无明文；`HashChange`/`Audit` 仅为 原因串分类标签，不建 Matrix 票。
 //!
-//! 接线：`AppState.approval` 持有本网关（白名单/`AUDIT_TIMEOUT` 来自 `Config`）；
+//! 接线：`AppState.approval` 持有本网关（白名单/`AUDIT_TIMEOUT_SECS` 来自 `Config`）；
 //! 凭据 handler 经 `service::record_pending` 建单——审批建单走 tracked 发送
 //! （`send_text_tracked` 取真实 event id，失败 fail-closed），事件环/通知走
 //! `notify_text` 有界 spool best-effort，两条路由有意分离；问询经

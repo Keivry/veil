@@ -86,7 +86,7 @@ impl HashChangeOutcome {
 /// 静默改成配置窗口。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AuthorizationTtl {
-    /// 未声明：落定时取 `[storage].authorization_ttl_secs`。
+    /// 未声明：落定时取 `[credential.authorization].ttl_secs`。
     #[default]
     Absent,
     /// 声明为无期限。

@@ -161,21 +161,6 @@ pub(crate) fn config_error(var: &str, message: &str) -> VeilError {
     }
 }
 
-pub(crate) fn parse_positive(
-    get: &dyn Fn(&str) -> Option<String>,
-    var: &str,
-    default: i64,
-) -> Result<i64> {
-    let raw = get(var)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string());
-    match raw.parse::<i64>() {
-        Ok(v) if v >= 1 => Ok(v),
-        Ok(_) => Err(config_error(var, &format!("{var} 必须 ≥1 正整数: {raw:?}"))),
-        Err(_) => Err(config_error(var, &format!("{var} 非法整数: {raw:?}"))),
-    }
-}
-
 pub(crate) fn parse_positive_u64(
     get: &dyn Fn(&str) -> Option<String>,
     var: &str,
@@ -206,29 +191,34 @@ pub(crate) fn parse_positive_usize(
     }
 }
 
-pub(crate) fn parse_audit_timeout(get: &dyn Fn(&str) -> Option<String>) -> Result<i64> {
-    let raw = get("AUDIT_TIMEOUT")
+/// 审计审批超时解析（`AUDIT_TIMEOUT_SECS`，`u64`）：`0` 与非法整数拒启动，
+/// `110-130` 竞态区间拒启动。
+pub(crate) fn parse_audit_timeout(get: &dyn Fn(&str) -> Option<String>) -> Result<u64> {
+    let raw = get("AUDIT_TIMEOUT_SECS")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| AUDIT_TIMEOUT_DEFAULT.to_string());
-    let timeout: i64 = raw
-        .parse()
-        .map_err(|_| config_error("AUDIT_TIMEOUT", &format!("AUDIT_TIMEOUT 非法整数: {raw:?}")))?;
-    if timeout < 1 {
+    let timeout_secs: u64 = raw.parse().map_err(|_| {
+        config_error(
+            "AUDIT_TIMEOUT_SECS",
+            &format!("AUDIT_TIMEOUT_SECS 非法整数: {raw:?}"),
+        )
+    })?;
+    if timeout_secs < 1 {
         return Err(config_error(
-            "AUDIT_TIMEOUT",
-            &format!("AUDIT_TIMEOUT 必须 ≥1s: {raw:?}"),
+            "AUDIT_TIMEOUT_SECS",
+            &format!("AUDIT_TIMEOUT_SECS 必须 ≥1s: {raw:?}"),
         ));
     }
-    if (AUDIT_TIMEOUT_RACE_MIN..=AUDIT_TIMEOUT_RACE_MAX).contains(&timeout) {
+    if (AUDIT_TIMEOUT_RACE_MIN..=AUDIT_TIMEOUT_RACE_MAX).contains(&timeout_secs) {
         return Err(config_error(
-            "AUDIT_TIMEOUT",
+            "AUDIT_TIMEOUT_SECS",
             &format!(
-                "AUDIT_TIMEOUT 不得落在 {AUDIT_TIMEOUT_RACE_MIN}-{AUDIT_TIMEOUT_RACE_MAX}s 竞态区间\
+                "AUDIT_TIMEOUT_SECS 不得落在 {AUDIT_TIMEOUT_RACE_MIN}-{AUDIT_TIMEOUT_RACE_MAX}s 竞态区间\
                 （上游约 120s 断连窗口）: {raw:?}，合法区间为 ≥1 且避开 110-130",
             ),
         ));
     }
-    Ok(timeout)
+    Ok(timeout_secs)
 }
 
 pub(crate) fn parse_whitelist(get: &dyn Fn(&str) -> Option<String>) -> Result<Vec<String>> {

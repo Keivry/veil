@@ -76,7 +76,7 @@ pub struct StreamPumpCtx {
     /// 与 `NonstreamCtx` 共享的请求级字段（单一装配点构造）。
     pub req: RequestCtx,
     pub hold_max: usize,
-    /// 审计 hold 缓冲帧数上限（配置 `[limits].audit_hold_max_frames` 快照）。
+    /// 审计 hold 缓冲帧数上限（配置 `[audit].hold_max_frames` 快照）。
     pub hold_max_frames: usize,
     /// SSE 硬上限（配置 `SSE_FRAME_HARD_BYTES` 快照，默认 8MiB）：
     /// setup 经 [`crate::service::sse::SseParser::with_hard_bytes`] 注入解析器。

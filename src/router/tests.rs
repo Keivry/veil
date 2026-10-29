@@ -550,7 +550,7 @@ async fn normalize_enabled_sets_declared_header() {
     let (upstream, uhandle) = mock_upstream_echo(seen.clone()).await;
     let app = test_app(&[
         ("LLM_UPSTREAM", upstream.as_str()),
-        ("NORMALIZE_JSON_WHITESPACE", "1"),
+        ("PII_NORMALIZE_JSON_WHITESPACE", "1"),
     ]);
     let (base, handle) = serve_and_client(app).await;
     let client = reqwest::Client::new();

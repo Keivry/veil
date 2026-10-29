@@ -70,13 +70,13 @@ fn toml_escape(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
-/// 最小 TOML：`[storage].data_dir` 恒有；`[auth]` 仅在 `auth` 非空时写出。
-fn config_toml(data_dir: &Path, auth: &[(&str, &str)]) -> String {
+/// 最小 TOML：`[storage].data_dir` 恒有；`[matrix]` 仅在 `matrix` 非空时写出。
+fn config_toml(data_dir: &Path, matrix: &[(&str, &str)]) -> String {
     let mut out = String::from("[storage]\n");
     out.push_str(&format!("data_dir = \"{}\"\n", toml_escape(data_dir)));
-    if !auth.is_empty() {
-        out.push_str("\n[auth]\n");
-        for (key, value) in auth {
+    if !matrix.is_empty() {
+        out.push_str("\n[matrix]\n");
+        for (key, value) in matrix {
             out.push_str(&format!("{key} = \"{value}\"\n"));
         }
     }
@@ -127,7 +127,8 @@ fn assert_started_or_port_conflict(stderr: &str, started: bool) {
     }
 }
 
-/// 已迁移的致命 env 被忽略：进程不因它们拒启动，且出现指名告警。
+/// 已迁移的致命 env 被忽略：进程不因它们拒启动；迁移清单内的名字告警，
+/// 0.2.0 改名前的旧名（自本版起无任何告警）完全静默。
 #[test]
 fn migrated_fatal_env_ignored_and_warns() {
     let _guard = serial_lock();
@@ -146,22 +147,25 @@ fn migrated_fatal_env_ignored_and_warns() {
         .env("AUDIT_MODE", "bogus");
     let (stderr, started) = run_and_collect(cmd, Duration::from_secs(2));
 
-    // 决定性否定：若仍读取，`AUDIT_TIMEOUT=120` 落 110-130 禁区拒启动、
+    // 决定性否定：若仍读取，审计超时落在 110-130 禁区会拒启动、
     // `AUDIT_MODE=bogus` 解析失败。
     assert!(
-        !stderr.contains("AUDIT_TIMEOUT 不得落在"),
-        "AUDIT_TIMEOUT 仍被读取（应已迁移）: {stderr}"
+        !stderr.contains("不得落在"),
+        "审计超时旧名仍被读取（应已迁移）: {stderr}"
     );
     assert!(
         !stderr.contains("AUDIT_MODE 非法"),
         "AUDIT_MODE 仍被读取（应已迁移）: {stderr}"
     );
-    for needle in ["AUDIT_TIMEOUT", "AUDIT_MODE", "VEIL_CONFIG_FILE"] {
-        assert!(
-            stderr.contains(needle),
-            "stderr 须含迁移告警与 VEIL_CONFIG_FILE 指引，缺 {needle}: {stderr}"
-        );
-    }
+    // 迁移清单名（AUDIT_MODE）仍告警；改名旧名已无任何提示。
+    assert!(
+        stderr.contains("AUDIT_MODE") && stderr.contains("VEIL_CONFIG_FILE"),
+        "stderr 须含迁移告警与 VEIL_CONFIG_FILE 指引: {stderr}"
+    );
+    assert!(
+        !stderr.contains("AUDIT_TIMEOUT"),
+        "改名旧名置位不得产生任何提示: {stderr}"
+    );
     assert_started_or_port_conflict(&stderr, started);
 }
 

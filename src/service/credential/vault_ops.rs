@@ -722,13 +722,13 @@ pub async fn approve_hash_change(
     new_hash: &str,
     outcome: HashChangeOutcome,
 ) -> Result<RegistrationView> {
-    if state.config().entry_mode == EntryMode::LlmOnly {
+    if state.config().surface_mode == EntryMode::LlmOnly {
         tracing::warn!(
-            "llm-only 纯代理入口（{:?}）配 approve：凭据面不可用，已降级为阻断",
-            state.config().entry_mode
+            "llm_only 纯代理入口（{:?}）配 approve：凭据面不可用，已降级为阻断",
+            state.config().surface_mode
         );
         return Err(VeilError::Auth {
-            message: "llm-only 入口 approve 已降级为阻断".to_string(),
+            message: "llm_only 入口 approve 已降级为阻断".to_string(),
         });
     }
     if key.is_empty() || new_hash.is_empty() {

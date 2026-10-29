@@ -551,7 +551,7 @@ fn tokens_per_sec_is_none_without_measurable_window() {
 
 #[test]
 fn llm_only_filter_excludes_non_chat_rows() {
-    let log = RequestLog::new(temp_db("llm-only"), true, 0);
+    let log = RequestLog::new(temp_db("llm_only"), true, 0);
     let now = now_secs();
     log.record(row_at(now, "chat-model", true));
     let mut passthrough = row_at(now - 1, "passthrough-model", false);

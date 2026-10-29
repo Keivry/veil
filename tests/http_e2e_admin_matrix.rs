@@ -1,5 +1,5 @@
 //! 管理面鉴权全矩阵：优先级 header > Cookie > query（仅 SSE）、
-//! 非 SSE 带 query 恒 401、token 环境独立性、OBSERVABILITY_DISABLE=1 全 404。
+//! 非 SSE 带 query 恒 401、token 环境独立性、ADMIN_ENABLED=0（正向开关关闭）全 404。
 //! 每个用例独立建 app（sqlite 隔离 + 限流器隔离），经真 HTTP 回环，无外网依赖。
 
 use {
@@ -237,12 +237,12 @@ async fn b1_env_token_independent_of_admin_token_file() {
     std::fs::remove_dir_all(&dir_empty).ok();
 }
 
-// OBSERVABILITY_DISABLE=1 时管理面全 404，与 token 有效性无关。
+// ADMIN_ENABLED=0（正向开关显式关闭）
 // 门控 404 复用 `with_security_headers`，authed/anon 均须含
 // `cache-control: no-store`。
 #[tokio::test]
 async fn b1_disable_all_admin_404_regardless_of_token() {
-    let (base, handle) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", "1")])).await;
+    let (base, handle) = serve(test_app_router(&[("ADMIN_ENABLED", "0")])).await;
     let client = reqwest::Client::new();
     for path in ["/_admin/metrics", "/_admin/events/stream", "/_admin/health"] {
         let authed = client
@@ -280,11 +280,11 @@ async fn b1_disable_all_admin_404_regardless_of_token() {
     handle.abort();
 }
 
-// OBSERVABILITY_DISABLE=1 的门控 404 五项安全头齐全，
+// ADMIN_ENABLED=0 的门控 404 五项安全头齐全，
 // 非 `/_admin` 路径不受该分支影响。
 #[tokio::test]
 async fn admin_gate_404_security_headers() {
-    let (base, handle) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", "1")])).await;
+    let (base, handle) = serve(test_app_router(&[("ADMIN_ENABLED", "0")])).await;
     let client = reqwest::Client::new();
     for path in ["/_admin/metrics", "/_admin/events/stream", "/_admin/health"] {
         for authed in [true, false] {
@@ -317,7 +317,7 @@ async fn admin_gate_404_security_headers() {
     handle.abort();
 }
 
-// 取消置位后恢复正常鉴权；值非 1 时不触发全 404。
+// 取消置位后恢复正常鉴权；非假值（1/true/yes/2）不关闭管理面。
 #[tokio::test]
 async fn b1_disable_off_recovers_and_non_one_no_effect() {
     let (base, handle) = serve(test_app_router(&[])).await;
@@ -330,8 +330,8 @@ async fn b1_disable_off_recovers_and_non_one_no_effect() {
         .unwrap();
     assert_eq!(ok.status().as_u16(), 200);
     handle.abort();
-    for value in ["true", "yes", "0", "2"] {
-        let (base_v, handle_v) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", value)])).await;
+    for value in ["true", "yes", "1", "2"] {
+        let (base_v, handle_v) = serve(test_app_router(&[("ADMIN_ENABLED", value)])).await;
         let resp = client
             .get(format!("{base_v}/_admin/metrics"))
             .header("X-Admin-Token", ADMIN_TOKEN)

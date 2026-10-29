@@ -15,7 +15,7 @@
   前置：上述 venv、Go 工具链、`cargo build --bin veil`；无 TPM 硬件时脚本内建 Mock TPM 回退
   （`VEIL_ALLOW_MOCK_TPM=1`，仅开发/CI）。
   就地依赖两项（无需外部服务）：脚本内置**本地 Matrix stub**（`whoami`/`sync`/发送三端点，
-  随机回环端口）并把临时 TOML 的 `[auth].homeserver` 指过去，使转审 `202 + E_PENDING` 建单路径
+  随机回环端口）并把临时 TOML 的 `[matrix].homeserver` 指过去，使转审 `202 + E_PENDING` 建单路径
   可端到端验证；另按 Go wrapper 的**真实 sha256** 预置调用方注册表（取用相须命中已启用调用方，
   未 enrolled 会转审批而非直接返凭据；注册表完整性 `sha256` 按 `BTreeMap` 键序重建）。
 - `gate.sh` — 发布/CI 统一门禁：串联

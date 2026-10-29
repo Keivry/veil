@@ -1149,7 +1149,7 @@
   var REQ_EMPTY_COLS = 12;
   // 与服务端 `request_log::MAX_OFFSET` 一致：超出即 400，故不发出该页请求。
   var REQ_MAX_OFFSET = 10000;
-  var REQ_OFF_DISABLED = '逐请求记录已关闭（[storage].request_log_enabled = false）';
+  var REQ_OFF_DISABLED = '逐请求记录已关闭（[request_log].enabled = false）';
   var REQ_EMPTY_RANGE = '当前范围内无请求';
   var REQ_NEXT_LIMIT = '已到最后可翻页位置（offset 上限 ' + REQ_MAX_OFFSET + '）';
 

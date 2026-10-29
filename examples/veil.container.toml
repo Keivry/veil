@@ -4,150 +4,226 @@
 #   export VEIL_CONFIG_FILE=/etc/veil/veil.toml
 # 优先级：白名单 env 显式 > 本文件 > 内建默认。
 # 白名单概念只要对应环境变量非空（trim 后），恒以 env 为准，本文件不覆盖；两处皆缺时取内建默认。
-# 白名单外的概念（脱敏/PII 作用域/审计/限额/入口/存储/LLM 上游等）只由本文件承载，恒为「本文件 > 内建默认」。
+# 白名单外的概念（脱敏/PII 作用域/审计/凭据/请求日志/存储/LLM 上游等）只由本文件承载，恒为「本文件 > 内建默认」。
 # 未设置 VEIL_CONFIG_FILE 时不读盘，生效配置为「白名单 env + 内建默认」基线。
 #
 # fail-closed：文件缺失/不可读/超过 1MB/TOML 语法错误/未知键/类型错误/取值越界，
 # 一律拒绝启动；空文件合法（等价于无文件覆盖）。
 #
-# 密钥类键（matrix_access_token、observability_admin_token、veilctl_secret、
-# veilctl_binary_hash、value_sample_hmac_key）一旦写入本文件，Unix 下文件权限必须收窄到
-# 0600（mode & 0o077 == 0），否则拒绝启动；env 覆盖不豁免该门禁（密钥文本已落盘）。
-# 本示例不声明任何密钥类键，保持入库权限 0644 也可直接加载；密钥建议继续走 env 注入。
+# 严格键面：本示例只使用 0.2.0 的规范键名与规范枚举拼写。0.1.x 的旧分节
+# （auth / limits / keepass）与旧键名已随兼容层移除，出现即按未知键拒启动。
+#
+# 密钥类键（matrix.access_token、admin.token、storage.veilctl_secret、
+# storage.veilctl_binary_hash、redaction.value_sample_hmac_key）一旦写入本文件，Unix 下
+# 文件权限必须收窄到 0600（mode & 0o077 == 0），否则拒绝启动；env 覆盖不豁免该门禁
+# （密钥文本已落盘）。本示例不声明任何密钥类键，保持入库权限 0644 也可直接加载；
+# 密钥建议继续走 env 注入。
 
-[auth]
-homeserver = "https://matrix.example.com"
-room_id = "!room:example.com"
-observability_disable = false
-# 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
-# matrix_access_token = "syt_..."
-# observability_admin_token = "至少 32 字符的随机串"
-
+# ── 监听与暴露面 ──
 [server]
-# 监听地址（文件专属部署参数；必须为 IP:PORT 字面量，不接受主机名）
-# 容器内必须 0.0.0.0，否则 DNAT 投递不到回环监听；宿主机侧仍由 compose 发布到 127.0.0.1
-bind = "0.0.0.0:8877"
+# 主监听地址（文件专属部署参数；必须为 IP:PORT 字面量，不接受主机名）。
+# 容器内必须 0.0.0.0，否则 bridge 网络的 DNAT 投递不到回环监听；宿主机侧仍由 compose 发布到 127.0.0.1。
+listen_addr = "0.0.0.0:8877"
+# 暴露面模式：full（默认，凭据 API + 管理面 + LLM 代理）| llm_only（纯代理，凭据面不可用）。
+# 只接受 full / llm_only；其它拼写（含 0.1.x 的连字符写法）拒启动。
+# 注意：本键不改变任何审批口径——allow_mode = "pending" 的条目在任一取值下都每次建票；
+#       需要自动放行请在条目上显式声明 allow_mode = "allow"。
+surface_mode = "full"
 
-[limits]
-audit_hold_max_bytes = 1048576
-# 审计 hold 暂存 tool 帧数上限（默认 65536）：与字节上限并行的独立维度，
-# 单次大 tool 调用按 token 分片可达数千帧，不得由字节预算隐式约束
-audit_hold_max_frames = 65536
-nonstream_max_bytes = 8388608
-# SSE 单行/单事件硬上限（字节，默认 8388608 = 8MiB；超限 fail-closed）
-# sse_frame_hard_bytes = 8388608
+# ── 管理面（正向开关） ──
+[admin]
+# true 才挂载 /_admin*；缺省 true。极性写成正向：false = 关闭管理面（/_admin 全 404）。
+# 对应 env 名 ADMIN_ENABLED（正向开关：true 才启用；缺 token 时管理面不可用）。
+enabled = true
+# /_admin 鉴权 token（密钥类）：空则管理面不启用。写入本文件须 chmod 600，或继续走 env 注入。
+# token = "至少 32 字符的随机串"
 
+# ── Matrix 部署参数（空则审批/同步关闭，不拒启动） ──
+[matrix]
+# Matrix homeserver URL（如 https://matrix.example.com）；缺失即关闭审批/同步。
+homeserver = "https://matrix.example.com"
+# 审批房间 id（形如 !room:example.com）；缺失即关闭审批/同步。
+room_id = "!room:example.com"
+# Matrix Bot access token（密钥类）：缺省即关闭 Matrix 通知/审批。
+# 写入本文件须 chmod 600，或继续走 env 注入（MATRIX_ACCESS_TOKEN）。
+# access_token = "syt_..."
+
+# ── 审计 ──
 [audit]
 mode = "off"          # off | block | approve；approve 必须配 approval_whitelist
-timeout = 90          # 秒；禁止落在 110-130 竞态区间
+timeout_secs = 90     # 审批等待秒数（u64，须 ≥1）；禁止落在 110-130 竞态区间
+# 审批人 MXID 列表（精确匹配）；空白名单＝房间内任意成员可审批，生产必须显式配置。
 # approval_whitelist = ["@admin:example.com"]
-# policy_file = "/etc/veil/audit-policy.yaml"   # 其 mode 低于本文件 [audit].mode
+# 外部审计策略文件路径；其 mode 低于本文件 [audit].mode。
+# policy_file = "/etc/veil/audit-policy.yaml"
+# 审计 hold 暂存**载荷字节**上限（u64，须 ≥1，缺省 1048576 = 1MiB）。
+hold_max_bytes = 1048576
+# 审计 hold 暂存 **tool 帧数**上限（u64，须 ≥1，缺省 65536）。
+# 与字节上限是**两个相互独立的维度**：单次大 tool 调用按 token 分片可达数千帧（每帧仅数字节），
+# 只按字节记账会让帧数维度先行触顶；帧数预算不得由字节预算隐式推导。
+hold_max_frames = 65536
 
-[storage]
-data_dir = "/data"                  # 派生 db_dir / tpm_dir / caller_registry_path
-# db_dir = "/data/db"
-# tpm_dir = "/data/tpm"
-# caller_registry_path = "/data/caller_registry.json"
-auto_approve = "pending"            # allow | deny | pending
-entry_mode = "full"                 # full | llm-only（credential-only 已废弃，等价于 full）
-# 注意：entry_mode 不改变任何审批口径——allow_mode = "pending" 的条目在任一取值下
-#       都每次建票；需要自动放行请在条目上显式声明 allow_mode = "allow"。
-#       llm-only 使凭据面不可用（取用返回鉴权失败）。示例给最不意外的 full。
-authorization_ttl_secs = 0           # 授权窗口（秒）；0 = 无期限（缺省，行为同升级前）
+# ── 凭据 ──
+[credential]
+# 未声明 allow_mode 的条目取用时的缺省裁决：allow（放行）| deny（拒绝）| pending（转 Matrix 审批）。
+default_decision = "pending"
+# 凭据库后端：real（缺省）| mock（仅 CI 逃生，生产禁用）。
+vault_backend = "real"
+
+[credential.approval]
+# true 时取用阻塞至审批终态（超时口径固定 300s）；false = 202 建单即返回（缺省）。
+block_wait = false
+
+[credential.authorization]
+# 授权窗口秒数；0 = 无期限（缺省，行为同升级前）。
 # 非 0 时授权到期即转审批（建票 + 阻塞至 300s 超时），无人值守脚本必须配置审批人；
 # 每次到期或续期都会写一次注册表。设过小（<60）会在启动期 warn。
-credential_block_wait = false
-# 请求日志（文件专属，无 env 对应源）：逐请求落 metrics.sqlite 的 llm_requests 表
-# request_log_enabled = true        # 缺省 true
-# request_log_retention_days = 7    # 缺省 7 天；0 = 不清理
-# 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
-# veilctl_secret = "..."
-# veilctl_binary_hash = "..."
+ttl_secs = 0
 
+# ── 请求日志（逐请求落 metrics.sqlite 的 llm_requests 表） ──
+[request_log]
+enabled = true          # 请求记录总开关（缺省 true）
+retention_days = 7      # 保留天数（u64，缺省 7）；0 = 不清理
+
+# ── 存储：只留路径与部署密钥 ──
+[storage]
+data_dir = "/data"                  # 派生 db_dir / tpm_dir / caller_registry_path
+# db_dir = "/data/db"               # .kdbx 库目录（缺省 <data_dir>/db）
+# tpm_dir = "/data/tpm"             # TPM 密封目录（缺省 <data_dir>/tpm）
+# caller_registry_path = "/data/caller_registry.json"  # 调用方注册表（缺省 <data_dir>/caller_registry.json）
+# 密钥类 - 写入本文件须 chmod 600，或继续走 env 注入
+# veilctl_secret = "..."            # 三因子之部署密钥
+# veilctl_binary_hash = "..."       # 直调哈希门禁
+
+# ── 脱敏 ──
 [redaction]
+# 脱敏总开关：false 时请求体原样透传（仅保留占位符还原能力）。
 enabled = true
+# 残缺/宽松形态占位符按序号回查请求表还原（默认 false = 仅严格形态还原）。
 fuzzy_restore = false
+# 检测强化：对内置规则做严格边界复核，丢弃 ASCII 粘连与前导零 IPv4（默认 true）。
 detection_hardening = true
-# custom_rules_file = "/etc/veil/pii-rules.json"      # 缺文件/解析失败拒启动
+# 自定义正则规则文件：JSON / YAML / TXT 三种格式均支持（缺文件/解析失败拒启动）。
+# 格式样例见 examples/pii-custom.yaml。
+# custom_rules_file = "/etc/veil/pii-rules.json"
 # custom_patterns_file = "/etc/veil/pii-patterns.json"
 # custom_dict_file = "/etc/veil/pii-dict.txt"
+# 值级采样总开关（默认 false = 不采样；热重载不支持）。
 value_sample_enabled = false
+# 值级采样是否落盘（默认 true；无 HMAC key 时会话列留空）。
 value_sample_persist = true
 # value_sample_hmac_key = "..."        # 密钥类 - 写入本文件须 chmod 600
 placeholder_prompt = true
 # placeholder_prompt_text = "请原样保留 __PII_*__ 占位符"
 normalize_json_whitespace = false
 
+# ── PII 会话作用域 ──
 [pii_scope]
-mode = "request"                     # request | conversation
+# request（缺省，逐请求隔离）| conversation（启用有界的会话级 PII 关联）。
+mode = "request"
+# 会话条目空闲 TTL 秒数（u64，须 ≥1）；0 会拒绝启动。
 ttl_secs = 3600
+# 会话条目数上限（≥1）。
 max_conversations = 1024
-key_header = "x-veil-conversation-id"   # 最高优先；其后内置回退链：
-                                    # x-opencode-session -> x-opencode-session-id ->
-                                    # x-opencode-parent-session-id -> x-session-affinity -> x-session-id
-# prev_id_max_entries = 1024          # 缺省联动 max_conversations 生效值
+# 会话键请求头名（最高优先）；保留鉴权/传输头名拒启动。其后内置回退链：
+# x-opencode-session -> x-opencode-session-id ->
+# x-opencode-parent-session-id -> x-session-affinity -> x-session-id
+key_header = "x-veil-conversation-id"
+# previous_response_id 映射上限（≥1）；缺省联动 max_conversations 生效值。
+# prev_id_max_entries = 1024
 
+# ── LLM 网关 ──
 [llm]
+# 缺省上游 URL：未命中任何端口专用上游时的回退目标。
 default_upstream = "http://127.0.0.1:11434"
+# 上游请求超时秒数（u64，须 ≥1，缺省 30）。
 timeout_secs = 30
+# 每上游空闲连接上限（usize，须 ≥1，缺省 16）。
 pool_max_idle_per_host = 16
+# 空闲连接回收秒数（u64，须 ≥1，缺省 90）。
 pool_idle_timeout_secs = 90
+# 非流对话响应体上限（u64，须 ≥1，缺省 8388608 = 8MiB；软限，严格超限返回 502）。
+nonstream_max_bytes = 8388608
+# SSE 单帧/单行**硬上限**（u64，须 ≥1，缺省 8388608 = 8MiB）；超限 fail-closed，
+# 按协议合成终止帧，不下发半截 JSON。与 1MiB 软限（仅记观测指标、帧仍完整交付）分属两级。
+# sse_frame_hard_bytes = 8388608
 
-# 每个端口键各开一条专用 TCP 监听（绑定地址 = [server].bind 的 IP + 该端口），
+# 每个端口键各开一条专用 TCP 监听（绑定地址 = [server].listen_addr 的 IP + 该端口），
 # 客户端连哪个端口就选哪条上游：多个客户端指向同一上游 URL 也能按接入端口区分。
 # 未声明端口（如主监听 8877）上的请求仍按 Host 头端口选路，旧部署映射不受影响。
 [llm.upstreams]
+# 入口端口 8878 → 该端口的专用上游 URL。
 "8878" = "http://127.0.0.1:11434"
+# 入口端口 8879 → 该端口的专用上游 URL（示例里指向第二台上游）。
 "8879" = "http://127.0.0.1:11435"
 
 # 上游请求覆盖（文件专属，无 env 对应源）：目标键为入口端口（须有对应上游）或保留键 default（须有缺省上游）。
-# 目标级 override 布尔（缺省 true）：true = 配置恒胜客户端同名头/同键参数；false = 合并模式（headers 与
-# params 的 default/override 两段均仅补缺，客户端已有值保留；drop 不受开关影响）。
+# 目标级 override_existing 布尔（缺省 true）：true = 配置恒胜客户端同名头/同键参数；false = 合并模式
+# （headers 与 params 的 default/override 两段均仅补缺，客户端已有值保留；drop 不受开关影响）。
 # 出站头在保留头剔除/逐跳过滤之后注入；硬拒 host、content-length、content-encoding、accept-encoding、
 # transfer-encoding、逐跳头、x-veil-* 前缀、authorization、x-api-key、api-key、cookie；头值禁 CR/LF，归一重复头名拒启动。
 # params 仅对话协议生效，按 chat | anthropic | responses 分表，每协议三段：
 # default（缺则补）→ override（恒写）→ drop（删顶层键，缺失静默）；
 # 保留键 model/stream/messages/input/instructions/system/stream_options 任一段出现即拒启动。
 # NonDialog 字节透传与 count_tokens（redact-only）仅注入头、忽略 params（各记一次 warn）；参数值为配置原文。
+# 端口 8878 目标：给该入口补一个静态协议版本头与一个特性标记头。
 [llm.targets."8878".headers]
+# Anthropic 协议版本头（静态值，恒按目标级 override_existing 语义注入）。
 anthropic-version = "2023-06-01"
+# 自定义特性标记头，便于上游区分是哪条入口进来的请求。
 x-upstream-feature = "port-8878"
 
+# 端口 8878 的 chat 协议参数三段（default 缺则补 → override 恒写 → drop 删顶层键）。
 [llm.targets."8878".params.chat]
+# 缺则补：请求体没有 temperature 时写入 0.7。
 default = { temperature = 0.7 }
+# 恒写：请求体已有 top_p 时也改为 0.9（合并模式下降级为缺则补）。
 override = { top_p = 0.9 }
+# 删除：移除顶层 presence_penalty（不存在时静默）。
 drop = ["presence_penalty"]
 
+# 端口 8878 的 anthropic 协议参数：恒写 max_tokens。
 [llm.targets."8878".params.anthropic]
+# 恒写：max_tokens 一律改为 1024。
 override = { max_tokens = 1024 }
 
+# 端口 8878 的 responses 协议参数：删掉 store 顶层键。
 [llm.targets."8878".params.responses]
+# 删除：移除顶层 store。
 drop = ["store"]
 
-# 合并模式示例：仅补缺，客户端显式给定的头/参数优先
+# 合并模式示例：仅补缺，客户端显式给定的头/参数优先。
+# 注意目标级布尔键名为 override_existing；协议段内的 params.<proto>.override 是**参数表**，
+# 两者旧版同名会歧义，本版已把布尔键改名，故可在同一目标下共存。
 [llm.targets.default]
-override = false
+# 目标级冲突策略：false = 合并模式（客户端已有值恒保留，仅补缺；drop 不受影响）。
+override_existing = false
+# 仅在客户端未发送该头时新增（合并模式下同语义）。
 headers = { x-upstream-feature = "default" }
+# 合并模式下的协议段覆盖表：客户端缺 temperature 时才补 1.0。
 params.chat.override = { temperature = 1.0 }
 
 # opencode zen/go 兼容示例（双场景共用一套配置）：
-# - opencode CLI 经 veil 接入：override = false 保留其动态身份头（x-opencode-session/request）；
+# - opencode CLI 经 veil 接入：override_existing = false 保留其动态身份头（x-opencode-session/request）；
 # - 缺 x-opencode-session 的客户端：以 veil 会话键头动态补齐——客户端携带会话键头（默认
 #   x-veil-conversation-id）时展开其首值为该头；未携带时该条跳过不注入（不伪造会话键）；
 # - 第三方客户端伪装 opencode：user_agent 恒胜替换客户端 UA，x-opencode-* 缺项补齐。
-# UA 版本串请取实际安装版本（如 opencode/1.18.33），与服务端指标口径一致。
 [llm.targets."8879"]
-override = false
+# 目标级冲突策略：false = 合并模式（保留 opencode CLI 的动态身份头）。
+override_existing = false
+# UA 版本串取实际安装版本（如 opencode/1.18.33），便于上游识别客户端（metrics 不读取该值）。
 user_agent = "opencode/1.18.33"
+# 缺项补齐：静态客户端标记头 + `$conversation` 动态展开的会话头（未携带会话键头时跳过）。
 headers = { x-opencode-client = "cli", x-opencode-session = "$conversation" }
-
-[keepass]
-backend = "real"                     # real | mock（mock 仅 CI 逃生，生产禁用）
 
 # ── 下游命令执行（文件专属；enabled = false 时端点 404、零行为差异）──
 [command]
+# 下游命令执行总开关：false（缺省）时 /commands 相关端点全 404，其余行为不变。
 enabled = false
-block_wait = false            # true 时调用阻塞至审批终态
+
+[command.approval]
+# true 时命令调用阻塞至审批终态（超时口径固定 300s）；缺省 false = 202 建单即返回。
+block_wait = false
 
 # 命令定义示例（取消注释并按需修改）：
 # [command.hosts.api]

@@ -167,9 +167,9 @@ async fn auto_approve_none_turns_to_202() {
 }
 
 #[tokio::test]
-async fn credential_only_entry_approve_allowed_as_full() {
-    // credential-only 已等价于 full：approve 不再被阻断。
-    let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
+async fn full_entry_approve_allowed() {
+    // full 入口下 approve 不被入口模式阻断。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "full")]);
     let state = cred_state(&env);
     register_caller(&state, "/s/a.sh", "h1", "test-src")
         .await
@@ -181,7 +181,7 @@ async fn credential_only_entry_approve_allowed_as_full() {
         crate::registry::HashChangeOutcome::ApproveAlways,
     )
     .await
-    .expect("credential-only 下 approve 须与 full 同效，不得被入口模式阻断");
+    .expect("full 下 approve 不得被入口模式阻断");
     assert_eq!(
         view.status, "⏳",
         "须进入待审批流转（与 full 同效），而非被入口模式拒绝"
@@ -190,8 +190,8 @@ async fn credential_only_entry_approve_allowed_as_full() {
 
 #[tokio::test]
 async fn llm_only_entry_approve_blocked_forbidden() {
-    // llm-only 凭据面整体不可用，approve 仍须阻断。
-    let env = cred_env(&[("VEIL_ENTRY_MODE", "llm-only")]);
+    // llm_only 凭据面整体不可用，approve 仍须阻断。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "llm_only")]);
     let state = cred_state(&env);
     register_caller(&state, "/s/a.sh", "h1", "test-src")
         .await
@@ -288,7 +288,7 @@ async fn approval_ticket_uses_matrix_gateway_with_split_timeouts() {
 #[tokio::test]
 async fn audit_ask_uses_audit_timeout() {
     let mut env = cred_env(&[]);
-    env.insert("AUDIT_TIMEOUT".to_string(), "1".to_string());
+    env.insert("AUDIT_TIMEOUT_SECS".to_string(), "1".to_string());
     let state = cred_state(&env);
     assert_eq!(
         state.approval.audit_timeout(),

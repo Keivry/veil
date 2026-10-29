@@ -68,7 +68,7 @@ fn auth_config_file(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let path = dir.join("veil.toml");
     std::fs::write(
         &path,
-        "[auth]\nhomeserver = \"https://matrix.example.com\"\nroom_id = \"!room:example.com\"\n",
+        "[matrix]\nhomeserver = \"https://matrix.example.com\"\nroom_id = \"!room:example.com\"\n",
     )
     .expect("写临时认证文件");
     (path, dir)
@@ -271,6 +271,60 @@ fn legacy_set_warns_with_description() {
     );
 }
 
+/// 0.2.0 改名的 4 个旧名：不在读取集合（迁移清单 / 白名单），置位不产生任何告警。
+const RENAMED_OLD_NAMES: [&str; 4] = [
+    "AUDIT_TIMEOUT",
+    "NORMALIZE_JSON_WHITESPACE",
+    "PII_PREV_ID_MAX_ENTRIES",
+    "OBSERVABILITY_DISABLE",
+];
+
+/// 对应的规范名（仍在迁移清单内，作为对照锚点）。
+const RENAMED_NEW_NAMES: [&str; 4] = [
+    "AUDIT_TIMEOUT_SECS",
+    "PII_NORMALIZE_JSON_WHITESPACE",
+    "PII_SCOPE_PREV_ID_MAX_ENTRIES",
+    "ADMIN_ENABLED",
+];
+
+#[test]
+fn renamed_env_names_are_absent_and_silent() {
+    let migrated: std::collections::BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
+    let whitelist: std::collections::BTreeSet<&str> =
+        CONFIG_ENV_WHITELIST.iter().copied().collect();
+    for (old, new) in RENAMED_OLD_NAMES.into_iter().zip(RENAMED_NEW_NAMES) {
+        assert!(
+            !migrated.contains(old) && !whitelist.contains(old),
+            "旧名 {old} 不得出现在迁移清单或白名单中"
+        );
+        assert!(
+            migrated.contains(new),
+            "规范名 {new} 须在迁移清单中（旧名移除不改变读取集合）"
+        );
+    }
+
+    // 仅置位这四个旧名：告警函数不得产出任何指名它们（或「已改名」）的消息。
+    let mut map: HashMap<String, String> = HashMap::new();
+    for old in RENAMED_OLD_NAMES {
+        map.insert(old.to_string(), "1".to_string());
+    }
+    let messages = capture_events(|| warn_migrated_and_legacy(&map));
+    assert!(
+        messages.is_empty(),
+        "四个旧名置位不得产生任何告警: {messages:?}"
+    );
+    for old in RENAMED_OLD_NAMES {
+        assert!(
+            !messages.iter().any(|m| m.contains(old)),
+            "不得再指名旧名 {old}: {messages:?}"
+        );
+    }
+
+    // 旧名也不属白名单，进程 env 路径上被 `filter_process_env` 剔除。
+    let filtered = filter_process_env(map);
+    assert!(filtered.is_empty(), "旧名须被 `filter_process_env` 剔除");
+}
+
 /// 告警函数签名返回 `()`，结构上不存在 `Err` 路径；空 map 亦不 panic。
 #[test]
 fn warn_function_never_errors() {
@@ -309,12 +363,12 @@ fn from_env_map_filters_migrated_then_builtin_default() {
         auth.to_string_lossy().into_owned(),
     );
     map.insert("REDACTION_ENABLED".to_string(), "0".to_string());
-    map.insert("AUDIT_TIMEOUT".to_string(), "120".to_string());
+    map.insert(RENAMED_OLD_NAMES[0].to_string(), "120".to_string());
     let cfg = crate::config::Config::from_env_map(map).expect("迁移键不得拒启动（早已被过滤）");
     assert!(cfg.redaction_enabled, "迁移键 REDACTION_ENABLED 不得再生效");
     assert_eq!(
         cfg.audit_timeout_secs, 90,
-        "迁移键 AUDIT_TIMEOUT 不得再生效"
+        "改名旧名置位不得生效（不读取、也不告警）"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -365,7 +419,7 @@ fn from_env_map_applies_config_file_after_filter() {
     let path = dir.join("veil.toml");
     std::fs::write(
         &path,
-        "[auth]\nhomeserver = \"https://matrix.example.com\"\nroom_id = \"!room:example.com\"\n\n\
+        "[matrix]\nhomeserver = \"https://matrix.example.com\"\nroom_id = \"!room:example.com\"\n\n\
          [redaction]\nenabled = false\n",
     )
     .expect("写临时文件");

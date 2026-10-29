@@ -4,12 +4,12 @@
 //! 会话级 PII 共享。合法值以外的取值 fail-closed 拒启动，不静默回退。
 
 use {
-    super::super::validate::{parse_positive, parse_positive_usize},
+    super::super::validate::{parse_positive_u64, parse_positive_usize},
     crate::error::{Result, VeilError},
 };
 
 /// `PII_SCOPE_TTL_SECS` 默认值（秒，30 分钟空闲 TTL）。
-pub const PII_SCOPE_TTL_SECS_DEFAULT: i64 = 1800;
+pub const PII_SCOPE_TTL_SECS_DEFAULT: u64 = 1800;
 /// `PII_SCOPE_MAX_CONVERSATIONS` 默认值（会话条目上限）。
 pub const PII_SCOPE_MAX_CONVERSATIONS_DEFAULT: usize = 1024;
 /// `PII_SCOPE_KEY_HEADER` 默认头名（属 `x-veil-*` 内部命名空间，转发前剔除）。
@@ -45,7 +45,7 @@ impl std::str::FromStr for PiiScopeMode {
 /// PII 作用域域解析产物（`Config` 字段的装配输入）。
 pub struct PiiScopeParts {
     pub mode: PiiScopeMode,
-    pub ttl_secs: i64,
+    pub ttl_secs: u64,
     pub max_conversations: usize,
     pub key_header: String,
     pub prev_id_max_entries: usize,
@@ -72,7 +72,7 @@ fn is_reserved_key_header(name: &str) -> bool {
 }
 
 /// 解析 `PII_SCOPE_*`：模式非法与 TTL/上限非正整数一律拒启动并指明变量；
-/// 保留会话键头名拒启动。`PII_PREV_ID_MAX_ENTRIES` 未设置时取
+/// 保留会话键头名拒启动。`PII_SCOPE_PREV_ID_MAX_ENTRIES` 未设置时取
 /// `PII_SCOPE_MAX_CONVERSATIONS` 的**生效值**（配置相关默认，非钉死 1024）。
 pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
     let mode = match get("PII_SCOPE_MODE").filter(|v| !v.is_empty()) {
@@ -82,7 +82,7 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
         })?,
         None => PiiScopeMode::Request,
     };
-    let ttl_secs = parse_positive(get, "PII_SCOPE_TTL_SECS", PII_SCOPE_TTL_SECS_DEFAULT)?;
+    let ttl_secs = parse_positive_u64(get, "PII_SCOPE_TTL_SECS", PII_SCOPE_TTL_SECS_DEFAULT)?;
     let max_conversations = parse_positive_usize(
         get,
         "PII_SCOPE_MAX_CONVERSATIONS",
@@ -101,7 +101,7 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
         });
     }
     let prev_id_max_entries =
-        parse_positive_usize(get, "PII_PREV_ID_MAX_ENTRIES", max_conversations)?;
+        parse_positive_usize(get, "PII_SCOPE_PREV_ID_MAX_ENTRIES", max_conversations)?;
     Ok(PiiScopeParts {
         mode,
         ttl_secs,

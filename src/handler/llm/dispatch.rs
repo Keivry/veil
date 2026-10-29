@@ -437,7 +437,7 @@ async fn serve_inner(
     let detector = state.detector.clone();
     let sqlite_precise = state.sqlite_ok();
     let hold_max = state.config.audit_hold_max_bytes.max(1) as usize;
-    // 审计 hold 缓冲帧数上限（配置文件 `[limits].audit_hold_max_frames`，默认 65536）：
+    // 审计 hold 缓冲帧数上限（配置文件 `[audit].hold_max_frames`，默认 65536）：
     // 单次大 tool 调用的参数按 token 分片可达数千帧，帧数维度须独立于字节维度。
     let hold_max_frames = state.config.audit_hold_max_frames.max(1) as usize;
     // SSE 硬上限运行时值（env/TOML `SSE_FRAME_HARD_BYTES`），经 `StreamPumpCtx`

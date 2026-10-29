@@ -1,5 +1,11 @@
-//! 文件层单测：schema 严格性 / 封闭映射表 / 规范化 / 合并优先级 / 引导加载 /
-//! 密钥权限门禁（对应 design D1/D3/D4/D5/D6/D7 与 tasks 2.x/3.x/4.1）。
+//! 文件层单测：schema 严格性 / 封闭映射表 / 规范化 / 合并优先级 / 引导加载
+//! （对应 design Decision 1 至 4 与 tasks 1.x 至 3.x）。
+//!
+//! 拆分：旧键拒绝用例在 `tests/legacy_removed.rs`、管理面极性在
+//! `tests/admin_polarity.rs`、密钥权限门禁在 `tests/secrets.rs`、
+//! `[server]` 两键在 `tests/bindings.rs`、`[storage]`/`[request_log]` 在
+//! `tests/storage.rs`、审计 hold 双维度在 `tests/limits_hold.rs`、
+//! 文档锁步在 `tests/docs_lockstep.rs`（行数红线保持）。
 
 use {
     super::*,
@@ -69,9 +75,12 @@ fn apply_only(env: &mut HashMap<String, String>) {
     apply_config_file(env).expect("文件层应用须成功");
 }
 
+/// 文件层应用 + 合并装载：走生产同一条 `load_from_with_file`（`request_log` 等
+/// 文件专属标量键经 `FileLayerOutcome` 进入 `Config`，不能用不带产物的
+/// `Config::load_from`）。
 fn apply_and_load(env: &mut HashMap<String, String>) -> Config {
-    apply_only(env);
-    Config::load_from(env).expect("合并后配置须可加载")
+    let outcome = apply_config_file(env).expect("文件层应用须成功");
+    Config::load_from_with_file(env, outcome).expect("合并后配置须可加载")
 }
 
 fn with_config_file(file: &TempFile) -> HashMap<String, String> {
@@ -92,6 +101,12 @@ fn resolved_value(cfg: &FileConfig, key: &str) -> String {
         .value
 }
 
+/// 0.1.x 的 `surface_mode` 历史拼写，0.2.0 起一律拒绝（供负向用例喂入）。
+pub(super) const LEGACY_SURFACE_MODES: [&str; 3] =
+    ["credential-only", "credential_only", "llm-only"];
+
+/// 声明键集展平：端口表归一为 `llm.upstreams`，其余键原样；`server.surface_mode`
+/// 这类「文件专属根下的有 env 映射键」须保留精确键名（MAPPINGS 优先于根清单）。
 fn flattened_keys(cfg: &FileConfig) -> Vec<String> {
     let value = serde_json::to_value(cfg).expect("内部序列化");
     let mut leaves = Vec::new();
@@ -101,6 +116,8 @@ fn flattened_keys(cfg: &FileConfig) -> Vec<String> {
         .map(|(key, _)| {
             if key.starts_with(UPSTREAMS_KEY_PREFIX) {
                 UPSTREAMS_KEY.to_string()
+            } else if mapping_for(&key).is_some() {
+                key
             } else if let Some(root) = file_only_root(&key) {
                 root.to_string()
             } else {
@@ -113,7 +130,7 @@ fn flattened_keys(cfg: &FileConfig) -> Vec<String> {
     keys
 }
 
-/// 捕获事件 `message` 字段的订阅者（断言冲突 warn 文案）。
+/// 捕获事件 `message` 字段的订阅者（断言冲突/弃用 warn 文案）。
 #[derive(Clone, Default)]
 struct CaptureMessages {
     messages: Arc<Mutex<Vec<String>>>,
@@ -171,25 +188,42 @@ fn capture_apply(env: &mut HashMap<String, String>) -> Vec<String> {
     capture.take()
 }
 
+/// 全键样例（迁移后布局；每节至少一个键，覆盖全部 48 个映射键的文字形态）。
 const MAXIMAL_TOML: &str = r#"
-[auth]
+[server]
+listen_addr = "0.0.0.0:8877"
+surface_mode = "full"
+
+[admin]
+enabled = true
+token = "admin-token-0123456789abcdef"
+
+[matrix]
 homeserver = "https://matrix.example.com"
 room_id = "!room:example.com"
-matrix_access_token = "syt-maximal-token"
-observability_admin_token = "admin-token-0123456789abcdef"
-observability_disable = false
-
-[limits]
-audit_hold_max_bytes = 1048576
-audit_hold_max_frames = 65536
-nonstream_max_bytes = 8388608
-sse_frame_hard_bytes = 8388608
+access_token = "syt-maximal-token"
 
 [audit]
 mode = "block"
-timeout = 90
+timeout_secs = 90
 approval_whitelist = ["@admin:example.com", "@ops:example.com"]
 policy_file = "/etc/veil/audit-policy.yaml"
+hold_max_bytes = 1048576
+hold_max_frames = 65536
+
+[credential]
+default_decision = "pending"
+vault_backend = "mock"
+
+[credential.approval]
+block_wait = true
+
+[credential.authorization]
+ttl_secs = 3600
+
+[request_log]
+enabled = true
+retention_days = 7
 
 [storage]
 data_dir = "/srv/veil"
@@ -198,12 +232,6 @@ tpm_dir = "/srv/veil/tpm"
 caller_registry_path = "/srv/veil/caller_registry.json"
 veilctl_secret = "deploy-secret"
 veilctl_binary_hash = "abcdef0123456789"
-auto_approve = "pending"
-entry_mode = "credential-only"
-credential_block_wait = true
-authorization_ttl_secs = 3600
-request_log_enabled = true
-request_log_retention_days = 7
 
 [redaction]
 enabled = true
@@ -231,41 +259,50 @@ default_upstream = "http://127.0.0.1:11434"
 timeout_secs = 30
 pool_max_idle_per_host = 16
 pool_idle_timeout_secs = 90
+nonstream_max_bytes = 8388608
+sse_frame_hard_bytes = 8388608
 
 [llm.upstreams]
 "8878" = "http://127.0.0.1:11434"
 "8879" = "http://127.0.0.1:11435"
 
-[keepass]
-backend = "mock"
+[llm.targets."8878".headers]
+x-upstream-feature = "port-8878"
+
+[command]
+enabled = false
+
+[command.approval]
+block_wait = false
 "#;
 
-const EXPECTED_KEYS: [&str; 48] = [
-    "auth.homeserver",
-    "auth.room_id",
-    "auth.matrix_access_token",
-    "auth.observability_admin_token",
-    "auth.observability_disable",
-    "limits.audit_hold_max_bytes",
-    "limits.audit_hold_max_frames",
-    "limits.nonstream_max_bytes",
-    "limits.sse_frame_hard_bytes",
+/// `FileConfig` 可声明键集（MAPPINGS 48 + 文件专属键根 3 = 51）。
+const EXPECTED_KEYS: [&str; 51] = [
+    "server.surface_mode",
+    "server",
+    "admin.enabled",
+    "admin.token",
+    "matrix.homeserver",
+    "matrix.room_id",
+    "matrix.access_token",
     "audit.mode",
-    "audit.timeout",
+    "audit.timeout_secs",
     "audit.approval_whitelist",
     "audit.policy_file",
+    "audit.hold_max_bytes",
+    "audit.hold_max_frames",
+    "credential.default_decision",
+    "credential.approval.block_wait",
+    "credential.authorization.ttl_secs",
+    "credential.vault_backend",
+    "request_log.enabled",
+    "request_log.retention_days",
     "storage.data_dir",
     "storage.db_dir",
     "storage.tpm_dir",
     "storage.caller_registry_path",
     "storage.veilctl_secret",
     "storage.veilctl_binary_hash",
-    "storage.auto_approve",
-    "storage.entry_mode",
-    "storage.credential_block_wait",
-    "storage.authorization_ttl_secs",
-    "storage.request_log_enabled",
-    "storage.request_log_retention_days",
     "redaction.enabled",
     "redaction.fuzzy_restore",
     "redaction.detection_hardening",
@@ -287,8 +324,11 @@ const EXPECTED_KEYS: [&str; 48] = [
     "llm.timeout_secs",
     "llm.pool_max_idle_per_host",
     "llm.pool_idle_timeout_secs",
+    "llm.nonstream_max_bytes",
+    "llm.sse_frame_hard_bytes",
     "llm.upstreams",
-    "keepass.backend",
+    "llm.targets",
+    "command",
 ];
 
 const ENV_PARSE_SRC: &str = include_str!("../env_parse/mod.rs");
@@ -304,33 +344,46 @@ fn file_config_valid_sample_parses() {
         Some(FileAuditMode::Block)
     );
     assert_eq!(
-        cfg.storage.as_ref().and_then(|s| s.entry_mode),
-        Some(FileEntryMode::CredentialOnly)
+        cfg.server.as_ref().and_then(|s| s.surface_mode),
+        Some(FileSurfaceMode::Full)
     );
     assert_eq!(
-        cfg.storage.as_ref().and_then(|s| s.auto_approve),
+        cfg.credential.as_ref().and_then(|s| s.default_decision),
         Some(FileAutoApprove::Pending)
+    );
+    assert_eq!(
+        cfg.credential.as_ref().and_then(|s| s.vault_backend),
+        Some(FileKeepassBackend::Mock)
     );
     assert_eq!(
         cfg.pii_scope.as_ref().and_then(|s| s.mode),
         Some(FilePiiScopeMode::Conversation)
     );
     assert_eq!(
-        cfg.keepass.as_ref().and_then(|s| s.backend),
-        Some(FileKeepassBackend::Mock)
-    );
-    assert_eq!(
         cfg.llm
             .as_ref()
             .and_then(|s| s.upstreams.as_ref())
-            .map(BTreeMap::len),
+            .map(std::collections::BTreeMap::len),
         Some(2)
+    );
+    assert_eq!(
+        cfg.command
+            .as_ref()
+            .and_then(|s| s.approval.as_ref())
+            .and_then(|a| a.block_wait),
+        Some(false)
     );
 }
 
 #[test]
 fn file_config_missing_and_empty_sections_are_legal() {
-    for text in ["", "# 仅注释\n", "[audit]\n", "[audit]\n[storage]\n"] {
+    for text in [
+        "",
+        "# 仅注释\n",
+        "[audit]\n",
+        "[audit]\n[storage]\n",
+        "[server]\n[admin]\n[matrix]\n",
+    ] {
         assert!(parse(text).is_ok(), "缺省/空分节须合法: {text:?}");
     }
 }
@@ -342,12 +395,36 @@ fn file_config_unknown_keys_rejected() {
         ("[audit]\nmode = \"off\"\nrush_log = \"info\"\n", "rush_log"),
         ("[storage]\ndata_dir = \"/x\"\nnot_a_key = 1\n", "not_a_key"),
         (
-            "[auth]\nhomeserver = \"x\"\n[redaction]\nunknown_sub = true\n",
+            "[matrix]\nhomeserver = \"x\"\n[redaction]\nunknown_sub = true\n",
             "unknown_sub",
+        ),
+        (
+            "[admin]\nenabled = true\nobservability_disable = true\n",
+            "observability_disable",
+        ),
+        (
+            "[credential]\ndefault_decision = \"allow\"\nauto_approve = \"deny\"\n",
+            "auto_approve",
         ),
     ] {
         let err = parse(text).expect_err(&format!("未知键 {key} 须拒解析"));
         assert!(err.to_string().contains(key), "错误信息须指名 {key}: {err}");
+    }
+}
+
+/// 旧分节本身已删除：`[auth]` / `[limits]` / `[keepass]` 表头即未知键
+/// （旧键名逐一拒绝的用例见 `tests/legacy_removed.rs`）。
+#[test]
+fn removed_sections_reject_unknown_keys() {
+    // 分节本身已删除：`deny_unknown_fields` 在顶层即拒，错误指名的是**分节名**
+    // （`auth` / `limits` / `keepass`），这已足以让部署方定位。
+    for section in ["auth", "limits", "keepass"] {
+        let text = format!("[{section}]\nsome_new_key = 1\n");
+        let err = parse(&text).expect_err(&format!("分节 {section} 须被拒"));
+        assert!(
+            err.to_string().contains(section),
+            "错误信息须指名被删除的分节 {section}: {err}"
+        );
     }
 }
 
@@ -383,7 +460,7 @@ fn alias_legacy_and_env_only_keys_rejected() {
         ("[redaction]\npii_custom_dict = \"/a\"\n", "pii_custom_dict"),
         ("[audit]\naudit_enabled = true\n", "audit_enabled"),
         (
-            "[auth]\ncredential_admin_token = \"x\"\n",
+            "[admin]\ncredential_admin_token = \"x\"\n",
             "credential_admin_token",
         ),
         ("rust_log = \"info\"\n", "rust_log"),
@@ -395,7 +472,7 @@ fn alias_legacy_and_env_only_keys_rejected() {
         let err = parse(text).expect_err(&format!("键 {key} 须被拒"));
         assert!(err.to_string().contains(key), "错误信息须指名 {key}: {err}");
     }
-    let legacy_key: &str = concat!("get_bin", "ary_secret");
+    let legacy_key = "get_binary_secret";
     let err = parse(&format!("[storage]\n{legacy_key} = \"x\"\n")).expect_err("遗留键名须被拒");
     assert!(
         err.to_string().contains(legacy_key),
@@ -422,16 +499,10 @@ fn command_section_rejected_at_startup_with_key_path() {
 #[test]
 fn file_config_type_errors_rejected() {
     for (text, key) in [
-        ("[audit]\ntimeout = \"30\"\n", "timeout"),
+        ("[audit]\ntimeout_secs = \"30\"\n", "timeout_secs"),
         ("[redaction]\nenabled = \"false\"\n", "enabled"),
-        (
-            "[auth]\nobservability_disable = \"false\"\n",
-            "observability_disable",
-        ),
-        (
-            "[storage]\ncredential_block_wait = 1\n",
-            "credential_block_wait",
-        ),
+        ("[admin]\nenabled = \"false\"\n", "enabled"),
+        ("[credential.approval]\nblock_wait = 1\n", "block_wait"),
         ("[llm.upstreams]\n\"8878\" = 123\n", "8878"),
     ] {
         let err = parse(text).expect_err(&format!("类型错误 {key} 须被拒"));
@@ -444,12 +515,12 @@ fn file_config_enum_empty_and_invalid_rejected() {
     for text in [
         "[audit]\nmode = \"\"\n",
         "[audit]\nmode = \"x\"\n",
-        "[storage]\nentry_mode = \"\"\n",
-        "[storage]\nentry_mode = \"x\"\n",
-        "[storage]\nauto_approve = \"\"\n",
-        "[storage]\nauto_approve = \"x\"\n",
+        "[server]\nsurface_mode = \"\"\n",
+        "[server]\nsurface_mode = \"x\"\n",
+        "[credential]\ndefault_decision = \"\"\n",
+        "[credential]\ndefault_decision = \"x\"\n",
         "[pii_scope]\nmode = \"x\"\n",
-        "[keepass]\nbackend = \"x\"\n",
+        "[credential]\nvault_backend = \"x\"\n",
     ] {
         assert!(
             parse(text).is_err(),
@@ -469,9 +540,14 @@ fn mapping_table_locked_to_schema_and_canonical_list() {
         "FileConfig 可声明键集须与规范清单逐项相等"
     );
 
-    let mut mapping_keys: Vec<String> = MAPPINGS.iter().map(|m| m.key.to_string()).collect();
+    let mut mapping_keys: Vec<String> = MAPPINGS
+        .iter()
+        .map(|m| m.key.to_string())
+        .chain(FILE_ONLY_KEYS.iter().map(|key| (*key).to_string()))
+        .collect();
     mapping_keys.sort();
     assert_eq!(mapping_keys, expected, "封闭映射表键集须与规范清单逐项相等");
+    assert_eq!(MAPPINGS.len(), 48, "封闭映射表须恰 48 行");
 
     let mut resolved_keys: Vec<String> = resolve_entries(&cfg)
         .expect("最大样例须可解析为条目")
@@ -483,28 +559,36 @@ fn mapping_table_locked_to_schema_and_canonical_list() {
                 entry.key.clone()
             }
         })
+        .chain(
+            // 文件专属根下的标量键不产生逐键条目：其代表根必须出现在声明键集中。
+            flattened_keys(&cfg)
+                .into_iter()
+                .filter(|key| file_only_root(key).is_some() && mapping_for(key).is_none()),
+        )
         .collect();
     resolved_keys.sort();
     resolved_keys.dedup();
     assert_eq!(resolved_keys, expected, "每条声明键须有解析产物");
 }
 
+/// `server` 是文件专属根，但其下的 `surface_mode` 有 env 映射：`resolve_entries`
+/// 必须先查 MAPPINGS 再退到根清单，否则该键会被整根跳过（R1）。
 #[test]
-fn mapping_targets_are_env_read_names() {
-    for mapping in MAPPINGS {
-        let name = match mapping.target {
-            MappingTarget::Env(name) => name,
-            MappingTarget::PortTable | MappingTarget::FileOnly => continue,
-        };
-        let needle = format!("\"{name}\"");
-        assert!(
-            ENV_PARSE_SRC.contains(&needle)
-                || PII_SCOPE_SRC.contains(&needle)
-                || STORAGE_ENV_SRC.contains(&needle)
-                || VALIDATE_SRC.contains(&needle),
-            "映射目标 {name} 须为 env_parse 读取的 env 名"
-        );
-    }
+fn surface_mode_resolved_through_mapping_not_file_only_root() {
+    let cfg = parse("[server]\nlisten_addr = \"127.0.0.1:8877\"\nsurface_mode = \"llm_only\"\n")
+        .expect("样例须可解析");
+    let entries = resolve_entries(&cfg).expect("解析条目");
+    assert!(
+        entries.iter().all(|entry| entry.key != "server"),
+        "listen_addr 属文件专属根，不得生成逐键条目"
+    );
+    let surface = entries
+        .iter()
+        .find(|entry| entry.key == "server.surface_mode")
+        .expect("surface_mode 须有逐键条目（MAPPINGS 优先于根清单）");
+    assert_eq!(surface.canonical_env.as_deref(), Some("VEIL_ENTRY_MODE"));
+    assert_eq!(surface.value, "llm_only");
+    assert_eq!(surface.env_explicit_names, vec!["VEIL_ENTRY_MODE"]);
 }
 
 #[test]
@@ -554,6 +638,8 @@ fn alias_env_explicit_name_sets_match_design() {
         ["VEILCTL_SECRET"].as_slice()
     );
     assert_eq!(names("audit.mode"), ["AUDIT_MODE"].as_slice());
+    assert_eq!(names("server.surface_mode"), ["VEIL_ENTRY_MODE"].as_slice());
+    assert_eq!(names("admin.enabled"), ["ADMIN_ENABLED"].as_slice());
 }
 
 #[test]
@@ -583,19 +669,34 @@ fn resolve_coerces_scalar_types() {
 fn resolve_coerces_enum_tokens() {
     let cfg = parse(
         "[audit]\nmode = \"approve\"\n\
-         [storage]\nauto_approve = \"allow\"\nentry_mode = \"llm-only\"\n\
-         [pii_scope]\nmode = \"conversation\"\n\
-         [keepass]\nbackend = \"mock\"\n",
+         [credential]\ndefault_decision = \"allow\"\nvault_backend = \"mock\"\n\
+         [server]\nsurface_mode = \"llm_only\"\n\
+         [pii_scope]\nmode = \"conversation\"\n",
     )
     .expect("合法样例");
     assert_eq!(resolved_value(&cfg, "audit.mode"), "approve");
-    assert_eq!(resolved_value(&cfg, "storage.auto_approve"), "true");
-    assert_eq!(resolved_value(&cfg, "storage.entry_mode"), "llm-only");
+    assert_eq!(resolved_value(&cfg, "credential.default_decision"), "true");
+    assert_eq!(resolved_value(&cfg, "server.surface_mode"), "llm_only");
     assert_eq!(resolved_value(&cfg, "pii_scope.mode"), "conversation");
-    assert_eq!(resolved_value(&cfg, "keepass.backend"), "mock");
+    assert_eq!(resolved_value(&cfg, "credential.vault_backend"), "mock");
     for (raw, token) in [("deny", "false"), ("pending", "pending")] {
-        let cfg = parse(&format!("[storage]\nauto_approve = {raw:?}\n")).expect("合法样例");
-        assert_eq!(resolved_value(&cfg, "storage.auto_approve"), token);
+        let cfg = parse(&format!("[credential]\ndefault_decision = {raw:?}\n")).expect("合法样例");
+        assert_eq!(resolved_value(&cfg, "credential.default_decision"), token);
+    }
+}
+
+/// `surface_mode` 只接受两个规范拼写；0.1.x 的三个历史拼写按非法枚举值拒。
+#[test]
+fn surface_mode_rejects_historical_spellings() {
+    for raw in LEGACY_SURFACE_MODES {
+        assert!(
+            parse(&format!("[server]\nsurface_mode = {raw:?}\n")).is_err(),
+            "历史拼写 {raw:?} 须拒解析"
+        );
+    }
+    for (raw, want) in [("full", "full"), ("llm_only", "llm_only")] {
+        let cfg = parse(&format!("[server]\nsurface_mode = {raw:?}\n")).expect("规范拼写须可解析");
+        assert_eq!(resolved_value(&cfg, "server.surface_mode"), want);
     }
 }
 
@@ -745,262 +846,6 @@ fn bootstrap_empty_file_is_legal() {
 }
 
 #[test]
-fn merge_env_canonical_wins_over_file_and_warns() {
-    let file = TempFile::new(
-        "canonical-wins.toml",
-        "[audit]\nmode = \"block\"\n[pii_scope]\nttl_secs = 99\n",
-    );
-    let mut env = with_config_file(&file);
-    env.insert("AUDIT_MODE".to_string(), "off".to_string());
-    env.insert("PII_SCOPE_TTL_SECS".to_string(), "3600".to_string());
-    let messages = capture_apply(&mut env);
-    assert_eq!(env.get("AUDIT_MODE").map(String::as_str), Some("off"));
-    assert_eq!(
-        env.get("PII_SCOPE_TTL_SECS").map(String::as_str),
-        Some("3600")
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.contains("audit.mode") && m.contains("AUDIT_MODE")),
-        "冲突须记指名概念的 warn: {messages:?}"
-    );
-    assert!(
-        messages.iter().any(|m| m.contains("pii_scope.ttl_secs")),
-        "冲突须记指名概念的 warn: {messages:?}"
-    );
-    let cfg = Config::load_from(&env).unwrap();
-    assert_eq!(cfg.audit_mode, AuditMode::Off);
-    assert_eq!(cfg.pii_scope_ttl_secs, 3600);
-}
-
-#[test]
-fn merge_blank_env_falls_back_to_file() {
-    let file = TempFile::new(
-        "blank-env.toml",
-        "[pii_scope]\nttl_secs = 99\n[redaction]\nenabled = false\n",
-    );
-    let mut env = with_config_file(&file);
-    env.insert("PII_SCOPE_TTL_SECS".to_string(), "   ".to_string());
-    env.insert("REDACTION_ENABLED".to_string(), "\t".to_string());
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.pii_scope_ttl_secs, 99);
-    assert!(!cfg.redaction_enabled);
-    assert_eq!(
-        env.get("PII_SCOPE_TTL_SECS").map(String::as_str),
-        Some("99"),
-        "空白 env 视同未设置，文件值写入"
-    );
-}
-
-#[test]
-fn merge_env_aliases_win_over_file_canonical_keys() {
-    let file = TempFile::new("alias-enabled.toml", "[redaction]\nenabled = true\n");
-    let mut env = with_config_file(&file);
-    env.insert("PII_REDACTION_ENABLED".to_string(), "0".to_string());
-    let cfg = apply_and_load(&mut env);
-    assert!(!cfg.redaction_enabled, "env 别名关闭须恒胜文件开启");
-    assert!(
-        !env.contains_key("REDACTION_ENABLED"),
-        "冲突时不得写入规范名"
-    );
-
-    let rules = TempFile::new(
-        "alias-rules.json",
-        r#"[{"name":"ext-id","pattern":"EXT-\\d{6}"}]"#,
-    );
-    let file = TempFile::new(
-        "alias-rules.toml",
-        "[redaction]\ncustom_rules_file = \"/nonexistent/file-would-win.json\"\n",
-    );
-    let mut env = with_config_file(&file);
-    env.insert(
-        "PII_RULES_FILE".to_string(),
-        rules.path().to_string_lossy().into_owned(),
-    );
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.pii_custom_rules_file.as_deref(), Some(rules.path()));
-    assert!(!env.contains_key("PII_CUSTOM_RULES_FILE"));
-
-    let file = TempFile::secret(
-        "alias-secret.toml",
-        "[storage]\nveilctl_secret = \"file-secret\"\n",
-    );
-    let mut env = with_config_file(&file);
-    env.insert(
-        concat!("CREDENTIAL", "_SECRET").to_string(),
-        "env-alias-secret".to_string(),
-    );
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.veilctl_secret.as_deref(), Some("file-secret"));
-    assert!(env.contains_key("VEILCTL_SECRET"));
-}
-
-#[test]
-fn merge_ignores_legacy_audit_enabled_file_mode_wins() {
-    for raw in ["true", " ON ", "1", "yes"] {
-        let file = TempFile::new("audit-enabled.toml", "[audit]\nmode = \"off\"\n");
-        let mut env = with_config_file(&file);
-        env.insert("AUDIT_ENABLED".to_string(), raw.to_string());
-        let messages = capture_apply(&mut env);
-        assert_eq!(
-            env.get("AUDIT_MODE").map(String::as_str),
-            Some("off"),
-            "AUDIT_ENABLED 不再是 env 显式，文件 mode 须写入"
-        );
-        assert!(
-            !messages.iter().any(|m| m.contains("AUDIT_ENABLED")),
-            "AUDIT_ENABLED 不应再触发审计冲突 warn: {messages:?}"
-        );
-        let cfg = Config::load_from(&env).unwrap();
-        assert_eq!(
-            cfg.audit_mode,
-            AuditMode::Off,
-            "AUDIT_ENABLED 真值 {raw:?} 不得再回退 block"
-        );
-        assert!(cfg.audit_mode_explicit, "文件写入 AUDIT_MODE 后视同显式");
-    }
-}
-
-#[test]
-fn audit_file_mode_wins_policy_file_mode() {
-    let policy_off = TempFile::new("policy-off.yaml", "mode: off\n");
-    let policy_block = TempFile::new("policy-block.yaml", "mode: block\n");
-    let config_file = TempFile::new("audit-file-block.toml", "[audit]\nmode = \"block\"\n");
-
-    let mut env = with_config_file(&config_file);
-    let mut cfg = apply_and_load(&mut env);
-    assert!(cfg.audit_mode_explicit, "文件 mode 视同显式");
-    let policy = AuditPolicy::load_from_file(Some(policy_off.path())).expect("策略文件可解析");
-    policy.apply_effective_mode(&mut cfg);
-    assert_eq!(
-        cfg.audit_mode,
-        AuditMode::Block,
-        "配置文件 mode 须优先于策略文件 mode"
-    );
-
-    let mut env = with_config_file(&config_file);
-    env.insert("AUDIT_MODE".to_string(), "off".to_string());
-    let mut cfg = apply_and_load(&mut env);
-    let policy = AuditPolicy::load_from_file(Some(policy_block.path())).expect("策略文件可解析");
-    policy.apply_effective_mode(&mut cfg);
-    assert_eq!(cfg.audit_mode, AuditMode::Off, "env 显式须恒胜");
-}
-
-#[test]
-fn legacy_audit_enabled_ignored_policy_mode_applies() {
-    let policy_off = TempFile::new("policy-off-2.yaml", "mode: off\n");
-    let config_file = TempFile::new("audit-enabled-policy.toml", "[audit]\nmode = \"off\"\n");
-    let mut env = with_config_file(&config_file);
-    env.insert("AUDIT_ENABLED".to_string(), "true".to_string());
-    let mut cfg = apply_and_load(&mut env);
-    let policy = AuditPolicy::load_from_file(Some(policy_off.path())).expect("策略文件可解析");
-    policy.apply_effective_mode(&mut cfg);
-    assert_eq!(
-        cfg.audit_mode,
-        AuditMode::Off,
-        "AUDIT_ENABLED 已废弃，须以文件 mode 为准"
-    );
-}
-
-#[test]
-fn llm_upstream_ports_merge_by_port() {
-    let file = TempFile::new(
-        "llm-ports.toml",
-        "[llm.upstreams]\n\"8879\" = \"http://file-8879:1\"\n\"8890\" = \"http://file-8890:1\"\n",
-    );
-    let mut env = with_config_file(&file);
-    env.insert("LLM_8878".to_string(), "http://env-8878:1".to_string());
-    env.insert("LLM_8890".to_string(), "http://env-8890:1".to_string());
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(
-        cfg.llm_upstreams.get(&8878).map(String::as_str),
-        Some("http://env-8878:1")
-    );
-    assert_eq!(
-        cfg.llm_upstreams.get(&8879).map(String::as_str),
-        Some("http://file-8879:1")
-    );
-    assert_eq!(
-        cfg.llm_upstreams.get(&8890).map(String::as_str),
-        Some("http://env-8890:1"),
-        "同端口 env 恒胜"
-    );
-    assert_eq!(cfg.llm_upstreams.len(), 3);
-
-    let file_only = TempFile::new(
-        "llm-file-only.toml",
-        "[llm.upstreams]\n8879 = \"http://file:1\"\n",
-    );
-    let mut env = with_config_file(&file_only);
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(
-        cfg.llm_upstreams.get(&8879).map(String::as_str),
-        Some("http://file:1")
-    );
-
-    let empty = TempFile::new("llm-empty.toml", "");
-    let mut env = with_config_file(&empty);
-    env.insert("LLM_8879".to_string(), "http://env:1".to_string());
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(
-        cfg.llm_upstreams.get(&8879).map(String::as_str),
-        Some("http://env:1")
-    );
-    assert_eq!(cfg.llm_upstreams.len(), 1);
-
-    let none = TempFile::new("llm-none.toml", "");
-    let mut env = with_config_file(&none);
-    let cfg = apply_and_load(&mut env);
-    assert!(cfg.llm_upstreams.is_empty(), "两处皆缺不得新增端口");
-}
-
-#[test]
-fn llm_invalid_port_via_file_rejects_startup() {
-    let file = TempFile::new(
-        "llm-bad-port.toml",
-        "[llm.upstreams]\n\"abc\" = \"http://x:1\"\n",
-    );
-    let mut env = with_config_file(&file);
-    let err = apply_config_file(&mut env).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains(BOOTSTRAP_VAR) && msg.contains("abc"),
-        "实际: {msg}"
-    );
-}
-
-#[test]
-fn file_without_targets_stays_env_only_baseline() {
-    // task 5.2：文件含默认值键（非 targets）时零变化——返回空覆盖表、cfg 与
-    // env-only 基线逐字段相等，且不新增与 [llm.targets] 相关的告警。
-    let file = TempFile::new(
-        "no-targets.toml",
-        "[limits]\naudit_hold_max_bytes = 1048576\n[llm]\ntimeout_secs = 30\n",
-    );
-    let mut env = with_config_file(&file);
-    let capture = CaptureMessages::default();
-    let outcome = crate::test_support::with_capture_subscriber(capture.clone(), || {
-        apply_config_file(&mut env).expect("文件层应用须成功")
-    });
-    let messages = capture.take();
-    assert!(outcome.llm_targets.is_empty(), "未声明覆盖须返回空表");
-    assert!(
-        !messages
-            .iter()
-            .any(|message| message.contains("llm.targets")),
-        "未声明 [llm.targets] 不得新增相关告警: {messages:?}"
-    );
-    let cfg =
-        Config::load_from_with_targets(&env, outcome.llm_targets).expect("合并后配置须可加载");
-    assert_eq!(
-        cfg,
-        Config::load_from(&base_env()).unwrap(),
-        "设文件但未声明 [llm.targets] 须与 env-only 基线逐字段相等"
-    );
-}
-
-#[test]
 fn file_data_dir_derives_db_tpm_and_registry_paths() {
     let file = TempFile::new(
         "data-dir.toml",
@@ -1029,160 +874,13 @@ fn file_max_conversations_defaults_prev_id_entries() {
     );
 }
 
-#[test]
-fn integration_absent_file_layer_is_baseline() {
-    let mut env = base_env();
-    apply_only(&mut env);
-    assert_eq!(env, base_env());
-    assert_eq!(
-        Config::load_from(&env).unwrap(),
-        Config::load_from(&base_env()).unwrap(),
-        "未设引导变量须与基线逐字段相等"
-    );
-}
-
-#[test]
-fn integration_file_only_and_env_precedence() {
-    let file = TempFile::new(
-        "integration.toml",
-        "[storage]\nentry_mode = \"llm-only\"\nauto_approve = \"deny\"\n\
-         [redaction]\nfuzzy_restore = true\nenabled = false\n\
-         [llm]\ndefault_upstream = \"http://file-upstream:11434\"\ntimeout_secs = 12\n",
-    );
-
-    let mut env = with_config_file(&file);
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.entry_mode, EntryMode::LlmOnly);
-    assert_eq!(cfg.auto_approve, AutoApprove::Deny);
-    assert!(cfg.pii_fuzzy_restore);
-    assert!(!cfg.redaction_enabled);
-    assert_eq!(
-        cfg.llm_default_upstream.as_deref(),
-        Some("http://file-upstream:11434")
-    );
-    assert_eq!(cfg.http_timeout_secs, 12);
-
-    let mut env = with_config_file(&file);
-    env.insert("VEIL_ENTRY_MODE".to_string(), "full".to_string());
-    env.insert("AUTO_APPROVE".to_string(), "pending".to_string());
-    env.insert("HTTP_TIMEOUT_SECS".to_string(), "45".to_string());
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.entry_mode, EntryMode::Full);
-    assert_eq!(cfg.auto_approve, AutoApprove::Pending);
-    assert_eq!(cfg.http_timeout_secs, 45);
-    assert!(cfg.pii_fuzzy_restore, "未冲突键仍取文件值");
-}
-
-#[cfg(unix)]
-#[test]
-fn secret_keys_with_wide_permissions_rejected() {
-    let cases = [
-        (
-            "[auth]\nmatrix_access_token = \"syt-token\"\n",
-            "matrix_access_token",
-        ),
-        (
-            "[auth]\nobservability_admin_token = \"0123456789abcdef0123456789abcdef\"\n",
-            "observability_admin_token",
-        ),
-        (
-            "[storage]\nveilctl_secret = \"deploy-secret\"\n",
-            "veilctl_secret",
-        ),
-        (
-            "[storage]\nveilctl_binary_hash = \"abcdef0123456789\"\n",
-            "veilctl_binary_hash",
-        ),
-        (
-            "[redaction]\nvalue_sample_hmac_key = \"hmac-key\"\n",
-            "value_sample_hmac_key",
-        ),
-    ];
-    for (index, (content, key)) in cases.iter().enumerate() {
-        let file = TempFile::with_mode(&format!("secret-wide-{index}.toml"), content, 0o644);
-        let mut env = with_config_file(&file);
-        let err = apply_config_file(&mut env).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("chmod 600") && msg.contains("644"),
-            "密钥键 {key} 宽权限须拒启动并给指引: {msg}"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn secret_key_with_narrow_permissions_passes() {
-    let file = TempFile::with_mode(
-        "secret-narrow.toml",
-        "[storage]\nveilctl_secret = \"deploy-secret\"\n",
-        0o600,
-    );
-    let mut env = with_config_file(&file);
-    let cfg = apply_and_load(&mut env);
-    assert_eq!(cfg.veilctl_secret.as_deref(), Some("deploy-secret"));
-    assert_eq!(
-        env.get("VEILCTL_SECRET").map(String::as_str),
-        Some("deploy-secret")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn non_secret_wide_permissions_pass() {
-    let file = TempFile::with_mode("non-secret.toml", "[redaction]\nenabled = false\n", 0o644);
-    let mut env = with_config_file(&file);
-    let cfg = apply_and_load(&mut env);
-    assert!(!cfg.redaction_enabled, "无密钥不得施加权限门禁");
-}
-
-#[cfg(unix)]
-#[test]
-fn secret_env_override_does_not_exempt_gate() {
-    let file = TempFile::with_mode(
-        "secret-env-override.toml",
-        "[storage]\nveilctl_secret = \"file-secret\"\n",
-        0o644,
-    );
-    let mut env = with_config_file(&file);
-    env.insert("VEILCTL_SECRET".to_string(), "env-secret".to_string());
-    let err = apply_config_file(&mut env).unwrap_err();
-    assert!(
-        err.to_string().contains("chmod 600"),
-        "env 覆盖不豁免门禁（密钥已落盘）: {err}"
-    );
-}
-
-#[test]
-fn file_value_bounds_reuse_env_validation() {
-    for (content, var) in [
-        ("[audit]\ntimeout = 120\n", "AUDIT_TIMEOUT"),
-        ("[limits]\nnonstream_max_bytes = 0\n", "NONSTREAM_MAX_BYTES"),
-        ("[llm]\ntimeout_secs = 0\n", "HTTP_TIMEOUT_SECS"),
-    ] {
-        let file = TempFile::new("bounds.toml", content);
-        let mut env = with_config_file(&file);
-        apply_only(&mut env);
-        let err = Config::load_from(&env).unwrap_err();
-        assert!(
-            err.to_string().contains(var),
-            "文件值越界须沿用既有 env 校验并指名 {var}: {err}"
-        );
-    }
-
-    let file = TempFile::new("approve-empty.toml", "[audit]\nmode = \"approve\"\n");
-    let mut env = with_config_file(&file);
-    apply_only(&mut env);
-    let err = Config::load_from(&env).unwrap_err();
-    assert!(
-        err.to_string().contains("APPROVAL_WHITELIST"),
-        "approve 空白名单门禁须沿用: {err}"
-    );
-}
-
+mod admin_polarity;
+mod bindings;
 mod docs_lockstep;
 mod env_read_surface;
+mod legacy_removed;
 mod limits_hold;
+mod merge;
 mod redline;
-mod server_bind;
+mod secrets;
 mod storage;

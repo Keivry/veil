@@ -113,7 +113,10 @@ fn pii_prev_id_capacity_defaults_to_effective_conversations() {
     assert_eq!(cfg.pii_prev_id_max_entries, 2048, "未设时须取生效值");
 
     let mut env = base_env();
-    env.insert("PII_PREV_ID_MAX_ENTRIES".to_string(), "77".to_string());
+    env.insert(
+        "PII_SCOPE_PREV_ID_MAX_ENTRIES".to_string(),
+        "77".to_string(),
+    );
     let cfg = Config::load_from(&env).unwrap();
     assert_eq!(cfg.pii_prev_id_max_entries, 77);
     assert_eq!(
@@ -123,8 +126,11 @@ fn pii_prev_id_capacity_defaults_to_effective_conversations() {
 
     for raw in ["0", "-1", "abc", "1.5"] {
         let mut env = base_env();
-        env.insert("PII_PREV_ID_MAX_ENTRIES".to_string(), raw.to_string());
+        env.insert("PII_SCOPE_PREV_ID_MAX_ENTRIES".to_string(), raw.to_string());
         let msg = Config::load_from(&env).unwrap_err().to_string();
-        assert!(msg.contains("PII_PREV_ID_MAX_ENTRIES"), "{raw} 实际: {msg}");
+        assert!(
+            msg.contains("PII_SCOPE_PREV_ID_MAX_ENTRIES"),
+            "{raw} 实际: {msg}"
+        );
     }
 }

@@ -9,7 +9,7 @@ services:
       # 部署参数（Matrix homeserver/room_id、数据目录、LLM 上游映射）由挂载的 TOML 承载。
       # 复制示例并按需修改宿主机 `./veil.toml`：
       #   cp examples/veil.toml ./veil.toml
-      # 需覆盖的关键键：[auth].homeserver / [auth].room_id、
+      # 需覆盖的关键键：[matrix].homeserver / [matrix].room_id、
       # [storage].data_dir = "/data"、[llm].upstreams."8878"/"8879" 与 [llm].default_upstream。
       - VEIL_CONFIG_FILE=/etc/veil/veil.toml
 
@@ -19,6 +19,8 @@ services:
 
       # ── 可观测 admin（/_admin）token ──
       # 可缺省：缺省即管理面全 404（启动期 warn）。须独立（不得复用 MATRIX_ACCESS_TOKEN），建议 ≥32 字符。
+      # 管理面开关本身在 TOML 的 [admin].enabled（正向，缺省 true），env 名为 ADMIN_ENABLED
+      # （见 docs/engineering-reference.md §1 的键表与改名说明）。
       - OBSERVABILITY_ADMIN_TOKEN=${OBSERVABILITY_ADMIN_TOKEN:-}
 
       # ── 三因子认证（强烈建议开启）──
@@ -52,7 +54,7 @@ services:
       - ${TPM_HOST_PATH:-./data/tpm}:/data/tpm:ro
       # KeePass 数据库（.kdbx + .key）。
       - ${DB_HOST_PATH:-./data/db}:/data/db:ro
-      # 容器版示例（只读）：bind = 0.0.0.0:8877；需要私有配置时改挂自己的 TOML。
+      # 容器版示例（只读）：[server].listen_addr = "0.0.0.0:8877"；需要私有配置时改挂自己的 TOML。
       - ./examples/veil.container.toml:/etc/veil/veil.toml:ro
     devices:
       - /dev/tpm0:/dev/tpm0

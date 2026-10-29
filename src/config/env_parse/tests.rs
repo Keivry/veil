@@ -423,36 +423,41 @@ fn credential_admin_token_cross_check_removed() {
     assert_eq!(cfg.observability_admin_token, token);
 }
 
+/// 管理面开关与 token 门禁：`admin_enabled` 缺省 `true`，显式假值关闭；
+/// 缺 token 始终令管理面不可用（token 门禁独立生效）。
 #[test]
-fn disable_and_missing_token_toggle_admin_surface() {
-    // 缺 token（未禁用）：不拒启动，管理面关闭。
+fn enabled_and_missing_token_toggle_admin_surface() {
+    // 缺 token（开关缺省启用）：不拒启动，管理面关闭。
     let mut env = base_env();
     env.remove("OBSERVABILITY_ADMIN_TOKEN");
     let cfg = Config::load_from(&env).expect("缺 token 不得拒启动");
-    assert!(!cfg.observability_disabled);
+    assert!(cfg.admin_enabled, "admin_enabled 缺省须为 true");
     assert!(!cfg.admin_surface_enabled());
     assert!(cfg.observability_admin_token.is_empty());
 
-    // DISABLE=1 且缺 token：不拒启动，observability_disabled 置位。
+    // ADMIN_ENABLED=0 且缺 token：不拒启动，开关关闭。
     let mut env = base_env();
     env.remove("OBSERVABILITY_ADMIN_TOKEN");
-    env.insert("OBSERVABILITY_DISABLE".to_string(), "1".to_string());
-    let cfg = Config::load_from(&env).expect("DISABLE=1 缺 token 不得拒启动");
-    assert!(cfg.observability_disabled);
+    env.insert("ADMIN_ENABLED".to_string(), "0".to_string());
+    let cfg = Config::load_from(&env).expect("ADMIN_ENABLED=0 缺 token 不得拒启动");
+    assert!(!cfg.admin_enabled);
     assert!(!cfg.admin_surface_enabled());
 
-    // 非 =1（未设/其它值）且缺 token：仍不拒启动（可选语义），管理面关闭。
-    for value in ["", "0", "true", "yes", "2"] {
+    // 显式真值 / 其它非假值：开关保持启用，但缺 token 仍令管理面不可用。
+    for value in ["1", "true", "yes", "2"] {
         let mut env = base_env();
         env.remove("OBSERVABILITY_ADMIN_TOKEN");
-        if !value.is_empty() {
-            env.insert("OBSERVABILITY_DISABLE".to_string(), value.to_string());
-        }
+        env.insert("ADMIN_ENABLED".to_string(), value.to_string());
         let cfg = Config::load_from(&env)
             .unwrap_or_else(|e| panic!("值 {value:?} 缺 token 不得拒启动: {e}"));
-        assert!(!cfg.observability_disabled, "值 {value:?} 不得置禁用");
+        assert!(cfg.admin_enabled, "非假值 {value:?} 不得关闭正向开关");
         assert!(!cfg.admin_surface_enabled());
     }
+
+    // 空白值视同未设置：缺省启用。
+    let mut env = base_env();
+    env.insert("ADMIN_ENABLED".to_string(), "   ".to_string());
+    assert!(Config::load_from(&env).unwrap().admin_enabled);
 }
 
 #[test]
@@ -461,22 +466,41 @@ fn entry_mode_notice_only_for_non_full_modes() {
         entry_mode_notice(EntryMode::Full).is_none(),
         "full 无启动提示"
     );
-    let credential_only = entry_mode_notice(EntryMode::CredentialOnly).expect("须有提示");
-    assert!(
-        credential_only.contains("已等价于 full"),
-        "{credential_only}"
-    );
-    assert!(
-        credential_only.contains("审批豁免已删除"),
-        "{credential_only}"
-    );
-    assert!(
-        credential_only.contains("allow_mode = allow"),
-        "须给出改用条目 ACL 的指引: {credential_only}"
-    );
     let llm_only = entry_mode_notice(EntryMode::LlmOnly).expect("须有提示");
     assert!(llm_only.contains("凭据面"), "{llm_only}");
     assert!(llm_only.contains("不可用"), "{llm_only}");
+    assert!(
+        llm_only.contains("[server].surface_mode"),
+        "提示须指名新键路径: {llm_only}"
+    );
+}
+
+/// `EntryMode` 解析：只接受两个规范拼写，历史拼写一律拒。
+#[test]
+fn entry_mode_parses_only_canonical_spellings() {
+    for (raw, want) in [("full", EntryMode::Full), ("llm_only", EntryMode::LlmOnly)] {
+        assert_eq!(raw.parse::<EntryMode>().unwrap(), want, "{raw}");
+    }
+    for legacy in [
+        "credential-only",
+        "credential_only",
+        "llm-only",
+        "LLM_ONLY_X",
+        "",
+        "bogus",
+    ] {
+        let msg = legacy
+            .parse::<EntryMode>()
+            .expect_err(&format!("{legacy:?} 须被拒"));
+        assert!(
+            msg.contains("VEIL_ENTRY_MODE"),
+            "{legacy:?} 的错误须指名 VEIL_ENTRY_MODE: {msg}"
+        );
+        assert!(
+            msg.contains("full/llm_only") && !msg.contains("历史拼写"),
+            "{legacy:?} 的错误只列两个规范取值: {msg}"
+        );
+    }
 }
 
 #[test]
@@ -537,7 +561,7 @@ fn authorization_ttl_loaded_from_config_file() {
     let path = dir.join("veil.toml");
     std::fs::write(
         &path,
-        "[storage]\ndata_dir = \"/tmp/veil-ttl\"\nauthorization_ttl_secs = 7200\n",
+        "[storage]\ndata_dir = \"/tmp/veil-ttl\"\n[credential.authorization]\nttl_secs = 7200\n",
     )
     .unwrap();
     let mut env = base_env();

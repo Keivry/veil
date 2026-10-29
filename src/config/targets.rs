@@ -40,7 +40,7 @@ impl TargetKey {
 /// `[llm.targets]` 分节原始 schema：键为 TOML 字符串（校验后转 [`TargetKey`]）。
 pub type RawTargets = BTreeMap<String, TargetSection>;
 
-/// 单个目标声明：仅 `headers` / `params` / `override` / `user_agent`，未知键
+/// 单个目标声明：仅 `headers` / `params` / `override_existing` / `user_agent`，未知键
 /// （含错误嵌套层级）拒启动。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,8 +49,10 @@ pub struct TargetSection {
     pub headers: Option<BTreeMap<String, String>>,
     /// 协议 → 三段参数覆盖（键集恰为 `chat` / `anthropic` / `responses`）。
     pub params: Option<TargetParams>,
-    /// 冲突策略开关（缺省 `true` = 恒胜；`false` = 合并模式，仅补缺）。
-    pub r#override: Option<bool>,
+    /// 冲突策略开关（文件键 `override_existing`；缺省 `true` = 恒胜，
+    /// `false` = 合并模式，仅补缺）。键名与 [`UpstreamOverrides::override_existing`]
+    /// 字段一致，故与协议段表 `params.<proto>.override` 不再碰撞。
+    pub override_existing: Option<bool>,
     /// 出站 `User-Agent` 恒胜覆盖值（与 `r#override` 开关正交；值校验与
     /// `headers."user-agent"` 互斥规则见 [`validate_target`]）。
     pub user_agent: Option<String>,
@@ -104,7 +106,7 @@ pub struct UpstreamOverrides {
 }
 
 impl Default for UpstreamOverrides {
-    /// 缺省即恒胜，与 schema `override` 缺省 `true` 对齐；手写不派生，
+    /// 缺省即恒胜，与 schema `override_existing` 缺省 `true` 对齐；手写不派生，
     /// 避免 `bool` 的 `false` 派生默认值把空载荷误置为合并模式。
     fn default() -> Self {
         Self {
@@ -281,7 +283,7 @@ fn validate_target(key: TargetKey, section: &TargetSection) -> Result<UpstreamOv
         user_agent: validate_user_agent(key, section.user_agent.as_deref(), &headers)?,
         headers,
         params: validate_params(key, section.params.as_ref())?,
-        override_existing: section.r#override.unwrap_or(true),
+        override_existing: section.override_existing.unwrap_or(true),
     })
 }
 
@@ -604,7 +606,10 @@ fn reserved_key_error(path: &str, name: &str) -> VeilError {
 /// 不属此列；锁步测试据此与工程参考 §1 结构性键表比对，schema 侧增删改须同步。
 #[cfg(test)]
 pub(crate) const TARGETS_STRUCTURAL_KEYS: &[(&str, &[&str])] = &[
-    ("目标内", &["headers", "params", "override", "user_agent"]),
+    (
+        "目标内",
+        &["headers", "params", "override_existing", "user_agent"],
+    ),
     ("params 内", &["chat", "anthropic", "responses"]),
     ("协议段内", &["default", "override", "drop"]),
 ];

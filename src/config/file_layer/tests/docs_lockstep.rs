@@ -1,6 +1,12 @@
-//! 锁步测试（tasks 5.1/5.4）：文件 schema ↔ 工程参考 §1「配置文件层（TOML）」
-//! 子节键集、映射目标 ↔ env 读取名、别名概念 ↔ design D6 别名表、
-//! `examples/veil.toml` ↔ schema 与密钥门禁。任一侧漂移即 `cargo test` 失败。
+//! 锁步测试：文件 schema ↔ 工程参考 §1「配置文件层（TOML）」子节键集、
+//! 映射目标 ↔ env 读取名、别名概念 ↔ env 显式名集合、`examples/veil.toml` ↔
+//! schema 与密钥门禁。任一侧漂移即 `cargo test` 失败。
+//!
+//! 本变更（`rename-config-fields`）的三项不变量同步点：
+//! 1. §1 点键表全量重排为迁移后布局（51 行 = MAPPINGS 48 + 文件专属键根 3）；
+//! 2. 结构键清单仍为 `llm.targets` / `command` / `server`（`[audit]` / `[credential]` /
+//!    `[request_log]` 有 env 映射，**不进**）；
+//! 3. 迁移 env 并集换名 4 项后仍恰 49（旧名告警集合已随 0.2.0 移除，不再叠加）。
 
 use {
     super::{
@@ -14,7 +20,6 @@ use {
     crate::config::{
         AutoApprove,
         Config,
-        EntryMode,
         HeaderValueSegment,
         HeaderValueSpec,
         ParamProtocol,
@@ -30,6 +35,7 @@ use {
             apply_config_file,
             declares_secret_keys,
             file_only_root,
+            mapping_for,
         },
         targets::TARGETS_STRUCTURAL_KEYS,
     },
@@ -40,7 +46,7 @@ use {
 const ENGINEERING_REFERENCE: &str = include_str!("../../../../docs/engineering-reference.md");
 /// 可加载示例（示例侧锁步真源）。
 const EXAMPLE_TOML: &str = include_str!("../../../../examples/veil.toml");
-/// 容器版示例（仅 `[server].bind` 与本机版不同）。
+/// 容器版示例（仅 `[server].listen_addr` 与本机版不同）。
 const CONTAINER_EXAMPLE_TOML: &str = include_str!("../../../../examples/veil.container.toml");
 
 /// 文档侧子节标题（§1 内，非顶级 §N）。
@@ -322,20 +328,23 @@ fn config_key_table_covers_migrated_concepts_and_aliases() {
 }
 
 /// 文档第二列的规范 env 名须与映射目标一致（含端口表的 `LLM_<port>` 展开形态）。
+/// 文档第二列须与映射目标一致。判定顺序与 `resolve_entries` 相同——**先查
+/// MAPPINGS，再退到文件专属键根**：否则 `server.surface_mode`（`server` 根下的
+/// 有 env 映射键）会被误判为「文件专属」。
 #[test]
 fn doc_env_names_match_mapping_targets() {
     for (key, doc_env) in doc_schema_rows() {
-        if file_only_root(&key).is_some() {
+        let Some(mapping) = mapping_for(&key) else {
+            assert!(
+                file_only_root(&key).is_some(),
+                "文档键 {key} 须在封闭映射表中或为文件专属键根"
+            );
             assert_eq!(
                 doc_env, FILE_ONLY_ENV_LABEL,
                 "文件专属键 {key} 的说明列须为 {FILE_ONLY_ENV_LABEL:?}"
             );
             continue;
-        }
-        let mapping = MAPPINGS
-            .iter()
-            .find(|m| m.key == key)
-            .unwrap_or_else(|| panic!("文档键 {key} 须在封闭映射表中"));
+        };
         let want: &str = match &mapping.target {
             MappingTarget::Env(name) => name,
             MappingTarget::PortTable => "LLM_<port>",
@@ -416,18 +425,18 @@ fn container_example_differs_only_in_server_bind_and_loads() {
     let mut local_value = serde_json::to_value(&local).expect("本机示例序列化");
     let mut container_value = serde_json::to_value(&container).expect("容器示例序列化");
     assert_eq!(
-        local_value["server"]["bind"],
+        local_value["server"]["listen_addr"],
         serde_json::json!("127.0.0.1:8877")
     );
     assert_eq!(
-        container_value["server"]["bind"],
+        container_value["server"]["listen_addr"],
         serde_json::json!("0.0.0.0:8877")
     );
-    local_value["server"]["bind"] = serde_json::json!("normalized");
-    container_value["server"]["bind"] = serde_json::json!("normalized");
+    local_value["server"]["listen_addr"] = serde_json::json!("normalized");
+    container_value["server"]["listen_addr"] = serde_json::json!("normalized");
     assert_eq!(
         local_value, container_value,
-        "两份示例除 [server].bind 外须逐项一致"
+        "两份示例除 [server].listen_addr 外须逐项一致"
     );
 
     for (content, want) in [
@@ -486,6 +495,101 @@ fn example_file_covers_all_sections_and_declares_no_secret_keys() {
     );
 }
 
+/// 示例注释完备性机检（tasks 7.2 至 7.8 / spec「示例文件注释完备性」）：
+/// ① 每个非注释赋值行须有同行尾注释或紧邻的前置注释行；
+/// ② 点名键逐个命中注释；③ UA 注释不得声称指标读 UA；
+/// ④ `custom_rules_file` 注释须提到 JSON / YAML / TXT；⑤ 须引用 `examples/pii-custom.yaml`。
+#[test]
+fn example_comments_are_complete_and_accurate() {
+    for (name, text) in [
+        ("examples/veil.toml", EXAMPLE_TOML),
+        ("examples/veil.container.toml", CONTAINER_EXAMPLE_TOML),
+    ] {
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // 表头与数组表头不是键声明。
+            if trimmed.starts_with('[') {
+                continue;
+            }
+            let Some((_, rhs)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if rhs.contains('#') {
+                continue;
+            }
+            let mut prev = index;
+            let mut has_comment = false;
+            while prev > 0 {
+                prev -= 1;
+                let candidate = lines[prev].trim();
+                if candidate.is_empty() {
+                    continue;
+                }
+                has_comment = candidate.starts_with('#');
+                break;
+            }
+            assert!(
+                has_comment,
+                "{name}:{} 的键 {trimmed} 缺少前置注释（spec 要求每键有注释）",
+                index + 1
+            );
+        }
+        // UA 注释不得声称与服务端指标口径相关（metrics 从不读 UA）。
+        for line in &lines {
+            if line.contains("user_agent") || (line.contains("UA ") && line.starts_with('#')) {
+                assert!(
+                    !line.contains("指标口径一致"),
+                    "{name} 的 UA 注释不得声称与指标口径一致: {line}"
+                );
+            }
+        }
+        assert!(
+            !text.contains("指标口径一致"),
+            "{name} 不得残留「指标口径一致」说法"
+        );
+        assert!(
+            text.contains("pii-custom.yaml"),
+            "{name} 须在 [redaction] 段引用 examples/pii-custom.yaml"
+        );
+        // `custom_rules_file` 的注释须声明三种格式。
+        let rules_comment = lines
+            .iter()
+            .position(|line| line.contains("自定义正则规则文件"))
+            .map(|index| lines[index])
+            .unwrap_or_else(|| panic!("{name} 须有 custom_rules_file 的格式说明注释"));
+        for format in ["JSON", "YAML", "TXT"] {
+            assert!(
+                rules_comment.contains(format),
+                "{name} 的 custom_rules_file 注释须提到 {format}: {rules_comment}"
+            );
+        }
+        // 点名键须有注释（含迁移后新增路径）。
+        for needle in [
+            "timeout_secs",
+            "pool_max_idle_per_host",
+            "pool_idle_timeout_secs",
+            "nonstream_max_bytes",
+            "hold_max_bytes",
+            "hold_max_frames",
+            "ttl_secs",
+            "max_conversations",
+            "prev_id_max_entries",
+            "block_wait",
+        ] {
+            assert!(text.contains(needle), "{name} 须声明并注释 {needle}");
+        }
+        // `hold_max_bytes` / `hold_max_frames` 的注释须点明两维度相互独立。
+        assert!(
+            text.contains("两个相互独立的维度"),
+            "{name} 须说明 hold 的两个维度相互独立"
+        );
+    }
+}
+
 /// 取 `HeaderValueSpec` 的静态值文本（模板返回 `None`）。
 fn static_text(spec: &HeaderValueSpec) -> Option<&str> {
     match spec {
@@ -520,7 +624,12 @@ fn example_file_loads_and_applies_from_disk() {
     let cfg = Config::load_from_with_targets(&env, targets).expect("示例文件须通过既有校验链");
     assert_eq!(cfg.pii_scope_ttl_secs, 3600);
     assert!(cfg.pii_detection_hardening);
-    assert_eq!(cfg.entry_mode, EntryMode::Full);
+    assert!(cfg.admin_enabled, "示例 [admin].enabled = true 须生效");
+    assert_eq!(
+        cfg.surface_mode,
+        crate::config::EntryMode::Full,
+        "示例 [server].surface_mode = \"full\" 须生效"
+    );
     assert_eq!(cfg.auto_approve, AutoApprove::Pending);
     assert_eq!(
         cfg.llm_default_upstream.as_deref(),
@@ -586,7 +695,7 @@ fn example_file_loads_and_applies_from_disk() {
     );
     assert!(
         !default.override_existing,
-        "default 目标声明 override = false，须为合并模式"
+        "default 目标声明 override_existing = false，须为合并模式"
     );
 
     // opencode 兼容示例（8879）：UA 恒胜 + 合并模式身份头（含动态 `$conversation` 补齐）。

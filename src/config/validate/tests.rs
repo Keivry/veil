@@ -7,11 +7,11 @@ use {
 fn audit_timeout_zero_negative_and_forbidden_zone_rejects_startup() {
     for raw in ["0", "-5", "110", "120", "130"] {
         let mut env = base_env();
-        env.insert("AUDIT_TIMEOUT".to_string(), raw.to_string());
+        env.insert("AUDIT_TIMEOUT_SECS".to_string(), raw.to_string());
         let err = Config::load_from(&env).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("AUDIT_TIMEOUT"),
+            msg.contains("AUDIT_TIMEOUT_SECS"),
             "报错须指明变量名，输入 {raw} 实际: {msg}"
         );
     }
@@ -21,12 +21,12 @@ fn audit_timeout_zero_negative_and_forbidden_zone_rejects_startup() {
 fn audit_timeout_valid_values_allow_with_range_hint() {
     for (raw, want) in [("90", 90), ("1", 1), ("109", 109), ("131", 131)] {
         let mut env = base_env();
-        env.insert("AUDIT_TIMEOUT".to_string(), raw.to_string());
+        env.insert("AUDIT_TIMEOUT_SECS".to_string(), raw.to_string());
         let cfg = Config::load_from(&env).unwrap();
         assert_eq!(cfg.audit_timeout_secs, want);
     }
     let mut env = base_env();
-    env.insert("AUDIT_TIMEOUT".to_string(), "120".to_string());
+    env.insert("AUDIT_TIMEOUT_SECS".to_string(), "120".to_string());
     let msg = Config::load_from(&env).unwrap_err().to_string();
     assert!(msg.contains("110-130") && msg.contains("≥1"));
 }
@@ -147,17 +147,17 @@ fn audit_enabled_truthy_table_no_effect() {
     assert!(!cfg.audit_mode_explicit);
 }
 
-/// 非法 `AUDIT_TIMEOUT`（0/负/110-130）与 `AUDIT_HOLD_MAX_BYTES`/
+/// 非法 `AUDIT_TIMEOUT_SECS`（0/负/110-130）与 `AUDIT_HOLD_MAX_BYTES`/
 /// `AUDIT_HOLD_MAX_FRAMES`（0/负/非整数）一律拒启动，不静默回落默认值。
 #[test]
 fn audit_invalid_env_rejects() {
     for raw in ["0", "-1", "110", "120", "130", "abc", "1.5"] {
         let mut env = base_env();
-        env.insert("AUDIT_TIMEOUT".to_string(), raw.to_string());
+        env.insert("AUDIT_TIMEOUT_SECS".to_string(), raw.to_string());
         let err = Config::load_from(&env).unwrap_err();
         assert!(
-            err.to_string().contains("AUDIT_TIMEOUT"),
-            "AUDIT_TIMEOUT={raw:?} 须拒启动并指明变量"
+            err.to_string().contains("AUDIT_TIMEOUT_SECS"),
+            "AUDIT_TIMEOUT_SECS={raw:?} 须拒启动并指明变量"
         );
     }
     for raw in ["0", "-1", "abc", "1.5"] {
@@ -180,7 +180,7 @@ fn audit_invalid_env_rejects() {
     }
     // 合法边界仍放行（1 与 109/131 避开禁区）。
     let mut env = base_env();
-    env.insert("AUDIT_TIMEOUT".to_string(), "109".to_string());
+    env.insert("AUDIT_TIMEOUT_SECS".to_string(), "109".to_string());
     env.insert("AUDIT_HOLD_MAX_BYTES".to_string(), "1".to_string());
     env.insert("AUDIT_HOLD_MAX_FRAMES".to_string(), "2".to_string());
     let cfg = Config::load_from(&env).unwrap();
@@ -309,7 +309,7 @@ fn legacy_warn_covers_env_loopback_and_api_port() {
     loaded.insert("CREDENTIAL_API_PORT".to_string(), "9999".to_string());
     let cfg = Config::load_from(&loaded).unwrap();
     assert_eq!(cfg.audit_mode, AuditMode::Off);
-    assert_eq!(cfg.entry_mode, crate::config::EntryMode::Full);
+    assert_eq!(cfg.surface_mode, crate::config::EntryMode::Full);
     assert!(!cfg.credential_block_wait);
     assert!(!cfg.llm_upstreams.contains_key(&9999));
 }
@@ -375,13 +375,15 @@ fn legacy_vars_reference_lockstep() {
         names.push(name.to_string());
     }
     let reference_set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+    // §7.4 恰为「遗留不读取」清单（7 项）；「已改名旧名」告警集合已随 0.2.0 移除。
     let list_set: std::collections::BTreeSet<String> = LEGACY_IGNORED_VARS
         .iter()
         .map(|(name, _)| name.to_string())
         .collect();
+    assert_eq!(list_set.len(), 7, "LEGACY_IGNORED_VARS 须恰 7 项");
     assert_eq!(
         reference_set, list_set,
-        "工程参考 §7.4 与 LEGACY_IGNORED_VARS 名称集合须相等"
+        "工程参考 §7.4 须与 LEGACY_IGNORED_VARS 名称集合相等（恰 7 项）"
     );
     assert_eq!(
         names.len(),

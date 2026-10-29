@@ -782,20 +782,20 @@ fn timeout_disconnect_race_window_constants_locked() {
     // `110..=130` 拒启动，区间外（`109`/`131`/`90`）通过。
     let parse = |raw: &str| {
         crate::config::parse_audit_timeout(&|k: &str| {
-            (k == "AUDIT_TIMEOUT").then(|| raw.to_string())
+            (k == "AUDIT_TIMEOUT_SECS").then(|| raw.to_string())
         })
     };
     for rejected in ["110", "130"] {
         assert!(
             parse(rejected).is_err(),
-            "AUDIT_TIMEOUT={rejected} 落在竞态区间须被拒"
+            "AUDIT_TIMEOUT_SECS={rejected} 落在竞态区间须被拒"
         );
     }
     for accepted in ["109", "131", "90"] {
         assert_eq!(
             parse(accepted).unwrap(),
-            accepted.parse::<i64>().unwrap(),
-            "AUDIT_TIMEOUT={accepted} 在竞态区间外须通过"
+            accepted.parse::<u64>().unwrap(),
+            "AUDIT_TIMEOUT_SECS={accepted} 在竞态区间外须通过"
         );
     }
 }

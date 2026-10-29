@@ -163,7 +163,7 @@ async fn redaction_disabled_passthrough_original_request() {
 
 #[tokio::test]
 async fn rewrite_injects_stream_options_and_declares_normalization() {
-    let config = test_config(&[("NORMALIZE_JSON_WHITESPACE", "1")]);
+    let config = test_config(&[("PII_NORMALIZE_JSON_WHITESPACE", "1")]);
     let (scope, vault, detector) = fresh_arcs();
     let raw = br#"{"model":"m","stream":true,"messages":[]}"#;
     let out = request_rewrite(
@@ -801,7 +801,7 @@ fn forward_headers_override_mode_still_inserts_over_client_value() {
 
 #[test]
 fn forward_headers_user_agent_force_overrides_in_all_mode_combinations() {
-    // task 2.1：UA 恒胜覆盖——override = true/false × 客户端带 UA/不带 UA 四组合，
+    // task 2.1：UA 恒胜覆盖——override_existing = true/false × 客户端带 UA/不带 UA 四组合，
     // 出站均为配置值且仅单值（客户端多值同样被替换为单一值）。
     use axum::http::HeaderValue;
     let metrics = GatewayMetrics::default();
@@ -827,7 +827,7 @@ fn forward_headers_user_agent_force_overrides_in_all_mode_combinations() {
             assert_eq!(
                 values,
                 vec!["opencode/1.18.33"],
-                "override = {config_wins}、客户端 UA = {client_ua:?} 时出站 UA 须为配置单值"
+                "override_existing = {config_wins}、客户端 UA = {client_ua:?} 时出站 UA 须为配置单值"
             );
         }
     }

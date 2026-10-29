@@ -510,15 +510,12 @@ async fn same_secret_cross_requests_same_token() {
 }
 
 #[tokio::test]
-async fn pending_entry_always_requires_approval_in_credential_only_mode() {
-    // 审批豁免已删除：`credential-only` 下 `Pending` 条目仍须建票（202 + E_PENDING），
-    // 不得直接放行返回凭据。
-    let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
+async fn pending_entry_requires_approval_in_full_mode_with_explicit_env() {
+    // 审批豁免已删除：`full` 下 `Pending` 条目仍须建票（202 + E_PENDING），
+    // 不得直接放行返回凭据（env 显式声明 full 与缺省 full 同效）。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "full")]);
     let state = cred_state(&env);
-    assert_eq!(
-        state.config().entry_mode,
-        crate::config::EntryMode::CredentialOnly
-    );
+    assert_eq!(state.config().surface_mode, crate::config::EntryMode::Full);
     let err = handle_credential(
         &state,
         &headers("gethash", Some("s3cr3t")),
@@ -528,7 +525,7 @@ async fn pending_entry_always_requires_approval_in_credential_only_mode() {
     .unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::ACCEPTED);
     assert_eq!(err.code(), "E_PENDING");
-    assert_eq!(state.pending.len(), 1, "credential-only 下仍须建审批单");
+    assert_eq!(state.pending.len(), 1, "full 下仍须建审批单");
 }
 
 #[tokio::test]
@@ -709,9 +706,9 @@ async fn entry_without_ttl_never_expires() {
 }
 
 #[tokio::test]
-async fn expired_entry_in_credential_only_mode_still_creates_ticket() {
-    // 到期与 entry_mode 无交互：credential-only 下到期条目仍建票。
-    let env = cred_env(&[("VEIL_ENTRY_MODE", "credential-only")]);
+async fn expired_entry_in_full_mode_still_creates_ticket() {
+    // 到期与 surface_mode 无交互：full 下到期条目仍建票。
+    let env = cred_env(&[("VEIL_ENTRY_MODE", "full")]);
     let state = cred_state(&env);
     enrolled_with_entries(
         &state,

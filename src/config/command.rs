@@ -20,11 +20,19 @@ use {
 #[serde(deny_unknown_fields)]
 pub struct CommandSection {
     pub enabled: Option<bool>,
-    pub block_wait: Option<bool>,
+    pub approval: Option<CommandApprovalSection>,
     pub hosts: Option<BTreeMap<String, HostSection>>,
     pub groups: Option<BTreeMap<String, GroupSection>>,
     pub commands: Option<BTreeMap<String, CommandDefSection>>,
     pub downstreams: Option<BTreeMap<String, DownstreamSection>>,
+}
+
+/// `[command.approval]`：命令调用的审批行为（超时口径固定 300s）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandApprovalSection {
+    /// `true` 时调用阻塞至审批终态（默认 `false` = 202 建单即返回）。
+    pub block_wait: Option<bool>,
 }
 
 /// `[command.hosts.<name>]`。
@@ -257,7 +265,11 @@ pub fn validate_command(section: Option<&CommandSection>) -> Result<CommandConfi
     };
     let mut cfg = CommandConfig {
         enabled: section.enabled.unwrap_or(false),
-        block_wait: section.block_wait.unwrap_or(false),
+        block_wait: section
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.block_wait)
+            .unwrap_or(false),
         ..CommandConfig::default()
     };
 

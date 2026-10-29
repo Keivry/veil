@@ -12,7 +12,7 @@ fn each_error_variant_has_unique_code() {
         },
         VeilError::EmptyBody,
         VeilError::Config {
-            var: "AUDIT_TIMEOUT".to_string(),
+            var: "AUDIT_MODE".to_string(),
             message: "非法".to_string(),
         },
         VeilError::Storage {

@@ -11,6 +11,10 @@
 //! - [`filter_process_env`]：仅保留白名单名，其余（含 `LLM_<port>` 模式键）剔除；
 //! - [`warn_migrated_and_legacy`]：迁移/`LLM_<port>`/遗留置位告警，绝不返回 `Err`、绝不拒启动。
 //!
+//! 0.2.0 移除：`LEGACY_ENV_ALIASES`（4 个已改名旧 env 名与其「已改名」warn）已删除。
+//! 这些名字现在与任意未知 env 完全同形——不在白名单即被
+//! [`filter_process_env`] 剔除，不读取、不告警。
+//!
 //! 注意：过滤只作用于**进程 env**；`Config::load_from(&HashMap)` 的注入通道
 //! （测试注入与文件层「映射为规范 env 名后注入」）不被过滤，禁止另设第二套过滤。
 
@@ -41,6 +45,13 @@ pub(crate) const CONFIG_ENV_WHITELIST: [&str; 9] = [
 ///
 /// 分组（与 `specs/config-env-surface` 及 design D11 逐项一致）：脱敏 20、
 /// PII 作用域 5、审计 6、认证/入口/存储 12、LLM/限额 6。任一置位仅告警、不生效。
+///
+/// 0.2.0 换掉了 4 个名字（数量不变，仍 49）。那 4 个旧名自此不再被识别为
+/// 「已改名的旧名」：它们不在本清单、也不在白名单，因此与任意未知 env 同形。
+///
+/// **已识别、未执行**：`NONSTREAM_MAX_BYTES` / `SSE_FRAME_HARD_BYTES` 迁入 `[llm]`
+/// 后 env 前缀本应为 `LLM_*`，但改名会同时牵动 §1 键表、`docs_lockstep` 迁移 env
+/// 并集与全部容器模板，故本变更显式冻结（design 5.3），留作后续独立条目。
 pub(crate) const MIGRATED_ENV_VARS: [&str; 49] = [
     // 脱敏 20（含全部兼容别名）
     "REDACTION_ENABLED",
@@ -62,23 +73,23 @@ pub(crate) const MIGRATED_ENV_VARS: [&str; 49] = [
     "PII_VALUE_SAMPLE_PERSIST",
     "PII_PLACEHOLDER_PROMPT",
     "PII_PLACEHOLDER_PROMPT_TEXT",
-    "NORMALIZE_JSON_WHITESPACE",
+    "PII_NORMALIZE_JSON_WHITESPACE",
     // PII 作用域 5
     "PII_SCOPE_MODE",
     "PII_SCOPE_TTL_SECS",
     "PII_SCOPE_MAX_CONVERSATIONS",
-    "PII_PREV_ID_MAX_ENTRIES",
+    "PII_SCOPE_PREV_ID_MAX_ENTRIES",
     "PII_SCOPE_KEY_HEADER",
     // 审计 6
     "AUDIT_MODE",
-    "AUDIT_TIMEOUT",
+    "AUDIT_TIMEOUT_SECS",
     "AUDIT_HOLD_MAX_BYTES",
     "AUDIT_HOLD_MAX_FRAMES",
     "AUDIT_POLICY_FILE",
     "APPROVAL_WHITELIST",
     // 认证/入口/存储 12
     "AUTHORIZATION_TTL_SECS",
-    "OBSERVABILITY_DISABLE",
+    "ADMIN_ENABLED",
     "AUTO_APPROVE",
     "CREDENTIAL_BLOCK_WAIT",
     "VEIL_ENTRY_MODE",
@@ -116,8 +127,9 @@ pub(crate) fn filter_process_env(mut map: HashMap<String, String>) -> HashMap<St
 /// 与遗留清单中非空（trim 后）置位者并各记一条 `warn!`。
 ///
 /// 迁移项与可解析的 `LLM_<port>` 模式项指名变量并指引改用 `VEIL_CONFIG_FILE`；
-/// 不可解析的 `LLM_` 键（如 `LLM_FOO`）静默。遗留项（[`validate::LEGACY_IGNORED_VARS`]）
-/// 附带其中文说明。函数返回 `()`——任何路径都不返回 `Err`、不改变生效配置、不拒启动。
+/// 不可解析的 `LLM_` 键（如 `LLM_FOO`）静默。遗留项
+/// （[`validate::LEGACY_IGNORED_VARS`]）附带其中文说明。函数返回 `()`——任何路径
+/// 都不返回 `Err`、不改变生效配置、不拒启动。
 pub(crate) fn warn_migrated_and_legacy(map: &HashMap<String, String>) {
     for &name in MIGRATED_ENV_VARS.iter() {
         if map.get(name).is_some_and(|v| !v.trim().is_empty()) {

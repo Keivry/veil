@@ -98,11 +98,11 @@ fn b8_auto_approve_invalid_rejects_startup_and_case_variants() {
     assert!(Config::load_from(&env).is_ok());
 }
 
-// `llm-only` 入口下 approve_hash_change 降级阻断（403）且不执行变更；
-// `credential-only` 已等价于 full，不再被入口模式阻断（见下方 credential-only 用例）。
+// `llm_only` 入口下 approve_hash_change 降级阻断（403）且不执行变更；
+// `full` 入口下不被入口模式阻断（见下方 full 用例）。
 #[tokio::test]
 async fn b8_non_full_entry_approve_blocked_without_mutation() {
-    let mode = "llm-only";
+    let mode = "llm_only";
     let (base, handle) = serve(test_app_router(&[
         ("VEIL_ENTRY_MODE", mode),
         ("AUTO_APPROVE", "false"),
@@ -172,11 +172,11 @@ async fn b8_non_full_entry_approve_blocked_without_mutation() {
     handle.abort();
 }
 
-// `credential-only` 已等价于 full：approve 不再被入口模式阻断，而是走审批流转。
+// `full` 入口下 approve 不再被入口模式阻断，而是走审批流转。
 #[tokio::test]
-async fn b8_credential_only_entry_approve_not_blocked_by_entry_mode() {
+async fn b8_full_entry_approve_not_blocked_by_entry_mode() {
     let (base, handle) = serve(test_app_router(&[
-        ("VEIL_ENTRY_MODE", "credential-only"),
+        ("VEIL_ENTRY_MODE", "full"),
         ("AUTO_APPROVE", "false"),
     ]))
     .await;
@@ -186,12 +186,12 @@ async fn b8_credential_only_entry_approve_not_blocked_by_entry_mode() {
         .header("X-Veilctl-Binary-Hash", "gethash1")
         .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
-            "caller_path": "/srv/b8co.sh",
-            "caller_hash": "h-b8-co-A",
-            "name": "b8co-job",
+            "caller_path": "/srv/b8full.sh",
+            "caller_hash": "h-b8-full-A",
+            "name": "b8full-job",
             "entry": "网易",
             "field": "授权码",
-            "auth": {"caller_hash": "h-b8-co-A", "caller_path": "/srv/b8co.sh"}
+            "auth": {"caller_hash": "h-b8-full-A", "caller_path": "/srv/b8full.sh"}
         }))
         .send()
         .await
@@ -202,10 +202,10 @@ async fn b8_credential_only_entry_approve_not_blocked_by_entry_mode() {
         .header("X-Veilctl-Binary-Hash", "gethash1")
         .header("X-Veilctl-Secret", "s3cr3t")
         .json(&serde_json::json!({
-            "caller_path": "/srv/b8co.sh",
+            "caller_path": "/srv/b8full.sh",
             "reaction": "✅",
-            "new_hash": "h-b8-co-B",
-            "auth": {"caller_hash": "h-b8-co-A", "caller_path": "/srv/b8co.sh"}
+            "new_hash": "h-b8-full-B",
+            "auth": {"caller_hash": "h-b8-full-A", "caller_path": "/srv/b8full.sh"}
         }))
         .send()
         .await
@@ -213,7 +213,7 @@ async fn b8_credential_only_entry_approve_not_blocked_by_entry_mode() {
     assert_ne!(
         approve.status().as_u16(),
         403,
-        "credential-only 已等价于 full，不得被入口模式阻断"
+        "full 入口下不得被入口模式阻断"
     );
     handle.abort();
 }

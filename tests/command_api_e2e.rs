@@ -43,6 +43,8 @@ fn command_config(dir: &std::path::Path, body: &str, requires_approval: bool) ->
         r#"
 [command]
 enabled = true
+
+[command.approval]
 block_wait = false
 
 [command.hosts.api]

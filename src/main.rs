@@ -199,8 +199,8 @@ async fn main() -> ExitCode {
     if let Some(warning) = config.empty_whitelist_warning() {
         eprintln!("{warning}");
     }
-    if !config.admin_surface_enabled() && !config.observability_disabled {
-        eprintln!("警告: 管理面未启用：缺少 OBSERVABILITY_ADMIN_TOKEN");
+    if !config.admin_surface_enabled() && config.admin_enabled {
+        eprintln!("警告: 管理面未启用：缺少 OBSERVABILITY_ADMIN_TOKEN 或 [admin].token");
     }
 
     let allow_mock_tpm = allow_mock_from_env();
@@ -212,7 +212,7 @@ async fn main() -> ExitCode {
             "警告: PII_VALUE_SAMPLE_ENABLED=1 且未设 PII_VALUE_SAMPLE_HMAC_KEY：hash 退化为无盐 SHA256，低熵 PII 可被离线字典枚举，生产必须配置"
         );
     }
-    if let Some(msg) = veil::config::entry_mode_notice(config.entry_mode) {
+    if let Some(msg) = veil::config::entry_mode_notice(config.surface_mode) {
         eprintln!("警告: {msg}");
     }
     // 缺 HMAC 键时会话列留空（不写可被离线字典反查的弱摘要）；属功能降级，走可抑制的 tracing 告警。
@@ -227,7 +227,7 @@ async fn main() -> ExitCode {
         && ttl < 60
     {
         tracing::warn!(
-            "[storage].authorization_ttl_secs = {ttl}（< 60s）：授权窗口极短，每次到期都会重建成审批票，无人值守脚本将频繁阻塞至 300s 超时"
+            "[credential.authorization].ttl_secs = {ttl}（< 60s）：授权窗口极短，每次到期都会重建成审批票，无人值守脚本将频繁阻塞至 300s 超时"
         );
     }
     match startup_tpm_in(&config.tpm_dir, allow_mock_tpm) {
@@ -361,7 +361,7 @@ async fn main() -> ExitCode {
         tracing::warn!(
             "检测到容器环境但监听地址为回环 {bind_addr}：端口发布（DNAT）无法投递到回环，\
              宿主机侧将无法访问（容器内 /health 仍为 ok）。请在挂载的 TOML 中设置 \
-             [server].bind = \"0.0.0.0:8877\""
+             [server].listen_addr = \"0.0.0.0:8877\""
         );
     }
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {

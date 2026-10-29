@@ -45,14 +45,20 @@
   即 env 胜并记一条冲突 warn；否则取文件声明值；两处皆缺取内建默认。**文件专属**概念的进程 env 面恒空，文件恒胜。
   文件不引入新概念：下表每个键都对应一个白名单 env 名或一个文件专属概念；例外为三处声明式结构化分节
   ——`[llm.upstreams]`（按端口展开为 `LLM_<port>`）、`[llm.targets]`（文件专属上游目标覆盖，无 env 对应源，见下）与 `[command]`（文件专属下游命令配置，见 command-api 规格）
-  ——以及两个文件专属标量键 `storage.request_log_enabled`/`storage.request_log_retention_days`（无 env 对应源，进程 env 置位不生效）。
+  ——以及两个文件专属标量键 `request_log.enabled`/`request_log.retention_days`（无 env 对应源，进程 env 置位不生效）。
 - 过滤边界：白名单过滤只作用于 `Config::from_env` 收集到的**进程 env**；`Config::load_from(&HashMap)` 与文件层
   「映射为规范名后注入」的通道**保持不变**（文件值到达 `Config` 的唯一路径即该注入），故测试/脚本经 map
   注入的键不受过滤影响。
 - 审计 mode 层级：配置文件 `[audit].mode` > `[audit].policy_file` 所指策略文件的 `mode` > `off`
   ；配置文件 `mode` 视同显式，不得被策略文件的 `off` 静默降级为关闭审计。
-- 密钥类文件权限门禁：文件声明 `matrix_access_token`/`observability_admin_token`/`veilctl_secret`/
-  `veilctl_binary_hash`/`value_sample_hmac_key` 任一键时，Unix 下要求 `mode & 0o077 == 0`（即 `chmod 600`），
+- 键裁决只有一条口径：`FileConfig` 各分节 `deny_unknown_fields`。0.1.x 兼容期曾存在的遗留键别名表与其
+  `toml::Value` 预扫描归一已在 0.2.0 发布前移除——旧分节（`auth`/`limits`/`keepass`）与旧键名
+  （`server.bind`、`audit.timeout`、`storage.entry_mode`/`auto_approve`/`credential_block_wait`/
+  `authorization_ttl_secs`/`request_log_*`、`llm.targets.*.override`、`command.block_wait`）
+  与任意未知键同形，一律 fail-closed 拒启动并指名该键；不存在静默归一，也不存在新旧键并存优先级。
+  env 侧同样不做别名：不在白名单的名字一律不读取、不生效、无提示。
+- 密钥类文件权限门禁：文件声明 `matrix.access_token`/`admin.token`/`storage.veilctl_secret`/
+  `storage.veilctl_binary_hash`/`redaction.value_sample_hmac_key` 任一键时，Unix 下要求 `mode & 0o077 == 0`（即 `chmod 600`），
   否则拒绝启动并给出修正指引；env 覆盖不豁免该门禁（密钥文本已落盘）。非 Unix 平台该检查不适用。
   密钥类键建议继续走 env 注入。
 - env-only 例外（不参与文件层，写入即未知键拒启动）：`RUST_LOG`、`VEIL_ALLOW_MOCK_TPM`、`HOME`
@@ -61,35 +67,47 @@
 - 示例：`examples/veil.toml`（各分节代表键 + 中文注释；不含密钥类键，`0644` 权限即可加载）。
 
 文件 schema 键表（TOML 分节写法；键集由锁步测试与 `src/config/file_layer/mod.rs` 的封闭映射表逐项绑定，
-`llm.targets`/`command`/`server` 为文件专属键根，`storage.request_log_enabled`/`storage.request_log_retention_days` 为文件专属标量键（均无 env 对应源，增删须同步本表）：
+`llm.targets`/`command`/`server` 为文件专属键根，`request_log.enabled`/`request_log.retention_days` 为文件专属标量键（均无 env 对应源，增删须同步本表）。`server` 根下仅 `listen_addr` 属纯文件专属，`server.surface_mode` 有 env 映射（`VEIL_ENTRY_MODE`），故两者分别成行；
 
 | 文件键 | 规范 env 名 | TOML 类型 | 说明 |
 |:--|:--|:--|:--|
-| `auth.homeserver` | `HOMESERVER` | string | Matrix homeserver URL（概念可选：缺失即关闭 Matrix 通知/审批，不拒启动） |
-| `auth.room_id` | `ROOM_ID` | string | Matrix 审批房间 ID（概念可选：同 homeserver，缺失即关闭 Matrix 通知/审批） |
-| `auth.matrix_access_token` | `MATRIX_ACCESS_TOKEN` | string | Matrix Bot access token；密钥类（须 0600）；概念可选（缺失即关闭 Matrix 通知/审批） |
-| `auth.observability_admin_token` | `OBSERVABILITY_ADMIN_TOKEN` | string | `/_admin` 鉴权 token，建议 ≥32 字符且不得与 Matrix token 相同；密钥类（须 0600）；概念可选（缺失即 `/_admin*` 全 404） |
-| `auth.observability_disable` | `OBSERVABILITY_DISABLE` | bool | `true` → `/_admin*` 全 404 |
-| `limits.audit_hold_max_bytes` | `AUDIT_HOLD_MAX_BYTES` | integer | 审计 hold 字节上限（参数载荷累计）；≥1，默认 1MiB |
-| `limits.audit_hold_max_frames` | `AUDIT_HOLD_MAX_FRAMES` | integer | 审计 hold 暂存 tool 缓冲帧数上限；≥1，默认 65536 |
-| `limits.nonstream_max_bytes` | `NONSTREAM_MAX_BYTES` | integer | 非流对话响应体上限；≥1 |
-| `limits.sse_frame_hard_bytes` | `SSE_FRAME_HARD_BYTES` | integer | SSE 单行/单事件硬上限；≥1（默认 8MiB，超限 fail-closed） |
+| `server.surface_mode` | `VEIL_ENTRY_MODE` | enum `full`/`llm_only` | 暴露面模式；只接受这两个规范拼写，集合外取值（含 0.1.x 的连字符写法）拒启动；不改变任何审批口径 |
+| `admin.enabled` | `ADMIN_ENABLED` | bool（正向） | `true` 才挂载 `/_admin*`；缺省 `true`。极性反向于旧 `auth.observability_disable`（旧 `true` = 新 `false`） |
+| `admin.token` | `OBSERVABILITY_ADMIN_TOKEN` | string | `/_admin` 鉴权 token，建议 ≥32 字符且不得与 Matrix token 相同；密钥类（须 0600）；为空即 `/_admin*` 全 404 |
+| `matrix.homeserver` | `HOMESERVER` | string | Matrix homeserver URL（概念可选：缺失即关闭 Matrix 通知/审批，不拒启动） |
+| `matrix.room_id` | `ROOM_ID` | string | Matrix 审批房间 ID（概念可选：同 homeserver） |
+| `matrix.access_token` | `MATRIX_ACCESS_TOKEN` | string | Matrix Bot access token；密钥类（须 0600）；概念可选（缺失即关闭 Matrix 通知/审批） |
 | `audit.mode` | `AUDIT_MODE` | enum `off`/`block`/`approve` | 见上方审计 mode 层级；`approve` 须配 `approval_whitelist` |
-| `audit.timeout` | `AUDIT_TIMEOUT` | integer | 审批超时秒数；禁止落在 110-130 竞态区间 |
+| `audit.timeout_secs` | `AUDIT_TIMEOUT_SECS` | u64 | 审批超时秒数；须 ≥1，禁止落在 110-130 竞态区间 |
 | `audit.approval_whitelist` | `APPROVAL_WHITELIST` | array of string | 审批人 MXID 列表，数组按逗号连接为 env 值；空白名单＝不过滤；Matrix 面启用时启动期以裸 stderr 告警（`RUST_LOG=off` 也输出）；生产部署必须显式配置 |
 | `audit.policy_file` | `AUDIT_POLICY_FILE` | string | 审计策略文件路径；其 `mode` 低于配置文件 `mode` |
+| `audit.hold_max_bytes` | `AUDIT_HOLD_MAX_BYTES` | u64 | 审计 hold **载荷字节**上限；须 ≥1，默认 1MiB。与帧数维度相互独立 |
+| `audit.hold_max_frames` | `AUDIT_HOLD_MAX_FRAMES` | u64 | 审计 hold 暂存 **tool 帧数**上限；须 ≥1，默认 65536。帧数预算不得由字节预算隐式推导 |
+| `credential.default_decision` | `AUTO_APPROVE` | enum `allow`/`deny`/`pending` | 未声明 `allow_mode` 的条目取用时的缺省裁决（`allow`→放行、`deny`→拒绝、`pending`→Matrix 审批）；内建默认 `allow` |
+| `credential.approval.block_wait` | `CREDENTIAL_BLOCK_WAIT` | bool | 凭据审批 300s 阻塞双模开关 |
+| `credential.authorization.ttl_secs` | `AUTHORIZATION_TTL_SECS` | u64，`0`=无期限 | 授权窗口长度（秒）；到期转审批，不自动吊销 |
+| `credential.vault_backend` | `VEIL_KEEPASS_BACKEND` | enum `real`/`mock` | 凭据库后端；`mock` 仅 CI 逃生（生产禁用） |
+| `request_log.enabled` | `（文件专属）` | bool | 请求记录总开关（文件专属，无 env 对应源）；缺省 `true` |
+| `request_log.retention_days` | `（文件专属）` | u64，`0`=不清理 | 请求记录保留天数（文件专属，无 env 对应源）；缺省 `7` |
 | `storage.data_dir` | `DATA_DIR` | string | sqlite/审计日志父目录；派生 `db_dir`/`tpm_dir`/`caller_registry_path` |
 | `storage.db_dir` | `DB_DIR` | string | kdbx 库目录（缺省 `<data_dir>/db`） |
 | `storage.tpm_dir` | `TPM_DIR` | string | TPM 密封目录（缺省 `<data_dir>/tpm`） |
 | `storage.caller_registry_path` | `CALLER_REGISTRY_PATH` | string | 调用方注册表路径（缺省 `<data_dir>/caller_registry.json`） |
 | `storage.veilctl_secret` | `VEILCTL_SECRET` | string | 三因子之部署密钥；密钥类（须 0600） |
 | `storage.veilctl_binary_hash` | `VEILCTL_BINARY_HASH` | string | 直调哈希门禁；密钥类（保守纳入门禁，须 0600） |
-| `storage.auto_approve` | `AUTO_APPROVE` | enum `allow`/`deny`/`pending` | `allow`→放行、`deny`→拒绝、`pending`→Matrix 审批 |
-| `storage.entry_mode` | `VEIL_ENTRY_MODE` | enum `full`/`credential-only`(已废弃,=full)/`llm-only` | 入口语义模式；不改变审批口径 |
-| `storage.credential_block_wait` | `CREDENTIAL_BLOCK_WAIT` | bool | 凭据审批 300s 阻塞双模开关 |
-| `storage.authorization_ttl_secs` | `AUTHORIZATION_TTL_SECS` | u64，`0`=无期限 | 授权窗口长度（秒）；到期转审批，不自动吊销 |
-| `storage.request_log_enabled` | `（文件专属）` | bool | 请求记录总开关（文件专属，无 env 对应源）；缺省 `true` |
-| `storage.request_log_retention_days` | `（文件专属）` | u64，`0`=不清理 | 请求记录保留天数（文件专属，无 env 对应源）；缺省 `7`，`0` 表示不清理 |
+| `llm.default_upstream` | `LLM_UPSTREAM` | string | 缺省上游 URL |
+| `llm.timeout_secs` | `HTTP_TIMEOUT_SECS` | u64 | 非流/Dialog 上游整体超时秒；须 ≥1 |
+| `llm.pool_max_idle_per_host` | `HTTP_POOL_MAX_IDLE_PER_HOST` | usize | 每主机空闲连接上限；须 ≥1（容器容量语义，非时长/字节预算） |
+| `llm.pool_idle_timeout_secs` | `HTTP_POOL_IDLE_TIMEOUT_SECS` | u64 | 空闲连接保活秒；须 ≥1 |
+| `llm.nonstream_max_bytes` | `NONSTREAM_MAX_BYTES` | u64 | 非流对话响应体上限（软限，严格 `len >` 即 502）；须 ≥1，默认 8MiB |
+| `llm.sse_frame_hard_bytes` | `SSE_FRAME_HARD_BYTES` | u64 | SSE 单帧/单行硬上限；须 ≥1，默认 8MiB，超限 fail-closed 并合成终止帧 |
+| `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16；每个端口键各派生一条专用监听（见「端口语义」子节） |
+| `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标键、硬拒清单、保留键与三段语义见下 |
+| `pii_scope.mode` | `PII_SCOPE_MODE` | enum `request`/`conversation` | 会话级关联开关 |
+| `pii_scope.ttl_secs` | `PII_SCOPE_TTL_SECS` | u64 | 会话条目空闲 TTL 秒；须 ≥1（`0` 拒启动） |
+| `pii_scope.max_conversations` | `PII_SCOPE_MAX_CONVERSATIONS` | usize | 会话条目上限；须 ≥1 |
+| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名（最高优先；其后**PII 专用窄链** `x-opencode-session` → `x-opencode-session-id`，刻意不含 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，见 §6）；保留名拒启动 |
+| `pii_scope.prev_id_max_entries` | `PII_SCOPE_PREV_ID_MAX_ENTRIES` | usize | `previous_response_id` 映射上限；缺省联动 `max_conversations` |
 | `redaction.enabled` | `REDACTION_ENABLED` | bool | 脱敏总开关；env 别名 `PII_REDACTION_ENABLED` |
 | `redaction.fuzzy_restore` | `PII_FUZZY_RESTORE` | bool | 残缺占位符按序号回查还原 |
 | `redaction.detection_hardening` | `PII_DETECTION_HARDENING` | bool | 严格边界复核（丢弃 ASCII 粘连与前导零 IPv4） |
@@ -101,21 +119,9 @@
 | `redaction.value_sample_hmac_key` | `PII_VALUE_SAMPLE_HMAC_KEY` | string | 值级采样 HMAC key；密钥类（须 0600） |
 | `redaction.placeholder_prompt` | `PII_PLACEHOLDER_PROMPT` | bool | 占位符说明注入 |
 | `redaction.placeholder_prompt_text` | `PII_PLACEHOLDER_PROMPT_TEXT` | string | 自定义说明文案（4KB 上限，超限截断） |
-| `redaction.normalize_json_whitespace` | `NORMALIZE_JSON_WHITESPACE` | bool | 请求体空白归一 |
-| `pii_scope.mode` | `PII_SCOPE_MODE` | enum `request`/`conversation` | 会话级关联开关 |
-| `pii_scope.ttl_secs` | `PII_SCOPE_TTL_SECS` | integer | 会话条目空闲 TTL 秒；≥1 |
-| `pii_scope.max_conversations` | `PII_SCOPE_MAX_CONVERSATIONS` | integer | 会话条目上限；≥1 |
-| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名（最高优先；其后**PII 专用窄链** `x-opencode-session` → `x-opencode-session-id`，刻意不含 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，见 §6）；保留名拒启动 |
-| `pii_scope.prev_id_max_entries` | `PII_PREV_ID_MAX_ENTRIES` | integer | `previous_response_id` 映射上限；缺省联动 `max_conversations` |
-| `llm.default_upstream` | `LLM_UPSTREAM` | string | 缺省上游 URL |
-| `llm.timeout_secs` | `HTTP_TIMEOUT_SECS` | integer | 非流/Dialog 上游整体超时秒；≥1 |
-| `llm.pool_max_idle_per_host` | `HTTP_POOL_MAX_IDLE_PER_HOST` | integer | 每主机空闲连接上限；≥1 |
-| `llm.pool_idle_timeout_secs` | `HTTP_POOL_IDLE_TIMEOUT_SECS` | integer | 空闲连接保活秒；≥1 |
-| `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16；每个端口键各派生一条专用监听（见「端口语义」子节） |
-| `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标键、硬拒清单、保留键与三段语义见下 |
-| `command` | `（文件专属）` | table（命令配置分节） | 下游命令执行配置（文件专属，无 env 对应源）；schema 与行为见 command-api 规格 |
-| `server` | `（文件专属）` | table（`bind` → 监听地址） | 主监听地址（文件专属，无 env 对应源）：`bind` 须为 `IP:PORT` 字面量（不接受主机名）；缺省 `127.0.0.1:8877`，容器内写 `0.0.0.0:8877`。已声明上游端口在此 IP 上另开专用监听（见「端口语义」子节） |
-| `keepass.backend` | `VEIL_KEEPASS_BACKEND` | enum `real`/`mock` | `mock` 仅 CI 逃生（生产禁用） |
+| `redaction.normalize_json_whitespace` | `PII_NORMALIZE_JSON_WHITESPACE` | bool | 请求体空白归一 |
+| `command` | `（文件专属）` | table（命令配置分节） | 下游命令执行配置（文件专属，无 env 对应源）；`command.approval.block_wait` 为阻塞开关；schema 与行为见 command-api 规格 |
+| `server` | `（文件专属）` | table（`listen_addr` → 监听地址） | 主监听地址（文件专属，无 env 对应源）：`listen_addr` 须为 `IP:PORT` 字面量（不接受主机名）；缺省 `127.0.0.1:8877`，容器内写 `0.0.0.0:8877`。其子键 `surface_mode` 有 env 映射（见上表首行）。已声明上游端口在此 IP 上另开专用监听（见「端口语义」子节） |
 
 **[llm.targets] 上游覆盖（文件专属分节，无 env 对应源；未声明时零行为变化）**
 
@@ -125,7 +131,7 @@
   客户端其余头原样保留；`params` 仅对对话协议按协议子表（`chat`/`anthropic`/`responses`）生效，每协议三段
   `default`（缺则补）→ `override`（恒写）→ `drop`（删顶层键，缺失静默），注入在脱敏与占位符说明之后，参数值为配置原文；
   实际发生改写时响应带 `x-veil-normalized: json-whitespace`。
-- `override` 冲突策略（目标级布尔，缺省 `true`）：`true` = 恒胜（上述语义）；`false` = 合并模式——headers 仅当客户端
+- `override_existing` 冲突策略（目标级布尔，缺省 `true`；旧键名 `override` 已在 0.2.0 移除）：`true` = 恒胜（上述语义）；`false` = 合并模式——headers 仅当客户端
   未发送同名头时新增，`params` 的 `default` 与 `override` 两段均仅在请求体原文缺失该顶层键时写入（客户端已有值恒保留），
      `drop` 不受开关影响（两态均删除所列顶层键）；合并模式下同一键跨段仍「后段生效」，但仅限配置段之间，绝不覆盖客户端值。
 - 头值动态插值（仅 `headers` 表的值；`user_agent` 恒为字面值、不参与插值）：值内 `$` 触发展开，三种来源——
@@ -139,11 +145,11 @@
   未闭合/嵌套 `$header(`、空或非法头名、含 `$` 的镜像名、`$header(x-veil-*)` 内部命名空间引用。
   opencode 动态 session 配方：`headers` 写 `x-opencode-session = "$conversation"`——客户端携带会话键头时
   动态透传其首值（会话粘性随键头走），缺失时跳过（不注入伪造值）；合并模式下客户端自带该头时原样保留。
-- `user_agent` 出站 `User-Agent` 恒胜覆盖（目标级字符串，与 `override` 正交）：声明后出站 UA 恒为该单一配置值——
-  与 `override` 取值及客户端是否发送 UA 均无关；未声明时 UA 装配逐项零变化（客户端值透传、未发送则不含该头）。
+- `user_agent` 出站 `User-Agent` 恒胜覆盖（目标级字符串，与 `override_existing` 正交）：声明后出站 UA 恒为该单一配置值——
+  与 `override_existing` 取值及客户端是否发送 UA 均无关；未声明时 UA 装配逐项零变化（客户端值透传、未发送则不含该头）。
   对话与 NonDialog 透传路径一致生效。值须为合法 HTTP 头值（禁 CR/LF），空/全空白/含首尾空白拒启动（不做静默修剪）；同一目标与 `headers` 中
   归一后为 `user-agent` 的键并存拒启动（两条 UA 通道语义不同，并存歧义）。opencode zen/go 兼容配方：
-  `override = false` + `user_agent = "opencode/<实际安装版本>"` + `headers` 补 `x-opencode-client` 等静态身份头——
+  `override_existing = false` + `user_agent = "opencode/<实际安装版本>"` + `headers` 补 `x-opencode-client` 等静态身份头——
   opencode CLI 的动态身份头保留、第三方客户端缺项补齐且 UA 恒被替换。
 - 缺省回退不命中覆盖：无端口专用上游且无缺省上游时按端口升序选 URL（端口升序兼容路径）不命中任何目标覆盖（行为不变）。
 - 硬拒清单（任一项即拒启动）：`host`、`content-length`、`content-encoding`、`accept-encoding`、`transfer-encoding`、
@@ -159,8 +165,8 @@
 |:--|:--|:--|
 | `headers` | 目标内 | 出站请求头表（头名 → 字符串；值支持 `$` 动态插值，见上） |
 | `params` | 目标内 | 按协议分表的请求体参数覆盖容器 |
-| `override` | 目标内 | 冲突策略：`true`（缺省）= 恒胜；`false` = 合并模式（仅补缺，`drop` 不受影响） |
-| `user_agent` | 目标内 | 出站 `User-Agent` 恒胜覆盖值（与 `override` 正交；未声明零变化；与 `headers."user-agent"` 归一后互斥） |
+| `override_existing` | 目标内 | 冲突策略：`true`（缺省）= 恒胜；`false` = 合并模式（仅补缺，`drop` 不受影响）。原键名 `override` 已随 0.2.0 移除（出现即拒启动），与协议段 `params.<proto>.override` 表的命名碰撞随之消失 |
+| `user_agent` | 目标内 | 出站 `User-Agent` 恒胜覆盖值（与 `override_existing` 正交；未声明零变化；与 `headers."user-agent"` 归一后互斥） |
 | `chat` | params 内 | OpenAI Chat Completions 协议规则 |
 | `anthropic` | params 内 | Anthropic Messages 协议规则 |
 | `responses` | params 内 | OpenAI Responses 协议规则 |
@@ -175,14 +181,19 @@
 `CREDENTIAL_MASTER_PASSWORD`、`CREDENTIAL_PORT`、`ENV`、
 `ALLOW_LOOPBACK_NO_TOKEN`、`CREDENTIAL_API_PORT`、`CREDENTIAL_ADMIN_TOKEN`、`AUDIT_ENABLED`。
 
+这 7 项检出置位即 `warn`、一律**不读取**，措辞为「已置位但二进制不读取」。
+
+env 一律不做别名：不在白名单的名字（含 0.2.0 改名前的 4 个旧名）与任意未知变量同形——
+不读取、不生效、也不产生任何改名提示。
+
 ### 端口语义：主监听 + 每上游一条专用监听
 
 **主监听一条，另有若干专用 LLM 监听，全部由同一进程承载。**
 
-- 主监听：`[server].bind` 一个地址，承载凭据 API、管理面与 LLM 代理（含按 `Host` 头选路）；
+- 主监听：`[server].listen_addr` 一个地址，承载凭据 API、管理面与 LLM 代理（含按 `Host` 头选路）；
   绑定失败仍为致命错误（启动即退出）。
 - 专用 LLM 监听：对 `[llm.upstreams]` 的每个端口键与 `[llm.targets]` 的每个端口目标键，
-  在 `[server].bind` 的 IP 上额外绑定同号端口（排除与主监听重复者，升序去重）。
+  在 `[server].listen_addr` 的 IP 上额外绑定同号端口（排除与主监听重复者，升序去重）。
   某端口是否「已声明」只由 `Config::declares_port` 判定，监听派生
   （`Config::dedicated_listener_addrs`）与请求期选路复用同一判定，两处不会漂移。
 - 每条监听服务同一份 `build_router`：`AppState`、鉴权、管理面与 SSE 行为逐项一致，
@@ -216,7 +227,7 @@
 - 数据绑定（时间轴与 KPI）：图表 X 轴与 tooltip 以 series 点的 `ts_start`（窗口起始 Unix 秒）按浏览器本地时间渲染，`window` 仅作内部键、不作可读标签；KPI 总量取自 `/_admin/metrics` 与 SSE `metrics` 快照的 `pii_hits`/`pii_miss`/`cred_hits` 三个 additive 字段（命中率 = `pii_hits/(pii_hits+pii_miss)`，分母为 0 显示 `—`）。
 - 指标字段兼容：上述新增字段只增不改；控制台不依赖任何字段的移除或改名，旧调用方可忽略新字段。新增的「LLM 请求」分区消费 `/_admin/requests`，不改变既有分区的取数路径。
 - 事件空态说明：事件表为空且 `[audit].mode` 为默认 `off` 时，页面展示说明性空态文案——审计默认关闭时事件环仅承载截断/故障类事件，属设计语义而非故障。
-- `[auth].observability_disable = true` 时 `/_admin/` 与其余管理面路由一致返回 404。
+- `[admin].enabled = false`（旧键 `[auth].observability_disable = true`）时 `/_admin/` 与其余管理面路由一致返回 404。
 - `GET /_admin`（无尾斜杠）与 `GET /_admin/` 注册为同一 handler，均按 `Accept` 协商（浏览器得控制台 HTML、
   脚本得 JSON 索引），双注册见 `src/router.rs`；`/_admin/{*rest}` 未知子路径仍 404。
 - 管理面鉴权：请求头 `X-Admin-Token`（对应环境变量 `OBSERVABILITY_ADMIN_TOKEN`）优先，
@@ -236,7 +247,7 @@
 ### 本地直跑
 
 ```bash
-cp examples/veil.toml ./veil.toml            # 按需改 [auth].homeserver / [auth].room_id、[storage].data_dir、[llm]
+cp examples/veil.toml ./veil.toml            # 按需改 [matrix].homeserver / [matrix].room_id、[storage].data_dir、[llm]
 export VEIL_CONFIG_FILE="$PWD/veil.toml"
 export MATRIX_ACCESS_TOKEN='syt_...'
 export OBSERVABILITY_ADMIN_TOKEN="$(openssl rand -hex 32)"
@@ -246,7 +257,7 @@ export VEIL_ALLOW_MOCK_TPM=1
 cargo run --release
 ```
 
-- 部署参数（Matrix homeserver/room、数据目录、LLM 上游）仅从配置文件读取；同名进程 env 置位不生效（仅启动期告警）。
+- 部署参数（Matrix homeserver/room、数据目录、LLM 上游）仅从配置文件读取；同名进程 env 置位不生效（列入迁移清单者仅启动期告警，未列入者静默）。
 - 两 token 可缺省：缺省即关闭对应功能（启动期 warn），不拒启动。
 
 服务监听 `127.0.0.1:8877`（回环，见 `src/main.rs`）。
@@ -308,10 +319,10 @@ curl -fsS http://127.0.0.1:8877/credential \
 语义补充：
 
 - 服务端未配置对应调用方期望哈希（未 enrolled）时**默认转 Matrix 审批**
-  （`202 + E_PENDING`；`[storage].auto_approve = "deny"` 时直接 `403`）——未注册调用方不直接取用凭据，
+  （`202 + E_PENDING`；`[credential].default_decision = "deny"` 时直接 `403`）——未注册调用方不直接取用凭据，
   自动放行仅对已注册调用方生效。
 - `caller_hash == VEILCTL_BINARY_HASH`（终端直调而非脚本调用）拒绝 403。
-- 自动放行三态（`[storage].auto_approve` 文件枚举）：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（哈希不一致走 `pending` 分支）；
+- 自动放行三态（`[credential].default_decision` 文件枚举）：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（哈希不一致走 `pending` 分支）；
   三态取值由配置文件承载，非法值拒启动（`src/config/env_parse/mod.rs::AutoApprove`）。
 - 管理面鉴权优先级：`X-Admin-Token` 头 > `__Host-admin_token` Cookie > `?access_token`（仅 SSE 回退）；
   非 SSE 接口以 query 携带 token 恒 401。
@@ -400,11 +411,11 @@ done
 | 通用 admin 接口限流 | `10/min`/IP | `429` + `Retry-After` | 是 | 速率维度；按 TCP 远端地址计数，不采信代理头；豁免 `/_admin`、`/_admin/`、`/_admin/health`、`/_admin/events/stream` 四路（数据接口阈值不变） |
 | SSE 并发 | `5`/IP | 拒绝新连接，已建连接不受影响 | 是 | 并发维度；不占速率桶（见上行豁免集）；`60s` ping + `5min` 强制重连 |
 | 通用请求体上限 | `10MB` | `413` | 是（入口唯一 enforcement） | 通用 JSON 检查点 |
-| 非流对话响应上限 | `[limits].nonstream_max_bytes` 默认 `8MB` | `502` + `response_too_large` JSON 体（`error.type`，见 `src/handler/llm/nonstream.rs::oversize_response`） | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代；本仓超限分支无独立指标与 warning、无状态门 |
-| 审计类上限 | `8MB` | — | 否（纯 ceiling 锚点） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `[limits].audit_hold_max_bytes` 默认 1MB 均不得超过它）；与入口 `10MB` 属不同检查点、差异有意 |
+| 非流对话响应上限 | `[llm].nonstream_max_bytes` 默认 `8MB` | `502` + `response_too_large` JSON 体（`error.type`，见 `src/handler/llm/nonstream.rs::oversize_response`） | 是（入口 enforcement） | 对话尾缀（chat/completions、v1/messages、v1/responses）响应体严格超限；`Protocol::NonDialog` 透传不受限；与审计 ceiling `AUDIT_SUBLIMIT_CEILING_BYTES`（子限锚点、非入口 enforcement）分属不同检查点，不可互相替代；本仓超限分支无独立指标与 warning、无状态门 |
+| 审计类上限 | `8MB` | — | 否（纯 ceiling 锚点） | 策略子限 ceiling（`AUDIT_SUBLIMIT_CEILING_BYTES` 回归锚点：现网可配子限如 `[audit].hold_max_bytes` 默认 1MB 均不得超过它）；与入口 `10MB` 属不同检查点、差异有意 |
 | 审计日志轮转 | `10MB` x 5，`0600` | 写失败双层 fail-closed | 先脱敏后截断，零明文 |
-| 审批超时 | `[audit].timeout` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
-| 凭据审批超时 | `300`s | — | 与审计 `[audit].timeout` 分表 |
+| 审批超时 | `[audit].timeout_secs` 默认 `90`s | — | 禁止落在 `110`-`130`s 竞态区间 |
+| 凭据审批超时 | `300`s | — | 与审计 `[audit].timeout_secs` 分表 |
 
 `GET /health` 的 `pending` 计数在审批终态（批准/拒绝/超时）即时归零：内存侧与矩阵侧 pending
 在同批终态清理，不依赖空闲票 `60s` 孤儿清扫延迟。
@@ -473,7 +484,7 @@ done
 - `session`：`session_id` **前缀**匹配，少于 4 字符 `400`（`%`/`_`/`\` 已转义，不作通配）。`scope` 取 `session|user|any`，`any` 等同不过滤。
 - `limit`：默认 `50`，取值收敛到 `1..=200`（`limit=500` 得 200、`limit=0` 得 1，均不报错）；`offset`：默认 `0`，上限 `10000`，超出 `400`。响应回显收敛后的 `limit`/`offset`。
 - 无 `range` 时响应**省略** `range`/`since_ts`/`boundary_slack_secs` 三个键（不以 `null` 冒充全局口径），`coverage_secs` 取 `now - 该 WHERE 下最早记录 ts`，`partial=false`。
-- 记录功能关闭（`[storage].request_log_enabled = false`）时短路为 `{"ok":true,"enabled":false,"rows":[],"total":0}`，不解析其余参数。
+- 记录功能关闭（`[request_log].enabled = false`）时短路为 `{"ok":true,"enabled":false,"rows":[],"total":0}`，不解析其余参数。
 - 顶层 `sum_cached_read`/`sum_cache_input_tokens`/`hit_rate` 与 `rows` **同 WHERE**（`total` 也是），`hit_rate` 为 `SUM/SUM`，分母 `0` 时为 `null`。
 
 ```bash
@@ -494,10 +505,10 @@ veilctl revoke --name "check-mail"
   （未配置）下三者恒 `403`（`E_AUTH`）不执行动作。Go `veilctl` 实发
   `X-Veilctl-Secret`，配置后无需改客户端。`POST /credential` 取用路径不受影响。
 
-- `POST /revoke` 异步 `202` 轮询契约：默认模式（`[storage].credential_block_wait` 未开启）下
+- `POST /revoke` 异步 `202` 轮询契约：默认模式（`[credential.approval].block_wait` 未开启）下
   与 `POST /credential` 同口径——`202 + E_PENDING`（`{"error":{"code":"E_PENDING",...}}`）表示**已建单
   待审批**，**不代表吊销已完成**；调用方 SHALL 对同一请求轮询重试（建议指数退避），批准后吊销生效
-  （条目 `revoked=true`/`enabled=false`），拒绝/超时返回 `403`，重试不重复建单。`[storage].credential_block_wait = true`
+  （条目 `revoked=true`/`enabled=false`），拒绝/超时返回 `403`，重试不重复建单。`[credential.approval].block_wait = true`
   时同请求阻塞返回终态、无需轮询。紧急吊销转常规审批路径**不受** `credential_block_wait` 影响，恒返回 `202 + E_PENDING`（`src/service/credential/vault_ops.rs::emergency_revoke` 经决策闭环异步落定）。
 
 - `POST /revoke` 定位顺序 `key → caller_path → caller_hash → name`：
@@ -512,16 +523,16 @@ veilctl revoke --name "check-mail"
 
 - 三因子字段：`X-Veilctl-Binary-Hash` + `X-Veilctl-Secret`（或 `body.secret`）+ `body.auth.caller_hash` /
   `caller_path`；齐全时按既有语义放行或进入审批，缺失时返回明确的鉴权失败（403），不会空响应或挂起。
-- 凭据审批 `202` 轮询语义：默认（`[storage].credential_block_wait` 未开启）待审请求返回
+- 凭据审批 `202` 轮询语义：默认（`[credential.approval].block_wait` 未开启）待审请求返回
   `202 + E_PENDING` 即已建单，客户端应对同一请求轮询重试（建议指数退避），批准后重试返回凭据、
-  拒绝后 `403`；`[storage].credential_block_wait = true` 时无需轮询（同请求阻塞等待，批准返回凭据、拒绝/超时 `403`）。
+  拒绝后 `403`；`[credential.approval].block_wait = true` 时无需轮询（同请求阻塞等待，批准返回凭据、拒绝/超时 `403`）。
   超时码归并：阻塞超时按拒绝返回 `403`（`VeilError::Auth`），与拒绝同码，下游重试语义一律按拒绝处理（见 §6.7）。
 - Go `202` 处理（`veilctl/`，本仓内置客户端）：`veilctl revoke` / `veilctl register` / `veilctl credential` 在收到
   `202 + E_PENDING` 后按退避轮询**同一请求**（服务端经决策表幂等复用既有票，不重复建单）直至终态：
   批准 → 成功（吊销生效 / 注册生效 / 返回凭据），拒绝或超时 → `403` 报错；间隔与时限由
   `PROXY_APPROVAL_POLL`（默认 `500ms`，逐次翻倍至 `10s`）与 `PROXY_APPROVAL_TIMEOUT`（默认 `300s`）控制。
   `--no-wait` 或 `PROXY_APPROVAL_WAIT=0` 时仅提交审批单并以**退出码 `2`** 表示「已受理未完成」
-  （不再把 `202` 当成功）；`[storage].credential_block_wait = true` 时服务端阻塞返回终态，客户端单次调用即完成。
+  （不再把 `202` 当成功）；`[credential.approval].block_wait = true` 时服务端阻塞返回终态，客户端单次调用即完成。
   错误体兼容（`ErrMessage`：网关对象取 `message`、兼容字符串形态错误体）与 `/credential`
   成功信封 `{"ok":true,"credential":{...}}` 不变；`202` 体不再报「解析响应失败」。
 - Go 客户端环境变量（`veilctl/`，本仓内置）：`PROXY_URL`（网关基址，默认 `http://127.0.0.1:8877`）、
@@ -554,7 +565,7 @@ veilctl revoke --name "check-mail"
   目标在 `hosts` 范围内时转审批，否则 403。
 - 审批：`MatrixBranch::Command`，`✅` 批准一次、`❎` 拒绝、`♾️` 批准并持久化 accept-always
   （`data_dir/command_grants.json`，`0600` 原子写，损坏按空）；超时（默认 300s）按拒绝。
-  默认 `202 + E_PENDING`，`[command].block_wait = true` 时阻塞至终态。
+  默认 `202 + E_PENDING`，`[command.approval].block_wait = true` 时阻塞至终态。
 - 幂等：同一次审批至多执行一次；并发/重复重入返回同一终态（不会重复执行）。
 - 日志：`data_dir/commands.sqlite` 的 `command_invocations` 表记录审批状态、执行状态、
   退出码、耗时与脱敏截断后的参数/输出摘要；`GET /_admin/commands` 提供分页与过滤
@@ -596,8 +607,8 @@ veilctl revoke --name "check-mail"
 
 ### 6.7 凭据审批默认异步 `202` 与阻塞模式
 
-- 默认（`[storage].credential_block_wait` 未开启）：enrolled 哈希篡改/未 enrolled 待审请求立即返回 `202` + `E_PENDING`，先经 tracked 发送取真实 Bot Matrix event id 并以之为 pending 键建单，再即返回；同一请求不阻塞。
-- 阻塞模式（`[storage].credential_block_wait = true`）：同请求阻塞至 `300`s，批准返回凭据、拒绝或超时按拒绝返回 `403`（`VeilError::Auth`，`src/service/credential/approval.rs`）。
+- 默认（`[credential.approval].block_wait` 未开启）：enrolled 哈希篡改/未 enrolled 待审请求立即返回 `202` + `E_PENDING`，先经 tracked 发送取真实 Bot Matrix event id 并以之为 pending 键建单，再即返回；同一请求不阻塞。
+- 阻塞模式（`[credential.approval].block_wait = true`）：同请求阻塞至 `300`s，批准返回凭据、拒绝或超时按拒绝返回 `403`（`VeilError::Auth`，`src/service/credential/approval.rs`）。
 - 发送路由：审批建单走 `NotificationSink::send_text_tracked`（需真实回执——真实 `event_id` 是反应回调命中 pending 的唯一键；发送失败/取不到 id 即 fail-closed 返回 `403`，不建不可决单）；事件环/失败通知走 `notify_text` 有界 spool 的 best-effort 路径（可丢、不计回执）。二者共用同一 Bot。
 - 审批建单路径白名单：仅凭据、注册、命令、吊销（`MatrixBranch::Revoke`）四类路径经 `send_text_tracked` 以真实 `event_id` 建单；`audit-hold` 仅内存 pending（见 §6.4）、哈希变更经 best-effort `notify_text` 通知（`src/service/credential/approval.rs::notify_hash_change`），两者不建 Matrix 审批票。`unlock` 分支已删除（无建单路径，见 §8.4）。
 - 轮询语义：`202 + E_PENDING` = 已建单等待 Matrix 人工审批；客户端应轮询重试同一请求（建议指数退避），批准后重试返回凭据、拒绝后 `403`。本仓内置 Go 客户端（`veilctl/`）按契约自动轮询，并以退出码 `2` 区分「已受理未完成」（见 §5）。待审期间的幂等重试不受 `2s` 凭据限流约束（见 §3 豁免条），故 500ms 级轮询不会换来 `429`；该重试的 `202` 响应日志为 `debug` 级、文案「已受理待审批」，不再以 WARN「请求失败」记录（见 §6.12）。
@@ -626,8 +637,8 @@ veilctl revoke --name "check-mail"
 ### 6.10 非法审计值拒启动
 
 - 审计模式来源为配置文件 `[audit].mode`（另有 `[audit].policy_file` 所指策略文件的 `mode` 兜底，见 §6.11）；遗留 `AUDIT_ENABLED` 不被读取，置位仅启动期 `warn`、不改变生效模式。
-- `[audit].timeout`（须 ≥1 且避开 `110-130` 竞态区间）与 `[limits].audit_hold_max_bytes`/`[limits].audit_hold_max_frames`（均须 ≥1 正整数）取值非法时拒启动，启动错误信息给出合法区间；不静默回落（fail-closed，防静默关闭审计）。
-- 审计 hold 的四个有界维度各自独立判定、任一超限即 fail-closed 阻断（`[blocked: audit-hold-overflow]`）：① 载荷字节——缓冲帧只按**参数载荷**（真正进审计的 `arguments` 文本）计费，`total_bytes` 与缓冲载荷**共享同一 `audit_hold_max_bytes` 上限但各自判超、不求和**，确保 1MiB 配置即 1MiB 可用；② 帧数——`[limits].audit_hold_max_frames`（默认 65536），与字节维度并行，单个大 tool 调用即使分片上万帧（参数总量仍在字节预算内）也不得被判为洪泛；③ 零载荷帧——载荷为 0 的帧不增字节，另设固定 4096 帧上限约束其洪泛；④ 信封字节——SSE 前缀 + JSON 外壳单独成账，受固定 8MiB 预算约束，**不占用**载荷预算（旧实现把整帧计入载荷预算，几千个合法分片的信封即独吞整份 1MiB，是本缺陷成因）。聚合槽条目（`args_by_index`/`responses_slots`）仍固定受 `AUDIT_HOLD_MAX_ENTRIES`（4096）约束，与该配置键无关。
+- `[audit].timeout_secs`（须 ≥1 且避开 `110-130` 竞态区间）与 `[audit].hold_max_bytes`/`[audit].hold_max_frames`（均须 ≥1 正整数）取值非法时拒启动，启动错误信息给出合法区间；不静默回落（fail-closed，防静默关闭审计）。
+- 审计 hold 的四个有界维度各自独立判定、任一超限即 fail-closed 阻断（`[blocked: audit-hold-overflow]`）：① 载荷字节——缓冲帧只按**参数载荷**（真正进审计的 `arguments` 文本）计费，`total_bytes` 与缓冲载荷**共享同一 `audit_hold_max_bytes` 上限但各自判超、不求和**，确保 1MiB 配置即 1MiB 可用；② 帧数——`[audit].hold_max_frames`（默认 65536），与字节维度并行，单个大 tool 调用即使分片上万帧（参数总量仍在字节预算内）也不得被判为洪泛；③ 零载荷帧——载荷为 0 的帧不增字节，另设固定 4096 帧上限约束其洪泛；④ 信封字节——SSE 前缀 + JSON 外壳单独成账，受固定 8MiB 预算约束，**不占用**载荷预算（旧实现把整帧计入载荷预算，几千个合法分片的信封即独吞整份 1MiB，是本缺陷成因）。聚合槽条目（`args_by_index`/`responses_slots`）仍固定受 `AUDIT_HOLD_MAX_ENTRIES`（4096）约束，与该配置键无关。
 
 ### 6.11 审计策略文件 fail-closed
 
@@ -641,7 +652,7 @@ veilctl revoke --name "check-mail"
 ### 6.12 日志层默认可见
 
 - 进程启动第一步即安装 tracing 订阅者，默认向 stderr 输出 `warn` 及以上人类可读日志（无 ANSI），stdout 保持零输出。`RUST_LOG` 自此生效（`EnvFilter` 指令，支持 per-target 过滤；非法指令不拒启动，回退默认级别并在 stderr 说明一行）。
-- 降级类告警（`mlockall` 失败、sqlite 降级 memory-only、凭据 alternation 回退）走日志层，默认 `warn` 级别可见且可被 `RUST_LOG` 抑制；进程终止类诊断（fail-fast 启动失败、TPM 门禁、端口绑定失败、`serve` 异常退出）与缺 HMAC 安全配置告警（`[redaction].value_sample_enabled = true` 且未设 `PII_VALUE_SAMPLE_HMAC_KEY`）以及空白名单弱授权告警（Matrix 面启用且 `[audit].approval_whitelist` 为空，见 §6.11）保留裸 stderr，不受 `RUST_LOG` 影响（含 `RUST_LOG=off`）。`[storage].entry_mode != full` 的降级告警不在此列：它是可被 `RUST_LOG` 抑制的日志层 `warn`。
+- 降级类告警（`mlockall` 失败、sqlite 降级 memory-only、凭据 alternation 回退）走日志层，默认 `warn` 级别可见且可被 `RUST_LOG` 抑制；进程终止类诊断（fail-fast 启动失败、TPM 门禁、端口绑定失败、`serve` 异常退出）与缺 HMAC 安全配置告警（`[redaction].value_sample_enabled = true` 且未设 `PII_VALUE_SAMPLE_HMAC_KEY`）以及空白名单弱授权告警（Matrix 面启用且 `[audit].approval_whitelist` 为空，见 §6.11）保留裸 stderr，不受 `RUST_LOG` 影响（含 `RUST_LOG=off`）。`[server].surface_mode != full` 的降级告警不在此列：它是可被 `RUST_LOG` 抑制的日志层 `warn`。
 - 响应日志三档（`VeilError` 的 `IntoResponse`，`src/error.rs`）：`202` 待审批（`PendingApproval`）记 `debug`、文案「已受理待审批」；4xx 记 `warn`、文案「请求被拒绝」；5xx 记 `error`、文案「请求失败」。三档均带 `code` 与数值 `status` 字段，`RateLimited`（`429`）另带 `retry_after`。意图是让预期结果不稀释告警：`202` 与常规 4xx 不落 `error`，故默认 `warn` 级别下看不到 202 行。
 - 请求作用域字段：每个 HTTP 请求建立 `request_id`/`method`/`route` 三个字段（`route` 为静态路由模式，如 `/`、`/{*tail}`、`/_admin/{*rest}`），响应日志与请求处理期日志自动继承，为继续处理同一请求而派生的异步任务（上游分发、流式泵、审批等待、命令审批等待）显式继承；`request_id` 取入站 `x-request-id`（限 `1..=64` 字节、字符集 `[A-Za-z0-9._-]`），不满足则进程生成。该字段不新增任何响应头。
 - 看 `202` 受理行需显式放开 `veil::error` 到 `debug`：用 `RUST_LOG=warn,veil::error=debug`。**不要**只写 `RUST_LOG=veil::error=debug`，那样 `EnvFilter` 的默认级别变为 `off`，按 target 前缀匹配会把 `veil::router` 的 ERROR span 一并关闭，`202` 行反而丢了 `request_id`/`method`/`route`，无法定位。
@@ -764,7 +775,7 @@ SSE 出口信封保真：出口在 `event:` 重放基础上
 SSE 超长行有界混合（勿截断）：单行/单事件或未终结行尾（`text_carry`）超过软限 `SSE_FRAME_SOFT_BYTES`
 （1MiB）时**完整缓冲并原样交付**，事件带 `oversize` 标记（取代旧 `truncated`），并记
 `oversize_frame_bytes`/`oversize_frames`；`truncated_line_dropped_bytes` 退役为生产恒 0（字段保留兼容）。
-超过可配硬上限 `[limits].sse_frame_hard_bytes`（默认 8MiB，配置文件可配、运行时注入解析器生效）时 fail-closed：
+超过可配硬上限 `[llm].sse_frame_hard_bytes`（默认 8MiB，配置文件可配、运行时注入解析器生效）时 fail-closed：
 置 `carry_fatal`、停止解析并由既有中途断流收尾路径合成协议正确终止帧（Chat 恰一 `data: [DONE]`、
 Anthropic 零合成帧、Responses 单帧
 `response.failed`），观测复用 `TruncatedMode::OpenEnded`（Chat/Anthropic）/`SynthesizedFailed`（Responses），
@@ -819,7 +830,7 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 **仅 `status == 200`** 返回空体或非 JSON 体 → 下游 `502`（`src/error.rs::VeilError::code` 的码映射与
 `src/error.rs::VeilError::status_code` 的 `EmptyBody → BAD_GATEWAY`）。错误体的字段形态为 `{"error":{"code":"E_EMPTY_BODY","message":"上游返回空响应体"}}`
 （网关级装配见 `src/handler/llm/mod.rs::empty_body_response`；入口级故障如上流未配置亦以同码 `502` 返回，
-见 `src/handler/llm/dispatch.rs::gateway_serve` 的 `resolve_upstream` 未配置分支）。判定先后关系：非流响应体上限（`[limits].nonstream_max_bytes`，超限 → `502`
+见 `src/handler/llm/dispatch.rs::gateway_serve` 的 `resolve_upstream` 未配置分支）。判定先后关系：非流响应体上限（`[llm].nonstream_max_bytes`，超限 → `502`
 `response_too_large`，见 §4 阈值表）判定**先于**空体/非 JSON 的 `E_EMPTY_BODY` 判定——有界读取先于空体
 分类（`src/handler/llm/nonstream.rs::serve_nonstream`）；`status>=400` 的错误体不受二者改写，按上段透传语义保留
 状态码与正文字节。注意两枚 502 错误体的字段名不同：`E_EMPTY_BODY` 用 `error.code`，超限 `response_too_large`
@@ -836,12 +847,12 @@ error 对象中 `type`/`code`/`param`/`message` 之外的其余字段不保留�
 上游 `status<400` 且响应 `content-type` 为 `text/event-stream` 时进入 SSE 泵；
 上游 `status>=400`（4xx/5xx 的 JSON/HTML/空体）或 2xx 非 `text/event-stream`
 正文一律按非流口径保状态与正文字节透传（hop 头过滤 + `x-veil-protocol`，受
-`[limits].nonstream_max_bytes` 约束），不改写为 200 SSE 假流；进入 SSE 泵的上游 2xx（`status<400` 且
+`[llm].nonstream_max_bytes` 约束），不改写为 200 SSE 假流；进入 SSE 泵的上游 2xx（`status<400` 且
 `content-type: text/event-stream`）下游 SHALL 逐字携带上游原状态码（如 `201`/`202`/`206`），
 SHALL NOT 硬编码改写为 `200`（实现见
 `src/handler/llm/pump/event.rs::build_sse_response`），`<400` 入泵门不放宽；仅非错误状态（`status<400`）
 严格超限走 502 `response_too_large`（见 `src/handler/llm/dispatch.rs::stream_upstream_passthrough`）。
-有界读：透传读取先判上游 `content-length`，再按 `[limits].nonstream_max_bytes`
+有界读：透传读取先判上游 `content-length`，再按 `[llm].nonstream_max_bytes`
 有界读，不先全量缓冲；超限 502 **严格作用于非错误状态**，4xx/5xx 错误体不因体大
 改写状态或正文（有界读/流式转发仅为内存安全，错误体按透传语义不改写，与 §4
 「错误体按透传语义不改写」一致）。内部头隔离：透传前剔除上游所有
@@ -882,7 +893,7 @@ sync 失败退避：常规序列 `1s→2s→4s→…→60s`（`sync_backoff_secs
 fail-closed 收尾。档位硬编码，见 `src/service/llm_gateway/mod.rs::RETRY_DELAYS_MS`
 与 `MAX_RETRY_ATTEMPTS`。
 
-非流超限观测口径：`[limits].nonstream_max_bytes`
+非流超限观测口径：`[llm].nonstream_max_bytes`
 严格超限（仅 `status<400`）恒返回 502 `response_too_large`，`len == cap` 放行、
 `status>=400` 错误体不改写；超限判定先于空体/非 JSON 502 生效。本仓超限分支**无独立
 指标与 warning、无状态门**；该选择记录见对应设计说明。
@@ -1014,11 +1025,19 @@ PII 与凭据计数口径：
 | `CREDENTIAL_PORT` | 二进制不读取 | 宿主机端口改用 `PORT_8877/8878/8879`（仅改映射） |
 | `ENV` | 二进制不读取（置位启动 warn） | dev 环境显式配置 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`（回环免 token 未迁移，见 §6.6） |
 | `ALLOW_LOOPBACK_NO_TOKEN` | 二进制不读取（置位启动 warn） | 回环免 token 未迁移：dev 环境显式配置 `OBSERVABILITY_ADMIN_TOKEN` 并携带 `X-Admin-Token`（见 §6.6） |
-| `CREDENTIAL_API_PORT` | 二进制不读取（置位启动 warn） | 入口统一走 `[storage].entry_mode` + 单端口 `8877`（见 §8.4） |
+| `CREDENTIAL_API_PORT` | 二进制不读取（置位启动 warn） | 入口统一走 `[server].surface_mode` + 单端口 `8877`（见 §8.4） |
 | `CREDENTIAL_ADMIN_TOKEN` | 二进制不读取（置位启动 warn） | 无替代：启动期交叉校验已废除；管理面/紧急吊销统一用 `OBSERVABILITY_ADMIN_TOKEN`（独立 token 由部署面保证，见 §7.5） |
 | `AUDIT_ENABLED` | 二进制不读取（置位启动 warn） | 审计模式改用配置文件的 `[audit].mode`；env 真值回退（→ `block`）已移除（见 §6.10） |
 
-沿用旧名部署不生效（置位仅启动期告警），须改用下表「改用」列给出的新形态。
+上表 7 项是**检出置位即 warn、一律不读取**的遗留名，与 `LEGACY_IGNORED_VARS` 逐项锁步；
+须改用「改用」列给出的新形态。
+
+0.2.0 改名前的 4 个旧变量名（审计超时、JSON 空白归一、前驱 id 上限、
+管理面关闭开关）自 0.2.0 起没有任何「已改名」提示：它们与任意未知 env 无区别，置位既不改生效值、
+也不再产生告警。这四个概念已不读进程 env，须写入配置文件：`AUDIT_TIMEOUT` →
+`[audit].timeout_secs`、`NORMALIZE_JSON_WHITESPACE` → `[redaction].normalize_json_whitespace`、
+`PII_PREV_ID_MAX_ENTRIES` → `[pii_scope].prev_id_max_entries`、
+`OBSERVABILITY_DISABLE` → `[admin].enabled = false`（**极性相反**，缺省 `true`）。
 
 ### 7.5 吊销与注册鉴权声明
 
@@ -1049,7 +1068,7 @@ PII 与凭据计数口径：
 - 常规吊销 `POST /revoke`：经 Matrix 审批确认后执行——
   建单（`MatrixBranch::Revoke`，预置 `✅`/`❎`）后仅 `✅` 置 `revoked=true` 且 `enabled=false`；
   `♾️` 不受理（回执，票保持未决）、`❎` 与等待超时**保持条目原状**（不做破坏性动作）。
-  默认 `202` 抛单，`[storage].credential_block_wait = true` 阻塞至 `300s`。
+  默认 `202` 抛单，`[credential.approval].block_wait = true` 阻塞至 `300s`。
 - `GET /registrations`：要求管理面鉴权（`X-Admin-Token` 或部署密钥
   `X-Veilctl-Secret`，见 `src/handler/credential.rs::registrations_handler`），两者皆缺/不匹配 401。
   Go `veilctl list` 携带部署密钥可用。
@@ -1138,7 +1157,7 @@ PII 与凭据计数口径：
   ② 响应侧非流式全部调用点在还原之后（`scope.rs:293,310`、`handler/llm/nonstream.rs:413,722`）；
   ③ 响应侧 SSE 残余帧在还原**之前**（`service/sse/parser.rs:85` 的 `Utf8ByteBuffer::flush_text`，
   经 `SseParser::residual_json_aware` 由 `handler/llm/pump/spawn/terminal.rs:269` 的终端收尾调用），
-  作用于**上游原始残余字节**，入参规模受 `[limits].sse_frame_hard_bytes`（默认 8MiB、可配置、
+  作用于**上游原始残余字节**，入参规模受 `[llm].sse_frame_hard_bytes`（默认 8MiB、可配置、
   无上界）约束——该路径上 `Err` 原样返回等价于「跳过残缺剥离」，因该文本本就发往客户端而
   不新增明文暴露面，但 MUST NOT 据此推断其入参不含明文；新增其它前置调用点时同样按此判定。
   可达性由「回溯步数上界随输入长度线性增长（基础余量 1,000,000 + 8 × 字节数，硬上限
@@ -1220,11 +1239,11 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 
 ### 7.14 逐请求记录与 `range` 口径
 
-`[storage].request_log_enabled`（默认 `true`）开启时，每个 LLM 请求落一行到
+`[request_log].enabled`（默认 `true`）开启时，每个 LLM 请求落一行到
 `metrics.sqlite` 的 `llm_requests` 表（与指标同库、不同表），并由 `counted_metrics=1` 的行
 聚合出 `request_model_rollup` 投影（粒度/窗口/协议/模型四键）。写入路径为有界队列
 （`REQUEST_QUEUE_CAP` = 4096，满则丢最旧并计 `dropped`）+ 2 秒或积压 ≥64 行的单事务批量写，
-关闭路径 `flush_blocking` 兜底。`llm_requests` 按 `[storage].request_log_retention_days`
+关闭路径 `flush_blocking` 兜底。`llm_requests` 按 `[request_log].retention_days`
 （默认 `7`，`0` = 不清理）删除；`request_model_rollup` 随窗口数驱逐（`d` 32 / `h` 170 / `m` 13）。
 本表只存元数据与脱敏摘要，不存请求/响应正文；`upstream` 只记 `host:port`。
 
@@ -1330,11 +1349,10 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 
 ### 8.4 入口与审批语义
 
-- `[storage].entry_mode` 三态：`full`（默认）/ `credential-only`（**已废弃，等价于 `full`**）/ `llm-only`，非法值拒启动。
-- `entry_mode` **不改变任何审批口径**：`allow_mode = pending` 的条目在任一取值下都每次建票（`credential-only`
-  曾经的「`Pending` 跳过审批」豁免已删除）。需要自动放行的部署须在条目上显式声明 `allow_mode = allow`，
-  使决策可被注册表与审批记录审计。`credential-only` 被解析时启动期输出不可抑制告警（裸 stderr）。
-- `llm-only` 入口下凭据面整体不可用（取用返回鉴权失败），`approve_hash_change` 亦降级为阻断
+- `[server].surface_mode` 两态：`full`（默认）/ `llm_only`，只接受这两个规范拼写，集合外取值拒启动。
+- `[server].surface_mode` **不改变任何审批口径**：`allow_mode = pending` 的条目在任一取值下都每次建票。
+  需要自动放行的部署须在条目上显式声明 `allow_mode = allow`，使决策可被注册表与审批记录审计。
+- `llm_only` 入口下凭据面整体不可用（取用返回鉴权失败），`approve_hash_change` 亦降级为阻断
   （见 `src/service/credential/vault_ops.rs::approve_hash_change`）。
 - Matrix 审批返回 `None` 即 rejected 并清理；审批票回收两口径并存、不得混用：
   **空闲票 60s 回收上限**——无阻塞等待者的孤儿票（`Audit`/`Unknown`）按分支 TTL `60s` 清扫；
@@ -1346,9 +1364,9 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
   明确不在 `lock` 清理范围的两项：`DecisionTable`（已落定的审批结论，条目本身按 TTL 自然过期，清它等于让「已批准」变成「无记录」）与 `previous_response_map`（只存 HMAC 派生会话键、不含明文 PII 或口令材料）。清理范围以 `service::matrix::GatewayCleanup::lock_cleanup` 的 `LockCleanupReport` 为准，回执条数取自其真实返回值。发送者须经与 reaction 相同的白名单判定（`[audit].approval_whitelist`）；非成员发送的 `lock`/`status`/`forget` 在指令解析前被丢弃（`debug` 日志），不产生回执。
 - `MatrixBranch::Unlock` 已删除：`unlock`/`解锁` 前缀原因在 `from_reason` 直接返回错误，
   `record_pending` fail-closed（不建一张永远不可决的票）。
-- `[storage].auto_approve` 三态：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（见 §2）。
+- `[credential].default_decision` 三态：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（见 §2）。
 
-授权生命周期（`[storage].authorization_ttl_secs`，规范 env 名 `AUTHORIZATION_TTL_SECS`——该名不在白名单内，进程 env 置位仅触发迁移告警、不改变生效配置）：
+授权生命周期（`[credential.authorization].ttl_secs`，规范 env 名 `AUTHORIZATION_TTL_SECS`——该名不在白名单内，进程 env 置位仅触发迁移告警、不改变生效配置）：
 
 - 条目可选带授权窗口：`authorized_at`（落定时刻）+ `authorized_ttl_secs`（窗口长度）。两者任一为
   `null` 即**无期限**（缺省），行为与未引入该特性前完全一致。配置值 `0` 归一为无期限（与 `null` 同义）。

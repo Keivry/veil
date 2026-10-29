@@ -10,6 +10,11 @@
 //!
 //! 再拆分：存储/入口域（`StorageParts`/`load_storage`/授权窗口解析）移至
 //! `env_parse/storage.rs`，父模块按原调用位置引用，行为与错误顺序不变。
+//!
+//! 配置键改名（`rename-config-fields`）：管理面开关改为正向 `admin_enabled`
+//! （env `ADMIN_ENABLED`，缺省 `true`），入口模式字段改为 `surface_mode`
+//! （文件键 `[server].surface_mode`，env 规范名仍为 `VEIL_ENTRY_MODE`）；
+//! 时长/字节/帧数类字段统一 `u64`（负值在文件反序列化阶段即失败）。
 
 use {
     super::{
@@ -23,7 +28,6 @@ use {
             parse_bool_off,
             parse_bool_on,
             parse_placeholder_prompt,
-            parse_positive,
             parse_positive_u64,
             parse_positive_usize,
             parse_whitelist,
@@ -44,26 +48,26 @@ pub use {
     pii_scope::PiiScopeMode,
 };
 
-/// 默认监听地址：本机回环（容器部署在 `[server].bind` 显式写 `0.0.0.0:8877`）。
+/// 默认监听地址：本机回环（容器部署在 `[server].listen_addr` 显式写 `0.0.0.0:8877`）。
 pub const DEFAULT_SERVER_BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
     std::net::Ipv4Addr::new(127, 0, 0, 1),
     8877,
 ));
 
 /// 审计审批默认超时（秒）。
-pub const AUDIT_TIMEOUT_DEFAULT: i64 = 90;
-/// `AUDIT_TIMEOUT` 禁区下限（含端点）：上游约 120s 断连窗口两侧各留约 10s 余量。
-pub const AUDIT_TIMEOUT_RACE_MIN: i64 = 110;
-/// `AUDIT_TIMEOUT` 禁区上限（含端点）。
-pub const AUDIT_TIMEOUT_RACE_MAX: i64 = 130;
+pub const AUDIT_TIMEOUT_DEFAULT: u64 = 90;
+/// `AUDIT_TIMEOUT_SECS` 禁区下限（含端点）：上游约 120s 断连窗口两侧各留约 10s 余量。
+pub const AUDIT_TIMEOUT_RACE_MIN: u64 = 110;
+/// `AUDIT_TIMEOUT_SECS` 禁区上限（含端点）。
+pub const AUDIT_TIMEOUT_RACE_MAX: u64 = 130;
 /// `AUDIT_HOLD_MAX_BYTES` 默认值。
-pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: i64 = 1_048_576;
+pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: u64 = 1_048_576;
 /// `AUDIT_HOLD_MAX_FRAMES` 默认值：`audit_hold_on` 下暂存的 tool 帧数上限。
 ///
 /// 与字节上限分属不同维度：单次大 tool 调用的参数按 token 分片时可达数千帧
 /// （每帧参数仅数字节），只按字节记账会让帧数维度先行触顶；故帧数单独可配，
 /// 默认值取「远超合法长流、又能在异常洪泛下收敛」的 65536。
-pub const AUDIT_HOLD_MAX_FRAMES_DEFAULT: i64 = 65_536;
+pub const AUDIT_HOLD_MAX_FRAMES_DEFAULT: u64 = 65_536;
 /// 管理 token 建议最小长度，不足仅告警不断链。
 pub const ADMIN_TOKEN_MIN_LEN: usize = 32;
 /// 通用网关 ingress JSON 上限 10MB（检查点：`handler::llm` 入口 `to_bytes`；
@@ -135,7 +139,7 @@ impl std::str::FromStr for AutoApprove {
     }
 }
 
-/// 凭据审批超时（秒），与审计 `AUDIT_TIMEOUT` 分表，固定 300s。
+/// 凭据审批超时（秒），与审计 `AUDIT_TIMEOUT_SECS` 分表，固定 300s。
 pub const CREDENTIAL_APPROVAL_TIMEOUT_SECS: i64 = 300;
 /// `POST /credential` 同一调用方限流窗口（秒）。
 pub const CREDENTIAL_RATE_WINDOW_SECS: u64 = 2;
@@ -173,21 +177,22 @@ pub struct Config {
     pub room_id: String,
     pub matrix_access_token: String,
     pub observability_admin_token: String,
-    /// 可观测性总开关（`OBSERVABILITY_DISABLE`，仅精确 `1` 生效）：
-    /// 置位时网关入口拒绝管理面（`/_admin` 全 404，与 token 有效性无关）。
-    pub observability_disabled: bool,
-    /// 监听地址（文件专属 `[server].bind`；缺省 `127.0.0.1:8877`）。
+    /// 管理面总开关（正向语义；`ADMIN_ENABLED` / `[admin].enabled`，缺省 `true`）：
+    /// `false` 时网关入口拒绝管理面（`/_admin` 全 404，与 token 有效性无关）。
+    /// 正向开关：`true` 才启用（缺省启用，缺 token 时管理面不可用）。
+    pub admin_enabled: bool,
+    /// 监听地址（文件专属 `[server].listen_addr`；缺省 `127.0.0.1:8877`）。
     pub server_bind: SocketAddr,
     pub audit_mode: AuditMode,
     /// 审计模式是否由环境来源显式给出（`AUDIT_MODE` 非空）。
     /// 用于区分「显式 `AUDIT_MODE=off`」与「未设置」，决定策略文件 `mode`
     /// 是否生效。
     pub audit_mode_explicit: bool,
-    pub audit_timeout_secs: i64,
+    pub audit_timeout_secs: u64,
     pub approval_whitelist: Vec<String>,
-    pub audit_hold_max_bytes: i64,
-    /// 审计 hold 暂存 tool 帧数上限（`[limits].audit_hold_max_frames`，默认 65536）。
-    pub audit_hold_max_frames: i64,
+    pub audit_hold_max_bytes: u64,
+    /// 审计 hold 暂存 tool 帧数上限（`[audit].hold_max_frames`，默认 65536）。
+    pub audit_hold_max_frames: u64,
     /// 非流对话响应体上限（`NONSTREAM_MAX_BYTES`，默认 8MB；严格超限 502）。
     pub nonstream_max_bytes: usize,
     /// SSE 单行/单事件硬上限（`SSE_FRAME_HARD_BYTES`，默认 8MiB；超限 fail-closed）。
@@ -196,8 +201,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub veilctl_secret: Option<String>,
     pub veilctl_binary_hash: Option<String>,
+    /// 未声明 `allow_mode` 的条目取用时的缺省裁决（`[credential].default_decision`）。
     pub auto_approve: AutoApprove,
-    pub entry_mode: EntryMode,
+    /// 暴露面模式（文件键 `[server].surface_mode`，env 规范名 `VEIL_ENTRY_MODE`）。
+    pub surface_mode: EntryMode,
     pub registry_path: PathBuf,
     pub credential_approval_timeout_secs: i64,
     pub llm_upstreams: HashMap<u16, String>,
@@ -216,14 +223,14 @@ pub struct Config {
     /// PII 作用域模式（`PII_SCOPE_MODE`，默认 `request`）：`conversation` 时
     /// PII 映射按会话键跨轮共享（凭据仍请求级）；`request` 逐请求。
     pub pii_scope_mode: PiiScopeMode,
-    /// 会话条目空闲 TTL（`PII_SCOPE_TTL_SECS`，默认 1800s；非正整数拒启动）。
-    pub pii_scope_ttl_secs: i64,
+    /// 会话条目空闲 TTL（`PII_SCOPE_TTL_SECS`，默认 1800s；`0` 拒启动）。
+    pub pii_scope_ttl_secs: u64,
     /// 会话条目上限（`PII_SCOPE_MAX_CONVERSATIONS`，默认 1024；非正整数拒启动）。
     pub pii_scope_max_conversations: usize,
     /// 显式会话键请求头名（`PII_SCOPE_KEY_HEADER`，默认
     /// `x-veil-conversation-id`；该头 MUST NOT 转发上游；保留鉴权/传输头名拒启动）。
     pub pii_scope_key_header: String,
-    /// `previous_response_id` 映射容量（`PII_PREV_ID_MAX_ENTRIES`；未设置时取
+    /// `previous_response_id` 映射容量（`PII_SCOPE_PREV_ID_MAX_ENTRIES`；未设置时取
     /// `PII_SCOPE_MAX_CONVERSATIONS` 的生效值，非正整数拒启动）。
     pub pii_prev_id_max_entries: usize,
     /// 自定义正则规则文件（`PII_CUSTOM_RULES_FILE` 或 `PII_CUSTOM_RULES`，JSON 数组）。
@@ -240,7 +247,7 @@ pub struct Config {
     pub pii_value_sample_hmac_key: Option<String>,
     pub placeholder_prompt_enabled: bool,
     pub placeholder_prompt_text: String,
-    /// 字节契约开关（`NORMALIZE_JSON_WHITESPACE`，仅 `"1"` 开启；
+    /// 字节契约开关（`PII_NORMALIZE_JSON_WHITESPACE`，仅 `"1"` 开启；
     /// 默认关闭时请求体除 token 子串替换外保持字节一致）。
     pub normalize_json_whitespace: bool,
     /// §6.11 审计策略文件路径（`AUDIT_POLICY_FILE`，缺省为内建默认策略）。
@@ -251,7 +258,7 @@ pub struct Config {
     pub db_dir: PathBuf,
     pub tpm_dir: PathBuf,
     pub keepass_backend: KeepassBackendKind,
-    /// 授权窗口长度（`AUTHORIZATION_TTL_SECS` / `[storage].authorization_ttl_secs`）：
+    /// 授权窗口长度（`AUTHORIZATION_TTL_SECS` / `[credential.authorization].ttl_secs`）：
     /// `None` 表示无期限（缺省 `0` 归一为 `None`）。到期即转审批，不自动吊销。
     pub authorization_ttl: Option<u64>,
     /// 凭据审批双模开关（`CREDENTIAL_BLOCK_WAIT`，默认关闭）：
@@ -259,9 +266,9 @@ pub struct Config {
     /// 默认保持 202 抛单（建单 + best-effort 发送即返回）。
     /// 接线：`service::credential::approval_dual_mode` 唯一读取方（接线已复核，保留）。
     pub credential_block_wait: bool,
-    /// 请求日志总开关（文件专属 `[storage].request_log_enabled`，缺省 `true`）。
+    /// 请求日志总开关（文件专属 `[request_log].enabled`，缺省 `true`）。
     pub request_log_enabled: bool,
-    /// 请求记录保留天数（文件专属 `[storage].request_log_retention_days`，缺省 `7`；
+    /// 请求记录保留天数（文件专属 `[request_log].retention_days`，缺省 `7`；
     /// `0` = 不清理）。
     pub request_log_retention_days: u64,
 }
@@ -336,12 +343,9 @@ impl Config {
             tracing::warn!("{name} 已置位但二进制不读取（置位已忽略）：{hint}");
         }
 
-        // 可观测性总开关：仅精确 `1`（去空白后）生效，其余值（含 true/yes）不触发，
-        // 与「值非 1 时不 404」的边缘口径对齐；提前求值以豁免 token 门禁。
-        let observability_disabled = matches!(
-            get("OBSERVABILITY_DISABLE").as_deref().map(str::trim),
-            Some("1")
-        );
+        // 管理面总开关（正向）：缺省 `true`，显式假值（0/false/no/off）关闭；
+        // 提前求值以豁免 token 门禁。
+        let admin_enabled = parse_bool_on(&get, "ADMIN_ENABLED");
 
         let AuthParts {
             observability_admin_token,
@@ -367,7 +371,7 @@ impl Config {
             veilctl_secret,
             veilctl_binary_hash,
             auto_approve,
-            entry_mode,
+            surface_mode,
             registry_path,
             db_dir,
             tpm_dir,
@@ -411,7 +415,7 @@ impl Config {
             room_id,
             matrix_access_token,
             observability_admin_token,
-            observability_disabled,
+            admin_enabled,
             server_bind: server_bind.unwrap_or(DEFAULT_SERVER_BIND),
             audit_mode,
             audit_mode_explicit,
@@ -425,7 +429,7 @@ impl Config {
             veilctl_secret,
             veilctl_binary_hash,
             auto_approve,
-            entry_mode,
+            surface_mode,
             registry_path,
             credential_approval_timeout_secs: CREDENTIAL_APPROVAL_TIMEOUT_SECS,
             llm_upstreams,
@@ -480,10 +484,10 @@ impl Config {
         )
     }
 
-    /// 管理面是否可用：未显式禁用（`OBSERVABILITY_DISABLE` 精确 `1`）且 admin token
+    /// 管理面是否可用：显式启用（`admin_enabled`，缺省 `true`）且 admin token
     /// 非空；任一不满足即 `/_admin*` 全 404，不影响 LLM 代理。
     pub fn admin_surface_enabled(&self) -> bool {
-        !self.observability_disabled && !self.observability_admin_token.is_empty()
+        self.admin_enabled && !self.observability_admin_token.is_empty()
     }
 
     /// Matrix 三要素缺失键清单（顺序固定），供启动告警与审批 fail-closed 早退指名缺失项。
@@ -542,20 +546,20 @@ fn load_auth(get: &dyn Fn(&str) -> Option<String>) -> Result<AuthParts> {
 
 /// 限额域：限额早于审计模式解析，错误顺序与原实现一致。
 struct LimitParts {
-    audit_hold_max_bytes: i64,
-    audit_hold_max_frames: i64,
+    audit_hold_max_bytes: u64,
+    audit_hold_max_frames: u64,
     nonstream_max_bytes: usize,
     sse_frame_hard_bytes: usize,
 }
 
 fn load_limits(get: &dyn Fn(&str) -> Option<String>) -> Result<LimitParts> {
     Ok(LimitParts {
-        audit_hold_max_bytes: parse_positive(
+        audit_hold_max_bytes: parse_positive_u64(
             get,
             "AUDIT_HOLD_MAX_BYTES",
             AUDIT_HOLD_MAX_BYTES_DEFAULT,
         )?,
-        audit_hold_max_frames: parse_positive(
+        audit_hold_max_frames: parse_positive_u64(
             get,
             "AUDIT_HOLD_MAX_FRAMES",
             AUDIT_HOLD_MAX_FRAMES_DEFAULT,
@@ -577,7 +581,7 @@ fn load_limits(get: &dyn Fn(&str) -> Option<String>) -> Result<LimitParts> {
 struct AuditParts {
     audit_mode: AuditMode,
     audit_mode_explicit: bool,
-    audit_timeout_secs: i64,
+    audit_timeout_secs: u64,
     approval_whitelist: Vec<String>,
     audit_policy_file: Option<PathBuf>,
 }
@@ -716,7 +720,7 @@ fn load_llm(
     }
     let llm_default_upstream = get("LLM_UPSTREAM").filter(|v| !v.is_empty());
     let normalize_json_whitespace =
-        matches!(get("NORMALIZE_JSON_WHITESPACE").as_deref(), Some("1"));
+        matches!(get("PII_NORMALIZE_JSON_WHITESPACE").as_deref(), Some("1"));
     let http_timeout_secs =
         parse_positive_u64(get, "HTTP_TIMEOUT_SECS", HTTP_TIMEOUT_SECS_DEFAULT)?;
     let http_pool_max_idle_per_host = parse_positive_usize(

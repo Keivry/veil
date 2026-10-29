@@ -6,7 +6,8 @@
 //!
 //! - 本文件：`PendingApprovals` 待审单据存储（`Mutex<HashMap>`，`PENDING_TTL_SECS` 60s 孤儿上限）。
 //! - `service::credential::approval`：`approval_dual_mode` 双模（默认 202 抛单建单即返；
-//!   `CREDENTIAL_BLOCK_WAIT=1` 时 300s 阻塞等 reaction；审计问询走 `AUDIT_TIMEOUT` 90s 口径）。
+//!   `CREDENTIAL_BLOCK_WAIT=1` 时 300s 阻塞等 reaction；审计问询走 `AUDIT_TIMEOUT_SECS` 90s
+//!   口径）。
 //! - `service::matrix`：`MatrixBranch` 建单分支（Register/Credential/Command/Revoke）
 //!   与原因标签（HashChange/Audit/Unknown）流转，凭据 300s / 审计 90s 分表超时，`ORPHAN_SWEEP_SECS`
 //!   60s 孤儿清扫， `spawn_sync_loop` 常驻同步。

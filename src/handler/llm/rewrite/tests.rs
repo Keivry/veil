@@ -318,7 +318,7 @@ async fn rewrite_whitespace_flag_off_keeps_bytes() {
 #[tokio::test]
 async fn rewrite_whitespace_flag_on_compacts_and_declares() {
     // 空白归一开关开启（仅 "1"）时压缩为空白无关紧凑 JSON 并声明。
-    let config = test_config(&[("NORMALIZE_JSON_WHITESPACE", "1")]);
+    let config = test_config(&[("PII_NORMALIZE_JSON_WHITESPACE", "1")]);
     assert!(config.normalize_json_whitespace);
     let (scope, vault, detector) = fresh_arcs();
     let raw = br#"{ "model" : "m" , "messages" : [ { "role" : "user" , "content" : "hello" } ] }"#;
@@ -734,7 +734,7 @@ async fn param_injection_after_redaction_keeps_tokens_and_raw_config_values() {
 
 #[tokio::test]
 async fn param_injection_merge_mode_preserves_client_value_bytes_unchanged() {
-    // task 3.2：合并模式（override = false）下客户端已有参数值恒保留——
+    // task 3.2：合并模式（override_existing = false）下客户端已有参数值恒保留——
     // 无实际变化时不重序列化、字节逐字不变、不置位 `normalized_out`。
     let config = test_config(&[("REDACTION_ENABLED", "0"), ("PII_PLACEHOLDER_PROMPT", "0")]);
     let mut overrides = params_for(

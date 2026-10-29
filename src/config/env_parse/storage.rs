@@ -1,9 +1,12 @@
 //! 存储/入口域解析（自 `env_parse.rs` 拆出；`crate::config::env_parse::*`
 //! 导出路径不变）。
 //!
-//! 承载 [`StorageParts`] 与 `load_storage`（目录派生、三因子密钥、入口三态、
-//! 审批双模开关、授权窗口），以及授权窗口长度解析。父模块按原调用顺序引用，
-//! 默认值、错误顺序与错误消息与拆分前逐项相同。
+//! 承载 [`StorageParts`] 与 `load_storage`（目录派生、三因子密钥、暴露面模式
+//! `surface_mode`、审批双模开关、授权窗口），以及授权窗口长度解析。父模块按原
+//! 调用顺序引用，默认值、错误顺序与错误消息与拆分前逐项相同。
+//!
+//! `surface_mode` 的 env 规范名仍是 `VEIL_ENTRY_MODE`（文件键改名不改 env 名，
+//! 见 design Decision 5.3 的同族取舍）。
 
 use {
     super::{AutoApprove, EntryMode},
@@ -20,7 +23,7 @@ pub(super) struct StorageParts {
     pub(super) veilctl_secret: Option<String>,
     pub(super) veilctl_binary_hash: Option<String>,
     pub(super) auto_approve: AutoApprove,
-    pub(super) entry_mode: EntryMode,
+    pub(super) surface_mode: EntryMode,
     pub(super) registry_path: PathBuf,
     pub(super) db_dir: PathBuf,
     pub(super) tpm_dir: PathBuf,
@@ -41,7 +44,7 @@ pub(super) fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<Stora
         })?,
         _ => AutoApprove::Allow,
     };
-    let entry_mode: EntryMode = match get("VEIL_ENTRY_MODE") {
+    let surface_mode: EntryMode = match get("VEIL_ENTRY_MODE") {
         Some(v) if !v.is_empty() => v.parse().map_err(|message| VeilError::Config {
             var: "VEIL_ENTRY_MODE".to_string(),
             message,
@@ -64,7 +67,7 @@ pub(super) fn load_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<Stora
         veilctl_secret,
         veilctl_binary_hash,
         auto_approve,
-        entry_mode,
+        surface_mode,
         registry_path,
         db_dir,
         tpm_dir,
@@ -78,9 +81,9 @@ fn parse_authorization_ttl(get: &dyn Fn(&str) -> Option<String>) -> Result<Optio
     let raw = get("AUTHORIZATION_TTL_SECS")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "0".to_string());
-    let ttl: u64 = raw.parse().map_err(|_| VeilError::Config {
+    let ttl_secs: u64 = raw.parse().map_err(|_| VeilError::Config {
         var: "AUTHORIZATION_TTL_SECS".to_string(),
         message: format!("AUTHORIZATION_TTL_SECS 非法整数: {raw:?}"),
     })?;
-    Ok(crate::registry::normalize_ttl(Some(ttl)))
+    Ok(crate::registry::normalize_ttl(Some(ttl_secs)))
 }

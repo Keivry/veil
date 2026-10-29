@@ -743,13 +743,13 @@ def free_port():
 # `src/config/file_layer/mod.rs` 的 `FileConfig` 一致（字符串 / 整数）；`LLM_<port>`
 # 端口键不在此表，由 `_toml_document` 展开进 `[llm.upstreams]`。
 _MIGRATED_TOML_KEYS = {
-    "HOMESERVER": ("auth", "homeserver", "str"),
-    "ROOM_ID": ("auth", "room_id", "str"),
+    "HOMESERVER": ("matrix", "homeserver", "str"),
+    "ROOM_ID": ("matrix", "room_id", "str"),
     "DATA_DIR": ("storage", "data_dir", "str"),
     "DB_DIR": ("storage", "db_dir", "str"),
     "CALLER_REGISTRY_PATH": ("storage", "caller_registry_path", "str"),
     "AUDIT_MODE": ("audit", "mode", "str"),
-    "AUDIT_HOLD_MAX_BYTES": ("limits", "audit_hold_max_bytes", "int"),
+    "AUDIT_HOLD_MAX_BYTES": ("audit", "hold_max_bytes", "int"),
     "LLM_UPSTREAM": ("llm", "default_upstream", "str"),
 }
 
@@ -827,7 +827,7 @@ def _toml_document(migrated):
         section, file_key, kind = _MIGRATED_TOML_KEYS[key]
         sections.setdefault(section, []).append((file_key, _toml_scalar(value, kind)))
     lines = []
-    for section in ("auth", "storage", "audit", "limits", "llm"):
+    for section in ("matrix", "audit", "storage", "llm"):
         has_ports = section == "llm" and bool(ports)
         if section not in sections and not has_ports:
             continue

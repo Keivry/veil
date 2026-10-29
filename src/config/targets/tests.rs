@@ -336,7 +336,7 @@ fn user_agent_conflicting_with_headers_channel_rejected() {
 fn user_agent_legal_value_enters_config_without_startup_error() {
     // task 1.2：合法值加载通过（含与其它键共存的形态）。
     let targets = validated(
-        "[llm.targets.\"8878\"]\nuser_agent = \"opencode/1.18.33\"\noverride = false\n\
+        "[llm.targets.\"8878\"]\nuser_agent = \"opencode/1.18.33\"\noverride_existing = false\n\
          [llm.targets.\"8878\".headers]\nx-custom = \"1\"\n",
     )
     .expect("合法值须加载通过");
@@ -353,11 +353,11 @@ fn user_agent_legal_value_enters_config_without_startup_error() {
 
 #[test]
 fn target_override_switch_parses_bool_and_defaults_true() {
-    // task 1.1：override = false / true / 未声明三种写法均加载通过，载荷分别为
+    // override_existing = false / true / 未声明三种写法均加载通过，载荷分别为
     // false / true / true（缺省恒胜，向后兼容）。
     let targets = validated(
-        "[llm.targets.\"8878\"]\noverride = false\n\
-         [llm.targets.\"8879\"]\noverride = true\n\
+        "[llm.targets.\"8878\"]\noverride_existing = false\n\
+         [llm.targets.\"8879\"]\noverride_existing = true\n\
          [llm.targets.default]\nheaders = { x-custom = \"1\" }\n",
     )
     .expect("三种写法均须加载通过");
@@ -386,11 +386,11 @@ fn target_override_switch_parses_bool_and_defaults_true() {
 
 #[test]
 fn target_override_non_bool_rejected_with_key_name() {
-    // task 1.1：override 非布尔由 TOML 反序列化层拒绝并回显键名（不静默忽略）。
-    let msg = parse_err_msg("[llm.targets.\"8878\"]\noverride = \"x\"\n");
+    // override_existing 非布尔由 TOML 反序列化层拒绝并回显键名（不静默忽略）。
+    let msg = parse_err_msg("[llm.targets.\"8878\"]\noverride_existing = \"x\"\n");
     assert!(
-        msg.contains("override"),
-        "类型错误须回显键名 override：{msg}"
+        msg.contains("override_existing"),
+        "类型错误须回显键名 override_existing：{msg}"
     );
 }
 

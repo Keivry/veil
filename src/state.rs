@@ -153,7 +153,7 @@ impl AppState {
         ));
         let approval = Arc::new(crate::service::matrix::MatrixApproval::new(
             config.approval_whitelist.clone(),
-            config.audit_timeout_secs.max(1) as u64,
+            config.audit_timeout_secs.max(1),
         ));
         let audit_logger = Arc::new(crate::service::audit::AuditLogger::new(
             config.data_dir.clone(),
@@ -205,7 +205,7 @@ impl AppState {
         let gateway_metrics = Arc::new(crate::service::llm_gateway::GatewayMetrics::default());
         let conversation_scope_store = config.pii_scope_mode.is_conversation().then(|| {
             let capacity = config.pii_scope_max_conversations;
-            let ttl = std::time::Duration::from_secs(config.pii_scope_ttl_secs.max(1) as u64);
+            let ttl = std::time::Duration::from_secs(config.pii_scope_ttl_secs.max(1));
             Arc::new(
                 crate::service::redaction::ConversationScopeStore::new(capacity, ttl)
                     .with_metrics(gateway_metrics.clone()),

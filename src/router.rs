@@ -2,9 +2,9 @@
 //!
 //! `build_router` 将凭据 API（`/credential`、`/registrations`、注册/吊销/哈希变更）与 LLM
 //! 代理通配路由（`/` + `/{*tail}` + fallback）及 `/_admin` 管理面装配到同一 `Router`；
-//! `observability_gate` 中间件按 `Config::admin_surface_enabled`（显式禁用或 admin
-//! token 为空）对 `/_admin*` 全返回 `404`（与 token 有效性无关）。入口三态与监听端口语义见
-//! `src/main.rs` 与 工程参考 §1。
+//! `observability_gate` 中间件按 `Config::admin_surface_enabled`（`admin.enabled`
+//! 为假或 admin token 为空）对 `/_admin*` 全返回 `404`（与 token 有效性无关）。
+//! 暴露面模式与监听端口语义见 `src/main.rs` 与 工程参考 §1。
 //!
 //! `request_context` 为最外层 `route_layer`：每个已匹配路由都包一层 ERROR 级
 //! `http` span（`request_id`/`method`/`route`），使该请求派生出的日志行可关联。
@@ -121,8 +121,10 @@ async fn observability_gate(State(state): State<AppState>, req: Request, next: N
 pub fn build_router(state: AppState) -> Router {
     {
         let cfg = state.config();
-        if cfg.observability_disabled {
-            tracing::warn!("OBSERVABILITY_DISABLE=1：管理面已禁用，/_admin 全返回 404");
+        if !cfg.admin_enabled {
+            tracing::warn!(
+                "admin.enabled=false（或 ADMIN_ENABLED 显式关闭）：管理面已禁用，/_admin 全返回 404"
+            );
         } else if !cfg.admin_surface_enabled() {
             tracing::warn!("OBSERVABILITY_ADMIN_TOKEN 缺失：管理面未启用，/_admin 全返回 404");
         }

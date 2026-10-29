@@ -19,7 +19,7 @@ use {
 /// 超限与字节超限同语义 fail-closed 并清仓，使零字节洪泛下内存有界。
 ///
 /// 本上限**只管聚合槽表**；缓冲帧数另由可配的
-/// `[limits].audit_hold_max_frames`（见 [`AuditHold::with_limits`]）约束，二者
+/// `[audit].hold_max_frames`（见 [`AuditHold::with_limits`]）约束，二者
 /// 维度不同，不可互相替代。
 const AUDIT_HOLD_MAX_ENTRIES: usize = 4096;
 
@@ -31,7 +31,7 @@ const PENDING_ZERO_BYTE_FLOOD_CAP: usize = AUDIT_HOLD_MAX_ENTRIES;
 /// 缓冲帧**信封字节**（SSE 前缀 + JSON 外壳）的独立预算 8MiB。
 ///
 /// 为什么与载荷预算分开：信封随帧数线性增长（每帧约百余字节），若与参数载荷
-/// 共用 `[limits].audit_hold_max_bytes`，几千个合法分片的信封就会独吞乃至超过
+/// 共用 `[audit].hold_max_bytes`，几千个合法分片的信封就会独吞乃至超过
 /// 整份预算，使「20KB 参数的小调用」被判溢出（本缺陷成因）。单独成账后，
 /// 载荷预算只服务载荷，信封另有固定上界，二者相加仍是**确定的**内存上界
 /// （`2 × max_bytes + 8MiB + max_frames × 单帧开销`），不会无界增长。
@@ -125,14 +125,14 @@ pub struct AuditHold {
     pending_envelope_bytes: usize,
     /// 载荷字节为 0 的缓冲帧数（零字节洪泛独立维度）。
     pending_zero_byte_frames: usize,
-    /// 缓冲帧数上限（`[limits].audit_hold_max_frames`）。
+    /// 缓冲帧数上限（`[audit].hold_max_frames`）。
     max_frames: usize,
     /// 最近一次 fail-closed 清仓时的记账快照（告警用）。
     last_reject: Option<HoldRejectStats>,
 }
 
 impl AuditHold {
-    /// 以默认帧数上限构造（`[limits].audit_hold_max_frames` 的缺省值）。
+    /// 以默认帧数上限构造（`[audit].hold_max_frames` 的缺省值）。
     pub fn new(max_bytes: usize) -> Self {
         Self::with_limits(
             max_bytes,
@@ -196,7 +196,7 @@ impl AuditHold {
     ///
     /// 两路字节分账，均与本帧真实占用一一对应、互不重叠：
     /// * `payload_bytes` —— 真正被保留的 `arguments` 分片文本，即进审计的那份 参数，只花
-    ///   `[limits].audit_hold_max_bytes` 的额度；
+    ///   `[audit].hold_max_bytes` 的额度；
     /// * `envelope_bytes` —— SSE 前缀 + JSON 外壳（每帧约百余字节），花固定 的
     ///   [`PENDING_ENVELOPE_BUDGET_BYTES`]。
     ///
@@ -205,7 +205,7 @@ impl AuditHold {
     ///
     /// 四个维度任一超限即 fail-closed 清仓（调用方据此走
     /// `audit-hold-overflow` 阻断臂，不静默丢弃）：
-    /// 1. 帧数 `pending_frames > max_frames`（`[limits].audit_hold_max_frames`）；
+    /// 1. 帧数 `pending_frames > max_frames`（`[audit].hold_max_frames`）；
     /// 2. 零载荷帧 `pending_zero_byte_frames > PENDING_ZERO_BYTE_FLOOD_CAP` ——载荷为 0
     ///    的帧不增载荷字节，无此维度可无限堆积；
     /// 3. 载荷字节：`total_bytes` 与 `pending_bytes` **各自**受 `max_bytes`

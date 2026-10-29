@@ -62,8 +62,9 @@ fn expected_sites() -> BTreeSet<CallSite> {
     .collect()
 }
 
-/// 递归收集生产 `.rs` 文件：跳过 `tests.rs` 与名为 `tests` 的目录（测试专用代码）。
-fn collect_production_rs(root: &Path, out: &mut Vec<PathBuf>) {
+/// 递归收集生产源码：按扩展名白名单筛选，跳过 `tests.rs` 与 `tests/`
+/// 目录（测试代码须逐字写出旧名）。
+pub(super) fn collect_production_files(root: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(root).unwrap_or_else(|err| panic!("读取目录 {root:?} 失败: {err}"));
     for entry in entries {
         let path = entry.expect("读取目录项").path();
@@ -73,10 +74,31 @@ fn collect_production_rs(root: &Path, out: &mut Vec<PathBuf>) {
             .unwrap_or_default();
         if path.is_dir() {
             if file_name != "tests" {
-                collect_production_rs(&path, out);
+                collect_production_files(&path, extensions, out);
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") && file_name != "tests.rs"
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.contains(&e))
+            && file_name != "tests.rs"
         {
+            out.push(path);
+        }
+    }
+}
+
+/// 仅扫 `.rs` 的常用形态（env 读取面机检沿用）。
+pub(super) fn collect_production_rs(root: &Path, out: &mut Vec<PathBuf>) {
+    collect_production_files(root, &["rs"], out);
+}
+
+pub(super) fn collect_all_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(root).unwrap_or_else(|err| panic!("读取目录 {root:?} 失败: {err}"));
+    for entry in entries {
+        let path = entry.expect("读取目录项").path();
+        if path.is_dir() {
+            collect_all_files(&path, out);
+        } else {
             out.push(path);
         }
     }

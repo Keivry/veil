@@ -308,8 +308,8 @@ const PORT_AND_DEFAULT_TARGETS_TOML: &str = "[llm.targets.\"8878\".headers]\n\
     x-target = \"default\"\n\
     [llm.targets.default.params.chat]\noverride = { temperature = 0.9 }\n";
 
-/// 覆盖片段：default 目标合并模式（`override = false`）——同名头/参数与缺失项同在。
-const MERGE_MODE_TOML: &str = "[llm.targets.default]\noverride = false\n\
+/// 覆盖片段：default 目标合并模式（`override_existing = false`）——同名头/参数与缺失项同在。
+const MERGE_MODE_TOML: &str = "[llm.targets.default]\noverride_existing = false\n\
     [llm.targets.default.headers]\nx-target = \"config\"\nx-new = \"added\"\n\
     [llm.targets.default.params.chat]\noverride = { temperature = 0.9 }\ndefault = { top_p = 0.5 }\n";
 
@@ -813,7 +813,7 @@ async fn port_and_default_targets_resolve_same_source_overrides() {
 
 #[tokio::test]
 async fn dialog_nonstream_merge_mode_preserves_client_and_adds_missing() {
-    // task 8.1：override = false 对话非流——客户端同名头与参数值保留，
+    // task 8.1：override_existing = false 对话非流——客户端同名头与参数值保留，
     // 缺失配置项新增；体实际改写 → 响应带 x-veil-normalized。
     let up_body = br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
     let (url, captured, server) = capture_loopback_complete("application/json", up_body).await;
@@ -919,7 +919,7 @@ fn nondialog_merge_mode_header_merge_and_byte_identity() {
 }
 
 async fn nondialog_merge_mode_header_merge_impl() {
-    // task 8.1：NonDialog + override = false——头按合并结果注入（同名保留、缺失新增），
+    // task 8.1：NonDialog + override_existing = false——头按合并结果注入（同名保留、缺失新增），
     // 请求体逐字节等于客户端原文（params 被忽略）。
     let (url, captured, server) =
         capture_loopback_complete("application/json", b"{}".to_vec()).await;
@@ -954,7 +954,7 @@ async fn nondialog_merge_mode_header_merge_impl() {
 
 #[tokio::test]
 async fn count_tokens_merge_mode_headers_merged_params_skipped() {
-    // task 8.1：count_tokens（redact-only）+ override = false——headers 按合并结果
+    // task 8.1：count_tokens（redact-only）+ override_existing = false——headers 按合并结果
     // 注入，params 仍不注入。
     let up_body = br#"{"input_tokens":1}"#.to_vec();
     let (url, captured, server) = capture_loopback_complete("application/json", up_body).await;
@@ -994,7 +994,7 @@ async fn count_tokens_merge_mode_headers_merged_params_skipped() {
 
 #[tokio::test]
 async fn dialog_stream_merge_mode_preserves_client_and_declares_normalized() {
-    // task 8.1（流式）：override = false 对话流式——客户端参数值保留、缺失键新增、
+    // task 8.1（流式）：override_existing = false 对话流式——客户端参数值保留、缺失键新增、
     // SSE 帧序列不受影响（恰一终止帧）。
     let sse =
         b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n".to_vec();

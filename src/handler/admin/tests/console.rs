@@ -1,7 +1,7 @@
 //! 管理控制台静态壳单测：`Accept` 词法协商、壳响应头与自包含性。
 //!
 //! 只覆盖 `console.rs` 的纯逻辑与响应构造；入口路由的鉴权分支与
-//! `OBSERVABILITY_DISABLE` 门控由 `tests/http_e2e_admin_console.rs` 端到端锁定。
+//! `ADMIN_ENABLED` 门控由 `tests/http_e2e_admin_console.rs` 端到端锁定。
 
 use {
     crate::handler::admin::console::{CONSOLE_HTML, console_response, wants_html},
@@ -193,7 +193,7 @@ fn console_html_request_table_columns_and_filters() {
 fn console_html_request_states_pagination_and_range() {
     // 三态文案互不相同：记录关闭 / 范围内无请求 / partial 覆盖提示。
     for needle in [
-        "逐请求记录已关闭（[storage].request_log_enabled = false）",
+        "逐请求记录已关闭（[request_log].enabled = false）",
         "当前范围内无请求",
         "记录覆盖不足：实际覆盖 ",
         "if (d.partial === true) {",

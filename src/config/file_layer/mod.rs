@@ -6,38 +6,63 @@
 //! 唯一校验链；任何失败（缺失/超 1MB/语法/未知键/类型/枚举/越界）fail-closed
 //! 拒启动且错误指名 `VEIL_CONFIG_FILE`。未设置引导变量时零行为差异、不读盘。
 //!
-//! 防反向覆盖：每个文件键携带「env 显式名集合」（规范名 ∪ 全部兼容别名），
+//! 严格键面：`FileConfig` 各分节 `deny_unknown_fields` 是唯一的键裁决口径。
+//! 0.1.x 为旧分节（`auth` / `limits` / `keepass`）与旧键名提供的兼容层已在 0.2.0
+//! 移除；它们现在与任意未知键同形，一律 fail-closed 拒启动并指名该键。
+//!
+//! 防反向覆盖：每个文件键携带「env 显式名集合」（规范名 ∪ 存活 env 别名），
 //! 集合内任一非空（trim 后）即 env 显式，跳过文件写入并记冲突 warn。
 //!
-//! 密钥门禁：文件声明 5 个密钥类键任一（`matrix_access_token`/
-//! `observability_admin_token`/`veilctl_secret`/`veilctl_binary_hash`/
-//! `value_sample_hmac_key`）时，Unix 下要求 `mode & 0o077 == 0`，否则拒启动；
+//! 密钥门禁：文件声明 5 个密钥类键任一（`matrix.access_token`/
+//! `admin.token`/`storage.veilctl_secret`/`storage.veilctl_binary_hash`/
+//! `redaction.value_sample_hmac_key`）时，Unix 下要求 `mode & 0o077 == 0`，否则拒启动；
 //! env 覆盖不豁免（密钥文本已落盘）。
 //!
-//! 拆分：`[storage]` 分节的 schema（[`StorageSection`]）、两个文件枚举与该分节的
-//! 逐键映射条目移至 `file_layer/storage.rs`，本文件 `pub use` 重导出同一路径
-//! （`crate::config::file_layer::{StorageSection, FileEntryMode, FileAutoApprove}` 不变）。
+//! 拆分：分节 schema 在 `file_layer/sections.rs`、`[storage]` 与其两个文件专属
+//! 标量键在 `file_layer/storage.rs`；本文件 `pub use` 重导出同一路径
+//! （`crate::config::file_layer::{FileConfig, ...}` 不变）。
 
 use {
     super::{
-        command::{CommandConfig, CommandSection, validate_command},
+        command::{CommandConfig, validate_command},
         custom_file::CUSTOM_FILE_MAX_BYTES,
-        targets::{LlmTargets, RawTargets, validate_targets},
+        targets::{LlmTargets, validate_targets},
         validate::config_error,
     },
     crate::error::Result,
-    serde::{Deserialize, Deserializer, Serialize, de},
     serde_json::Value,
     std::{
-        collections::{BTreeMap, HashMap},
+        collections::HashMap,
         net::SocketAddr,
         path::{Path, PathBuf},
     },
 };
 
+mod sections;
 mod storage;
 
-pub use storage::{FileAutoApprove, FileEntryMode, RequestLogFileConfig, StorageSection};
+pub use {
+    sections::{
+        AdminSection,
+        AuditSection,
+        CredentialApprovalSection,
+        CredentialAuthorizationSection,
+        CredentialSection,
+        FileAuditMode,
+        FileAutoApprove,
+        FileConfig,
+        FileKeepassBackend,
+        FilePiiScopeMode,
+        FileSurfaceMode,
+        LlmSection,
+        MatrixSection,
+        PiiScopeSection,
+        RedactionSection,
+        RequestLogSection,
+        ServerSection,
+    },
+    storage::{RequestLogFileConfig, StorageSection},
+};
 
 /// 引导变量：唯一文件路径入口，仅从进程 env 读取，不作为文件内可声明键。
 pub(crate) const BOOTSTRAP_VAR: &str = "VEIL_CONFIG_FILE";
@@ -49,8 +74,9 @@ const UPSTREAMS_KEY_PREFIX: &str = "llm.upstreams.";
 /// 文件专属结构键根（无 env 映射，不参与逐键合并）：内部结构由
 /// `config::targets` 校验与结构性键锁步测试覆盖；工程参考 §1 与锁步测试须保持同步。
 ///
-/// `server` 是键根级文件专属概念：`[server].bind` 属部署参数，不进 env 白名单
-/// （design D1），故以根名登记、由 `FileLayerOutcome.server_bind` 单值进 `Config`。
+/// `server` 是键根级文件专属概念：`[server].listen_addr` 属部署参数，不进 env 白名单，
+/// 故以根名登记、由 `FileLayerOutcome.server_bind` 单值进 `Config`；该根下的
+/// `surface_mode` 有 env 映射，判定时 MAPPINGS 优先于本清单（见 [`resolve_entries`]）。
 pub(crate) const FILE_ONLY_KEYS: &[&str] = &["llm.targets", "command", "server"];
 
 /// 命中文件专属结构键根：`key == root` 或以 `root.` 开头时返回该根，否则 `None`。
@@ -61,158 +87,6 @@ fn file_only_root(key: &str) -> Option<&'static str> {
                 .strip_prefix(*root)
                 .is_some_and(|rest| rest.starts_with('.'))
     })
-}
-
-/// `[audit].mode` 文件取值：空串/集合外取值在 `toml::from_str` 即失败。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FileAuditMode {
-    #[serde(rename = "off")]
-    Off,
-    #[serde(rename = "block")]
-    Block,
-    #[serde(rename = "approve")]
-    Approve,
-}
-
-/// `[pii_scope].mode` 文件取值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FilePiiScopeMode {
-    #[serde(rename = "request")]
-    Request,
-    #[serde(rename = "conversation")]
-    Conversation,
-}
-
-/// `[keepass].backend` 文件取值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FileKeepassBackend {
-    #[serde(rename = "real")]
-    Real,
-    #[serde(rename = "mock")]
-    Mock,
-}
-
-/// 配置文件根：分节可选（缺省合法），顶层未知键拒启动。
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FileConfig {
-    pub auth: Option<AuthSection>,
-    pub limits: Option<LimitsSection>,
-    pub audit: Option<AuditSection>,
-    pub storage: Option<StorageSection>,
-    pub redaction: Option<RedactionSection>,
-    pub pii_scope: Option<PiiScopeSection>,
-    pub llm: Option<LlmSection>,
-    pub keepass: Option<KeepassSection>,
-    pub command: Option<CommandSection>,
-    pub server: Option<ServerSection>,
-}
-
-/// `[server]`：监听地址（文件专属；`bind` 必须是 `IP:PORT` 字面量）。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerSection {
-    #[serde(default, deserialize_with = "deserialize_bind")]
-    pub bind: Option<SocketAddr>,
-}
-
-/// `bind` 专属反序列化：把类型/语法错误统一改写为指名 `server.bind` 的 fail-closed
-/// 消息（`SocketAddr` 不接受主机名；缺端口/越界/非 IP 字面量一律拒启动）。
-fn deserialize_bind<'de, D>(deserializer: D) -> std::result::Result<Option<SocketAddr>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)
-        .map_err(|e| de::Error::custom(format!("server.bind 取值非法: {e}")))?;
-    raw.map(|text| {
-        text.trim().parse::<SocketAddr>().map_err(|e| {
-            de::Error::custom(format!(
-                "server.bind 取值非法: {text:?}（{e}）；须为 IP:PORT 字面量，如 \"127.0.0.1:8877\""
-            ))
-        })
-    })
-    .transpose()
-}
-
-/// `[auth]`：认证/服务身份（目录键见 `MAPPINGS`）。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthSection {
-    pub homeserver: Option<String>,
-    pub room_id: Option<String>,
-    pub matrix_access_token: Option<String>,
-    pub observability_admin_token: Option<String>,
-    pub observability_disable: Option<bool>,
-}
-
-/// `[limits]`：限额域。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LimitsSection {
-    pub audit_hold_max_bytes: Option<i64>,
-    pub audit_hold_max_frames: Option<i64>,
-    pub nonstream_max_bytes: Option<i64>,
-    pub sse_frame_hard_bytes: Option<i64>,
-}
-
-/// `[audit]`：审计域。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuditSection {
-    pub mode: Option<FileAuditMode>,
-    pub timeout: Option<i64>,
-    pub approval_whitelist: Option<Vec<String>>,
-    pub policy_file: Option<String>,
-}
-
-/// `[redaction]`：脱敏域。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RedactionSection {
-    pub enabled: Option<bool>,
-    pub fuzzy_restore: Option<bool>,
-    pub detection_hardening: Option<bool>,
-    pub custom_rules_file: Option<String>,
-    pub custom_patterns_file: Option<String>,
-    pub custom_dict_file: Option<String>,
-    pub value_sample_enabled: Option<bool>,
-    pub value_sample_persist: Option<bool>,
-    pub value_sample_hmac_key: Option<String>,
-    pub placeholder_prompt: Option<bool>,
-    pub placeholder_prompt_text: Option<String>,
-    pub normalize_json_whitespace: Option<bool>,
-}
-
-/// `[pii_scope]`：PII 会话作用域域。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PiiScopeSection {
-    pub mode: Option<FilePiiScopeMode>,
-    pub ttl_secs: Option<i64>,
-    pub max_conversations: Option<i64>,
-    pub key_header: Option<String>,
-    pub prev_id_max_entries: Option<i64>,
-}
-
-/// `[llm]`：LLM 网关域；`upstreams` 为端口表（端口字符串 → URL）。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LlmSection {
-    pub default_upstream: Option<String>,
-    pub timeout_secs: Option<i64>,
-    pub pool_max_idle_per_host: Option<i64>,
-    pub pool_idle_timeout_secs: Option<i64>,
-    pub upstreams: Option<BTreeMap<String, String>>,
-    /// 文件专属 `[llm.targets]`：端口 / `default` 目标的上游头与参数覆盖
-    /// （无 env 对应源，字段级校验见 `config::targets`）。
-    pub targets: Option<RawTargets>,
-}
-
-/// `[keepass]`：KeePass 后端选型。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeepassSection {
-    pub backend: Option<FileKeepassBackend>,
 }
 
 /// 映射目标：静态规范 env 名、端口表（`[llm.upstreams]` 逐端口展开为
@@ -250,47 +124,36 @@ const fn env(key: &'static str, name: &'static str, names: &'static [&'static st
 }
 
 /// 文件键封闭清单（`FileConfig` 可声明键集单一真源；键与目标 env 名逐项对齐
-/// 工程参考 §1 与 `env_parse` 读取名）。
+/// 工程参考 §1 与 `env_parse` 读取名）。恰 48 行。
 const MAPPINGS: &[MappingDef] = &[
-    env("auth.homeserver", "HOMESERVER", &["HOMESERVER"]),
-    env("auth.room_id", "ROOM_ID", &["ROOM_ID"]),
+    // ── server（1）──
     env(
-        "auth.matrix_access_token",
-        "MATRIX_ACCESS_TOKEN",
-        &["MATRIX_ACCESS_TOKEN"],
+        "server.surface_mode",
+        "VEIL_ENTRY_MODE",
+        &["VEIL_ENTRY_MODE"],
     ),
+    // ── admin（2）──
+    env("admin.enabled", "ADMIN_ENABLED", &["ADMIN_ENABLED"]),
     env(
-        "auth.observability_admin_token",
+        "admin.token",
         "OBSERVABILITY_ADMIN_TOKEN",
         &["OBSERVABILITY_ADMIN_TOKEN"],
     ),
+    // ── matrix（3）──
+    env("matrix.homeserver", "HOMESERVER", &["HOMESERVER"]),
+    env("matrix.room_id", "ROOM_ID", &["ROOM_ID"]),
     env(
-        "auth.observability_disable",
-        "OBSERVABILITY_DISABLE",
-        &["OBSERVABILITY_DISABLE"],
+        "matrix.access_token",
+        "MATRIX_ACCESS_TOKEN",
+        &["MATRIX_ACCESS_TOKEN"],
     ),
-    env(
-        "limits.audit_hold_max_bytes",
-        "AUDIT_HOLD_MAX_BYTES",
-        &["AUDIT_HOLD_MAX_BYTES"],
-    ),
-    env(
-        "limits.audit_hold_max_frames",
-        "AUDIT_HOLD_MAX_FRAMES",
-        &["AUDIT_HOLD_MAX_FRAMES"],
-    ),
-    env(
-        "limits.nonstream_max_bytes",
-        "NONSTREAM_MAX_BYTES",
-        &["NONSTREAM_MAX_BYTES"],
-    ),
-    env(
-        "limits.sse_frame_hard_bytes",
-        "SSE_FRAME_HARD_BYTES",
-        &["SSE_FRAME_HARD_BYTES"],
-    ),
+    // ── audit（6）──
     env("audit.mode", "AUDIT_MODE", &["AUDIT_MODE"]),
-    env("audit.timeout", "AUDIT_TIMEOUT", &["AUDIT_TIMEOUT"]),
+    env(
+        "audit.timeout_secs",
+        "AUDIT_TIMEOUT_SECS",
+        &["AUDIT_TIMEOUT_SECS"],
+    ),
     env(
         "audit.approval_whitelist",
         "APPROVAL_WHITELIST",
@@ -301,18 +164,104 @@ const MAPPINGS: &[MappingDef] = &[
         "AUDIT_POLICY_FILE",
         &["AUDIT_POLICY_FILE"],
     ),
+    env(
+        "audit.hold_max_bytes",
+        "AUDIT_HOLD_MAX_BYTES",
+        &["AUDIT_HOLD_MAX_BYTES"],
+    ),
+    env(
+        "audit.hold_max_frames",
+        "AUDIT_HOLD_MAX_FRAMES",
+        &["AUDIT_HOLD_MAX_FRAMES"],
+    ),
+    // ── credential（4）──
+    MappingDef {
+        key: "credential.default_decision",
+        target: MappingTarget::Env("AUTO_APPROVE"),
+        env_explicit_names: &["AUTO_APPROVE"],
+        coercion: Coercion::AutoApprove,
+    },
+    env(
+        "credential.approval.block_wait",
+        "CREDENTIAL_BLOCK_WAIT",
+        &["CREDENTIAL_BLOCK_WAIT"],
+    ),
+    env(
+        "credential.authorization.ttl_secs",
+        "AUTHORIZATION_TTL_SECS",
+        &["AUTHORIZATION_TTL_SECS"],
+    ),
+    env(
+        "credential.vault_backend",
+        "VEIL_KEEPASS_BACKEND",
+        &["VEIL_KEEPASS_BACKEND"],
+    ),
+    // ── request_log（2，文件专属标量键）──
+    storage::REQUEST_LOG_ENABLED,
+    storage::REQUEST_LOG_RETENTION_DAYS,
+    // ── storage（6）──
     storage::STORAGE_DATA_DIR,
     storage::STORAGE_DB_DIR,
     storage::STORAGE_TPM_DIR,
     storage::STORAGE_CALLER_REGISTRY_PATH,
     storage::STORAGE_VEILCTL_SECRET,
     storage::STORAGE_VEILCTL_BINARY_HASH,
-    storage::STORAGE_AUTO_APPROVE,
-    storage::STORAGE_ENTRY_MODE,
-    storage::STORAGE_CREDENTIAL_BLOCK_WAIT,
-    storage::STORAGE_AUTHORIZATION_TTL_SECS,
-    storage::STORAGE_REQUEST_LOG_ENABLED,
-    storage::STORAGE_REQUEST_LOG_RETENTION_DAYS,
+    // ── llm（7）──
+    env("llm.default_upstream", "LLM_UPSTREAM", &["LLM_UPSTREAM"]),
+    env(
+        "llm.timeout_secs",
+        "HTTP_TIMEOUT_SECS",
+        &["HTTP_TIMEOUT_SECS"],
+    ),
+    env(
+        "llm.pool_max_idle_per_host",
+        "HTTP_POOL_MAX_IDLE_PER_HOST",
+        &["HTTP_POOL_MAX_IDLE_PER_HOST"],
+    ),
+    env(
+        "llm.pool_idle_timeout_secs",
+        "HTTP_POOL_IDLE_TIMEOUT_SECS",
+        &["HTTP_POOL_IDLE_TIMEOUT_SECS"],
+    ),
+    env(
+        "llm.nonstream_max_bytes",
+        "NONSTREAM_MAX_BYTES",
+        &["NONSTREAM_MAX_BYTES"],
+    ),
+    env(
+        "llm.sse_frame_hard_bytes",
+        "SSE_FRAME_HARD_BYTES",
+        &["SSE_FRAME_HARD_BYTES"],
+    ),
+    MappingDef {
+        key: UPSTREAMS_KEY,
+        target: MappingTarget::PortTable,
+        env_explicit_names: &[],
+        coercion: Coercion::Plain,
+    },
+    // ── pii_scope（5）──
+    env("pii_scope.mode", "PII_SCOPE_MODE", &["PII_SCOPE_MODE"]),
+    env(
+        "pii_scope.ttl_secs",
+        "PII_SCOPE_TTL_SECS",
+        &["PII_SCOPE_TTL_SECS"],
+    ),
+    env(
+        "pii_scope.max_conversations",
+        "PII_SCOPE_MAX_CONVERSATIONS",
+        &["PII_SCOPE_MAX_CONVERSATIONS"],
+    ),
+    env(
+        "pii_scope.key_header",
+        "PII_SCOPE_KEY_HEADER",
+        &["PII_SCOPE_KEY_HEADER"],
+    ),
+    env(
+        "pii_scope.prev_id_max_entries",
+        "PII_SCOPE_PREV_ID_MAX_ENTRIES",
+        &["PII_SCOPE_PREV_ID_MAX_ENTRIES"],
+    ),
+    // ── redaction（12）──
     env(
         "redaction.enabled",
         "REDACTION_ENABLED",
@@ -384,56 +333,8 @@ const MAPPINGS: &[MappingDef] = &[
     ),
     env(
         "redaction.normalize_json_whitespace",
-        "NORMALIZE_JSON_WHITESPACE",
-        &["NORMALIZE_JSON_WHITESPACE"],
-    ),
-    env("pii_scope.mode", "PII_SCOPE_MODE", &["PII_SCOPE_MODE"]),
-    env(
-        "pii_scope.ttl_secs",
-        "PII_SCOPE_TTL_SECS",
-        &["PII_SCOPE_TTL_SECS"],
-    ),
-    env(
-        "pii_scope.max_conversations",
-        "PII_SCOPE_MAX_CONVERSATIONS",
-        &["PII_SCOPE_MAX_CONVERSATIONS"],
-    ),
-    env(
-        "pii_scope.key_header",
-        "PII_SCOPE_KEY_HEADER",
-        &["PII_SCOPE_KEY_HEADER"],
-    ),
-    env(
-        "pii_scope.prev_id_max_entries",
-        "PII_PREV_ID_MAX_ENTRIES",
-        &["PII_PREV_ID_MAX_ENTRIES"],
-    ),
-    env("llm.default_upstream", "LLM_UPSTREAM", &["LLM_UPSTREAM"]),
-    env(
-        "llm.timeout_secs",
-        "HTTP_TIMEOUT_SECS",
-        &["HTTP_TIMEOUT_SECS"],
-    ),
-    env(
-        "llm.pool_max_idle_per_host",
-        "HTTP_POOL_MAX_IDLE_PER_HOST",
-        &["HTTP_POOL_MAX_IDLE_PER_HOST"],
-    ),
-    env(
-        "llm.pool_idle_timeout_secs",
-        "HTTP_POOL_IDLE_TIMEOUT_SECS",
-        &["HTTP_POOL_IDLE_TIMEOUT_SECS"],
-    ),
-    MappingDef {
-        key: UPSTREAMS_KEY,
-        target: MappingTarget::PortTable,
-        env_explicit_names: &[],
-        coercion: Coercion::Plain,
-    },
-    env(
-        "keepass.backend",
-        "VEIL_KEEPASS_BACKEND",
-        &["VEIL_KEEPASS_BACKEND"],
+        "PII_NORMALIZE_JSON_WHITESPACE",
+        &["PII_NORMALIZE_JSON_WHITESPACE"],
     ),
 ];
 
@@ -456,10 +357,10 @@ pub struct FileLayerOutcome {
     pub request_log: RequestLogFileConfig,
 }
 
-/// 文件补充层入口：引导读取 → fail-closed 解析 → 密钥权限门禁 → 覆盖字段校验 →
-/// 逐键合并；返回校验后的 `[llm.targets]` 覆盖与 `[command]` 配置（供装载路径
-/// 并入 `Config`）。未设/空白 `VEIL_CONFIG_FILE` 时零副作用（不访问文件系统），
-/// 返回缺省产物；任一失败拒绝启动。
+/// 文件补充层入口：引导读取 → fail-closed 解析 → 密钥权限门禁 →
+/// 覆盖字段校验 → 逐键合并；返回校验后的 `[llm.targets]` 覆盖与 `[command]` 配置
+/// （供装载路径并入 `Config`）。未设/空白 `VEIL_CONFIG_FILE` 时零副作用（不访问
+/// 文件系统），返回缺省产物；任一失败拒绝启动。
 pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<FileLayerOutcome> {
     let Some(path) = bootstrap_path(env) else {
         return Ok(FileLayerOutcome::default());
@@ -472,8 +373,8 @@ pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<FileLayerO
             .and_then(|section| section.targets.as_ref()),
     )?;
     let command = validate_command(cfg.command.as_ref())?;
-    let server_bind = cfg.server.as_ref().and_then(|section| section.bind);
-    let request_log = RequestLogFileConfig::from_storage(cfg.storage.as_ref());
+    let server_bind = cfg.server.as_ref().and_then(|section| section.listen_addr);
+    let request_log = RequestLogFileConfig::from_request_log(cfg.request_log.as_ref());
     merge_entries(env, resolve_entries(&cfg)?);
     Ok(FileLayerOutcome {
         llm_targets,
@@ -567,8 +468,14 @@ fn collect_leaves(value: Value, path: &str, out: &mut Vec<(String, Value)>) {
     }
 }
 
+/// 封闭映射表精确命中（含 `server.surface_mode` 这类「文件专属根下的有 env 映射键」）。
+fn mapping_for(key: &str) -> Option<&'static MappingDef> { MAPPINGS.iter().find(|m| m.key == key) }
+
 /// 逐声明键解析为规范 env 名 + 规范字符串；端口表逐端口展开为 `LLM_<port>`，
 /// 端口不可 parse 为 `u16` 即拒启动；任一键未登记映射表按内部错误 fail-closed。
+///
+/// 判定顺序：端口表前缀 → 封闭映射表 → 文件专属结构键根。映射表先于根清单，
+/// 否则 `server.surface_mode`（`server` 根下的有 env 映射键）会被整根跳过。
 fn resolve_entries(cfg: &FileConfig) -> Result<Vec<ResolvedEntry>> {
     let root = serde_json::to_value(cfg).map_err(|e| {
         config_error(
@@ -580,11 +487,6 @@ fn resolve_entries(cfg: &FileConfig) -> Result<Vec<ResolvedEntry>> {
     collect_leaves(root, "", &mut leaves);
     let mut out = Vec::with_capacity(leaves.len());
     for (key, leaf) in leaves {
-        // 文件专属结构键（如 `[llm.targets]`）：无 env 映射，经 `validate_targets`
-        // 进入 `Config` 字段，跳过逐键合并与未登记映射表判定。
-        if file_only_root(&key).is_some() {
-            continue;
-        }
         if let Some(port_raw) = key.strip_prefix(UPSTREAMS_KEY_PREFIX) {
             let port = port_raw.parse::<u16>().map_err(|_| {
                 config_error(
@@ -604,42 +506,49 @@ fn resolve_entries(cfg: &FileConfig) -> Result<Vec<ResolvedEntry>> {
             });
             continue;
         }
-        let mapping = MAPPINGS.iter().find(|m| m.key == key).ok_or_else(|| {
-            config_error(
-                BOOTSTRAP_VAR,
-                &format!("文件键 {key} 未登记映射表（内部错误），拒绝启动"),
-            )
-        })?;
-        let canonical_env = match mapping.target {
-            MappingTarget::Env(name) => name,
-            MappingTarget::PortTable => {
-                return Err(config_error(
-                    BOOTSTRAP_VAR,
-                    &format!("文件键 {key} 端口表形态非法，拒绝启动"),
-                ));
-            }
-            MappingTarget::FileOnly => {
-                let value = coerce_value(&key, &leaf, mapping.coercion)?;
-                out.push(ResolvedEntry {
-                    key,
-                    canonical_env: None,
-                    env_explicit_names: Vec::new(),
-                    value,
-                });
-                continue;
-            }
-        };
-        let value = coerce_value(&key, &leaf, mapping.coercion)?;
-        out.push(ResolvedEntry {
-            key,
-            canonical_env: Some(canonical_env.to_string()),
-            env_explicit_names: mapping
-                .env_explicit_names
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-            value,
-        });
+        if let Some(mapping) = mapping_for(&key) {
+            let canonical_env = match mapping.target {
+                MappingTarget::Env(name) => name,
+                MappingTarget::PortTable => {
+                    return Err(config_error(
+                        BOOTSTRAP_VAR,
+                        &format!("文件键 {key} 端口表形态非法，拒绝启动"),
+                    ));
+                }
+                MappingTarget::FileOnly => {
+                    let value = coerce_value(&key, &leaf, mapping.coercion)?;
+                    out.push(ResolvedEntry {
+                        key,
+                        canonical_env: None,
+                        env_explicit_names: Vec::new(),
+                        value,
+                    });
+                    continue;
+                }
+            };
+            let value = coerce_value(&key, &leaf, mapping.coercion)?;
+            out.push(ResolvedEntry {
+                key,
+                canonical_env: Some(canonical_env.to_string()),
+                env_explicit_names: mapping
+                    .env_explicit_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                value,
+            });
+            continue;
+        }
+        // 文件专属结构键（如 `[llm.targets]`、`[command]`、`server.listen_addr`）：
+        // 无 env 映射，经 `validate_targets` / `validate_command` / 产物字段进入
+        // `Config`，跳过逐键合并与未登记映射表判定。
+        if file_only_root(&key).is_some() {
+            continue;
+        }
+        return Err(config_error(
+            BOOTSTRAP_VAR,
+            &format!("文件键 {key} 未登记映射表（内部错误），拒绝启动"),
+        ));
     }
     Ok(out)
 }
@@ -708,9 +617,14 @@ fn merge_entries(env: &mut HashMap<String, String>, entries: Vec<ResolvedEntry>)
 
 /// 文件是否声明任一密钥类键（5 个概念，首项两键同概念只计一次）。
 fn declares_secret_keys(cfg: &FileConfig) -> bool {
-    let auth = cfg.auth.as_ref().is_some_and(|section| {
-        section.matrix_access_token.is_some() || section.observability_admin_token.is_some()
-    });
+    let matrix = cfg
+        .matrix
+        .as_ref()
+        .is_some_and(|section| section.access_token.is_some());
+    let admin = cfg
+        .admin
+        .as_ref()
+        .is_some_and(|section| section.token.is_some());
     let storage = cfg.storage.as_ref().is_some_and(|section| {
         section.veilctl_secret.is_some() || section.veilctl_binary_hash.is_some()
     });
@@ -718,7 +632,7 @@ fn declares_secret_keys(cfg: &FileConfig) -> bool {
         .redaction
         .as_ref()
         .is_some_and(|section| section.value_sample_hmac_key.is_some());
-    auth || storage || redaction
+    matrix || admin || storage || redaction
 }
 
 /// Unix：声明密钥类键的文件须满足 `mode & 0o077 == 0`（group/other 读写执行位
@@ -746,7 +660,7 @@ fn enforce_secret_permissions(path: &Path, cfg: &FileConfig) -> Result<()> {
             BOOTSTRAP_VAR,
             &format!(
                 "{BOOTSTRAP_VAR} 文件 {} 声明了密钥类键但权限过宽（mode {:03o}，要求 mode & 0o077 == 0）：\
-                请 chmod 600 {} 或改用 env 注入；env 覆盖不豁免该门禁（密钥已落盘）",
+                 请 chmod 600 {} 或改用 env 注入；env 覆盖不豁免该门禁（密钥已落盘）",
                 path.display(),
                 mode & 0o777,
                 path.display()

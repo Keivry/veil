@@ -570,7 +570,7 @@ pub async fn await_credential_approval(state: &impl AppStateParts, event_id: &st
     state.approval().ask(event_id, timeout).await
 }
 
-/// 审计审批问询（`AUDIT_TIMEOUT` 口径，默认 90s）：超时返回 None，调用方按 rejected 处理。
+/// 审计审批问询（`AUDIT_TIMEOUT_SECS` 口径，默认 90s）：超时返回 None，调用方按 rejected 处理。
 pub async fn await_audit_approval(state: &impl AppStateParts, event_id: &str) -> Option<bool> {
     state.approval().ask_audit(event_id).await
 }

@@ -103,10 +103,11 @@ async fn c4_query_token_on_index_401_with_html_accept() {
     handle.abort();
 }
 
-// `OBSERVABILITY_DISABLE=1` 时入口亦 404，门控响应复用管理安全头（no-store）。
+// `ADMIN_ENABLED=0`（正向开关显式关闭）
+// 时入口亦 404，门控响应复用管理安全头（no-store）。
 #[tokio::test]
 async fn c5_disable_gate_404_keeps_security_headers() {
-    let (base, handle) = serve(test_app_router(&[("OBSERVABILITY_DISABLE", "1")])).await;
+    let (base, handle) = serve(test_app_router(&[("ADMIN_ENABLED", "0")])).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{base}/_admin/"))

@@ -294,7 +294,7 @@ struct PrevInner {
 pub struct PreviousResponseMap {
     inner: Mutex<PrevInner>,
     max_entries: usize,
-    /// 映射逐出计数落点（`PII_PREV_ID_MAX_ENTRIES` 达上限逐出最旧条目时）。
+    /// 映射逐出计数落点（`[pii_scope].prev_id_max_entries` 达上限逐出最旧条目时）。
     metrics: Option<Arc<GatewayMetrics>>,
 }
 

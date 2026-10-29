@@ -254,9 +254,9 @@ pub async fn handle_credential(
     headers: &CredentialHeaders,
     body: &CredentialBody,
 ) -> Result<serde_json::Value> {
-    if state.config().entry_mode == EntryMode::LlmOnly {
+    if state.config().surface_mode == EntryMode::LlmOnly {
         return Err(VeilError::Auth {
-            message: "llm-only 纯代理入口，凭据接口不可用".to_string(),
+            message: "llm_only 纯代理入口，凭据接口不可用".to_string(),
         });
     }
     let (caller_hash, caller_path) = effective_caller(headers, body);
