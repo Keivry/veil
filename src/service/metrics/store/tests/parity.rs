@@ -2,7 +2,7 @@
 //! 自 `store/tests.rs` 拆分以守 800 行红线。
 
 use {
-    super::super::{MetricsStore, ensure_tables},
+    super::super::{MetricsStore, ensure_tables, is_duplicate_column_error},
     crate::{
         fs_perm::open_wal,
         service::{
@@ -166,5 +166,84 @@ fn ensure_tables_idempotent_on_fresh_db() {
         cols.iter().filter(|n| n.as_str() == "pii_miss").count(),
         1,
         "重复建表不得重复加列: {cols:?}"
+    );
+}
+
+/// 补列错误分类器真值表：只有 SQLite 的 duplicate column 方言可被吞掉。
+#[test]
+fn duplicate_column_classifier_matches_sqlite_dialect_only() {
+    for message in [
+        "duplicate column name: bucket_bounds_version",
+        "DUPLICATE COLUMN NAME: cached_read",
+        "Duplicate Column Name: unknown",
+    ] {
+        assert!(
+            is_duplicate_column_error(message),
+            "列已存在须判定为可跳过: {message:?}"
+        );
+    }
+    for message in [
+        "attempt to write a readonly database",
+        "database or disk is full",
+        "database is locked",
+        "no such table: metrics_daily",
+        "duplicate key",
+        "",
+    ] {
+        assert!(
+            !is_duplicate_column_error(message),
+            "非 duplicate column 错误不得被静默吞掉: {message:?}"
+        );
+    }
+}
+
+/// 补列失败必须上抛：只读库下的 `ensure_tables` 不得静默成功，
+/// 否则后续插入每次刷盘都失败而指标持久化停摆。
+#[test]
+fn ensure_tables_propagates_non_duplicate_alter_errors() {
+    let db = tmp_db("parity-readonly-alter");
+    let _ = std::fs::remove_file(&db);
+    {
+        let conn = open_wal(&db).expect("库须可建");
+        // 旧表缺全部新列，触发补列路径。
+        conn.execute_batch(
+            "CREATE TABLE metrics_daily(
+                window TEXT NOT NULL, protocol TEXT NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(window, protocol));",
+        )
+        .expect("建旧表须成功");
+    }
+    // 同一连接上放一个长事务持有写锁之外的只读视图不可行；
+    // 改用 SQL 层面直接判定：把表换成视图使 `ALTER TABLE` 必然失败（错误既非重复列）。
+    {
+        let conn = open_wal(&db).expect("库须可开");
+        conn.execute_batch(
+            "DROP TABLE metrics_daily;
+             CREATE VIEW metrics_daily AS SELECT 'd1' AS window, 'chat' AS protocol, 0 AS requests;",
+        )
+        .expect("改视图须成功");
+        let err = ensure_tables(&conn).expect_err("非重复列错误须上抛");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("metrics_daily"), "错误须指明表名: {msg}");
+        assert!(
+            msg.contains("cached_read"),
+            "错误须指明列名（首个缺列）: {msg}"
+        );
+    }
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 源码级守卫：补列循环不得再吞掉全部错误（`let _ = conn.execute(`）。
+#[test]
+fn ensure_tables_alter_loop_does_not_swallow_all_errors() {
+    const SRC: &str = include_str!("../../store.rs");
+    assert!(
+        !SRC.contains("let _ = conn.execute(\n                &format!(\"ALTER TABLE"),
+        "补列循环不得用 `let _` 吞掉全部错误"
+    );
+    assert!(
+        SRC.contains("Err(err) if is_duplicate_column_error(&err.to_string()) => {}"),
+        "补列循环须只忽略 duplicate column"
     );
 }

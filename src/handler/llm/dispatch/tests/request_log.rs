@@ -79,6 +79,13 @@ async fn nonstream_success_writes_exactly_one_row() {
     assert_eq!(row.completion_tokens, 7);
     assert_eq!(row.cached_read, 4);
     assert_eq!(row.cache_input_tokens, 11, "Chat 分母即输入 token");
+    // 非流无 TTFT/TPS：响应体一次性读完，无逐 token 时间轴，
+    // 两列恒 `None`（若误用整体生成耗时当 TTFT，TPS 会算出数万 tok/s 的假值）。
+    assert_eq!(row.ttft_ms, None, "非流不得有 ttft_ms: {row:?}");
+    assert_eq!(row.tps, None, "非流不得有 tps: {row:?}");
+    // 但延迟与 token 计数仍照常填充。
+    assert!(row.latency_ms > 0, "非流仍须记 latency_ms: {row:?}");
+    assert_eq!(row.completion_tokens, 7, "token 计数不得因缺 TTFT 而丢");
     assert!(!row.request_id.is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -426,6 +433,11 @@ async fn streaming_success_writes_one_row_with_upstream_status() {
     assert_eq!(row.prompt_tokens, 5);
     assert_eq!(row.completion_tokens, 2);
     assert!(row.counted_metrics, "流式成功须计入 metrics");
+    // 流式口径：TTFT = 请求起始 → 首个内容帧真正下行。
+    assert!(
+        row.ttft_ms.is_some(),
+        "流式内容帧下行后须有 ttft_ms: {row:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -904,6 +916,51 @@ async fn admin_health_and_payload_too_large_do_not_record() {
 }
 
 #[tokio::test]
+async fn dedicated_listener_port_wins_over_host_header_end_to_end() {
+    // 整链证明：router 经 `with_ingress_port` 注入的端口一路到落行的 `ingress_port`，
+    // 且选路上游按该端口（8879）而非 `Host` 头端口（8878）。
+    let up_8878 = br#"{"choices":[{"message":{"content":"a"},"finish_reason":"stop"}]}"#.to_vec();
+    let up_8879 = br#"{"choices":[{"message":{"content":"b"},"finish_reason":"stop"}]}"#.to_vec();
+    let (url_8878, _cap_a, server_a) = capture_loopback_complete("application/json", up_8878).await;
+    let (url_8879, _cap_b, server_b) = capture_loopback_complete("application/json", up_8879).await;
+    let (state, dir) = test_app_state(&[
+        ("LLM_8878", url_8878.as_str()),
+        ("LLM_8879", url_8879.as_str()),
+    ]);
+    let app = crate::router::with_ingress_port(crate::router::build_router(state.clone()), 8879);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("回环监听须成功");
+    let addr = listener.local_addr().expect("回环地址须可读");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("host", "example.test:8878")
+        .body(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .expect("请求须可达");
+    assert_eq!(resp.status().as_u16(), 200);
+    handle.abort();
+    server_a.abort();
+    server_b.abort();
+
+    let row = only_row(&state);
+    assert_eq!(row.ingress_port, Some(8879), "落行须记生效选路端口");
+    let upstream = row.upstream.as_deref().expect("须记上游 host:port");
+    let want = url_8879
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .expect("上游基址须含 authority");
+    assert_eq!(upstream, want, "须命中 8879 上游而非 Host 头的 8878");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn count_tokens_row_is_not_marked_chat() {
     // `count_tokens` 走 Anthropic 协议线的对话臂（请求侧脱敏），但语义不是对话
     // 请求：落行 `is_chat` 须为 `false`，`protocol` 仍记 `anthropic`。
@@ -930,5 +987,67 @@ async fn count_tokens_row_is_not_marked_chat() {
     assert_eq!(row.protocol, "anthropic");
     assert!(!row.is_chat, "count_tokens 不得标记为对话请求");
     assert!(!row.counted_metrics, "count_tokens 不计入 metrics");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn audit_hold_overflow_marks_error_kind_on_request_row() {
+    // 审计 hold 缓冲超限是「阻断非截断」：客户端照样收到 `[blocked: audit-hold-overflow]`
+    // 协议阻断帧（原样不变），但请求行必须以 `error_kind = "audit_hold_overflow"`
+    // 暴露该失败——否则 `/_admin/requests` 会把它显示成一次普通 200 流。
+    // `truncated_mode` SHALL 保持 `None`（阻断不属截断，不污染截断指标）。
+    let mut sse = String::new();
+    sse.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-big\",\"type\":\"function\",\"function\":{\"name\":\"run\"}}]}}]}\n\n");
+    // 每帧 16 字节载荷，合计远超 64 字节预算（限制见下方 `AUDIT_HOLD_MAX_BYTES`）。
+    let chunk = "x".repeat(16);
+    for _ in 0..16 {
+        sse.push_str(&format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{chunk}\"}}}}]}}}}]}}\n\n"
+        ));
+    }
+    let (url, _captured, server) =
+        capture_loopback_complete("text/event-stream", sse.into_bytes()).await;
+    let (state, dir) = test_app_state(&[
+        ("LLM_UPSTREAM", url.as_str()),
+        ("AUDIT_MODE", "block"),
+        // 载荷预算 64 字节：第 5 帧即超限，确定性触发阻断臂。
+        ("AUDIT_HOLD_MAX_BYTES", "64"),
+    ]);
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(())
+        .expect("请求构造须成功");
+    let (mut parts, ()) = request.into_parts();
+    let resp = crate::handler::llm::dispatch::gateway_serve(
+        &state,
+        &mut parts,
+        "/v1/chat/completions",
+        br#"{"model":"m","stream":true,"messages":[]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "阻断不改为协议错误，仍 200");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("SSE 响应体须可读");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("[blocked: audit-hold-overflow]"),
+        "客户端可见阻断帧文本须逐字节不变: {text}"
+    );
+    server.abort();
+
+    let row = only_row(&state);
+    assert_eq!(row.status, Some(200), "上游状态仍记真实 200");
+    assert_eq!(
+        row.error_kind.as_deref(),
+        Some("audit_hold_overflow"),
+        "超限须在请求行可见: {row:?}"
+    );
+    assert_eq!(
+        row.truncated_mode, None,
+        "阻断非截断：不得写 truncated_mode"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

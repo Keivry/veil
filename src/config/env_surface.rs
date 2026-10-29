@@ -6,7 +6,7 @@
 //!
 //! 冻结接口（跨 agent 锁步测试依赖这些精确名字与语义）：
 //! - [`CONFIG_ENV_WHITELIST`]：9 个具名环境变量；
-//! - [`MIGRATED_ENV_VARS`]：48 个迁移清单变量（含全部兼容别名）；
+//! - [`MIGRATED_ENV_VARS`]：49 个迁移清单变量（含全部兼容别名）；
 //! - [`parse_llm_port`]：`LLM_<port>` 解析唯一实现（`load_llm` 复用同一语义）；
 //! - [`filter_process_env`]：仅保留白名单名，其余（含 `LLM_<port>` 模式键）剔除；
 //! - [`warn_migrated_and_legacy`]：迁移/`LLM_<port>`/遗留置位告警，绝不返回 `Err`、绝不拒启动。
@@ -37,11 +37,11 @@ pub(crate) const CONFIG_ENV_WHITELIST: [&str; 9] = [
     "PII_VALUE_SAMPLE_HMAC_KEY",
 ];
 
-/// 迁移清单：48 个已迁移到配置文件、不再从进程 env 读取的变量名（含全部兼容别名）。
+/// 迁移清单：49 个已迁移到配置文件、不再从进程 env 读取的变量名（含全部兼容别名）。
 ///
 /// 分组（与 `specs/config-env-surface` 及 design D11 逐项一致）：脱敏 20、
-/// PII 作用域 5、审计 5、认证/入口/存储 11、LLM/限额 6。任一置位仅告警、不生效。
-pub(crate) const MIGRATED_ENV_VARS: [&str; 48] = [
+/// PII 作用域 5、审计 6、认证/入口/存储 12、LLM/限额 6。任一置位仅告警、不生效。
+pub(crate) const MIGRATED_ENV_VARS: [&str; 49] = [
     // 脱敏 20（含全部兼容别名）
     "REDACTION_ENABLED",
     "PII_REDACTION_ENABLED",
@@ -69,10 +69,11 @@ pub(crate) const MIGRATED_ENV_VARS: [&str; 48] = [
     "PII_SCOPE_MAX_CONVERSATIONS",
     "PII_PREV_ID_MAX_ENTRIES",
     "PII_SCOPE_KEY_HEADER",
-    // 审计 5
+    // 审计 6
     "AUDIT_MODE",
     "AUDIT_TIMEOUT",
     "AUDIT_HOLD_MAX_BYTES",
+    "AUDIT_HOLD_MAX_FRAMES",
     "AUDIT_POLICY_FILE",
     "APPROVAL_WHITELIST",
     // 认证/入口/存储 12

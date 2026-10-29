@@ -12,12 +12,30 @@ use {
     },
 };
 
-/// hold **条目数上限**——与字节上限（`AUDIT_HOLD_MAX_BYTES`）并行的
+/// hold **聚合槽条目数上限**——与字节上限（`AUDIT_HOLD_MAX_BYTES`）并行的
 /// 独立维度。零字节分片（`output_item.added`、空 `function_call` 等不计
 /// `total_bytes` 的碎片）若只按字节记账可无限创建槽/条目，故以本上限约束活跃
 /// 条目数（Chat/Anthropic 的 `args_by_index` + Responses 的 `responses_slots`）；
 /// 超限与字节超限同语义 fail-closed 并清仓，使零字节洪泛下内存有界。
+///
+/// 本上限**只管聚合槽表**；缓冲帧数另由可配的
+/// `[limits].audit_hold_max_frames`（见 [`AuditHold::with_limits`]）约束，二者
+/// 维度不同，不可互相替代。
 const AUDIT_HOLD_MAX_ENTRIES: usize = 4096;
+
+/// 零载荷缓冲帧的独立洪泛上限：载荷字节为 0 的帧（如空 `arguments` 分片）
+/// 不受字节维度约束，若无独立计数可无限堆积 `pending_tool_frames`。取聚合
+/// 条目上限同值，保持既有「零字节洪泛至 4096 帧即 fail-closed」语义。
+const PENDING_ZERO_BYTE_FLOOD_CAP: usize = AUDIT_HOLD_MAX_ENTRIES;
+
+/// 缓冲帧**信封字节**（SSE 前缀 + JSON 外壳）的独立预算 8MiB。
+///
+/// 为什么与载荷预算分开：信封随帧数线性增长（每帧约百余字节），若与参数载荷
+/// 共用 `[limits].audit_hold_max_bytes`，几千个合法分片的信封就会独吞乃至超过
+/// 整份预算，使「20KB 参数的小调用」被判溢出（本缺陷成因）。单独成账后，
+/// 载荷预算只服务载荷，信封另有固定上界，二者相加仍是**确定的**内存上界
+/// （`2 × max_bytes + 8MiB + max_frames × 单帧开销`），不会无界增长。
+const PENDING_ENVELOPE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// hold 累积与流内保活（自 `audit_hold.rs` 并入，判定归属本模块）：
 /// `AuditHold` 只累积不合成帧，`RequestKeepalive` 为流内保活唯一实现。
@@ -55,6 +73,22 @@ impl ResponsesSlot {
     }
 }
 
+/// fail-closed 清仓瞬间的记账快照（供阻断告警读取）。
+///
+/// 必须单独留存：`reject_and_clear` 会把所有计数器归零，事后读取只剩 0，
+/// 告警就失去诊断价值。四组数字均不含参数明文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct HoldRejectStats {
+    /// 清仓前的缓冲帧数。
+    pub pending_frames: usize,
+    /// 清仓前的缓冲载荷字节。
+    pub pending_payload_bytes: usize,
+    /// 清仓前的缓冲信封字节。
+    pub pending_envelope_bytes: usize,
+    /// 清仓前的聚合载荷字节（`args_by_index`/`responses_slots` 持仓）。
+    pub held_payload_bytes: usize,
+}
+
 /// 职责声明：本结构只累积（tool 参数分片/字节预算/完成判定），不合成
 /// 任何响应帧/体；帧合成归 `block_inject`，两边不交叉。
 #[derive(Debug, Default)]
@@ -67,17 +101,54 @@ pub struct AuditHold {
     max_bytes: usize,
     rejected: bool,
     completed: bool,
-    /// `pending_tool_frames` 缓冲帧记账——条目与字节双维度与聚合
+    /// `pending_tool_frames` 缓冲帧记账——帧数与字节双维度与聚合
     /// 槽位（`args_by_index`/`responses_slots`）**独立**：同一 index 零字节分片
     /// 不创建聚合条目也不加聚合字节，聚合维度看不见该洪泛，故须独立计数。
     pending_frames: usize,
+    /// 仍滞留在 `pending_tool_frames` 里的参数载荷字节累计。
+    ///
+    /// 与 `total_bytes` 计的是**两块不同堆分配**（聚合槽里的 `args_by_index`
+    /// 与缓冲队列里的还原帧），内容重叠但内存不重叠，故不能合并成一个计数器；
+    /// 二者共享同一个 `max_bytes` 预算、**各自判超而不求和**——求和等于把同一
+    /// 份逻辑载荷计两遍，1MiB 配置会退化成 512KiB 实际可用（本缺陷的成因）。
+    /// 各自判超后的真实上界为 `2 × max_bytes`（信封另有独立预算，见
+    /// [`PENDING_ENVELOPE_BUDGET_BYTES`]），仍是有界内存。之所以必须独立的
+    /// 第二个计数器：审计释放会先减
+    /// `total_bytes`，而缓冲帧此时可能仍在等完成事件重放，只有本计数器还能
+    /// 如实反映缓冲占用。信封字节不在此计费（见
+    /// [`AuditHold::account_pending_frame`]）。
     pending_bytes: usize,
+    /// 缓冲帧信封字节累计（SSE 前缀 + JSON 外壳，不含参数载荷）。
+    ///
+    /// 与 `pending_bytes` 无重叠（信封不含载荷、载荷不含信封），受
+    /// [`PENDING_ENVELOPE_BUDGET_BYTES`] 独立约束，不占用配置的载荷预算。
+    pending_envelope_bytes: usize,
+    /// 载荷字节为 0 的缓冲帧数（零字节洪泛独立维度）。
+    pending_zero_byte_frames: usize,
+    /// 缓冲帧数上限（`[limits].audit_hold_max_frames`）。
+    max_frames: usize,
+    /// 最近一次 fail-closed 清仓时的记账快照（告警用）。
+    last_reject: Option<HoldRejectStats>,
 }
 
 impl AuditHold {
+    /// 以默认帧数上限构造（`[limits].audit_hold_max_frames` 的缺省值）。
     pub fn new(max_bytes: usize) -> Self {
+        Self::with_limits(
+            max_bytes,
+            crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
+        )
+    }
+
+    /// 以显式帧数上限构造；非法值（0）回退缺省值，与字节上限同口径。
+    pub fn with_limits(max_bytes: usize, max_frames: usize) -> Self {
         Self {
             max_bytes: if max_bytes == 0 { 1_048_576 } else { max_bytes },
+            max_frames: if max_frames == 0 {
+                crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize
+            } else {
+                max_frames
+            },
             ..Default::default()
         }
     }
@@ -121,11 +192,30 @@ impl AuditHold {
         self.args_by_index.len() + self.responses_slots.len() > AUDIT_HOLD_MAX_ENTRIES
     }
 
-    /// tool 缓冲帧入账——调用方在 `pending_tool_frames.push`
-    /// **之前**调用；条目维度复用 `AUDIT_HOLD_MAX_ENTRIES`，字节维度以独立
-    /// 计数器受 `max_bytes`（`AUDIT_HOLD_MAX_BYTES`）约束。超限与聚合超限同语义
-    /// fail-closed 清仓（调用方据此走 `audit-hold-overflow` 阻断臂，不静默丢弃）。
-    pub fn account_pending_frame(&mut self, bytes: usize) -> HoldVerdict {
+    /// tool 缓冲帧入账——调用方在 `pending_tool_frames.push` **之前**调用。
+    ///
+    /// 两路字节分账，均与本帧真实占用一一对应、互不重叠：
+    /// * `payload_bytes` —— 真正被保留的 `arguments` 分片文本，即进审计的那份 参数，只花
+    ///   `[limits].audit_hold_max_bytes` 的额度；
+    /// * `envelope_bytes` —— SSE 前缀 + JSON 外壳（每帧约百余字节），花固定 的
+    ///   [`PENDING_ENVELOPE_BUDGET_BYTES`]。
+    ///
+    /// 为什么必须分账：旧实现把整帧（外壳 + 载荷）都记进载荷预算，几千个合法
+    /// 分片的外壳就独吞乃至超过整份 1MiB，使「20KB 参数的小调用」被判溢出。
+    ///
+    /// 四个维度任一超限即 fail-closed 清仓（调用方据此走
+    /// `audit-hold-overflow` 阻断臂，不静默丢弃）：
+    /// 1. 帧数 `pending_frames > max_frames`（`[limits].audit_hold_max_frames`）；
+    /// 2. 零载荷帧 `pending_zero_byte_frames > PENDING_ZERO_BYTE_FLOOD_CAP` ——载荷为 0
+    ///    的帧不增载荷字节，无此维度可无限堆积；
+    /// 3. 载荷字节：`total_bytes` 与 `pending_bytes` **各自**受 `max_bytes`
+    ///    约束（共享同一上限，既不求和也不各分一半）；
+    /// 4. 信封字节 `pending_envelope_bytes > PENDING_ENVELOPE_BUDGET_BYTES`。
+    pub fn account_pending_frame(
+        &mut self,
+        payload_bytes: usize,
+        envelope_bytes: usize,
+    ) -> HoldVerdict {
         if self.rejected || self.completed {
             return if self.rejected {
                 HoldVerdict::Rejected
@@ -134,27 +224,60 @@ impl AuditHold {
             };
         }
         self.pending_frames = self.pending_frames.saturating_add(1);
-        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
-        if self.pending_frames > AUDIT_HOLD_MAX_ENTRIES || self.pending_bytes > self.max_bytes {
+        self.pending_bytes = self.pending_bytes.saturating_add(payload_bytes);
+        self.pending_envelope_bytes = self.pending_envelope_bytes.saturating_add(envelope_bytes);
+        if payload_bytes == 0 {
+            self.pending_zero_byte_frames = self.pending_zero_byte_frames.saturating_add(1);
+        }
+        if self.pending_frames > self.max_frames
+            || self.pending_zero_byte_frames > PENDING_ZERO_BYTE_FLOOD_CAP
+            || self.pending_bytes > self.max_bytes
+            || self.total_bytes > self.max_bytes
+            || self.pending_envelope_bytes > PENDING_ENVELOPE_BUDGET_BYTES
+        {
             return self.reject_and_clear();
         }
         HoldVerdict::Approved
     }
 
-    /// tool 缓冲帧出账——缓冲帧重放（按槽取出）后归还对应条目
-    /// 与字节，长流多轮 drain 不误判溢出。
-    pub fn release_pending_frames(&mut self, count: usize, bytes: usize) {
+    /// tool 缓冲帧出账——缓冲帧重放（按槽取出）后归还对应帧数、载荷字节与
+    /// 其中的零载荷帧数，长流多轮 drain 不误判溢出。
+    ///
+    /// 三个维度必须同源归还：只减字节不减零载荷帧数时，合法长流里的空分片会
+    /// 单调累积直至误触零字节洪泛上限。
+    pub fn release_pending_frames(
+        &mut self,
+        count: usize,
+        payload_bytes: usize,
+        envelope_bytes: usize,
+        zero_payload_frames: usize,
+    ) {
         self.pending_frames = self.pending_frames.saturating_sub(count);
-        self.pending_bytes = self.pending_bytes.saturating_sub(bytes);
+        self.pending_bytes = self.pending_bytes.saturating_sub(payload_bytes);
+        self.pending_envelope_bytes = self.pending_envelope_bytes.saturating_sub(envelope_bytes);
+        self.pending_zero_byte_frames = self
+            .pending_zero_byte_frames
+            .saturating_sub(zero_payload_frames);
     }
 
+    /// 缓冲帧记账实时快照 `(帧数, 载荷字节)`（单测与诊断用，不含参数明文）。
     #[cfg(test)]
     pub(crate) fn pending_accounting(&self) -> (usize, usize) {
         (self.pending_frames, self.pending_bytes)
     }
 
+    /// 最近一次 fail-closed 清仓的记账快照（未拒绝过为 `None`）。
+    pub(crate) fn last_reject_stats(&self) -> Option<HoldRejectStats> { self.last_reject }
+
     /// 字节或条目超限共用的 fail-closed 清仓（拒绝态 + 归零 + 清空全部槽）。
     fn reject_and_clear(&mut self) -> HoldVerdict {
+        // 先留存快照再归零——否则告警只能读到 0，失去诊断价值。
+        self.last_reject = Some(HoldRejectStats {
+            pending_frames: self.pending_frames,
+            pending_payload_bytes: self.pending_bytes,
+            pending_envelope_bytes: self.pending_envelope_bytes,
+            held_payload_bytes: self.total_bytes,
+        });
         self.rejected = true;
         self.total_bytes = 0;
         self.args_by_index.clear();
@@ -163,6 +286,8 @@ impl AuditHold {
         self.responses_slots.clear();
         self.pending_frames = 0;
         self.pending_bytes = 0;
+        self.pending_envelope_bytes = 0;
+        self.pending_zero_byte_frames = 0;
         HoldVerdict::Rejected
     }
 
@@ -387,6 +512,8 @@ impl AuditHold {
         self.responses_slots.clear();
         self.pending_frames = 0;
         self.pending_bytes = 0;
+        self.pending_envelope_bytes = 0;
+        self.pending_zero_byte_frames = 0;
     }
 
     /// 完成点审计用三元组：`(index, tool 名, 累积参数全文)`。

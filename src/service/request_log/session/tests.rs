@@ -227,3 +227,215 @@ fn source_and_scope_labels_are_stable() {
     assert!(SessionSource::PrevResponse.is_chain());
     assert!(!SessionSource::CacheKey.is_chain());
 }
+
+/// D1：非 `opencode*` provider 只发 `x-opencode-session-id`，配置头缺席时
+/// 须经回退链命中，来源仍为 `Header`。
+#[test]
+fn fallback_header_derives_session_when_configured_header_absent() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-opencode-session-id",
+        axum::http::HeaderValue::from_static("ses_fallback_1"),
+    );
+    let resolved = resolve_session_header(&headers, "x-veil-conversation-id");
+    assert_eq!(resolved, Some("ses_fallback_1"));
+
+    let inputs = SessionInputs {
+        header: resolved,
+        ..SessionInputs::default()
+    };
+    let (id, source, scope) = derive_session(&inputs, Some(KEY), "chat").expect("须派生会话摘要");
+    assert_eq!(
+        (source, scope),
+        (SessionSource::Header, SessionScope::Session)
+    );
+    assert_eq!(id.len(), SESSION_ID_HEX_LEN);
+}
+
+/// 配置头仍最高优先：两者同时存在时取配置头。
+#[test]
+fn configured_header_wins_over_fallback_headers() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-veil-conversation-id",
+        axum::http::HeaderValue::from_static("from-configured"),
+    );
+    headers.insert(
+        "x-opencode-session-id",
+        axum::http::HeaderValue::from_static("from-fallback"),
+    );
+    assert_eq!(
+        resolve_session_header(&headers, "x-veil-conversation-id"),
+        Some("from-configured")
+    );
+}
+
+/// 空串不算命中：配置头为空时继续向下取回退头。
+#[test]
+fn empty_header_value_is_skipped_in_favour_of_next_candidate() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-veil-conversation-id",
+        axum::http::HeaderValue::from_static(""),
+    );
+    headers.insert(
+        "x-opencode-session",
+        axum::http::HeaderValue::from_static(""),
+    );
+    headers.insert(
+        "x-session-affinity",
+        axum::http::HeaderValue::from_static("affinity-1"),
+    );
+    assert_eq!(
+        resolve_session_header(&headers, "x-veil-conversation-id"),
+        Some("affinity-1")
+    );
+}
+
+/// 回退链顺序固定：`x-opencode-session` 先于 `x-opencode-session-id`，
+/// 再先于 `x-opencode-parent-session-id`、`x-session-affinity`、`x-session-id`。
+#[test]
+fn fallback_chain_order_is_fixed() {
+    let names: Vec<&str> = [
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "x-opencode-parent-session-id",
+        "x-session-affinity",
+        "x-session-id",
+    ]
+    .to_vec();
+    assert_eq!(SESSION_HEADER_FALLBACKS, names.as_slice());
+    for (idx, name) in names.iter().enumerate() {
+        let mut headers = axum::http::HeaderMap::new();
+        for later in &names[idx..] {
+            headers.insert(*later, axum::http::HeaderValue::from_static("v"));
+        }
+        assert_eq!(
+            resolve_session_header(&headers, "x-veil-conversation-id"),
+            Some("v"),
+            "第 {idx} 项 {name} 须先命中"
+        );
+    }
+}
+
+/// 遥测链仍认基础设施头：`x-opencode-parent-session-id` 与 `x-session-affinity`
+/// 在日志口径下仍是合法会话来源。
+#[test]
+fn telemetry_chain_still_accepts_parent_and_affinity_headers() {
+    for name in ["x-opencode-parent-session-id", "x-session-affinity"] {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(name, axum::http::HeaderValue::from_static("infra-1"));
+        assert_eq!(
+            resolve_session_header(&headers, "x-veil-conversation-id"),
+            Some("infra-1"),
+            "遥测链须命中 {name}"
+        );
+        assert_eq!(
+            resolve_pii_scope_header(&headers, "x-veil-conversation-id"),
+            None,
+            "PII 链 MUST NOT 接受 {name}（隔离边界）"
+        );
+    }
+}
+
+/// PII 链刻意窄：仅 `x-opencode-session` / `x-opencode-session-id` 两个回退头。
+#[test]
+fn pii_scope_chain_excludes_infra_and_generic_headers() {
+    assert_eq!(
+        PII_SCOPE_HEADER_FALLBACKS,
+        ["x-opencode-session", "x-opencode-session-id"]
+    );
+    for name in [
+        "x-opencode-parent-session-id",
+        "x-session-affinity",
+        "x-session-id",
+        "X-Session-Id",
+    ] {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(name, axum::http::HeaderValue::from_static("v"));
+        assert_eq!(
+            resolve_pii_scope_header(&headers, "x-veil-conversation-id"),
+            None,
+            "PII 链 MUST NOT 接受 {name}"
+        );
+    }
+    for name in ["x-opencode-session", "x-opencode-session-id"] {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(name, axum::http::HeaderValue::from_static("v"));
+        assert_eq!(
+            resolve_pii_scope_header(&headers, "x-veil-conversation-id"),
+            Some("v"),
+            "PII 链须接受 {name}"
+        );
+    }
+}
+
+/// PII 链的配置头仍最高优先，且空串/非 UTF-8 值照旧跳过。
+#[test]
+fn pii_scope_chain_configured_header_wins_and_skips_invalid() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-veil-conversation-id",
+        axum::http::HeaderValue::from_static("from-configured"),
+    );
+    headers.insert(
+        "x-opencode-session",
+        axum::http::HeaderValue::from_static("from-opencode"),
+    );
+    assert_eq!(
+        resolve_pii_scope_header(&headers, "x-veil-conversation-id"),
+        Some("from-configured"),
+        "配置头须胜出"
+    );
+
+    let mut empty = axum::http::HeaderMap::new();
+    empty.insert(
+        "x-veil-conversation-id",
+        axum::http::HeaderValue::from_static(""),
+    );
+    empty.insert(
+        "x-opencode-session",
+        axum::http::HeaderValue::from_static(""),
+    );
+    assert_eq!(
+        resolve_pii_scope_header(&empty, "x-veil-conversation-id"),
+        None,
+        "空串须全部跳过"
+    );
+
+    let mut bad = axum::http::HeaderMap::new();
+    bad.insert(
+        "x-opencode-session-id",
+        axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("原始字节头值"),
+    );
+    assert_eq!(
+        resolve_pii_scope_header(&bad, "x-veil-conversation-id"),
+        None,
+        "非 UTF-8 值须跳过"
+    );
+}
+
+/// 告警定位：配置头缺席时须指名真正被拒的回退头。
+#[test]
+fn pii_scope_header_name_points_at_rejected_header() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-opencode-session-id",
+        axum::http::HeaderValue::from_static("v"),
+    );
+    assert_eq!(
+        pii_scope_header_name(&headers, "x-veil-conversation-id"),
+        Some("x-opencode-session-id"),
+        "须指回退头而非配置头名"
+    );
+    assert!(pii_scope_header_present(&headers, "x-veil-conversation-id"));
+    let mut only_infra = axum::http::HeaderMap::new();
+    only_infra.insert(
+        "x-session-affinity",
+        axum::http::HeaderValue::from_static("v"),
+    );
+    assert!(
+        !pii_scope_header_present(&only_infra, "x-veil-conversation-id"),
+        "仅遥测链头存在时不算 PII 键头存在"
+    );
+}

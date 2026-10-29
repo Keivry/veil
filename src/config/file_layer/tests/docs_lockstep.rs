@@ -244,7 +244,7 @@ fn doc_targets_structural_keys_match_schema_closed_list() {
 }
 
 /// 迁移清单等式（可机检）：`MIGRATED == (⋃ MAPPINGS.env_explicit_names) − WHITELIST`
-/// 且恰 48 项。任一迁移名或其 MAPPINGS 映射增删即失败。
+/// 且恰 49 项。任一迁移名或其 MAPPINGS 映射增删即失败。
 #[test]
 fn migrated_list_equals_mapping_union_minus_whitelist() {
     let whitelist: BTreeSet<&str> = CONFIG_ENV_WHITELIST.iter().copied().collect();
@@ -254,8 +254,8 @@ fn migrated_list_equals_mapping_union_minus_whitelist() {
         .collect();
     let want: BTreeSet<&str> = union.difference(&whitelist).copied().collect();
     let got: BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
-    assert_eq!(MIGRATED_ENV_VARS.len(), 48, "迁移清单须恰 48 项");
-    assert_eq!(got.len(), 48, "迁移清单不得有重复项");
+    assert_eq!(MIGRATED_ENV_VARS.len(), 49, "迁移清单须恰 49 项");
+    assert_eq!(got.len(), 49, "迁移清单不得有重复项");
     assert_eq!(
         got, want,
         "迁移清单须等于「映射 env 显式名并集 − 白名单」（任一侧增删须同步）"

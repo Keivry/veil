@@ -10,6 +10,7 @@ use {
     super::{
         super::store::MetricsStore,
         Granularity,
+        LATENCY_BOUNDS_VERSION,
         MetricsSnapshot,
         WindowAgg,
         bucket_index,
@@ -17,6 +18,7 @@ use {
         five_min_key,
         hour_key,
         p95_approx,
+        p95_saturated,
         window_ord,
     },
     std::collections::HashMap,
@@ -204,8 +206,12 @@ impl RangeSum {
         dst.t_open += src.t_open;
         dst.t_synth += src.t_synth;
         dst.t_upstream_error += src.t_upstream_error;
-        for (to, from) in dst.buckets.iter_mut().zip(src.buckets.iter()) {
-            *to += *from;
+        // 边界版本不符的窗口（升级前落盘的数据）只贡献计数，桶按零计：
+        // 旧桶下标对应的是旧边界，叠加进当前桶会让分布与 p95 失真。
+        if src.bucket_bounds_version == LATENCY_BOUNDS_VERSION {
+            for (to, from) in dst.buckets.iter_mut().zip(src.buckets.iter()) {
+                *to += *from;
+            }
         }
     }
 }
@@ -300,6 +306,7 @@ impl MetricsStore {
             cred_hits: sum.agg.cred_hits,
             latency_buckets: sum.agg.buckets,
             p95_ms: p95_approx(&sum.agg.buckets),
+            p95_saturated: p95_saturated(&sum.agg.buckets),
             per_protocol: sum.per_protocol,
             per_model: per_model_map,
             truncated_silent_discard: sum.agg.t_silent,

@@ -1,8 +1,12 @@
 (function () {
   'use strict';
   var state = { range: '1h', token: '', live: true, ev: [], kind: '', since: '', es: null, fallbackTimer: null, retryAt: 0, streamRetryAt: 0, metrics: null, series: null, cmdLimit: 50, cmdOffset: 0, cmdTotal: 0, cmdCommand: '', cmdStatus: '', lastCmdReload: 0,
+    // 「命令调用」「LLM 请求」两个分页分区的 Live 开关与共用的 5 秒轮询句柄。
+    reqLive: true, cmdLive: true, pollTimer: null, lastReqReload: 0,
+    // 同分区上一次列表取数是否仍在飞行：真时不再叠加第二个同源请求。
+    reqBusy: false, cmdBusy: false,
     // 「LLM 请求」分区状态：分页偏移、筛选值与最后一次响应体。
-    requests: { limit: 50, offset: 0, total: 0, model: '', protocol: '', status: '', session: '', scope: '', last: null } };
+    requests: { limit: 50, offset: 0, total: 0, model: '', protocol: '', status: '', session: '', scope: '', last: null, pending: false } };
 
   // 回退轮询间隔：管理面通用桶 10 次/分钟，断线后单端点每 15 秒轮询一次，
   // 仅占约 4 次/分钟；剩余预算留给登录探针与手动操作，恢复后立即停轮询。
@@ -14,7 +18,7 @@
   // SVG 命名空间：拆写避免字面量，取值仍为标准 SVG 命名空间。
   var SVGNS = 'http:' + '//www.w3.org/2000/svg';
   // 延迟 12 桶上界（毫秒），与网关口径一致，末桶为 +∞。
-  var BUCKET_BOUNDS = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
+  var BUCKET_BOUNDS = [50, 100, 200, 400, 800, 1500, 3000, 5000, 10000, 20000, 40000];
   // resize 去抖句柄：0 表示没有待执行的重绘。
   var resizeTimer = 0;
 
@@ -101,6 +105,40 @@
   // ── 分区导航与明暗主题（新增，不动既有数据逻辑）──
   var SEC_TITLES = { overview: '概览', redaction: '脱敏', performance: '性能', events: '事件', commands: '命令调用', requests: 'LLM 请求' };
 
+  // ── 分区级 Live 轮询（命令调用 / LLM 请求）：5 秒节拍，只刷当前可见分区 ──
+  // 这两个分区的数据不走 SSE，轮询即其刷新机制；开关关掉或切走分区都不留后台流量。
+  var POLL_MS = 5000;
+  // 管理面通用桶只有 10 次/分钟（与 SSE 并发维度正交），5 秒节拍若每次真发请求
+  // 会独占并击穿该桶，故实际取数取 30 秒最小间隔：单分区稳态仅 2 次/分钟，
+  // 留足预算给回退轮询、手动翻页与指标取数，多标签页/多运维共用出口 IP 也不越界。
+  var POLL_MIN_GAP_MS = 30000;
+
+  function pollTick() {
+    // 限流退避窗口内让路；SSE 断线回退已在轮询这两个分区时不叠加第二次取数。
+    if (Date.now() < state.retryAt || state.fallbackTimer) return;
+    // 后台标签页不烧限流预算：不可见时不取数，切回前台后由下一次节拍补上。
+    if (document.visibilityState !== 'visible') return;
+    if (!$('sec-requests').hidden) {
+      if (state.reqLive && Date.now() - state.lastReqReload >= POLL_MIN_GAP_MS) reloadRequests();
+      return;
+    }
+    // 不带 force：沿用 reloadCommands 内部的去抖，并再按 30 秒节流，不绕过限流预算。
+    if (!$('sec-commands').hidden && state.cmdLive &&
+        Date.now() - state.lastCmdReload >= POLL_MIN_GAP_MS) reloadCommands();
+  }
+
+  // 依据「当前分区 + 该分区开关」决定定时器是否存在：切走即清除，切回仍开则重建。
+  function syncPoll() {
+    var want = (!$('sec-requests').hidden && state.reqLive) ||
+      (!$('sec-commands').hidden && state.cmdLive);
+    if (want) {
+      if (state.pollTimer === null) state.pollTimer = setInterval(pollTick, POLL_MS);
+    } else if (state.pollTimer !== null) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  }
+
   function showSection(sec) {
     var i;
     var secs = document.querySelectorAll('.sec');
@@ -116,8 +154,10 @@
     if (sec === 'requests') {
       // 先回放上一页避免闪空，再拉取一次（分区打开即取数）。
       if (state.requests.last) renderRequests(state.requests.last);
-      reloadRequests();
+      reloadRequests(true);
     }
+    // 分区切换后重算轮询：离开命令/请求分区即清除定时器，不产生后台流量。
+    syncPoll();
   }
 
   // 主题：persist 为真时写 veil_theme Cookie（仅用户手动切换），否则只更新 UI。
@@ -171,6 +211,8 @@
     $('app').style.display = 'block';
     // 首屏只建实时通道：快照 + 建连回放驱动渲染，不并行打三个回退端点。
     connectStream();
+    // 首屏分区为概览：命令/请求的轮询此时不启动，进入对应分区时再建。
+    syncPoll();
   }
 
   function doLogin() {
@@ -269,7 +311,7 @@
         kpiCard(rangeLabel, fmtNum(req), String(req), '', 'primary') +
         kpiCard('Token 总量', fmtNum(total), String(total), '输入 ' + fmtNum(prompt) + ' / 输出 ' + fmtNum(completion), 'primary')) +
       kpiGroup('性能',
-        kpiCard('p95 延迟', fmtMs(m.p95_ms), String(m.p95_ms == null ? '' : m.p95_ms), precise ? '精确' : '近似', 'primary') +
+        kpiCard('p95 延迟', (m.p95_saturated ? '≥' : '') + fmtMs(m.p95_ms), String(m.p95_ms == null ? '' : m.p95_ms), (m.p95_saturated ? '≥ 上限，落溢出桶' : (precise ? '精确' : '近似')), 'primary') +
         kpiCard('统计精度', precise ? '精确' : '近似', String(!!m.is_precise), '')) +
       kpiGroup('脱敏与凭据',
         kpiCard('PII 作用域', mode, String(mode), '') +
@@ -464,6 +506,9 @@
     var max = pairs[0][1] || 1;
     drawBarsH(box, pairs, tips, SVGNS, max, 'barg-' + boxId, null, distLabelW || null);
   }
+
+  // 已弃用兼容别名：保留 `drawBars` 锚点，行为恒等于 `drawDistBars`，新代码用后者。
+  function drawBars(boxId, data, tips) { return drawDistBars(boxId, data, tips); }
 
   // PII 专用绘制：聚合后转调 drawDistBars，悬停/无障碍文本为 `kind: 合计`
   // 加该 kind 的 Top-3 掩码样本（`mask xcount`，count 降序）。
@@ -939,7 +984,9 @@
         onMetricsTree(m);
       }).catch(function (err) {
         if (err && err.message === 'ratelimited') {
-          if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
+          // 无 Retry-After 时也至少退避一个轮询间隔，避免下一拍立刻重撞。
+          var ra = (err.retryAfter > 0) ? err.retryAfter * 1000 : POLL_MIN_GAP_MS;
+          state.retryAt = Date.now() + ra;
           showRateLimit();
         }
       });
@@ -1001,22 +1048,29 @@
   function reloadCommands(force) {
     var now = Date.now();
     if (!force && now - state.lastCmdReload < CMD_RELOAD_MIN_MS) return;
+    // 上一次命令取数未落地时直接放弃本轮：避免投递第二个同源请求。
+    if (state.cmdBusy) return;
     state.lastCmdReload = now;
+    state.cmdBusy = true;
     var q = '/_admin/commands?range=' + encodeURIComponent(state.range) +
       '&limit=' + state.cmdLimit + '&offset=' + state.cmdOffset;
     if (state.cmdCommand) q += '&command=' + encodeURIComponent(state.cmdCommand);
     if (state.cmdStatus) q += '&approval_status=' + encodeURIComponent(state.cmdStatus);
     api(q).then(function (d) {
+      state.cmdBusy = false;
       state.cmdTotal = (d && d.total) || 0;
       if (d && d.limit) state.cmdLimit = d.limit;
       renderCommands((d && d.items) || []);
       updateCmdPager();
     }).catch(function (err) {
+      state.cmdBusy = false;
       if (err && err.message === 'unauthorized') {
         state.token = '';
         showLogin('会话失效，请重新登录');
       } else if (err && err.message === 'ratelimited') {
-        if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
+        // 无 Retry-After 时也至少退避一个轮询间隔，避免下一拍立刻重撞。
+        var ra = (err.retryAfter > 0) ? err.retryAfter * 1000 : POLL_MIN_GAP_MS;
+        state.retryAt = Date.now() + ra;
         showRateLimit();
       }
     });
@@ -1044,6 +1098,24 @@
     return Math.floor(h / 24) + ' 天 ' + (h % 24) + ' 小时';
   }
 
+  // 生成速率：保留一位小数，缺失/非法一律 em dash。
+  function fmtTps(v) {
+    if (v == null) return '—';
+    var n = Number(v);
+    if (!isFinite(n)) return '—';
+    return n.toFixed(1) + ' tok/s';
+  }
+
+  // 中段省略：超过 max 个字符时保留首尾、中间换 …，避免上游主机名撑宽表格。
+  function truncMiddle(s, max) {
+    if (!s) return '';
+    if (s.length <= max) return s;
+    var keep = max - 1;
+    var head = Math.ceil(keep / 2);
+    var tail = keep - head;
+    return s.slice(0, head) + '…' + (tail > 0 ? s.slice(s.length - tail) : '');
+  }
+
   function requestRowModel(item) {
     var it = item || {};
     var sid = it.session_id == null ? '' : String(it.session_id);
@@ -1051,10 +1123,14 @@
       (it.session_scope === 'user' ? '用户' : '');
     var io = (it.prompt_tokens == null ? '—' : Number(it.prompt_tokens).toLocaleString('en-US')) + ' · ' +
       (it.completion_tokens == null ? '—' : Number(it.completion_tokens).toLocaleString('en-US'));
+    // 上游只显示 authority（去 scheme/路径），超长时中段省略，完整值进 title。
+    var upstream = it.upstream == null ? '' : String(it.upstream);
     return {
       ts: fmtFullTs(it.ts_secs),
       model: it.model == null ? '' : String(it.model),
       protocol: it.protocol == null ? '' : String(it.protocol),
+      upstream: upstream,
+      upstreamShort: truncMiddle(upstream, 18),
       session: sid ? sid.slice(0, 12) : '',
       scope: scope,
       source: it.session_source == null ? '' : String(it.session_source),
@@ -1063,12 +1139,14 @@
       hit: fmtPct(it.cache_hit_rate),
       hitTitle: '缓存写比率 ' + fmtPct(it.cache_write_rate),
       latency: fmtMs(it.latency_ms),
+      ttft: fmtMs(it.ttft_ms),
+      tps: fmtTps(it.tps),
       summary: it.summary == null ? '' : String(it.summary)
     };
   }
   /* @veil-testable:end */
 
-  var REQ_EMPTY_COLS = 9;
+  var REQ_EMPTY_COLS = 12;
   // 与服务端 `request_log::MAX_OFFSET` 一致：超出即 400，故不发出该页请求。
   var REQ_MAX_OFFSET = 10000;
   var REQ_OFF_DISABLED = '逐请求记录已关闭（[storage].request_log_enabled = false）';
@@ -1135,6 +1213,7 @@
         '<td>' + esc(x.ts) + '</td>' +
         '<td>' + esc(x.model) + '</td>' +
         '<td>' + esc(x.protocol) + '</td>' +
+        '<td class="up" title="' + esc(x.upstream) + '">' + esc(x.upstreamShort) + '</td>' +
         '<td>' + esc(x.session) +
           (x.scope ? '<span class="badge" title="' + esc(x.source) + '">' + esc(x.scope) + '</span>' : '') +
         '</td>' +
@@ -1142,15 +1221,28 @@
         '<td class="num">' + esc(x.io) + '</td>' +
         '<td class="num" title="' + esc(x.hitTitle) + '">' + esc(x.hit) + '</td>' +
         '<td class="num">' + esc(x.latency) + '</td>' +
+        '<td class="num">' + esc(x.ttft) + '</td>' +
+        '<td class="num">' + esc(x.tps) + '</td>' +
         '<td class="sum" title="' + esc(x.summary) + '">' + esc(x.summary) + '</td>' +
         '</tr>';
     }).join(''));
     updateReqPager(rows.length);
   }
 
-  function reloadRequests() {
+  // 手动路径（翻页/筛选/应用/切分区）带走 `force`：若上一轮仍在飞行，把本次请求
+  // 排队为**一次**重跑，而不是静默丢弃——否则调用方已推进的 `r.offset` 与表格内容
+  // 长期错位（最长一个轮询间隔）。轮询路径不带 `force`，守卫语义不变。
+  function reloadRequests(force) {
     var r = state.requests;
+    // 上一次请求取数未落地时直接放弃本轮：避免投递第二个同源请求。
+    if (!force) { if (state.reqBusy) return; }
+    else if (state.reqBusy) { r.pending = true; return; }
+    // 手动筛选/翻页也会刷新该时间戳：轮询据此让路，不叠加一次同源请求。
+    state.lastReqReload = Date.now();
+    state.reqBusy = true;
+    // `llm=1` 由服务端追加 `AND is_chat = 1`：本分区只列真实 LLM API 记录。
     var q = '/_admin/requests?range=' + encodeURIComponent(state.range) +
+      '&llm=1' +
       '&limit=' + r.limit + '&offset=' + r.offset;
     if (r.model) q += '&model=' + encodeURIComponent(r.model);
     if (r.protocol) q += '&protocol=' + encodeURIComponent(r.protocol);
@@ -1159,18 +1251,26 @@
     if (r.scope) q += '&scope=' + encodeURIComponent(r.scope);
     if (!r.last) setReqTbody(reqEmptyRow('加载中…'));
     api(q).then(function (d) {
+      state.reqBusy = false;
       r.last = d;
       renderRequests(d);
+      if (r.pending) { r.pending = false; reloadRequests(true); }
     }).catch(function (err) {
+      state.reqBusy = false;
       if (err && err.message === 'unauthorized') {
+        r.pending = false;
         state.token = '';
         showLogin('会话失效，请重新登录');
       } else if (err && err.message === 'ratelimited') {
-        if (err.retryAfter > 0) state.retryAt = Date.now() + err.retryAfter * 1000;
+        // 无 Retry-After 时也至少退避一个轮询间隔，避免下一拍立刻重撞。
+        var ra = (err.retryAfter > 0) ? err.retryAfter * 1000 : POLL_MIN_GAP_MS;
+        state.retryAt = Date.now() + ra;
         showRateLimit();
+        if (r.pending) { r.pending = false; reloadRequests(true); }
       } else {
         // 非阻塞提示：保留上一页内容，不静默吞掉 400/5xx。
         setBanner('请求列表加载失败：' + (err && err.message ? err.message : '未知错误'));
+        if (r.pending) { r.pending = false; reloadRequests(true); }
       }
     });
   }
@@ -1235,7 +1335,7 @@
         restartStream();
         if (!$('sec-requests').hidden) {
           state.requests.offset = 0;
-          reloadRequests();
+          reloadRequests(true);
         } else if (!$('sec-events').hidden) {
           reloadEventsOnce();
         } else if (!$('sec-commands').hidden) {
@@ -1272,7 +1372,7 @@
       r.limit = Number($('req-limit').value) || 50;
       r.offset = 0;
       reqSessionHint($('req-session'));
-      reloadRequests();
+      reloadRequests(true);
     });
     $('req-session').addEventListener('input', function () {
       reqSessionHint(this);
@@ -1280,7 +1380,7 @@
     $('req-prev').addEventListener('click', function () {
       var r = state.requests;
       r.offset = Math.max(0, r.offset - r.limit);
-      reloadRequests();
+      reloadRequests(true);
     });
     $('req-next').addEventListener('click', function () {
       var r = state.requests;
@@ -1289,7 +1389,7 @@
         return;
       }
       r.offset += r.limit;
-      reloadRequests();
+      reloadRequests(true);
     });
     $('ev-apply').addEventListener('click', function () {
       state.kind = $('ev-kind').value.trim();
@@ -1305,6 +1405,16 @@
         stopFallback();
         setLive(false);
       }
+    });
+    $('req-live').addEventListener('click', function () {
+      state.reqLive = !state.reqLive;
+      this.className = state.reqLive ? 'active' : '';
+      syncPoll();
+    });
+    $('cmd-live').addEventListener('click', function () {
+      state.cmdLive = !state.cmdLive;
+      this.className = state.cmdLive ? 'active' : '';
+      syncPoll();
     });
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape') hideEvTooltip();

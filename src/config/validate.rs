@@ -33,7 +33,7 @@ pub const LEGACY_IGNORED_VARS: [(&str, &str); 7] = [
     ),
     (
         "CREDENTIAL_API_PORT",
-        "入口统一走 VEIL_ENTRY_MODE + 单端口 8877（见 工程参考 §8.4）",
+        "入口统一走 VEIL_ENTRY_MODE + 主监听 8877 / 已声明上游端口各一条专用监听（见 工程参考 §8.4）",
     ),
     (
         "CREDENTIAL_ADMIN_TOKEN",

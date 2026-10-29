@@ -17,12 +17,114 @@
 //! 密钥缺失 → `None`（`session_id=NULL` / `session_scope="none"`），**不得**退化为
 //! 无密钥哈希或进程随机盐（空密钥 HMAC 可字典反查）。
 
+use axum::http::HeaderMap;
+
 /// 摘要域串（与 `conversation_key` 的 `tenant || 0x1f || conversation` 域不同）。
 const SESSION_DOMAIN: &[u8] = b"veil-session-v1";
 /// 分量分隔符（与 `conversation_key::SEPARATOR` 同一字面量 `0x1f`）。
 const SEPARATOR: u8 = 0x1f;
 /// `session_id` 保留的 hex 字符数（16 hex = 64 bit，碰撞概率对 7 天窗口可接受）。
 pub const SESSION_ID_HEX_LEN: usize = 16;
+
+/// 内置会话头回退链（**遥测口径**，配置头之后依次尝试；HTTP 头名查找大小写不敏感）。
+///
+/// 起因：opencode 仅在 `providerID.startsWith("opencode")` 时发送
+/// `x-opencode-session`；其余 provider（如 `commandcode-veil/deepseek/...`）改发
+/// `x-opencode-session-id` / `x-opencode-parent-session-id` / `x-session-affinity` /
+/// `X-Session-Id`，且不设 `prompt_cache_key`。只读单一配置头会让这些调用在全部九档上
+/// 落空（`session_id=NULL` / `session_source="none"`），故固定一条回退链兜底。
+///
+/// 本链**只**服务 `llm_requests` 的会话摘要（[`resolve_session_header`]）。PII 会话
+/// 作用域用更窄的 [`PII_SCOPE_HEADER_FALLBACKS`]，两者不得合并，理由见该常量。
+pub const SESSION_HEADER_FALLBACKS: [&str; 5] = [
+    "x-opencode-session",
+    "x-opencode-session-id",
+    "x-opencode-parent-session-id",
+    "x-session-affinity",
+    "x-session-id",
+];
+
+/// PII 会话作用域专用回退链——**刻意比 [`SESSION_HEADER_FALLBACKS`] 窄**。
+///
+/// 只接受 opencode 明确表达「本会话」的两个头。被排除的三者都不是可信的客户端
+/// 隔离标识：`x-opencode-parent-session-id` 指向**父**会话（不是本会话身份，同父的
+/// 多个子会话会被合并）；`x-session-affinity` 是路由/亲和性提示（常见为固定常量或
+/// 跨客户端共享）；`x-session-id` 过于通用（代理、sidecar、网关常自行注入同一值）。
+///
+/// 为何必须窄（**不得**为了「日志与脱敏共用一条链」而重新合并两条链）：PII 会话
+/// 作用域的隔离边界只剩会话键值本身——上游 API key 由 `[llm.targets].headers` 注入
+/// 时客户端不带任何凭据头，`conversation_key::tenant_fingerprint` 对所有客户端取值
+/// 相同。若把上述基础设施头纳入键，两个逻辑客户端会落到同一会话键、共享同一
+/// `PiiScope` 占位符注册表，一方的明文可被还原进另一方的响应。
+pub const PII_SCOPE_HEADER_FALLBACKS: [&str; 2] = ["x-opencode-session", "x-opencode-session-id"];
+
+/// 单头取值：缺失、非 UTF-8 或空串一律视为未命中（空串不参与摘要）。
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+}
+
+/// 会话头解析（**遥测口径**）：配置头 `[pii_scope].key_header` 最高优先，其后按
+/// [`SESSION_HEADER_FALLBACKS`] 顺序逐项尝试，首个非空值胜出。
+///
+/// 仅供 `llm_requests.session_id` 的会话摘要推导（`RequestTrace::attach_identity`）。
+/// PII 会话作用域 MUST NOT 复用本函数——宽链含不可信的路由/通用头，见
+/// [`resolve_pii_scope_header`]。返回值的来源语义恒为 [`SessionSource::Header`]，
+/// 不新增来源变体。
+pub fn resolve_session_header<'a>(headers: &'a HeaderMap, configured: &str) -> Option<&'a str> {
+    header_value(headers, configured).or_else(|| {
+        SESSION_HEADER_FALLBACKS
+            .iter()
+            .find_map(|name| header_value(headers, name))
+    })
+}
+
+/// PII 会话作用域键解析（**隔离口径**）：配置头最高优先，其后仅按
+/// [`PII_SCOPE_HEADER_FALLBACKS`] 尝试，首个非空值胜出。
+///
+/// 与 [`resolve_session_header`] 的差异即隔离边界：客户端若只发
+/// `x-opencode-parent-session-id` / `x-session-affinity` / `x-session-id`，日志仍有
+/// `session_id`，但 PII 作用域退化为**逐请求**（键推导落第 4 级）——这是有意的取舍，
+/// 宁可损失跨轮 token 稳定，也不让共享的路由头把两个客户端并进同一 `PiiScope`。
+/// 空串与非 UTF-8 值同样跳过，配置头仍在最高优先级。
+pub fn resolve_pii_scope_header<'a>(headers: &'a HeaderMap, configured: &str) -> Option<&'a str> {
+    header_value(headers, configured).or_else(|| {
+        PII_SCOPE_HEADER_FALLBACKS
+            .iter()
+            .find_map(|name| header_value(headers, name))
+    })
+}
+
+/// 会话头链路中是否有任一头存在（配置头或回退头）。
+///
+/// 仅供「头存在但取值非法被丢弃」的告警/计数判定；头名列表仍只由
+/// [`SESSION_HEADER_FALLBACKS`] 单点维护。
+pub fn session_header_present(headers: &HeaderMap, configured: &str) -> bool {
+    std::iter::once(configured)
+        .chain(SESSION_HEADER_FALLBACKS)
+        .any(|name| headers.contains_key(name))
+}
+
+/// PII 链路中是否有任一头存在（配置头或 [`PII_SCOPE_HEADER_FALLBACKS`]）。
+///
+/// 仅供「PII 键头存在但取值非法被丢弃」的计数/告警；与宽链
+/// [`session_header_present`] 分开，避免把只在遥测链命中的头误报为 PII 键头非法。
+pub fn pii_scope_header_present(headers: &HeaderMap, configured: &str) -> bool {
+    pii_scope_header_name(headers, configured).is_some()
+}
+
+/// 解析出 PII 链路中实际存在的头名（配置头优先，其后按
+/// [`PII_SCOPE_HEADER_FALLBACKS`]），不校验取值合法性。
+///
+/// 取值非法被丢弃时告警须指名真正出问题的头：配置头缺席时值来自回退头，
+/// 只打印配置头名会误导排查。
+pub fn pii_scope_header_name<'a>(headers: &'a HeaderMap, configured: &'a str) -> Option<&'a str> {
+    std::iter::once(configured)
+        .chain(PII_SCOPE_HEADER_FALLBACKS)
+        .find(|name| headers.contains_key(*name))
+}
 
 /// 会话标识来源（design §4 九档；`None` 为末档「无标识」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,7 +197,7 @@ impl SessionScope {
 /// 任一字段为空串视为缺失（不产生空串摘要），由 [`derive_session`] 统一过滤。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionInputs<'a> {
-    /// 显式头值（头名由 `[pii_scope].key_header` 决定，非本模块职责）。
+    /// 显式头值（经 [`resolve_session_header`] 解析：配置头 + 内置回退链）。
     pub header: Option<&'a str>,
     /// Responses `conversation`（`string` 形态或 `{id}` 已折算为字符串）。
     pub conversation: Option<&'a str>,

@@ -501,7 +501,9 @@ async fn dialog_stream_receives_configured_header() {
 #[tokio::test]
 async fn dialog_nonstream_missing_conversation_source_skips_dynamic_header() {
     // task 3.1：声明了 `$conversation` 模板但客户端未提供会话键头时，该动态头
-    // 须整条跳过（不写不改不删）——客户端同名头保留原值，静态头照常注入。
+    // 须整条跳过（不写不改不删）——静态头照常注入。
+    // 同时锁定内部会话标识不外泄：客户端自带的 `x-opencode-session` 属回退链，
+    // 转发前已被无条件剔除，不得因「动态头跳过」而原样透传上游。
     let up_body = br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_vec();
     let (url, captured, server) = capture_loopback_complete("application/json", up_body).await;
     let (state, dir) = test_app_state_with_targets(
@@ -531,10 +533,8 @@ async fn dialog_nonstream_missing_conversation_source_skips_dynamic_header() {
         "静态头不受动态跳过影响: {text}"
     );
     assert!(
-        text.contains("x-opencode-session: client-dyn")
-            && text.matches("x-opencode-session").count() == 1
-            && !text.contains("$conversation"),
-        "缺源动态头须整条跳过且客户端同名头保留: {text}"
+        !text.contains("x-opencode-session") && !text.contains("client-dyn"),
+        "缺源动态头须整条跳过，且客户端回退链头须被剔除（不泄漏内部会话标识）: {text}"
     );
     server.abort();
     std::fs::remove_dir_all(&dir).ok();

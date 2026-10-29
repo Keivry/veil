@@ -9,6 +9,7 @@ use {
             decide,
             event::{record_emitted_events, should_synthesize_empty_stream},
             synth_flush::midstream_terminal,
+            ttft::{TtftTracker, carries_output_token},
         },
         frames::{FrameSink, RestoredFrame, emit_restored_json_frame, residual_frame_payload},
         release::{self, ReleaseCtx},
@@ -41,7 +42,7 @@ pub(super) struct TerminalCtx<'a> {
     /// 终端状态机（取代 `terminal_sent`/`block_injected`/`any_frame_sent` 借用字段）。
     pub terminator: &'a mut StreamTerminator,
     pub forwarded: &'a mut usize,
-    pub pending_tool_frames: &'a mut Vec<(Vec<u32>, String, String)>,
+    pub pending_tool_frames: &'a mut Vec<super::super::toolbuf::PendingToolFrame>,
     pub metrics: &'a GatewayMetrics,
     pub agg: &'a mut String,
     pub pump_tx: &'a tokio::sync::mpsc::Sender<String>,
@@ -57,6 +58,8 @@ pub(super) struct TerminalCtx<'a> {
     pub audit_policy: &'a AuditPolicy,
     pub approval_whitelist: &'a [String],
     pub audit_pending: &'a PendingApprovals,
+    /// 首 token 时延采样（收尾滞留帧/合成帧同样可能是首帧）。
+    pub ttft: &'a TtftTracker,
 }
 
 pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
@@ -84,6 +87,7 @@ pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
         audit_policy,
         approval_whitelist,
         audit_pending,
+        ttft,
     } = ctx;
 
     // 截断未完成 tool 分片信息（清除前捕获，供审计/告警；不含参数明文）。
@@ -92,7 +96,7 @@ pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
     let truncated_slots: Vec<u32> = {
         let mut v: Vec<u32> = pending_tool_frames
             .iter()
-            .flat_map(|(b, ..)| b.iter().copied())
+            .flat_map(|frame| frame.buckets.iter().copied())
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -218,6 +222,9 @@ pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
         );
     }
     let stream_truncated = transport_error || truncated_tool_dropped;
+    // carry 残段回吐期间是否出现过承载生成 token 文本的帧（TTFT 定格依据；
+    // 工具参数/签名等残段不算）。留到下方 `agg` flush 时一次性定格。
+    let mut carry_carried_token = false;
     // 正常结束（Chat 已见 finish_reason 的干净 EOF）前 fail-open 回吐 carry 残段；
     // 截断/上游错误维持 fail-closed 剥离（下方 `carry.drain()` 丢弃载荷）。
     if !stream_truncated && chat_finish_seen {
@@ -256,13 +263,27 @@ pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
                         metrics,
                     )
                     .await;
+                    // 残段帧同样按唯一判据定格：Chat 工具形参/Anthropic 签名等
+                    // 非生成文本残段不构成首个可见 token。
+                    carry_carried_token |= crate::service::json_walk::jloads(&data)
+                        .ok()
+                        .is_some_and(|v| carries_output_token(protocol, &v));
                 }
             }
         }
     }
     if !agg.is_empty() {
         record_emitted_events(metrics, agg);
-        let _ = pump_tx.send(std::mem::take(agg)).await;
+        // 此处 `agg` = 主循环未达攒批边界的真实内容帧（入队时已定格 pending）
+        // + 刚回吐的 carry 残段。只有后者才可能漏记，且仅当它承载生成 token 文本；
+        // 纯簿记滞留帧（`finish_reason` 块 / `[DONE]`）不得伪造 TTFT。
+        if carry_carried_token {
+            ttft.note_content();
+        }
+        let sent = pump_tx.send(std::mem::take(agg)).await.is_ok();
+        if sent {
+            ttft.note_sent();
+        }
         *forwarded += 1;
         terminator.note_frame_sent();
     }
@@ -291,7 +312,16 @@ pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
             )
             .await;
             if !agg.is_empty() {
-                let _ = pump_tx.send(std::mem::take(agg)).await;
+                // 残余帧同样按唯一判据定格（簿记帧残余不得伪造 TTFT）。
+                if carries_output_token(
+                    protocol,
+                    &crate::service::json_walk::jloads(&payload).unwrap_or_default(),
+                ) {
+                    ttft.note_content();
+                }
+                if pump_tx.send(std::mem::take(agg)).await.is_ok() {
+                    ttft.note_sent();
+                }
                 terminator.note_frame_sent();
             }
         }
@@ -320,7 +350,8 @@ pub(super) async fn finalize(ctx: TerminalCtx<'_>) -> Option<u32> {
             responses_seq_cursor,
             Some(metrics),
         ) {
-            let mid = midstream_terminal(protocol, &frames, truncated, agg, pump_tx, metrics).await;
+            let mid =
+                midstream_terminal(protocol, &frames, truncated, agg, pump_tx, metrics, ttft).await;
             *forwarded += mid.forwarded as usize;
             if mid.forwarded > 0 {
                 terminator.note_frame_sent();

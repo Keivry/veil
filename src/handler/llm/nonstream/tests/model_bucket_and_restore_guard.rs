@@ -159,6 +159,7 @@ async fn model_bucket_fallback_stream_and_nonstream() {
             redaction_tally: Default::default(),
         },
         hold_max: 1_048_576,
+        hold_max_frames: crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
         sse_frame_hard_bytes: crate::config::SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: "req-model-x".to_string(),

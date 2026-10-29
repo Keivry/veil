@@ -191,6 +191,13 @@
      .toolbar 保留 flex-wrap:wrap 以维持换行能力（#range-bar 也复用该类）。 */
   .tb-group { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
   .tb-pager { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; margin-left: auto; }
+  /* 请求分区筛选组须在 >1100px 保持组内 nowrap：面板内宽 1280px 时 ≈936px、1101px 时 ≈757px。
+     两个输入框 110px + 四个下拉 120px + 5 个 8px 间距 = 740px，在 1101px 处仍留 17px 余量。
+     动作按钮（筛选 / Live）移入分页组，不再计入筛选组 min-content。 */
+  #sec-requests .tb-group:not(.tb-pager) input,
+  #sec-requests .tb-group:not(.tb-pager) select { min-width: 0; }
+  #sec-requests .tb-group:not(.tb-pager) input { width: 110px; }
+  #sec-requests .tb-group:not(.tb-pager) select { width: 120px; }
   .toolbar button, .toolbar input {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--radius-sm); padding: 7px 12px; font-size: 12px; font-family: inherit;
@@ -233,8 +240,25 @@
   td.num, th.num { text-align: right; font-family: var(--mono); }
   /* 摘要列上限 MUST 保持「定长值 + white-space:nowrap」这一组合：百分比相对 auto-layout
      的表格宽度解析，会与内容驱动的列宽形成循环依赖而静默失效；去掉 nowrap 同理。
-     预算（1280px 实测）：滚动容器 924 − 其余八列 640 = 284px；20vw@1280 = 256px。 */
-  td.sum { max-width: clamp(140px, 20vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+     预算（1280px 实测，滚动容器内宽 924px）：9 列时上限 20vw 尚可；新增「上游 / TTFT /
+     TPS」三列后摘要列收到 8vw（上限 240px），配合下方文本列定长截断与更紧的数值列
+     内边距，实测 12 列总宽 924px（含 12.3 万 token、120s 耗时的极端行），不横向溢出。 */
+  td.sum { max-width: clamp(96px, 8vw, 240px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 12 列后单元格内边距收紧：8px 10px 的横向内边距乘以 24 个边会吃掉约 100px，
+     收至 6px（数值列 4px）后仍保持 tabular-nums 对齐可读。 */
+  #req-table th, #req-table td { padding-left: 6px; padding-right: 6px; }
+  #req-table td.num, #req-table th.num { padding-left: 4px; padding-right: 4px; }
+  /* 文本列定长截断：模型名（第 2 列）、上游主机名（第 4 列）、错误状态（第 6 列）都可能
+     很长，不限宽会挤压数值列并把表格撑出容器。统一 ellipsis + nowrap，完整值由 JS 写进
+     title；用列位选择器以免给单元格加类而改动既有渲染字面量。 */
+  #req-table td.up,
+  #req-table td:nth-child(2),
+  #req-table td:nth-child(6) {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #req-table td:nth-child(2) { max-width: 104px; }
+  #req-table td.up { max-width: 104px; }
+  #req-table td:nth-child(6) { max-width: 88px; }
   #req-table th { white-space: nowrap; }
   #req-table td.num { white-space: nowrap; }
   tr.clickable { cursor: pointer; transition: background .12s; }
@@ -344,8 +368,7 @@
     .grid2 { grid-template-columns: 1fr; }
   }
   /* 窄视口兜底：>860px 时 .layout 仍有 250px 侧栏，1024px 下面板内工具栏仅 ≈668–682px，
-     而请求页筛选组 min-content ≈764px（#req-model / #req-session 各有 min-width:150px
-     且 nowrap 下不可压缩）。不放开组内折行必致工具栏横向溢出、页面横向滚动。
+     请求页筛选组在其下宽度远超可用宽度。不放开组内折行必致工具栏横向溢出、页面横向滚动。
      注意：本块 MUST 位于 ≤560px 块之前——后者要覆盖 .tb-pager 的 flex-wrap。 */
   @media (max-width: 1100px) {
     .tb-group { flex-wrap: wrap; }
@@ -484,6 +507,7 @@
                 <option value="not_required">not_required</option>
               </select>
               <button id="cmd-apply">筛选</button>
+              <button id="cmd-live" class="active">Live</button>
             </div>
             <div class="tb-group tb-pager">
               <button id="cmd-prev">上一页</button>
@@ -508,13 +532,12 @@
           <h2>逐请求记录 <span class="h2-sub">悬停摘要列查看全文</span></h2>
           <div class="toolbar" style="margin-bottom:12px">
             <div class="tb-group">
-              <input id="req-model" placeholder="模型（空=全部）">
+              <input id="req-model" placeholder="模型">
               <select id="req-protocol" aria-label="协议过滤">
                 <option value="">协议：全部</option>
                 <option value="chat">chat</option>
                 <option value="responses">responses</option>
                 <option value="anthropic">messages</option>
-                <option value="passthrough">other</option>
               </select>
               <select id="req-status" aria-label="状态过滤">
                 <option value="">状态：全部</option>
@@ -523,7 +546,7 @@
                 <option value="5xx">5xx</option>
                 <option value="error">error</option>
               </select>
-              <input id="req-session" placeholder="会话前缀（≥4 字符）">
+              <input id="req-session" placeholder="会话前缀 ≥4">
               <select id="req-scope" aria-label="作用域过滤">
                 <option value="">作用域：全部</option>
                 <option value="session">会话</option>
@@ -534,9 +557,10 @@
                 <option value="100">每页 100</option>
                 <option value="200">每页 200</option>
               </select>
-              <button id="req-apply">筛选</button>
             </div>
             <div class="tb-group tb-pager">
+              <button id="req-apply">筛选</button>
+              <button id="req-live" class="active">Live</button>
               <button id="req-prev" disabled>上一页</button>
               <button id="req-next" disabled>下一页</button>
               <span class="pager-info" id="req-page-info">—</span>
@@ -547,10 +571,10 @@
           <div style="overflow:auto">
             <table id="req-table">
               <thead><tr>
-                <th>时间</th><th>模型</th><th>协议</th><th>会话</th><th>状态</th>
-                <th class="num">输入·输出</th><th class="num">命中率</th><th class="num">耗时</th><th>摘要</th>
+                <th>时间</th><th>模型</th><th>协议</th><th>上游</th><th>会话</th><th>状态</th>
+                <th class="num">输入·输出</th><th class="num">命中率</th><th class="num">耗时</th><th class="num">TTFT</th><th class="num">TPS</th><th>摘要</th>
               </tr></thead>
-              <tbody><tr><td colspan="9"><div class="empty">打开分区后自动加载</div></td></tr></tbody>
+              <tbody><tr><td colspan="12"><div class="empty">打开分区后自动加载</div></td></tr></tbody>
             </table>
           </div>
         </div>

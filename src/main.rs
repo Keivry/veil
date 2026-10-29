@@ -1,4 +1,4 @@
-//! 二进制入口：配置 fail-closed 校验 → sqlite 初始化 → 单 serve 启动。
+//! 二进制入口：配置 fail-closed 校验 → sqlite 初始化 → 主监听 + 专用 LLM 监听启动。
 
 use {
     detect_container::is_container,
@@ -371,16 +371,43 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Err(err) = axum::serve(
+    // 关闭广播：主监听与全部专用监听共用同一次信号（`watch` 保序、可多接收者）。
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tracing::info!("主监听 {bind_addr}（凭据 API + LLM 代理，按 Host 头选路）");
+    let mut serves = vec![tokio::spawn(serve_listener(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    {
-        eprintln!("服务异常退出: {err}");
-        return ExitCode::from(1);
+        app.clone(),
+        shutdown_rx.clone(),
+        format!("主监听 {bind_addr}（凭据 API + LLM 代理）"),
+    ))];
+    // 专用 LLM 监听：每个已声明端口一条，绑定失败仅告警并继续（其余入口不受影响）。
+    for addr in state.config.dedicated_listener_addrs() {
+        let upstream = veil::service::llm_gateway::resolve_target(&state.config, Some(addr.port()))
+            .map(|target| target.base_url.to_string())
+            .unwrap_or_else(|| "（未解析到上游）".to_string());
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                tracing::info!("LLM 入口监听 {addr} → 上游 {upstream}");
+                serves.push(tokio::spawn(serve_listener(
+                    listener,
+                    veil::router::with_ingress_port(app.clone(), addr.port()),
+                    shutdown_rx.clone(),
+                    format!("LLM 入口 {addr} → {upstream}"),
+                )));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "LLM 入口监听 {addr}（上游 {upstream}）绑定失败: {err}；\
+                     该端口的 LLM 入口不可用，其余入口不受影响"
+                );
+            }
+        }
     }
+    drop(shutdown_rx);
+    tracing::info!("已启动 {} 条监听（主监听 {bind_addr}）", serves.len());
+    shutdown_signal().await;
+    let _ = shutdown_tx.send(true);
+    let serve_failed = join_listeners_bounded(serves, SHUTDOWN_JOIN_TIMEOUT).await;
     let _ = flush_on_shutdown(state.admin.metrics.clone()).await;
     // 请求日志同步兜底刷盘：排空队列写库 + 保留期清理，避免 2s 窗口内未落盘的行丢失。
     if let Err(err) = state.request_log.flush_blocking() {
@@ -388,24 +415,147 @@ async fn main() -> ExitCode {
     }
     // 优雅停机——abort 通知消费者（剩余队列 best-effort 丢弃）。
     state.notify.shutdown();
+    if serve_failed {
+        return ExitCode::from(1);
+    }
     ExitCode::SUCCESS
+}
+
+/// 关闭时等待全部监听退出的上限。
+///
+/// 必须设上限：Axum 的优雅关闭会等在途连接自然结束，而 `/_admin/events/stream`
+/// 的 SSE 与长 LLM 流不会自行结束，无限等待会让 SIGTERM 永久挂住、后续刷盘与
+/// `notify.shutdown()` 永不执行（监听越多越容易）。超时即继续清理，宁可放弃
+/// 未退出的监听也不丢已排队的数据。
+const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 在 `timeout` 内收敛全部 serve 任务，返回是否有任务失败。
+///
+/// 超时后仍返回已观测到的失败标记并交由调用方继续清理；未退出的任务被 detach
+/// （不 abort，避免截断已在写响应的连接）。
+async fn join_listeners_bounded(
+    serves: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    timeout: std::time::Duration,
+) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let total = serves.len();
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let serve_failed = Arc::new(AtomicBool::new(false));
+    let drain = {
+        let stopped = Arc::clone(&stopped);
+        let serve_failed = Arc::clone(&serve_failed);
+        async move {
+            for handle in serves {
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        eprintln!("服务异常退出: {err}");
+                        serve_failed.store(true, Ordering::SeqCst);
+                    }
+                    Err(err) => {
+                        eprintln!("服务监听任务异常: {err}");
+                        serve_failed.store(true, Ordering::SeqCst);
+                    }
+                }
+                stopped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        tracing::warn!(
+            "关闭超时（{timeout:?}）：{}/{} 条监听未停止\
+             （SSE / 长 LLM 流可能仍在传输），继续执行刷盘与停机通知",
+            total.saturating_sub(stopped.load(Ordering::SeqCst)),
+            total
+        );
+    }
+    serve_failed.load(Ordering::SeqCst)
+}
+
+/// 单监听 serve：收到关闭信号后优雅停止（在途请求处理完毕），返回 `serve` 结果。
+async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    label: String,
+) -> std::io::Result<()> {
+    if *shutdown.borrow() {
+        return Ok(());
+    }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.wait_for(|stop| *stop).await;
+        tracing::info!("{label} 停止接收新请求");
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{flush_on_shutdown, preflight_whitelist};
+    use super::{flush_on_shutdown, join_listeners_bounded, preflight_whitelist};
 
     #[test]
     fn shutdown_wired() {
-        // 停机须实际触发 notify.shutdown；清理不得整体克隆 AppState。
+        // 多监听停机：信号驱动一次广播 → 有界收敛（超时也不阻塞后续清理）→
+        // 清理（刷盘/notify.shutdown）恰一次且在所有监听停止之后。
         let src = include_str!("main.rs");
-        let serve = src
-            .find("with_graceful_shutdown")
-            .expect("优雅关闭 serve 调用点");
+        let signal = src
+            .find("shutdown_signal().await")
+            .expect("优雅关闭信号等待点");
+        let broadcast = src.find("shutdown_tx.send(true)").expect("关闭广播发送点");
+        let join = src
+            .find("join_listeners_bounded(serves, SHUTDOWN_JOIN_TIMEOUT).await")
+            .expect("监听任务收敛点");
+        let flush = src
+            .find("flush_on_shutdown(state.admin.metrics.clone())")
+            .expect("关闭刷盘点");
         let shutdown = src
             .find("state.notify.shutdown()")
             .expect("notify.shutdown 接线点");
-        assert!(serve < shutdown, "停机通知须在 serve 返回后触发");
+        assert!(signal < broadcast, "关闭广播须在信号之后");
+        assert!(broadcast < join, "监听收敛须在广播之后");
+        assert!(join < flush, "关闭刷盘须在所有监听停止之后");
+        assert!(flush < shutdown, "停机通知须在刷盘之后");
+        // 收敛必须有界：SSE / 长 LLM 流不自行结束，无超时会永久挂住关闭路径。
+        let bounded = src
+            .find("tokio::time::timeout(timeout, drain)")
+            .expect("监听收敛须带超时上限");
+        assert!(join < bounded, "超时包装须位于收敛点之后");
+        assert!(
+            src.contains("const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration"),
+            "关闭收敛超时须为具名常量"
+        );
+        assert!(
+            src.contains("条监听未停止"),
+            "超时须 warn 报告未停止的监听数"
+        );
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("生产段须存在");
+        assert_eq!(
+            production.matches("state.notify.shutdown()").count(),
+            1,
+            "停机通知须恰触发一次"
+        );
+        assert_eq!(
+            production
+                .matches("flush_on_shutdown(state.admin.metrics.clone())")
+                .count(),
+            1,
+            "关闭刷盘须恰触发一次"
+        );
+        assert!(
+            src.contains("tokio::spawn(serve_listener("),
+            "每条监听须独立 spawn 同一 serve 封装"
+        );
+        assert!(
+            src.contains(".with_graceful_shutdown("),
+            "serve 须接到优雅关闭信号"
+        );
         let banned = format!("Arc::new(state{})", ".clone())");
         assert!(
             !src.contains(&banned),
@@ -414,6 +564,39 @@ mod tests {
         assert!(
             src.contains("CleanupHandles"),
             "清理须复用既有 AppState 的共享子句柄"
+        );
+    }
+
+    /// 无上限收敛会永久挂住：一个永不结束的任务（模拟 SSE / 长 LLM 流）必须在
+    /// 超时后放弃并返回，不阻塞调用方继续清理。
+    #[tokio::test]
+    async fn join_listeners_bounded_times_out_on_hung_listener() {
+        let hung = tokio::spawn(async { std::future::pending::<std::io::Result<()>>().await });
+        let done = tokio::spawn(async { Ok(()) });
+        let started = std::time::Instant::now();
+        let failed =
+            join_listeners_bounded(vec![done, hung], std::time::Duration::from_millis(50)).await;
+        assert!(!failed, "无失败任务时不得置退出码");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "超时须有界返回，实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 失败标记须保留：serve 任务返回错误即令退出码为 1，即使同时存在未退出任务。
+    #[tokio::test]
+    async fn join_listeners_bounded_keeps_failure_flag() {
+        let failed_serve =
+            tokio::spawn(async { Err(std::io::Error::other("模拟 serve 异常退出")) });
+        let hung = tokio::spawn(async { std::future::pending::<std::io::Result<()>>().await });
+        assert!(
+            join_listeners_bounded(
+                vec![failed_serve, hung],
+                std::time::Duration::from_millis(50)
+            )
+            .await,
+            "任一 serve 失败须令退出码为 1"
         );
     }
 

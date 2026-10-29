@@ -31,6 +31,7 @@ use {
                 StreamGuard,
                 cache_input_tokens,
                 derive_session,
+                resolve_session_header,
             },
         },
     },
@@ -210,9 +211,9 @@ impl RequestTrace {
     /// 会话解析与 PII 作用域解耦：`request` 模式下同样能取到显式头与各协议标识字段；
     /// 原文不落库，只留 HMAC 摘要。`body` 为 `None` 时（非对话端点）仅显式头可派生。
     pub fn attach_identity(&mut self, body: Option<&Value>, headers: &HeaderMap, config: &Config) {
-        let header = headers
-            .get(config.pii_scope_key_header.as_str())
-            .and_then(|v| v.to_str().ok());
+        // 配置头优先，其后走内置回退链（opencode 非 `opencode*` provider 只发
+        // `x-opencode-session-id` 等头，见 [`resolve_session_header`]）。
+        let header = resolve_session_header(headers, config.pii_scope_key_header.as_str());
         // `conversation` 的 `{id}` 形态需折算为字符串，故在此持有所有权。
         let conversation = body.and_then(|v| match v.get("conversation") {
             Some(Value::String(s)) => Some(s.clone()),
@@ -282,6 +283,11 @@ impl RequestTrace {
             apply_usage(&mut row, usage.as_ref());
         }
         row.latency_ms = elapsed_ms(self.req_start);
+        // 非流无 TTFT/TPS：`ttft_ms` 是流式专属指标（首个生成 token 的下行时刻），
+        // 非流响应体一次性读完、没有逐 token 时间轴，故恒 `None`；
+        // `tokens_per_sec` 因 `ttft_ms` 为 `None` 直接返回 `None`，不产生假速率。
+        row.ttft_ms = None;
+        row.tps = None;
         row
     }
 

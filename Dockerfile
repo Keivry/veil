@@ -40,8 +40,10 @@ USER veil
 WORKDIR /data
 VOLUME ["/data"]
 
-# 容器内服务固定监听 8877（见 src/main.rs），宿主机侧三端口映射见 docker-compose.yml。
-EXPOSE 8877
+# 容器内端口按 [llm.upstreams] / [llm.targets] 声明的入口端口各自开一条监听
+# （见 src/main.rs）；主监听 8877 承载凭据 API 与未声明端口的 LLM 代理。
+# 默认示例声明 8878/8879，故此处列出全部文档化 LLM 端口。
+EXPOSE 8877 8878 8879
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8877/health | grep -q '"ok":true'

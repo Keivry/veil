@@ -4,8 +4,9 @@
 //! `event` 终止/次要事件判定 + SSE 响应装配，`toolbuf` tool 分桶缓冲与入口钳位，
 //! `synth_flush` 合成终端前待发帧 flush（保序），
 //! `carry` 跨帧占位符残缺前缀缝合，`decide` 主循环纯决策函数
-//! （无 async/无 IO，供真值表断言）；旧路径经重导出兼容，对外 `handler::*` 不变。
-//! tool 分片提取统一走 `service::llm_gateway::tool::extract_tool_calls_with`，不再保留薄适配模块。
+//! （无 async/无 IO，供真值表断言），`ttft` 首 token 时延采样；旧路径经重导出兼容，对外
+//! `handler::*` 不变。 tool 分片提取统一走
+//! `service::llm_gateway::tool::extract_tool_calls_with`，不再保留薄适配模块。
 
 use {
     crate::{
@@ -29,6 +30,13 @@ pub mod synth_flush;
 pub mod toolbuf;
 
 pub mod decide;
+pub mod ttft;
+
+/// 审计 hold 缓冲超限的阻断原因（协议阻断帧文本中即 `[blocked: audit-hold-overflow]`）。
+///
+/// 单一真源：`event_loop` 的各拒绝点与 `reject.rs` 的观测标记共用本常量，
+/// 防止字面量漂移导致「阻断发生了但请求行不可见」。
+pub const AUDIT_HOLD_OVERFLOW_REASON: &str = "audit-hold-overflow";
 
 #[cfg(test)]
 mod tests;
@@ -68,6 +76,8 @@ pub struct StreamPumpCtx {
     /// 与 `NonstreamCtx` 共享的请求级字段（单一装配点构造）。
     pub req: RequestCtx,
     pub hold_max: usize,
+    /// 审计 hold 缓冲帧数上限（配置 `[limits].audit_hold_max_frames` 快照）。
+    pub hold_max_frames: usize,
     /// SSE 硬上限（配置 `SSE_FRAME_HARD_BYTES` 快照，默认 8MiB）：
     /// setup 经 [`crate::service::sse::SseParser::with_hard_bytes`] 注入解析器。
     pub sse_frame_hard_bytes: usize,

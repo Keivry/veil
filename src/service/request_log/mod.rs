@@ -14,7 +14,19 @@ pub mod store;
 
 pub use {
     guard::{CLIENT_ABORTED_KIND, StreamGuard, StreamOutcome},
-    session::{SessionInputs, SessionScope, SessionSource, derive_session},
+    session::{
+        PII_SCOPE_HEADER_FALLBACKS,
+        SESSION_HEADER_FALLBACKS,
+        SessionInputs,
+        SessionScope,
+        SessionSource,
+        derive_session,
+        pii_scope_header_name,
+        pii_scope_header_present,
+        resolve_pii_scope_header,
+        resolve_session_header,
+        session_header_present,
+    },
     store::{
         DEFAULT_LIMIT,
         FLUSH_BATCH_ROWS,
@@ -30,5 +42,6 @@ pub use {
         RequestRow,
         StatusClass,
         cache_input_tokens,
+        tokens_per_sec,
     },
 };

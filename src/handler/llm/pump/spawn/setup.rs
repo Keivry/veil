@@ -2,7 +2,13 @@
 
 use {
     super::{
-        super::{RequestCtx, StreamPumpCtx, carry::TokenCarry, toolbuf::clamp_pump_limits},
+        super::{
+            RequestCtx,
+            StreamPumpCtx,
+            carry::TokenCarry,
+            toolbuf::{PendingToolFrame, clamp_pump_limits},
+            ttft::TtftTracker,
+        },
         terminator::StreamTerminator,
     },
     crate::{
@@ -48,6 +54,8 @@ pub(super) struct PumpEnv {
     pub _keepalive: RequestKeepalive,
     /// 请求日志落行凭据（`None` = 单测直调泵，不落行）。
     pub stream_log: Option<crate::handler::llm::trace::StreamLog>,
+    /// 首 token 时延采样（首个内容帧真正下行时定格）。
+    pub ttft: TtftTracker,
 }
 
 /// 循环可变状态（setup 构造，主循环与单事件处理共享）。
@@ -60,7 +68,7 @@ pub(super) struct PumpLoopState {
     pub stream_usage: Option<llm_gateway::Usage>,
     pub hold: AuditHold,
     pub carry: TokenCarry,
-    pub pending_tool_frames: Vec<(Vec<u32>, String, String)>,
+    pub pending_tool_frames: Vec<PendingToolFrame>,
     pub meta: StreamMeta,
     pub agg: String,
     pub forwarded: usize,
@@ -77,6 +85,11 @@ pub(super) struct PumpLoopState {
     /// 流内首个结束原因（Chat `finish_reason` / Anthropic `stop_reason` /
     /// Responses `incomplete_details.reason`），供请求日志落行。
     pub stream_finish_reason: Option<String>,
+    /// 本流是否因审计 hold 缓冲超限被 fail-closed 阻断（`audit-hold-overflow`）。
+    ///
+    /// 阻断不属截断，故不写 `truncated_mode`（`阻断非截断` 不变量）；改由请求行
+    /// `error_kind = "audit_hold_overflow"` 承载，使 `/_admin/requests` 可见。
+    pub audit_hold_overflow: bool,
 }
 
 /// setup 构造器——解构 `StreamPumpCtx`，钳位配置，装配环境、循环状态与解析器。
@@ -87,6 +100,7 @@ pub(super) fn setup(
     let StreamPumpCtx {
         req,
         hold_max,
+        hold_max_frames,
         sse_frame_hard_bytes,
         init_conv,
         req_model,
@@ -124,7 +138,7 @@ pub(super) fn setup(
         stream_model: None,
         stream_model_from_resp: false,
         stream_usage: None,
-        hold: AuditHold::new(hold_max),
+        hold: AuditHold::with_limits(hold_max, hold_max_frames),
         carry: TokenCarry::new(),
         pending_tool_frames: Vec::new(),
         meta: StreamMeta::default(),
@@ -134,6 +148,7 @@ pub(super) fn setup(
         responses_seq_cursor: None,
         chat_finish_seen: false,
         stream_finish_reason: None,
+        audit_hold_overflow: false,
     };
     let env = PumpEnv {
         protocol,
@@ -155,6 +170,7 @@ pub(super) fn setup(
         redaction_tally,
         _keepalive: keepalive,
         stream_log,
+        ttft: TtftTracker::new(req_start),
     };
     (env, state, SseParser::with_hard_bytes(sse_frame_hard_bytes))
 }

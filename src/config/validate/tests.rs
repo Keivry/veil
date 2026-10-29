@@ -147,8 +147,8 @@ fn audit_enabled_truthy_table_no_effect() {
     assert!(!cfg.audit_mode_explicit);
 }
 
-/// 非法 `AUDIT_TIMEOUT`（0/负/110-130）与 `AUDIT_HOLD_MAX_BYTES`（0/非整数）
-/// 一律拒启动，不静默回落默认值。
+/// 非法 `AUDIT_TIMEOUT`（0/负/110-130）与 `AUDIT_HOLD_MAX_BYTES`/
+/// `AUDIT_HOLD_MAX_FRAMES`（0/负/非整数）一律拒启动，不静默回落默认值。
 #[test]
 fn audit_invalid_env_rejects() {
     for raw in ["0", "-1", "110", "120", "130", "abc", "1.5"] {
@@ -169,13 +169,24 @@ fn audit_invalid_env_rejects() {
             "AUDIT_HOLD_MAX_BYTES={raw:?} 须拒启动并指明变量"
         );
     }
+    for raw in ["0", "-1", "abc", "1.5"] {
+        let mut env = base_env();
+        env.insert("AUDIT_HOLD_MAX_FRAMES".to_string(), raw.to_string());
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("AUDIT_HOLD_MAX_FRAMES"),
+            "AUDIT_HOLD_MAX_FRAMES={raw:?} 须拒启动并指明变量"
+        );
+    }
     // 合法边界仍放行（1 与 109/131 避开禁区）。
     let mut env = base_env();
     env.insert("AUDIT_TIMEOUT".to_string(), "109".to_string());
     env.insert("AUDIT_HOLD_MAX_BYTES".to_string(), "1".to_string());
+    env.insert("AUDIT_HOLD_MAX_FRAMES".to_string(), "2".to_string());
     let cfg = Config::load_from(&env).unwrap();
     assert_eq!(cfg.audit_timeout_secs, 109);
     assert_eq!(cfg.audit_hold_max_bytes, 1);
+    assert_eq!(cfg.audit_hold_max_frames, 2);
 }
 
 #[test]

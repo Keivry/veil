@@ -1,10 +1,10 @@
 # veil
 
-> 本机 LLM 脱敏反向代理：请求侧脱敏，响应侧还原，单端口常驻。
+> 本机 LLM 脱敏反向代理：请求侧脱敏，响应侧还原，一条主监听 + 每条上游一条专用监听。
 
 ## 简介
 
-veil 是常驻本机的脱敏反向代理，站在客户端和 LLM 上游之间，只监听 `127.0.0.1:8877` 一个端口。请求侧的 PII 与凭据被替换成 `__PII_*__` / `__CRED_*__` 占位符；响应侧把上游回显的、由本次请求铸造的占位符还原成原文。未注册/未授权的完整占位符 token 与上游吐出的明文一律逐字节原样透传（不移除、不改写），仅残缺 token 形态被剥离。接入只需把 base URL 指过来，完整工程契约见 `docs/engineering-reference.md`。
+veil 是常驻本机的脱敏反向代理，站在客户端和 LLM 上游之间：主监听 `127.0.0.1:8877` 承载凭据 API 与管理面，`[llm.upstreams]` 里每个端口键再各开一条专用监听（默认示例为 `8878`/`8879`），客户端连哪个端口就选哪条上游。请求侧的 PII 与凭据被替换成 `__PII_*__` / `__CRED_*__` 占位符；响应侧把上游回显的、由本次请求铸造的占位符还原成原文。未注册/未授权的完整占位符 token 与上游吐出的明文一律逐字节原样透传（不移除、不改写），仅残缺 token 形态被剥离。接入只需把 base URL 指过来，完整工程契约见 `docs/engineering-reference.md`。
 
 ## 快速开始
 
@@ -24,7 +24,7 @@ export VEIL_ALLOW_MOCK_TPM=1
 - 配置文件缺省时 `[storage].data_dir` 为 `/data`；本地直跑请在 TOML 里设成可写路径。
 - `MATRIX_ACCESS_TOKEN` 与 `OBSERVABILITY_ADMIN_TOKEN` 均可缺省——缺 Matrix token 时仅审批/凭据同步关闭，缺 admin token（且未设 `[auth].observability_disable`）时 `/_admin*` 全返回 404（管理面未启用）；两 token 均非空且相同时按配置错误拒绝启动，建议 ≥32 字符（不足仅告警）。
 - `VEIL_ALLOW_MOCK_TPM=1` 仅限无 TPM 硬件的开发机与 CI，生产必须接 TPM 2.0 并去掉这一项。
-- 监听地址由配置文件 `[server].bind` 承载（缺省 `127.0.0.1:8877`，必须是 `IP:PORT` 字面量）；本机直跑保持回环即可，换宿主机入口端口仍走容器映射。
+- 监听地址由配置文件 `[server].bind` 承载（缺省 `127.0.0.1:8877`，必须是 `IP:PORT` 字面量）；本机直跑保持回环即可，换宿主机入口端口仍走容器映射。已声明的 LLM 上游端口在此 IP 上自动各开一条专用监听。
 
 ### 容器
 
@@ -51,7 +51,7 @@ docker compose up -d
 - compose 把配置文件只读挂到 `/etc/veil/veil.toml` 并设 `VEIL_CONFIG_FILE`；数据卷父卷 `${DATA_DIR:-./data}` 是**宿主机侧**的卷路径（仅 compose 变量），与配置文件的 `[storage].data_dir`（默认 `/data`）相互独立。
 - 监听地址分两层：容器内必须 `[server].bind = "0.0.0.0:8877"`（bridge 网络的 DNAT 目标不是回环，写回环收不到），宿主机侧仍只发布到 `127.0.0.1`（见 `ports`）——对外不暴露到局域网。
 - `cap_add: IPC_LOCK` 与 `ulimits.memlock: -1` 让 `mlockall` 成功；若受限 daemon 拒绝 `ulimits`，删除该段只保留 `cap_add` 即可（`mlockall` 检查的是 `CAP_IPC_LOCK`）。
-- 三条映射都指向容器内 `8877`；入口端口只区分选路上游，`[llm].default_upstream` 是缺省上游。宿主机端口可经 `PORT_8877`/`PORT_8878`/`PORT_8879` 覆盖，容器内监听恒为 `8877`。
+- `8877` 是主监听（凭据 API + LLM 代理，按 `Host` 头选路），`8878`/`8879` 映射到容器内同名端口（各自一条专用监听，已声明端口恒胜 `Host` 头）；`[llm].default_upstream` 是缺省上游。宿主机端口可经 `PORT_8877`/`PORT_8878`/`PORT_8879` 覆盖。
 - 无 TPM 硬件：注释掉 `devices` 两行，设置 `VEIL_ALLOW_MOCK_TPM=1`，并用 `TPM_GID=$(id -g)` 满足 compose 必填校验（mock 路径不需要真实设备属组）。
 
 ### 健康检查与停止

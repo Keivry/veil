@@ -645,6 +645,51 @@ fn conversation_key_header_ignored_when_mode_request() {
     assert_eq!(explicit_header(true, raw).as_deref(), Some("conv-1"));
 }
 
+/// D1：PII 会话作用域键与请求日志会话标识须对同一会话身份达成一致——
+/// 配置头缺席、仅 `x-opencode-session-id` 在场时，经回退链解析出的键
+/// 与「配置头携带同一值」时完全相同。
+#[test]
+fn fallback_header_yields_same_conversation_bucket_as_configured_header() {
+    use crate::service::request_log::resolve_session_header;
+
+    let configured = "x-veil-conversation-id";
+    let mut via_configured = HeaderMap::new();
+    via_configured.insert(configured, HeaderValue::from_static("ses_shared_1"));
+    let mut via_fallback = HeaderMap::new();
+    via_fallback.insert(
+        "x-opencode-session-id",
+        HeaderValue::from_static("ses_shared_1"),
+    );
+
+    let from_configured = derive_conversation_key(
+        SECRET,
+        TENANT,
+        Protocol::Chat,
+        resolve_session_header(&via_configured, configured),
+        None,
+        None,
+        &json!({}),
+        &PreviousResponseMap::new(8),
+    )
+    .expect("配置头须产出会话键");
+    let from_fallback = derive_conversation_key(
+        SECRET,
+        TENANT,
+        Protocol::Chat,
+        resolve_session_header(&via_fallback, configured),
+        None,
+        None,
+        &json!({}),
+        &PreviousResponseMap::new(8),
+    )
+    .expect("回退头须产出会话键");
+
+    assert_eq!(
+        from_fallback, from_configured,
+        "回退头与配置头须落到同一会话桶"
+    );
+}
+
 #[test]
 fn conversation_key_header_not_forwarded_upstream() {
     let mut headers = HeaderMap::new();

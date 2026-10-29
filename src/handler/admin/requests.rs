@@ -2,8 +2,8 @@
 //!
 //! 过滤：`range`（四档，折算精确秒级下界）、`model`、`protocol`、
 //! `status`（`2xx|4xx|5xx|error`）、`session`（前缀，≥4 字符）、
-//! `scope`（`session|user|any`，默认 `any`）、`limit`（默认 50 / 上限 200）、
-//! `offset`（上限 10000，超出 400）。
+//! `scope`（`session|user|any`，默认 `any`）、`llm`（`1|true` 只列真实 LLM 请求）、
+//! `limit`（默认 50 / 上限 200）、`offset`（上限 10000，超出 400）。
 //!
 //! 未给 `range` 时响应省略 `range`/`since_ts`/`boundary_slack_secs` 三个键（不以
 //! `null` 冒充全局口径），`coverage_secs` 取 `now - 最早记录`、`partial=false`。
@@ -92,6 +92,14 @@ pub async fn admin_requests(
             _ => return bad_request(format!("scope 取值 session|user|any（当前值 {raw:?}）")),
         },
     };
+    let llm_only = match query.get("llm") {
+        None => false,
+        Some(raw) => match raw.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => return bad_request(format!("llm 取值 1|true|0|false（当前值 {raw:?}）")),
+        },
+    };
     let limit = match query.get("limit") {
         None => None,
         Some(raw) => match raw.parse::<usize>() {
@@ -123,6 +131,7 @@ pub async fn admin_requests(
         status_class,
         session_prefix,
         scope,
+        llm_only,
         limit,
         offset,
     };
@@ -196,6 +205,8 @@ fn row_json(row: &RequestRow) -> Value {
         "summary": row.req_summary,
         "truncated_mode": row.truncated_mode,
         "error_kind": row.error_kind,
+        "ttft_ms": row.ttft_ms,
+        "tps": row.tps,
     })
 }
 

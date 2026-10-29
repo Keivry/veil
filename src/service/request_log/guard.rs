@@ -10,7 +10,7 @@
 //!   `record`（零 I/O，只入队），不阻塞、不 panic；`Weak` 升级失败时只计数。
 
 use {
-    super::store::{RequestLog, RequestRow, cache_input_tokens, now_secs},
+    super::store::{RequestLog, RequestRow, cache_input_tokens, now_secs, tokens_per_sec},
     crate::service::{llm_gateway::Usage, lock_recover::lock_or_recover},
     std::sync::{
         Arc,
@@ -40,6 +40,8 @@ pub struct StreamOutcome<'a> {
     pub usage: Option<&'a Usage>,
     /// 测量耗时（省略则保留行内原值）。
     pub latency_ms: Option<u64>,
+    /// 首 token 时延（毫秒，请求起始 → 首个内容帧真正下行）。
+    pub ttft_ms: Option<u32>,
     /// 是否计入 metrics（取 `record_chat*` 的返回值）。
     pub counted_metrics: Option<bool>,
 }
@@ -81,6 +83,11 @@ impl StreamOutcome<'_> {
                 usage.cached_write,
             );
         }
+        if let Some(ttft) = self.ttft_ms {
+            row.ttft_ms = Some(ttft);
+        }
+        // `tps` 依赖 `latency_ms` 与 `completion_tokens`，须在两者补齐后统一重算。
+        row.tps = tokens_per_sec(row.completion_tokens, row.latency_ms, row.ttft_ms);
     }
 }
 
@@ -144,6 +151,8 @@ fn client_aborted_row(mut row: RequestRow) -> RequestRow {
     row.latency_ms = u64::try_from(now.saturating_sub(row.ts_secs))
         .unwrap_or(0)
         .saturating_mul(1_000);
+    // 中断行保留已测得的第一帧时延，`tps` 按样本延迟重算（窗口内无输出则 NULL）。
+    row.tps = tokens_per_sec(row.completion_tokens, row.latency_ms, row.ttft_ms);
     row
 }
 

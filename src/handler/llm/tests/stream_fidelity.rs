@@ -70,6 +70,7 @@ async fn pump_secret_text_frame(secret: &str) -> (Vec<String>, Arc<GatewayMetric
     let ctx = StreamPumpCtx {
         req: unit_req(Protocol::Chat, scope, vault, detector, metrics.clone()),
         hold_max: 1_048_576,
+        hold_max_frames: crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
@@ -304,6 +305,7 @@ async fn pump_sse_with_vault_minted(
             Arc::new(GatewayMetrics::default()),
         ),
         hold_max: 1_048_576,
+        hold_max_frames: crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
@@ -843,6 +845,7 @@ async fn pump_raw_sse_with_metrics(
     let ctx = StreamPumpCtx {
         req: unit_req(protocol, scope, vault, detector, metrics.clone()),
         hold_max: 1_048_576,
+        hold_max_frames: crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
         sse_frame_hard_bytes: SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),

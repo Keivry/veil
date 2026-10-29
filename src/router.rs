@@ -61,6 +61,22 @@ pub(crate) fn generated_request_id() -> String {
 #[derive(Debug, Clone)]
 pub struct RequestId(pub String);
 
+/// 专用监听承载的本地端口（axum `Extension`，仅该监听的 router 注入）。
+///
+/// 多监听拓扑下「连的是哪个端口」是选路依据：专用监听的端口在请求进入
+/// `llm_proxy_handler` 前即写入 extensions，由 `dispatch::resolve_ingress_port`
+/// 与 `Host` 头派生的端口做优先级比较（声明端口恒胜）。主监听不注入本扩展，
+/// 保持 `Host` 头选路的既有语义（宿主机端口映射到容器端口 8877 的旧部署）。
+#[derive(Debug, Clone, Copy)]
+pub struct IngressPort(pub u16);
+
+/// 给单个 router 注入该监听承载的端口：所有路由（含 `fallback` 的 LLM 代理）
+/// 都可见同一扩展，故专用监听与主监听的 `AppState`/鉴权/管理面/SSE 行为逐项一致，
+/// 差别只有「生效入口端口」。
+pub fn with_ingress_port(router: Router, port: u16) -> Router {
+    router.layer(axum::Extension(IngressPort(port)))
+}
+
 /// 请求作用域日志上下文：为每个已匹配路由建一个 ERROR 级 `http` span。
 ///
 /// `error_span!` 而非 `info_span!`：默认 `RUST_LOG=warn` 下 span 须仍启用。`route` 只取

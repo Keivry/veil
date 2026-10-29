@@ -12,6 +12,7 @@ use {
             ExtendedChatRecord,
             ExtendedUsage,
             Granularity,
+            LATENCY_BOUNDS_VERSION,
             MetricSample,
             WindowAgg,
             bucket_index,
@@ -20,6 +21,7 @@ use {
         sample::{SampleRow, SamplerCounts},
     },
     crate::fs_perm::{ensure_0600, open_wal},
+    anyhow::Context as _,
     std::{
         collections::{HashMap, VecDeque},
         path::{Path, PathBuf},
@@ -156,6 +158,13 @@ impl MetricsStore {
                     any_new = true;
                 }
                 let entry = aggs.entry(agg_key).or_default();
+                // 旧版本窗口（升级前落盘、重启回填进来）的桶数组不得混入当前边界的新样本：
+                // 先把该窗口切到当前版本并清空旧桶（旧桶不可重解释），新样本自此次起
+                // 按当前边界累计；计数/token/附属列原样保留。
+                if entry.bucket_bounds_version != LATENCY_BOUNDS_VERSION {
+                    entry.buckets = [0; super::aggregate::LATENCY_BUCKETS];
+                    entry.bucket_bounds_version = LATENCY_BOUNDS_VERSION;
+                }
                 entry.count += 1;
                 entry.prompt += ext.prompt_tokens;
                 entry.completion += ext.completion_tokens;
@@ -312,6 +321,15 @@ pub fn wal_checkpoint_truncate(db_path: &Path) -> anyhow::Result<(u32, u32)> {
     Ok((busy, checkpointed))
 }
 
+/// 判定 `ALTER TABLE ... ADD COLUMN` 的错误是否仅表示「列已存在」。
+///
+/// 与 `service::request_log::store::schema::is_duplicate_column_error` 逐字同口径
+/// （SQLite `duplicate column name: <col>` 方言）；其余错误（只读库、磁盘满、
+/// 锁超时）必须上抛。
+pub(crate) fn is_duplicate_column_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("duplicate column")
+}
+
 pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metrics_daily(
@@ -332,6 +350,7 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             t_synth INTEGER NOT NULL DEFAULT 0,
             t_upstream_error INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
+            bucket_bounds_version INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(window, protocol));
          CREATE TABLE IF NOT EXISTS metrics_hourly(
             window TEXT NOT NULL, protocol TEXT NOT NULL,
@@ -351,6 +370,7 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             t_synth INTEGER NOT NULL DEFAULT 0,
             t_upstream_error INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
+            bucket_bounds_version INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(window, protocol));
          CREATE TABLE IF NOT EXISTS metrics_five_min(
             window TEXT NOT NULL, protocol TEXT NOT NULL,
@@ -370,9 +390,14 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             t_synth INTEGER NOT NULL DEFAULT 0,
             t_upstream_error INTEGER NOT NULL DEFAULT 0,
             buckets TEXT NOT NULL DEFAULT '',
+            bucket_bounds_version INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(window, protocol));",
     )?;
     // 存量库兼容：旧表缺新列时补列（双写兼容视图对等，旧大盘不断链）。
+    //
+    // 只吞「列已存在」这一种错误；只读库/磁盘满/锁超时等一律上抛并指明表与列——
+    // 否则 `ensure_tables` 表面成功、而后续 19 列 INSERT 每次刷盘都失败，
+    // 指标持久化静默停摆且报错点漂移到别处。
     for table in ["metrics_daily", "metrics_hourly", "metrics_five_min"] {
         for col in [
             "cached_read",
@@ -383,11 +408,22 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             "cred_hits",
             "audit_blocks",
             "t_upstream_error",
+            "bucket_bounds_version",
         ] {
-            let _ = conn.execute(
+            match conn.execute(
                 &format!("ALTER TABLE {table} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
                 [],
-            );
+            ) {
+                Ok(_) => {}
+                Err(err) if is_duplicate_column_error(&err.to_string()) => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "{table} 补列失败（列 {col}）：迁移不可跳过，否则后续指标刷盘必然失败"
+                        )
+                    });
+                }
+            }
         }
     }
     ensure_pii_value_samples_table(conn)?;
@@ -452,8 +488,9 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
         let sql = format!(
             "INSERT INTO {table}(window, protocol, requests, prompt_tokens, completion_tokens, \
              total_tokens, cached_read, cached_write, unknown, pii_hits, pii_miss, cred_hits, \
-             audit_blocks, t_silent, t_open, t_synth, t_upstream_error, buckets) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) \
+             audit_blocks, t_silent, t_open, t_synth, t_upstream_error, buckets, \
+             bucket_bounds_version) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19) \
              ON CONFLICT(window, protocol) DO UPDATE SET \
              requests=excluded.requests, prompt_tokens=excluded.prompt_tokens, \
              completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens, \
@@ -461,7 +498,8 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
              unknown=excluded.unknown, pii_hits=excluded.pii_hits, pii_miss=excluded.pii_miss, \
              cred_hits=excluded.cred_hits, audit_blocks=excluded.audit_blocks, \
              t_silent=excluded.t_silent, t_open=excluded.t_open, t_synth=excluded.t_synth, \
-             t_upstream_error=excluded.t_upstream_error, buckets=excluded.buckets"
+             t_upstream_error=excluded.t_upstream_error, buckets=excluded.buckets, \
+             bucket_bounds_version=excluded.bucket_bounds_version"
         );
         conn.execute(
             &sql,
@@ -484,6 +522,7 @@ fn flush_aggs_blocking(db_path: &Path, aggs: &[(AggKey, WindowAgg)]) -> anyhow::
                 agg.t_synth as i64,
                 agg.t_upstream_error as i64,
                 buckets_encode(&agg.buckets),
+                i64::from(agg.bucket_bounds_version),
             ],
         )?;
     }

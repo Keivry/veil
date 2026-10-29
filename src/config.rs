@@ -12,6 +12,7 @@ pub mod custom_file;
 pub mod env_parse;
 pub mod env_surface;
 pub mod file_layer;
+pub mod ingress;
 pub mod targets;
 pub mod validate;
 

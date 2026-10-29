@@ -1,19 +1,38 @@
 //! tool 分桶缓冲与泵入口钳位（自 `pump.rs` 拆出）：hold-until-complete 取出语义。
 
+/// 一帧被审计 hold 暂存的 tool 事件。
+///
+/// `payload_bytes`/`envelope_bytes` 是入账时分别计费的两块字节，必须随帧
+/// 保存：出账若不与入账同源，减多减少都会让 `pending_*` 计数器漂移，长流下
+/// 迟早误判溢出或漏判内存占用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingToolFrame {
+    /// 本帧涉及的 tool 槽号（到达序）。
+    pub buckets: Vec<u32>,
+    /// SSE 信封前缀（`event:`/`id:`/`retry:`）。
+    pub prefix: String,
+    /// 还原后的完整事件载荷。
+    pub data: String,
+    /// 入账时计费的**参数载荷**字节（各 `arguments` 分片文本之和，不含信封）。
+    pub payload_bytes: usize,
+    /// 入账时计费的信封字节（SSE 前缀 + JSON 外壳中不含载荷的部分）。
+    pub envelope_bytes: usize,
+}
+
 /// 缓冲取出：按到达序取出与 `slot` 相交的缓冲输入；
 /// `slot` 为 `None` 时全取（全局完成），否则只取含该槽号的帧（按槽完成）。
 /// 取出的是还原后输入，调用方须按到达序重放进 `agg` 再转发。
 pub(super) fn take_pending_tool_inputs(
-    pending: &mut Vec<(Vec<u32>, String, String)>,
+    pending: &mut Vec<PendingToolFrame>,
     slot: Option<u32>,
-) -> Vec<(String, String)> {
+) -> Vec<PendingToolFrame> {
     let mut out = Vec::new();
     let mut kept = Vec::new();
-    for (buckets, prefix, data) in std::mem::take(pending) {
-        if slot.is_none_or(|s| buckets.contains(&s)) {
-            out.push((prefix, data));
+    for frame in std::mem::take(pending) {
+        if slot.is_none_or(|s| frame.buckets.contains(&s)) {
+            out.push(frame);
         } else {
-            kept.push((buckets, prefix, data));
+            kept.push(frame);
         }
     }
     *pending = kept;
@@ -42,25 +61,29 @@ mod tests {
     fn dual_buffer_slot_handoff_e10() {
         // 方案 B 锁定：`pending_tool_frames` 按槽取出保到达序，
         // 全局完成全取、按槽完成只取相交槽（他槽继续缓冲），去向可追踪。
+        let frame = |b: &[u32], p: &str, d: &str| PendingToolFrame {
+            buckets: b.to_vec(),
+            prefix: p.to_string(),
+            data: d.to_string(),
+            payload_bytes: d.len(),
+            envelope_bytes: p.len(),
+        };
         let mut pending = vec![
-            (vec![0u32], "p0a".to_string(), "d0a".to_string()),
-            (vec![1u32], "p1".to_string(), "d1".to_string()),
-            (vec![0u32], "p0b".to_string(), "d0b".to_string()),
+            frame(&[0], "p0a", "d0a"),
+            frame(&[1], "p1", "d1"),
+            frame(&[0], "p0b", "d0b"),
         ];
         let taken = take_pending_tool_inputs(&mut pending, Some(0));
         assert_eq!(
-            taken,
-            vec![
-                ("p0a".to_string(), "d0a".to_string()),
-                ("p0b".to_string(), "d0b".to_string()),
-            ],
+            taken.iter().map(|f| f.data.as_str()).collect::<Vec<_>>(),
+            vec!["d0a", "d0b"],
             "按槽 0 只取相交帧且保到达序"
         );
         assert_eq!(pending.len(), 1, "他槽帧须继续缓冲");
         let rest = take_pending_tool_inputs(&mut pending, None);
         assert_eq!(
-            rest,
-            vec![("p1".to_string(), "d1".to_string())],
+            rest.iter().map(|f| f.data.as_str()).collect::<Vec<_>>(),
+            vec!["d1"],
             "全局完成全取剩余"
         );
         assert!(pending.is_empty());
@@ -81,10 +104,17 @@ mod tests {
     #[test]
     fn pending_tool_buffer_drains_by_slot_preserving_order() {
         // 缓冲按槽取出保到达序；全局完成全取，按槽完成只取对应槽。
-        let mut pending: Vec<(Vec<u32>, String, String)> = vec![
-            (vec![0], "e0".to_string(), "d0".to_string()),
-            (vec![1], "e1".to_string(), "d1".to_string()),
-            (vec![0, 1], "e2".to_string(), "d2".to_string()),
+        let frame = |b: &[u32], p: &str, d: &str| PendingToolFrame {
+            buckets: b.to_vec(),
+            prefix: p.to_string(),
+            data: d.to_string(),
+            payload_bytes: d.len(),
+            envelope_bytes: p.len(),
+        };
+        let mut pending = vec![
+            frame(&[0], "e0", "d0"),
+            frame(&[1], "e1", "d1"),
+            frame(&[0, 1], "e2", "d2"),
         ];
         let slot0 = take_pending_tool_inputs(&mut pending, Some(0));
         assert_eq!(slot0.len(), 2, "含槽 0 的两帧须取出");

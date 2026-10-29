@@ -1,8 +1,8 @@
 //! veil——Rust 实现的安全网关。
 //!
 //! crate 职责：凭据 API（三因子认证 + Matrix 审批）与 LLM 脱敏反向代理
-//! （SSE 流式还原 + 输出审计），单端口 `8877` 同时承载两者（部署与行为见
-//! docs/engineering-reference.md）。
+//! （SSE 流式还原 + 输出审计）；主监听 `8877` 承载两者，已声明的 LLM 上游端口
+//! 另各开一条专用监听（部署与行为见 docs/engineering-reference.md）。
 //!
 //! 模块组成：
 //! - [`config`]/[`auth`]/[`error`]：配置解析、鉴权原语与统一错误类型；

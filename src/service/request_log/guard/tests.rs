@@ -88,6 +88,7 @@ fn finish_applies_outcome_fields() {
         truncated_mode: Some("upstream_error"),
         usage: Some(&u),
         latency_ms: Some(812),
+        ttft_ms: Some(112),
         counted_metrics: Some(true),
     };
     let row = guard.finish(&outcome).expect("首次 finish");
@@ -101,6 +102,9 @@ fn finish_applies_outcome_fields() {
     assert_eq!(row.prompt_tokens, 120);
     assert_eq!(row.cached_read, 40);
     assert_eq!(row.cache_input_tokens, 120, "Chat 分母恒为 prompt_tokens");
+    // tps = 30 tokens / ((812 - 112) ms → 0.7 s) ≈ 42.9（保留一位小数）。
+    assert_eq!(row.ttft_ms, Some(112));
+    assert_eq!(row.tps, Some(42.9));
 }
 
 #[test]

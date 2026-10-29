@@ -3,6 +3,7 @@
 use {
     super::{
         super::{
+            AUDIT_HOLD_OVERFLOW_REASON,
             decide,
             event::{
                 advance_responses_seq_cursor,
@@ -20,7 +21,8 @@ use {
                 record_emitted_events,
                 stream_model_of,
             },
-            toolbuf::take_pending_tool_inputs,
+            toolbuf::{PendingToolFrame, take_pending_tool_inputs},
+            ttft::carries_output_token,
         },
         frames,
         release::{self, ReleaseCtx},
@@ -112,6 +114,16 @@ async fn release_carry_residual(state: &mut PumpLoopState, env: &PumpEnv) {
                 &env.metrics,
             )
             .await;
+            // 残段帧与终端的 `carry_carried_token` 同口径：只有承载生成 token 文本
+            // （内容/推理）的残段才定格 TTFT。纯工具调用流的残段落在
+            // `tool_calls[].function.arguments`，判据为假——否则 `[DONE]`/
+            // `message_stop`/`response.completed` 前的回吐会伪造流末 TTFT。
+            if crate::service::json_walk::jloads(&data)
+                .ok()
+                .is_some_and(|v| carries_output_token(env.protocol, &v))
+            {
+                env.ttft.note_content();
+            }
         }
     }
 }
@@ -306,7 +318,7 @@ pub(super) async fn handle_event(
             // 工具分片纳入 hold（先审后放），未完成分片缓冲至槽 `.done`。
             let audit_hold_on =
                 !matches!(env.audit_mode, AuditMode::Off) && env.protocol.is_dialog();
-            let mut reject_reason: Option<String> = None;
+            let mut reject_reason: Option<&'static str> = None;
             let mut approve_held = false;
             if audit_hold_on {
                 let slot = decide::tool_replay_slot(
@@ -340,7 +352,7 @@ pub(super) async fn handle_event(
                             {
                                 audit::AuditVerdict::Block { .. } => {
                                     state.hold.mark_rejected();
-                                    reject_reason = Some("audit-policy-block".to_string());
+                                    reject_reason = Some("audit-policy-block");
                                     break;
                                 }
                                 audit::AuditVerdict::NeedApproval { reason, summary } => {
@@ -364,13 +376,21 @@ pub(super) async fn handle_event(
                     if reject_reason.is_none() {
                         let taken = take_pending_tool_inputs(&mut state.pending_tool_frames, slot);
                         // 缓冲帧按槽取出即归还记账，长流多轮 drain 不误判溢出。
-                        let released_bytes: usize =
-                            taken.iter().map(|(p, d)| p.len() + d.len()).sum();
-                        state
-                            .hold
-                            .release_pending_frames(taken.len(), released_bytes);
-                        for (b_prefix, b_data) in taken {
-                            frames::feed_output_frame(&mut state.agg, &b_prefix, &b_data);
+                        // 只归还**载荷**字节——入账口径同源（信封不计费）；
+                        // 零载荷帧数一并归还，避免合法长流里的空分片单调累加。
+                        // 出账与入账同源：直接取帧上保存的两块字节与零载荷帧数。
+                        let released_bytes: usize = taken.iter().map(|f| f.payload_bytes).sum();
+                        let released_envelope: usize = taken.iter().map(|f| f.envelope_bytes).sum();
+                        let released_zero: usize =
+                            taken.iter().filter(|f| f.payload_bytes == 0).count();
+                        state.hold.release_pending_frames(
+                            taken.len(),
+                            released_bytes,
+                            released_envelope,
+                            released_zero,
+                        );
+                        for frame in taken {
+                            frames::feed_output_frame(&mut state.agg, &frame.prefix, &frame.data);
                         }
                     }
                 }
@@ -404,7 +424,7 @@ pub(super) async fn handle_event(
                         );
                         state.hold.mark_responses_done(&key, Some(&frag.args));
                         if state.hold.is_rejected() {
-                            reject_reason = Some("audit-hold-overflow".to_string());
+                            reject_reason = Some(AUDIT_HOLD_OVERFLOW_REASON);
                             break;
                         }
                         continue;
@@ -419,7 +439,7 @@ pub(super) async fn handle_event(
                         &frag.args,
                     );
                     if verdict == crate::service::audit::HoldVerdict::Rejected {
-                        reject_reason = Some("audit-hold-overflow".to_string());
+                        reject_reason = Some(AUDIT_HOLD_OVERFLOW_REASON);
                         break;
                     }
                 }
@@ -432,7 +452,7 @@ pub(super) async fn handle_event(
                         &frag.args,
                     ) == crate::service::audit::HoldVerdict::Rejected
                     {
-                        reject_reason = Some("audit-hold-overflow".to_string());
+                        reject_reason = Some(AUDIT_HOLD_OVERFLOW_REASON);
                         break;
                     }
                 }
@@ -458,7 +478,7 @@ pub(super) async fn handle_event(
                     {
                         audit::AuditVerdict::Block { .. } => {
                             state.hold.mark_rejected();
-                            reject_reason = Some("audit-policy-block".to_string());
+                            reject_reason = Some("audit-policy-block");
                             break;
                         }
                         audit::AuditVerdict::NeedApproval { reason, summary } => {
@@ -501,7 +521,7 @@ pub(super) async fn handle_event(
                     {
                         audit::AuditVerdict::Block { .. } => {
                             state.hold.mark_rejected();
-                            reject_reason = Some("audit-policy-block".to_string());
+                            reject_reason = Some("audit-policy-block");
                             break;
                         }
                         audit::AuditVerdict::NeedApproval { reason, summary } => {
@@ -600,22 +620,50 @@ pub(super) async fn handle_event(
                 )
                 .await
             };
+            // 首 token 时延只认**真正承载生成 token 文本**的帧（内容或推理），
+            // 判据统一走 `ttft::carries_output_token`：协议簿记帧
+            // （`message_start`/`response.created`/仅 `role` 的增量）与
+            // signature/citation/工具参数增量均不定格，否则 TTFT 退化为首字节时延。
+            // tool 分片缓冲（`emitted=false`）本就不进 `agg`，谓词侧亦排除工具参数。
+            if carries_output_token(env.protocol, v) {
+                env.ttft.note_content();
+            }
             // 未完成 tool 分片不进 `agg`（hold-until-complete），
             // 直接缓冲还原后输入；完成帧走正常透传（此前缓冲已在本帧前重放进 `agg`）。
             if buffer_tool_frame {
-                // 入缓冲前先记账——同一 index 零字节分片不增聚合
-                // 条目/字节（聚合维度看不见该洪泛），独立计数器超限即 fail-closed
-                // 走阻断臂（不静默丢弃，被清参数已由 hold 内终审评估）。
-                let pending_bytes = prefix.len() + restored_data.len();
-                if state.hold.account_pending_frame(pending_bytes)
+                // 入缓冲前先记账——载荷与信封**分账**：
+                // * 载荷 = 本帧各 `arguments` 分片实际保留的文本（即真正进 hold
+                //   审计的那份参数），只受配置的 `audit_hold_max_bytes` 约束；
+                // * 信封 = SSE 前缀 + JSON 外壳（每帧约百余字节），受固定的 8MiB 独立预算约束。
+                // 旧实现把整帧信封记进载荷预算，几千个合法分片的信封即独吞整份
+                // 1MiB，使「20KB 参数的小调用」被判溢出（本缺陷成因）。分账后
+                // 帧数/零载荷洪泛/载荷/信封四维度任一超限仍 fail-closed 走阻断臂
+                // （不静默丢弃，被清参数已由 hold 内终审评估）。
+                // 恒等式 `payload + envelope == prefix.len() + data.len()`：两块相加
+                // 恰为缓冲区的真实占用，既不重复也不遗漏。`payload` 取占位符帧里
+                // 的 `arguments` 文本（审计口径），故 `envelope` 用差值反推——还原
+                // 可能让参数变长/变短，差值法仍保证总量精确。
+                let payload_bytes: usize = frags.iter().map(|c| c.args.len()).sum();
+                let envelope_bytes = prefix
+                    .len()
+                    .saturating_add(restored_data.len().saturating_sub(payload_bytes));
+                if state
+                    .hold
+                    .account_pending_frame(payload_bytes, envelope_bytes)
                     == crate::service::audit::HoldVerdict::Rejected
                 {
-                    apply_reject_block(state, env, v, "audit-hold-overflow").await;
+                    // 观测（warn + 请求行 `error_kind`）统一在 `apply_reject_block`
+                    // 单点发出，覆盖缓冲维度与聚合维度的全部超限来源。
+                    apply_reject_block(state, env, v, AUDIT_HOLD_OVERFLOW_REASON).await;
                     return EventFlow::Next;
                 }
-                state
-                    .pending_tool_frames
-                    .push((tool_buckets, prefix, restored_data));
+                state.pending_tool_frames.push(PendingToolFrame {
+                    buckets: tool_buckets,
+                    prefix,
+                    data: restored_data,
+                    payload_bytes,
+                    envelope_bytes,
+                });
                 return EventFlow::Next;
             }
             if decide::should_suppress_held_output(
@@ -635,7 +683,9 @@ pub(super) async fn handle_event(
                 .resp_scope
                 .restore_response_with_spans(&env.resp_vault, &ev.data);
             let prefix = envelope_prefix(ev);
-            frames::feed_output_frame(&mut state.agg, &prefix, &restored);
+            if frames::feed_output_frame(&mut state.agg, &prefix, &restored) {
+                env.ttft.note_content();
+            }
         }
     } else if ev.data.is_empty() {
         // 空 `data:` 心跳帧丢弃不透传（不计数、不参与终端判定；
@@ -670,6 +720,8 @@ pub(super) async fn handle_event(
         if env.pump_tx.send(out).await.is_err() {
             return EventFlow::BreakFor;
         }
+        // 发送成功即客户端已收到本批帧：若其中含首个内容帧，此刻定格 TTFT。
+        env.ttft.note_sent();
     }
     EventFlow::Next
 }

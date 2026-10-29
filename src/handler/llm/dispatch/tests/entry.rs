@@ -38,6 +38,7 @@ fn shared_ctx_equivalence() {
     let stream = StreamPumpCtx {
         req: req.clone(),
         hold_max: 4096,
+        hold_max_frames: crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
         sse_frame_hard_bytes: crate::config::SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: "m".to_string(),
@@ -125,6 +126,45 @@ fn ingress_port_bracketed_ipv6_and_bare_fallback_a1() {
 }
 
 #[test]
+fn ingress_port_declared_listener_wins_over_host_header() {
+    // 专用监听承载 8879 且已声明：即使 `Host` 指 8878，也按 8879 选路上游。
+    let (state, dir) = super::test_app_state(&[
+        ("LLM_8878", "https://up-8878.example.com"),
+        ("LLM_8879", "https://up-8879.example.com"),
+    ]);
+    let effective = super::super::resolve_ingress_port(&state.config, Some(8879), Some(8878));
+    assert_eq!(effective, Some(8879), "已声明的专用监听端口恒胜 Host");
+    let target = crate::service::llm_gateway::resolve_target(&state.config, effective)
+        .expect("须命中 8879 上游");
+    assert_eq!(target.base_url, "https://up-8879.example.com");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ingress_port_host_header_used_on_primary_without_declaration() {
+    // 主监听（无专用端口）承载体旧部署：端口未声明，仍按 `Host: example.test:8878` 选路。
+    let (state, dir) = super::test_app_state(&[("LLM_8878", "https://up-8878.example.com")]);
+    let host_port = super::super::parse_ingress_port("example.test:8878");
+    let effective = super::super::resolve_ingress_port(&state.config, None, host_port);
+    assert_eq!(effective, Some(8878), "主监听须按 Host 派生端口选路");
+    let target = crate::service::llm_gateway::resolve_target(&state.config, effective)
+        .expect("须命中 8878 上游");
+    assert_eq!(target.base_url, "https://up-8878.example.com");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ingress_port_undeclared_listener_port_falls_back_to_host() {
+    // 专用监听端口未被声明（配置漂移）：不以其为准，回退 `Host` 派生值。
+    let (state, dir) = super::test_app_state(&[("LLM_8878", "https://up-8878.example.com")]);
+    let effective = super::super::resolve_ingress_port(&state.config, Some(9000), Some(8878));
+    assert_eq!(effective, Some(8878), "未声明端口不得参与选路");
+    let none = super::super::resolve_ingress_port(&state.config, None, None);
+    assert_eq!(none, None, "两者皆无时回退缺省上游");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn stream_flag_with_json_combo_routes_to_pump() {
     assert!(should_pump_stream("text/event-stream", false));
     assert!(should_pump_stream("text/event-stream", true));
@@ -161,6 +201,44 @@ fn body_limits_tiered_values_match_spec() {
     assert!(GATEWAY_BODY_LIMIT_BYTES > AUDIT_SUBLIMIT_CEILING_BYTES);
     assert!(!audit_scan_body_over_limit(AUDIT_SUBLIMIT_CEILING_BYTES));
     assert!(audit_scan_body_over_limit(AUDIT_SUBLIMIT_CEILING_BYTES + 1));
+}
+
+#[test]
+fn strip_session_headers_removes_whole_fallback_chain() {
+    // 回退链头是内部会话标识：配置头 + 五个内置名须一并剔除，无关键保留；
+    // 返回值仍只反映「配置头是否被剔除」（既有调用方/日志信号不变）。
+    let configured = "x-veil-conversation-id";
+    let mut headers = HeaderMap::new();
+    headers.insert(configured, axum::http::HeaderValue::from_static("conv"));
+    for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
+        headers.insert(name, axum::http::HeaderValue::from_static("leak"));
+    }
+    headers.insert("x-unrelated", axum::http::HeaderValue::from_static("keep"));
+    assert!(
+        super::super::strip_session_headers(&mut headers, configured),
+        "配置头确实存在并已剔除时须返回 true"
+    );
+    assert!(headers.get(configured).is_none(), "配置头须被剔除");
+    for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
+        assert!(headers.get(name).is_none(), "回退头 {name} 须被剔除");
+    }
+    assert_eq!(
+        headers.get("x-unrelated").and_then(|v| v.to_str().ok()),
+        Some("keep"),
+        "无关键须保留"
+    );
+
+    // 仅回退头在场、配置头缺席：仍须全部剔除，但返回 false（未剔除配置头）。
+    let mut only_fallback = HeaderMap::new();
+    only_fallback.insert(
+        "x-session-affinity",
+        axum::http::HeaderValue::from_static("aff"),
+    );
+    assert!(
+        !super::super::strip_session_headers(&mut only_fallback, configured),
+        "配置头缺席时返回值须为 false"
+    );
+    assert!(only_fallback.is_empty(), "回退头须仍被剔除");
 }
 
 #[test]

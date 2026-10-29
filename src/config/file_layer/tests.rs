@@ -181,6 +181,7 @@ observability_disable = false
 
 [limits]
 audit_hold_max_bytes = 1048576
+audit_hold_max_frames = 65536
 nonstream_max_bytes = 8388608
 sse_frame_hard_bytes = 8388608
 
@@ -239,13 +240,14 @@ pool_idle_timeout_secs = 90
 backend = "mock"
 "#;
 
-const EXPECTED_KEYS: [&str; 47] = [
+const EXPECTED_KEYS: [&str; 48] = [
     "auth.homeserver",
     "auth.room_id",
     "auth.matrix_access_token",
     "auth.observability_admin_token",
     "auth.observability_disable",
     "limits.audit_hold_max_bytes",
+    "limits.audit_hold_max_frames",
     "limits.nonstream_max_bytes",
     "limits.sse_frame_hard_bytes",
     "audit.mode",
@@ -429,10 +431,6 @@ fn file_config_type_errors_rejected() {
         (
             "[storage]\ncredential_block_wait = 1\n",
             "credential_block_wait",
-        ),
-        (
-            "[limits]\naudit_hold_max_bytes = 1.5\n",
-            "audit_hold_max_bytes",
         ),
         ("[llm.upstreams]\n\"8878\" = 123\n", "8878"),
     ] {
@@ -1159,10 +1157,6 @@ fn secret_env_override_does_not_exempt_gate() {
 fn file_value_bounds_reuse_env_validation() {
     for (content, var) in [
         ("[audit]\ntimeout = 120\n", "AUDIT_TIMEOUT"),
-        (
-            "[limits]\naudit_hold_max_bytes = 0\n",
-            "AUDIT_HOLD_MAX_BYTES",
-        ),
         ("[limits]\nnonstream_max_bytes = 0\n", "NONSTREAM_MAX_BYTES"),
         ("[llm]\ntimeout_secs = 0\n", "HTTP_TIMEOUT_SECS"),
     ] {
@@ -1188,6 +1182,7 @@ fn file_value_bounds_reuse_env_validation() {
 
 mod docs_lockstep;
 mod env_read_surface;
+mod limits_hold;
 mod redline;
 mod server_bind;
 mod storage;

@@ -7,7 +7,7 @@ fn file_len_redline() {
 }
 
 use {
-    super::*,
+    super::{schema::is_duplicate_column_error, *},
     crate::service::request_log::{CLIENT_ABORTED_KIND, SessionScope, StreamGuard, StreamOutcome},
     std::sync::atomic::Ordering,
 };
@@ -530,9 +530,212 @@ fn counted_metrics_matches_record_return_value() {
 }
 
 #[test]
+fn tokens_per_sec_uses_post_ttft_window() {
+    // 100 tokens / (5000 - 1000) ms = 25.0。
+    assert_eq!(tokens_per_sec(100, 5_000, Some(1_000)), Some(25.0));
+}
+
+#[test]
+fn tokens_per_sec_rounds_to_one_decimal() {
+    // 7 tokens / 0.3 s ≈ 23.33 → 23.3。
+    assert_eq!(tokens_per_sec(7, 400, Some(100)), Some(23.3));
+}
+
+#[test]
+fn tokens_per_sec_is_none_without_measurable_window() {
+    assert_eq!(tokens_per_sec(0, 5_000, Some(1_000)), None, "零输出 token");
+    assert_eq!(tokens_per_sec(100, 5_000, None), None, "缺 ttft");
+    assert_eq!(tokens_per_sec(100, 1_000, Some(1_000)), None, "窗口为 0");
+    assert_eq!(tokens_per_sec(100, 900, Some(1_000)), None, "窗口为负");
+}
+
+#[test]
+fn llm_only_filter_excludes_non_chat_rows() {
+    let log = RequestLog::new(temp_db("llm-only"), true, 0);
+    let now = now_secs();
+    log.record(row_at(now, "chat-model", true));
+    let mut passthrough = row_at(now - 1, "passthrough-model", false);
+    passthrough.protocol = "passthrough".to_string();
+    passthrough.is_chat = false;
+    log.record(passthrough);
+    let mut count_tokens = row_at(now - 2, "count-tokens-model", false);
+    count_tokens.protocol = "anthropic".to_string();
+    count_tokens.is_chat = false;
+    log.record(count_tokens);
+    log.flush_blocking().expect("刷盘");
+
+    let all = log.query(&RequestFilter::default()).expect("查询须成功");
+    assert_eq!(all.total, 3, "未带 llm 过滤时行数不变");
+
+    let only_llm = log
+        .query(&RequestFilter {
+            llm_only: true,
+            ..RequestFilter::default()
+        })
+        .expect("查询须成功");
+    assert_eq!(only_llm.total, 1, "llm=1 只留 is_chat=1 行");
+    assert_eq!(only_llm.rows[0].model, "chat-model");
+    assert!(only_llm.rows.iter().all(|r| r.is_chat));
+    // 聚合口径与行集合同 WHERE：非对话行不得混入 sum_*。
+    assert_eq!(only_llm.sum_cached_read, 40);
+    assert_eq!(only_llm.sum_cache_input_tokens, 100);
+    std::fs::remove_dir_all(log.db_path().parent().unwrap_or(Path::new("/tmp"))).ok();
+}
+
+#[test]
+fn migration_adds_ttft_and_tps_columns_to_legacy_table() {
+    let db = temp_db("legacy-ttft");
+    {
+        let conn = open_wal(&db).expect("旧库须可建");
+        // 旧 schema：无 ttft_ms / tps 两列。
+        conn.execute_batch(
+            "CREATE TABLE llm_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_secs INTEGER NOT NULL,
+                request_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                model TEXT NOT NULL,
+                upstream TEXT,
+                ingress_port INTEGER,
+                stream INTEGER NOT NULL,
+                is_chat INTEGER NOT NULL,
+                counted_metrics INTEGER NOT NULL,
+                status INTEGER,
+                error_kind TEXT,
+                latency_ms INTEGER NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                cached_read INTEGER NOT NULL,
+                cached_write INTEGER NOT NULL,
+                cache_input_tokens INTEGER NOT NULL,
+                session_id TEXT,
+                session_source TEXT NOT NULL,
+                session_scope TEXT NOT NULL,
+                upstream_id TEXT,
+                finish_reason TEXT,
+                truncated_mode TEXT,
+                req_summary TEXT);
+             INSERT INTO llm_requests(ts_secs, request_id, protocol, model, stream, is_chat,
+                counted_metrics, latency_ms, prompt_tokens, completion_tokens, total_tokens,
+                cached_read, cached_write, cache_input_tokens, session_source, session_scope)
+                VALUES(1700000000, 'legacy-1', 'chat', 'm', 0, 1, 1, 42, 10, 2, 12, 0, 0, 10,
+                       'none', 'none');",
+        )
+        .expect("建旧库须成功");
+        let conn = open_wal(&db).expect("打开旧库");
+        assert!(ensure_tables(&conn).is_ok(), "补列须成功");
+        assert!(
+            ensure_tables(&conn).is_ok(),
+            "重复补列须幂等（吞 duplicate column）"
+        );
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(llm_requests)")
+            .expect("prepare");
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect");
+        for want in ["ttft_ms", "tps"] {
+            assert!(
+                cols.iter().any(|c| c == want),
+                "补列须存在 {want}: {cols:?}"
+            );
+        }
+    }
+    // 旧行读出：新列为 NULL，既有列值不变。
+    let log = RequestLog::new(db.clone(), true, 0);
+    let page = log.query(&RequestFilter::default()).expect("查询须成功");
+    assert_eq!(page.total, 1);
+    assert_eq!(page.rows[0].latency_ms, 42);
+    assert_eq!(page.rows[0].ttft_ms, None);
+    assert_eq!(page.rows[0].tps, None);
+    std::fs::remove_dir_all(db.parent().unwrap_or(Path::new("/tmp"))).ok();
+}
+
+#[test]
+fn ttft_and_tps_round_trip_through_sqlite() {
+    let db = temp_db("ttft-roundtrip");
+    let log = RequestLog::new(db.clone(), true, 0);
+    let mut row = row_at(now_secs(), "ttft-model", true);
+    row.completion_tokens = 100;
+    row.latency_ms = 5_000;
+    row.ttft_ms = Some(1_000);
+    row.tps = tokens_per_sec(row.completion_tokens, row.latency_ms, row.ttft_ms);
+    log.record(row);
+    log.flush_blocking().expect("刷盘");
+    let page = log.query(&RequestFilter::default()).expect("查询须成功");
+    assert_eq!(page.rows[0].ttft_ms, Some(1_000));
+    assert_eq!(page.rows[0].tps, Some(25.0));
+    std::fs::remove_dir_all(db.parent().unwrap_or(Path::new("/tmp"))).ok();
+}
+
+#[test]
 fn aborted_counter_is_shared_and_atomic() {
     let log = RequestLog::new(temp_db("aborted"), true, 0);
     log.aborted.fetch_add(3, Ordering::Relaxed);
     assert_eq!(log.aborted_total(), 3);
     std::fs::remove_dir_all(log.db_path().parent().unwrap_or(Path::new("/tmp"))).ok();
+}
+
+/// 迁移幂等：列已存在时 duplicate column 被识别并忽略，重复调用不报错、列不重复。
+#[test]
+fn migration_ignores_existing_columns() {
+    let db = temp_db("migration-idempotent");
+    {
+        let conn = open_wal(&db).expect("建库");
+        ensure_tables(&conn).expect("首次建表");
+        ensure_tables(&conn).expect("二次建表须幂等");
+        assert!(
+            is_duplicate_column_error("duplicate column name: ttft_ms"),
+            "SQLite duplicate column 方言须判为可忽略"
+        );
+        assert!(
+            is_duplicate_column_error("Duplicate column name: tps"),
+            "大小写差异不影响判定"
+        );
+        for other in [
+            "attempt to write a readonly database",
+            "database or disk is full",
+            "database is locked",
+            "no such table: llm_requests",
+        ] {
+            assert!(
+                !is_duplicate_column_error(other),
+                "非 duplicate column 错误不得被吞: {other}"
+            );
+        }
+    }
+    let log = RequestLog::new(db.clone(), true, 0);
+    assert!(log.query(&RequestFilter::default()).is_ok(), "库可用");
+    std::fs::remove_dir_all(db.parent().unwrap_or(Path::new("/tmp"))).ok();
+}
+
+/// 非 duplicate column 的真实错误必须上抛：只读库下补列失败须带上下文返回，
+/// 而不是被吞掉后在 27 列 INSERT 处才暴露。
+#[test]
+fn migration_propagates_non_duplicate_error() {
+    let db = temp_db("migration-readonly");
+    {
+        let conn = open_wal(&db).expect("建库");
+        ensure_tables(&conn).expect("首次建表");
+        conn.execute_batch(
+            "ALTER TABLE llm_requests DROP COLUMN ttft_ms;
+             ALTER TABLE llm_requests DROP COLUMN tps;
+             PRAGMA query_only=1;",
+        )
+        .expect("回退成旧库并置只读");
+        let err = ensure_tables(&conn).expect_err("只读库补列须失败");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("补列失败") && text.contains("llm_requests"),
+            "错误须带表/列上下文: {text}"
+        );
+        assert!(
+            !text.contains("duplicate column"),
+            "失败原因须为真实错误而非 duplicate column: {text}"
+        );
+    }
+    std::fs::remove_dir_all(db.parent().unwrap_or(Path::new("/tmp"))).ok();
 }

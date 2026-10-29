@@ -458,6 +458,113 @@ fn pii_scope_counters_zero_in_request_mode() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// 隔离边界回归：两请求只差 `x-session-affinity` 时 MUST NOT 落进同一 PII 作用域。
+///
+/// 该头是路由/亲和性提示（可能为常量或跨客户端共享），PII 链刻意不认它，
+/// 故两次都退化为逐请求作用域（不同实例、不同键，无跨客户端明文串味）。
+#[test]
+fn differing_session_affinity_yields_distinct_pii_scopes() {
+    let (state, dir) = test_state(Some("conversation"));
+    let upstream = "https://up.example.com/v1";
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+    let mut client_a = HeaderMap::new();
+    client_a.insert("x-session-affinity", "affinity-a".parse().unwrap());
+    let mut client_b = HeaderMap::new();
+    client_b.insert("x-session-affinity", "affinity-b".parse().unwrap());
+
+    let scope_a = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &client_a,
+        crate::service::llm_gateway::Protocol::Chat,
+        upstream,
+        Some(&body),
+    );
+    let scope_b = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &client_b,
+        crate::service::llm_gateway::Protocol::Chat,
+        upstream,
+        Some(&body),
+    );
+
+    assert!(
+        !std::ptr::eq(scope_a.pii_scope(), scope_b.pii_scope()),
+        "仅差 x-session-affinity 的请求 MUST NOT 共享 PII 注册表"
+    );
+    assert!(
+        !scope_a.has_conversation() && !scope_b.has_conversation(),
+        "PII 链不认 affinity 头，两次均落逐请求"
+    );
+    assert_eq!(
+        state
+            .conversation_scope_store
+            .as_ref()
+            .expect("conversation 模式须构造存储")
+            .len(),
+        0,
+        "affinity 头不得插入会话存储"
+    );
+    assert_eq!(
+        state.gateway_metrics.request_fallback_count(),
+        2,
+        "两次均计逐请求回退"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 对照：两请求只差 `x-opencode-session-id`（同一值）时须复用同一 PII 作用域。
+#[test]
+fn same_opencode_session_id_shares_one_pii_scope() {
+    let (state, dir) = test_state(Some("conversation"));
+    let upstream = "https://up.example.com/v1";
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-opencode-session-id",
+        "ses_shared_scope_1".parse().unwrap(),
+    );
+    let mut headers_again = HeaderMap::new();
+    headers_again.insert(
+        "x-opencode-session-id",
+        "ses_shared_scope_1".parse().unwrap(),
+    );
+
+    let first = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &headers,
+        crate::service::llm_gateway::Protocol::Chat,
+        upstream,
+        Some(&body),
+    );
+    let second = crate::handler::llm::dispatch::build_request_scope(
+        &state,
+        &headers_again,
+        crate::service::llm_gateway::Protocol::Chat,
+        upstream,
+        Some(&body),
+    );
+
+    assert!(
+        std::ptr::eq(first.pii_scope(), second.pii_scope()),
+        "同一 x-opencode-session-id 须复用同一 PII 注册表"
+    );
+    assert_eq!(
+        state.gateway_metrics.conversation_reuse_count(),
+        1,
+        "第二次须记一次复用"
+    );
+    assert_eq!(
+        state
+            .conversation_scope_store
+            .as_ref()
+            .expect("conversation 模式须构造存储")
+            .len(),
+        1,
+        "只应有一个会话条目"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// 测试内最小 tracing 捕获订阅者：记录每条事件的级别与字段渲染文本。
 #[derive(Clone, Default)]
 struct LogCapture(Arc<Mutex<Vec<String>>>);

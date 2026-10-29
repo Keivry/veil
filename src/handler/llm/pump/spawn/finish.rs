@@ -45,6 +45,7 @@ pub(super) async fn finish(
         audit_policy: env.audit_policy.as_ref(),
         approval_whitelist: env.approval_whitelist.as_slice(),
         audit_pending: &env.audit_pending,
+        ttft: &env.ttft,
     })
     .await;
     env.hold_gate.store(false, Ordering::Relaxed);
@@ -82,9 +83,15 @@ fn record_request_row(env: &PumpEnv, state: &PumpLoopState, counted: bool) {
     let Some(log) = env.stream_log.as_ref() else {
         return;
     };
+    // 审计 hold 缓冲超限是「阻断非截断」：`truncated_mode` 保持 `None`（不污染
+    // 截断指标），改由 `error_kind` 让该失败在 `/_admin/requests` 可见。
+    // 上游 4xx/5xx 的真实状态分类优先（那才是根因）。
+    let overflow_kind = state.audit_hold_overflow.then_some("audit_hold_overflow");
     let outcome = StreamOutcome {
         status: Some(log.upstream_status),
-        error_kind: (log.upstream_status >= 400).then_some("upstream_status"),
+        error_kind: (log.upstream_status >= 400)
+            .then_some("upstream_status")
+            .or(overflow_kind),
         upstream_id: state.stream_first_id.as_deref(),
         finish_reason: state.stream_finish_reason.as_deref(),
         truncated_mode: state
@@ -94,6 +101,7 @@ fn record_request_row(env: &PumpEnv, state: &PumpLoopState, counted: bool) {
             .map(TruncatedMode::as_str),
         usage: state.stream_usage.as_ref(),
         latency_ms: Some(env.req_start.elapsed().as_millis() as u64),
+        ttft_ms: env.ttft.first_ms(),
         counted_metrics: Some(counted),
     };
     if let Some(row) = log.guard.finish(&outcome) {

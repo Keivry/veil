@@ -43,6 +43,11 @@ use {
                 },
                 tenant_fingerprint,
             },
+            request_log::{
+                pii_scope_header_name,
+                pii_scope_header_present,
+                resolve_pii_scope_header,
+            },
         },
         state::AppState,
     },
@@ -163,6 +168,23 @@ fn parse_ingress_port(host: &str) -> Option<u16> {
     host.rsplit(':').next()?.trim().parse::<u16>().ok()
 }
 
+/// 生效入口端口：专用监听的承载端口（仅当该端口已被声明为 LLM 入口）恒胜
+/// `Host` 头派生的端口；专用监听未承载（主监听）或无声明时回退 `Host` 派生值，
+/// 两者皆无则为 `None`（缺省上游）。
+///
+/// 旧部署（宿主机 8878/8879 映射到容器 8877）的请求落在主监听上、无专用端口，
+/// 只能靠 `Host` 区分，故回退分支不要求端口已声明。
+pub fn resolve_ingress_port(
+    config: &crate::config::Config,
+    dedicated_listener_port: Option<u16>,
+    host_port: Option<u16>,
+) -> Option<u16> {
+    match dedicated_listener_port {
+        Some(port) if config.declares_port(port) => Some(port),
+        _ => host_port,
+    }
+}
+
 /// 租户指纹可区分凭据头（可选次判别项）：Authorization / api-key。
 const CREDENTIAL_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-key"];
 
@@ -170,6 +192,24 @@ const CREDENTIAL_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-k
 pub(crate) fn strip_conversation_header(headers: &mut HeaderMap, header_name: &str) -> bool {
     let name = header_name.to_ascii_lowercase();
     headers.remove(name.as_str()).is_some()
+}
+
+/// 转发前剔除整条会话头链：配置头 + [`crate::service::request_log::SESSION_HEADER_FALLBACKS`]
+/// 全部五个内置名（含大小写不敏感的自定义配置名）。
+///
+/// 回退链头是**内部会话标识**，MUST NOT 泄漏给上游 provider（`x-opencode-*` 会暴露
+/// 客户端会话拓扑，`x-session-affinity`/`x-session-id` 会暴露内部路由键）。剔除范围
+/// 恒为全链，独立于当前请求实际命中了哪个头——否则「配置头命中时回退头被转发」会
+/// 形成按请求形状变化的泄漏路径。
+///
+/// 返回值语义与 [`strip_conversation_header`] 对齐：仅当**配置头**确实存在并已被剔除
+/// 时返回 `true`（既有调用方/日志的「配置头已剔除」信号不变），回退头被剔除不计入。
+pub(crate) fn strip_session_headers(headers: &mut HeaderMap, configured: &str) -> bool {
+    let configured_stripped = strip_conversation_header(headers, configured);
+    for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
+        headers.remove(name);
+    }
+    configured_stripped
 }
 
 /// 作用域选择：`request` 逐请求 `PiiScope`；`conversation` 按四级推导
@@ -205,16 +245,31 @@ pub(crate) fn build_request_scope(
         return per_request();
     };
     let secret = state.conversation_secret.as_ref();
-    let explicit_raw = headers
-        .get(state.config.pii_scope_key_header.as_str())
-        .and_then(|v| v.to_str().ok());
+    // PII 隔离口径：配置头优先，其后**只**接受 opencode 明确表达「本会话」的两个头
+    // （`x-opencode-session` / `x-opencode-session-id`），刻意窄于遥测链
+    // [`resolve_session_header`]（后者还认 parent-session/affinity/中间代理常用头）。
+    //
+    // 隔离边界只剩会话键值本身：上游 key 由 `[llm.targets].headers` 注入时客户端不发
+    // 凭据头，`tenant_fingerprint` 对所有客户端相同。因此路由/通用头（`x-session-affinity`
+    // 常为固定常量、`x-session-id` 常被代理复用）一旦纳入键，两个逻辑客户端会共用一个
+    // `PiiScope` 注册表，一方的明文可被还原进另一方响应。
+    //
+    // 已知取舍：只发 `x-session-affinity` 的客户端仍有日志 `session_id`，但此处键推导
+    // 落空→逐请求作用域（按既有第 4 级降级计数）。丢失跨轮 token 稳定性优于跨客户端串味。
+    let explicit_raw =
+        resolve_pii_scope_header(headers, state.config.pii_scope_key_header.as_str());
     let explicit = explicit_header(true, explicit_raw);
     // 显式会话键头存在但非法（超长/控制字符/非 UTF-8）
     // 被静默丢弃——记内部计数 + warn（头名可现，头值/明文/token MUST NOT 出现）。
-    if explicit.is_none() && headers.contains_key(state.config.pii_scope_key_header.as_str()) {
+    // 告警指名**实际被拒的头**：配置头缺席时值来自回退头，只打配置头名会误导排查。
+    if explicit.is_none()
+        && pii_scope_header_present(headers, state.config.pii_scope_key_header.as_str())
+    {
+        let rejected = pii_scope_header_name(headers, state.config.pii_scope_key_header.as_str())
+            .unwrap_or(state.config.pii_scope_key_header.as_str());
         state.gateway_metrics.record_conversation_header_invalid();
         tracing::warn!(
-            header = %state.config.pii_scope_key_header,
+            header = %rejected,
             "显式会话键头存在但非法，已丢弃且不参与键推导"
         );
     }
@@ -289,13 +344,19 @@ pub(crate) async fn gateway_serve(
     // `count_tokens` 的 redact-only 语义由等价 sibling 判定产出（不新增
     // `Protocol` 变体），在下方 RequestCtx 单一装配点写入；`is_passthrough` 仍只认
     // `NonDialog`，故此处置位后 `count_tokens` 走对话臂（请求侧脱敏、跳过四类后处理）。
-    // 入口宿主机端口（entry-transport）：`Host` 经 `parse_ingress_port` 解析
-    //（方括号 IPv6/裸 IPv6/非法一律有定义），缺失/非法回退 None（缺省上游），不猜测。
-    let ingress_port: Option<u16> = parts
+    // 入口端口（entry-transport）：专用监听的承载端口恒胜 `Host` 派生端口
+    //（方括号 IPv6/裸 IPv6/非法一律有定义，缺失/非法回退 None，不猜测）；
+    // 主监听无该扩展，按 `Host` 选路以保持旧部署兼容。
+    let host_port: Option<u16> = parts
         .headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_ingress_port);
+    let dedicated_port = parts
+        .extensions
+        .get::<crate::router::IngressPort>()
+        .map(|port| port.0);
+    let ingress_port = resolve_ingress_port(&state.config, dedicated_port, host_port);
     // 请求日志追踪点（design §1.1）：`req_start` 之后、`resolve_target` 与 NonDialog
     // 分支之前创建，保证后续所有早退都被记录；读取请求体前中断/`payload_too_large`
     // 不进入本函数，故不产生行（与 spec 一致）。
@@ -376,6 +437,9 @@ async fn serve_inner(
     let detector = state.detector.clone();
     let sqlite_precise = state.sqlite_ok();
     let hold_max = state.config.audit_hold_max_bytes.max(1) as usize;
+    // 审计 hold 缓冲帧数上限（配置文件 `[limits].audit_hold_max_frames`，默认 65536）：
+    // 单次大 tool 调用的参数按 token 分片可达数千帧，帧数维度须独立于字节维度。
+    let hold_max_frames = state.config.audit_hold_max_frames.max(1) as usize;
     // SSE 硬上限运行时值（env/TOML `SSE_FRAME_HARD_BYTES`），经 `StreamPumpCtx`
     // 注入解析器；默认值 8MiB 在配置层给出，此处零二次判定。
     let sse_frame_hard_bytes = state.config.sse_frame_hard_bytes;
@@ -388,7 +452,7 @@ async fn serve_inner(
     // NonDialog 透传与对话臂两条路径。键推导（`build_request_scope`）仍读原始
     // `parts.headers`，故此处只改转发克隆体。
     let mut fwd_headers = parts.headers.clone();
-    let _ = strip_conversation_header(&mut fwd_headers, &state.config.pii_scope_key_header);
+    let _ = strip_session_headers(&mut fwd_headers, &state.config.pii_scope_key_header);
 
     if !is_chat {
         // NonDialog 走专用透传入口（返回 `Response`，无 `Stream` 死臂）；
@@ -505,6 +569,7 @@ async fn serve_inner(
     let pump_ctx = || StreamPumpCtx {
         req: req.clone(),
         hold_max,
+        hold_max_frames,
         sse_frame_hard_bytes,
         init_conv: rw.init_conv.clone(),
         req_model: req_model.clone(),

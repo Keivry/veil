@@ -14,8 +14,12 @@ use {
 };
 
 mod range;
+mod stale;
 
 pub use range::{RANGE_LABELS, RangeGranularity, RangeSpec, series_since_for_range};
+use stale::note_stale_bucket_row;
+#[cfg(test)]
+pub(crate) use stale::stale_bucket_rows_total;
 
 /// 内存环容量（最近 10k 样本）。
 pub const RING_CAP: usize = 10_000;
@@ -30,7 +34,23 @@ pub(crate) const AGGS_FIVE_MIN_KEEP: usize = 13;
 /// `aggs` 硬上限（LRU 驱逐兜底，防异常键无界膨胀）。
 pub(crate) const AGGS_MAX_ENTRIES: usize = 4096;
 /// 延迟桶边界（毫秒）；11 条边界 → 12 桶（含上溢桶）。
-pub const LATENCY_BOUNDS_MS: [u64; 11] = [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000];
+///
+/// 尾部覆盖到 40s：LLM 流式请求常在 3–30s（首 token + 长输出），旧口径末桶上界
+/// 10s 会把 95 分位永远钉在 `10000`（溢出桶只回最后边界）。亚 50ms 区间对对话
+/// 端点无意义，故整体上移分辨率到 50ms–40s。
+pub const LATENCY_BOUNDS_MS: [u64; 11] = [
+    50, 100, 200, 400, 800, 1500, 3000, 5000, 10000, 20000, 40000,
+];
+/// 延迟桶边界版本：**每次改动 [`LATENCY_BOUNDS_MS`] 都必须递增**（当前 = 2）。
+///
+/// 持久聚合表（`metrics_five_min`/`metrics_hourly`/`metrics_daily`）只存 12 个桶计数，
+/// 不存边界本身，因此每行携带产生它的边界版本（`bucket_bounds_version` 列）。读取时
+/// 版本不符的历史行桶贡献按零计——不得用新边界重解释旧桶（旧口径上溢桶是 `>10s`，
+/// 新口径同下标是 `>40s`，误读会让 `p95_saturated` 虚假翻真）。
+///
+/// 代价：升级后延迟分布、p95 与时序图只由当前二进制写入的数据构成，需随
+/// `five_min`/`hourly`/`daily` 窗口滚动逐窗填充（旧行的请求数/token/附属计数仍照常求和）。
+pub const LATENCY_BOUNDS_VERSION: u32 = 2;
 /// 延迟桶数（硬性 12）。
 pub const LATENCY_BUCKETS: usize = 12;
 /// `truncated_mode` 唯一四态（他值不落指标；与 `sse::TruncatedMode` 四变体同集）。
@@ -117,27 +137,53 @@ pub fn bucket_index(latency_ms: u64) -> usize {
         .unwrap_or(LATENCY_BUCKETS - 1)
 }
 
-/// 12 桶近似 p95：首个累积 ≥95% 所在桶的桶中位 `(lower+upper)/2`；
-/// 上溢桶返回最后边界（无上界，中位无定义）。
+/// 12 桶 p95：桶内按**名次中点**插值
+/// （`lower + (upper-lower) * (2*rank-1) / (2*count)`），比取桶中位更接近真实分位。
+///
+/// 用中点而非 `rank / count` 是为了消除上偏：`rank == count` 时旧式会snap到桶上界，
+/// 单样本桶（`count = 1, rank = 1`）恒返回上界（60ms 样本报 100ms）；中点式给出区间
+/// 半程。整数运算全用 `u128` 防溢出，结果夹到桶上界（`upper`）以内。
+/// 上溢桶无上界，只能返回下界（最后一条边界）并置 [`p95_saturated`]。
 pub fn p95_approx(buckets: &[u64; LATENCY_BUCKETS]) -> u64 {
+    let Some((index, rank, count)) = p95_bucket(buckets) else {
+        return 0;
+    };
+    let lower = if index == 0 {
+        0
+    } else {
+        LATENCY_BOUNDS_MS[index - 1]
+    };
+    let Some(&upper) = LATENCY_BOUNDS_MS.get(index) else {
+        return lower;
+    };
+    let span = u128::from(upper - lower);
+    let numerator = span * (2 * u128::from(rank) - 1);
+    let denominator = 2 * u128::from(count);
+    let interpolated = lower + u64::try_from(numerator / denominator).unwrap_or(u64::MAX);
+    interpolated.min(upper)
+}
+
+/// p95 是否落在上溢桶（真实分位 ≥ 最后一条边界，`p95_ms` 只能给下界）。
+pub fn p95_saturated(buckets: &[u64; LATENCY_BUCKETS]) -> bool {
+    p95_bucket(buckets).is_some_and(|(index, ..)| index >= LATENCY_BOUNDS_MS.len())
+}
+
+/// 定位 p95 所在桶：返回 `(桶下标, 桶内名次 1..=count, 桶计数)`。
+fn p95_bucket(buckets: &[u64; LATENCY_BUCKETS]) -> Option<(usize, u64, u64)> {
     let total: u64 = buckets.iter().sum();
     if total == 0 {
-        return 0;
+        return None;
     }
     let threshold = ((total as f64) * 0.95).ceil() as u64;
     let mut acc = 0u64;
     for (i, &c) in buckets.iter().enumerate() {
+        let before = acc;
         acc += c;
-        if acc >= threshold {
-            let upper = LATENCY_BOUNDS_MS.get(i).copied().unwrap_or(u64::MAX);
-            if upper == u64::MAX {
-                return LATENCY_BOUNDS_MS[LATENCY_BOUNDS_MS.len() - 1];
-            }
-            let lower = if i == 0 { 0 } else { LATENCY_BOUNDS_MS[i - 1] };
-            return (lower + upper) / 2;
+        if acc >= threshold && c > 0 {
+            return Some((i, threshold - before, c));
         }
     }
-    LATENCY_BOUNDS_MS[LATENCY_BOUNDS_MS.len() - 1]
+    None
 }
 
 /// 精确性双条件：`窗口覆盖 ≥3600s && 样本 ≥100` 才标精确，否则近似标 `≈`。
@@ -225,7 +271,7 @@ pub(crate) struct AggKey {
     pub(crate) protocol: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct WindowAgg {
     pub(crate) count: u64,
     pub(crate) prompt: u64,
@@ -239,12 +285,41 @@ pub(crate) struct WindowAgg {
     pub(crate) cred_hits: u64,
     pub(crate) audit_blocks: u64,
     pub(crate) buckets: [u64; LATENCY_BUCKETS],
+    /// 产生 [`buckets`](Self::buckets) 的边界版本（见 [`LATENCY_BOUNDS_VERSION`]）。
+    /// 与当前版本不符的行只贡献计数，桶贡献按零计。
+    pub(crate) bucket_bounds_version: u32,
     pub(crate) t_silent: u64,
     pub(crate) t_open: u64,
     pub(crate) t_synth: u64,
     pub(crate) t_upstream_error: u64,
     /// 最近更新序号（LRU 驱逐依据；越小越旧）。
     pub(crate) updated: u64,
+}
+
+impl Default for WindowAgg {
+    /// 新建窗口一律按**当前**边界版本记账（只有从 sqlite 回填的历史行才可能是旧版本）。
+    fn default() -> Self {
+        Self {
+            count: 0,
+            prompt: 0,
+            completion: 0,
+            total: 0,
+            cached_read: 0,
+            cached_write: 0,
+            unknown: 0,
+            pii_hits: 0,
+            pii_miss: 0,
+            cred_hits: 0,
+            audit_blocks: 0,
+            buckets: [0; LATENCY_BUCKETS],
+            bucket_bounds_version: LATENCY_BOUNDS_VERSION,
+            t_silent: 0,
+            t_open: 0,
+            t_synth: 0,
+            t_upstream_error: 0,
+            updated: 0,
+        }
+    }
 }
 
 /// 窗口键 `d{days}`/`h{hours}`/`m{win}` 的整数序（解析失败视为最旧）。
@@ -337,6 +412,8 @@ pub struct MetricsSnapshot {
     pub cred_hits: u64,
     pub latency_buckets: [u64; LATENCY_BUCKETS],
     pub p95_ms: u64,
+    /// p95 落上溢桶：`p95_ms` 只是下界（最后一条边界），管理面须按“≥”展示。
+    pub p95_saturated: bool,
     pub per_protocol: HashMap<String, u64>,
     /// 模型分桶计数（环聚合；持久聚合仍按协议键，见 `AggKey`）。
     pub per_model: HashMap<String, u64>,
@@ -462,6 +539,7 @@ impl MetricsStore {
             cred_hits,
             latency_buckets: buckets,
             p95_ms: p95_approx(&buckets),
+            p95_saturated: p95_saturated(&buckets),
             per_protocol,
             per_model,
             truncated_silent_discard: t_silent,
@@ -630,15 +708,22 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
         let mut stmt = conn.prepare(&format!(
             "SELECT window, protocol, requests, prompt_tokens, completion_tokens, total_tokens, \
              cached_read, cached_write, unknown, pii_hits, pii_miss, cred_hits, audit_blocks, \
-             t_silent, t_open, t_synth, t_upstream_error, buckets FROM {table}"
+             t_silent, t_open, t_synth, t_upstream_error, buckets, bucket_bounds_version \
+             FROM {table}"
         ))?;
         let rows = stmt.query_map([], |row| {
             let window: String = row.get(0)?;
             let protocol: String = row.get(1)?;
             let buckets_s: String = row.get(17)?;
+            let row_version: i64 = row.get(18)?;
             let mut buckets = [0u64; LATENCY_BUCKETS];
             for (i, part) in buckets_s.split(',').enumerate().take(LATENCY_BUCKETS) {
                 buckets[i] = bounded_bucket_value(part, &window, &protocol);
+            }
+            // 桶原样读回（不重解释），版本随行携带；求和侧按版本决定是否计入桶。
+            // 这样旧行既不被删除，也不会被改写成新边界下的数字。
+            if row_version != i64::from(LATENCY_BOUNDS_VERSION) {
+                note_stale_bucket_row(&window, &protocol, row_version);
             }
             let count = |idx: usize, field: &str| -> rusqlite::Result<u64> {
                 let v: i64 = row.get(idx)?;
@@ -682,6 +767,7 @@ fn backfill_rows_blocking(db_path: &Path) -> anyhow::Result<Vec<(AggKey, WindowA
                     t_synth,
                     t_upstream_error,
                     buckets,
+                    bucket_bounds_version: u32::try_from(row_version).unwrap_or(0),
                     updated: 0,
                 },
             ))

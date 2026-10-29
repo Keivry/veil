@@ -217,6 +217,10 @@ pub async fn serve_detailed(
             }
         }
     };
+    // 非流不设 TTFT/TPS：`ttft_ms` 是**流式专属**指标（请求起始 → 首个生成 token
+    // 真正下行）。非流响应体是一次性读完的，读完时刻即整段生成结束，若拿它当
+    // 「首 token」再除以 `latency_ms - ttft_ms`，分母只剩毫秒级残差，`tps` 会算出
+    // 数万 tok/s 的假值。故此处保持 `None`，`tps` 随之同为 `None`。
     let is_json = parse_json_bytes(&bytes).is_some();
     // 先定空体分类，再判超限（严格 `len > cap`），最后才落空体 502：
     // 空体 len=0 恒不超限，非 JSON 超限体不落空体分支。

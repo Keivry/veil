@@ -30,6 +30,9 @@ bind = "0.0.0.0:8877"
 
 [limits]
 audit_hold_max_bytes = 1048576
+# 审计 hold 暂存 tool 帧数上限（默认 65536）：与字节上限并行的独立维度，
+# 单次大 tool 调用按 token 分片可达数千帧，不得由字节预算隐式约束
+audit_hold_max_frames = 65536
 nonstream_max_bytes = 8388608
 # SSE 单行/单事件硬上限（字节，默认 8388608 = 8MiB；超限 fail-closed）
 # sse_frame_hard_bytes = 8388608
@@ -79,7 +82,9 @@ normalize_json_whitespace = false
 mode = "request"                     # request | conversation
 ttl_secs = 3600
 max_conversations = 1024
-key_header = "x-veil-conversation-id"
+key_header = "x-veil-conversation-id"   # 最高优先；其后内置回退链：
+                                    # x-opencode-session -> x-opencode-session-id ->
+                                    # x-opencode-parent-session-id -> x-session-affinity -> x-session-id
 # prev_id_max_entries = 1024          # 缺省联动 max_conversations 生效值
 
 [llm]
@@ -88,7 +93,9 @@ timeout_secs = 30
 pool_max_idle_per_host = 16
 pool_idle_timeout_secs = 90
 
-# 按宿主机入口端口选择上游（端口号 -> URL）
+# 每个端口键各开一条专用 TCP 监听（绑定地址 = [server].bind 的 IP + 该端口），
+# 客户端连哪个端口就选哪条上游：多个客户端指向同一上游 URL 也能按接入端口区分。
+# 未声明端口（如主监听 8877）上的请求仍按 Host 头端口选路，旧部署映射不受影响。
 [llm.upstreams]
 "8878" = "http://127.0.0.1:11434"
 "8879" = "http://127.0.0.1:11435"

@@ -884,14 +884,14 @@ async fn pending_tool_frames_same_index_zero_byte_flood_bounded() {
             "同槽零字节分片不增聚合条目，聚合维度不得先行拒绝"
         );
         assert_eq!(
-            entries.account_pending_frame(0),
+            entries.account_pending_frame(0, 0),
             HoldVerdict::Approved,
             "未达条目上限不得拒绝"
         );
     }
     assert_eq!(entries.pending_accounting(), (AUDIT_HOLD_MAX_ENTRIES, 0));
     assert_eq!(
-        entries.account_pending_frame(0),
+        entries.account_pending_frame(0, 0),
         HoldVerdict::Rejected,
         "条目超限须 fail-closed（第 {} 帧）",
         AUDIT_HOLD_MAX_ENTRIES + 1
@@ -900,17 +900,37 @@ async fn pending_tool_frames_same_index_zero_byte_flood_bounded() {
     assert_eq!(entries.pending_accounting(), (0, 0), "清仓须归零双维度");
     // (2) 字节维度独立计数：恰达上限放行、超限拒绝；出账归还后长流不误判。
     let mut bytes = AuditHold::new(64);
-    assert_eq!(bytes.account_pending_frame(64), HoldVerdict::Approved);
-    assert_eq!(bytes.account_pending_frame(1), HoldVerdict::Rejected);
+    assert_eq!(bytes.account_pending_frame(64, 0), HoldVerdict::Approved);
+    assert_eq!(bytes.account_pending_frame(1, 0), HoldVerdict::Rejected);
     let mut reclaim = AuditHold::new(64);
     for _ in 0..100 {
-        assert_eq!(reclaim.account_pending_frame(64), HoldVerdict::Approved);
-        reclaim.release_pending_frames(1, 64);
+        assert_eq!(reclaim.account_pending_frame(64, 0), HoldVerdict::Approved);
+        reclaim.release_pending_frames(1, 64, 0, 0);
     }
     assert!(!reclaim.is_rejected(), "出账归还后长流不得误判溢出");
+    // 帧数上限独立可配且逐帧累计；出账同样归还帧数（长流多轮 drain 不触顶）。
+    let mut frames = AuditHold::with_limits(1 << 30, 2);
+    assert_eq!(frames.account_pending_frame(1, 0), HoldVerdict::Approved);
+    assert_eq!(frames.account_pending_frame(1, 0), HoldVerdict::Approved);
+    assert_eq!(
+        frames.account_pending_frame(1, 0),
+        HoldVerdict::Rejected,
+        "帧数超配置上限须 fail-closed"
+    );
+    let mut reclaim_frames = AuditHold::with_limits(1 << 30, 2);
+    for _ in 0..50 {
+        assert_eq!(
+            reclaim_frames.account_pending_frame(4, 0),
+            HoldVerdict::Approved
+        );
+        reclaim_frames.release_pending_frames(1, 4, 0, 0);
+    }
+    assert!(!reclaim_frames.is_rejected(), "帧数出账后长流不得误判溢出");
     // (3) e2e 判别力：真实泵路径（push 前记账缺失则无阻断、无粘滞抑制）。
+    // 零载荷帧不增字节，故须超过**零载荷帧上限**（4096）才收敛——旧口径靠
+    // 「整帧信封字节」撞小预算触发，新口径下信封不计费，判别点随之移到该维度。
     let flood = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-0\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"\"}}]}}]}\n\n";
-    let sse = flood.repeat(64).into_bytes();
+    let sse = flood.repeat(4100).into_bytes();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("回环监听须成功");
@@ -959,6 +979,7 @@ async fn pending_tool_frames_same_index_zero_byte_flood_bounded() {
             redaction_tally: Default::default(),
         },
         hold_max: 512,
+        hold_max_frames: crate::config::AUDIT_HOLD_MAX_FRAMES_DEFAULT as usize,
         sse_frame_hard_bytes: crate::config::SSE_FRAME_HARD_BYTES,
         init_conv: None,
         req_model: String::new(),
@@ -987,4 +1008,134 @@ async fn pending_tool_frames_same_index_zero_byte_flood_bounded() {
         1,
         "阻断帧恰一: {joined}"
     );
+}
+
+#[test]
+fn large_streamed_tool_call_within_byte_budget_not_rejected() {
+    // 回归：单次 tool 调用的参数按 token 分片时可达数千帧（本用例 **同一**
+    // tool 槽 8000 帧、载荷合计约 24KB）。旧实现按「整帧信封字节」计费且每帧
+    // 都撞 4096 帧硬顶，于是 1MiB 预算下仍被判 `audit-hold-overflow`；现口径
+    // 只计载荷字节、帧数上限独立可配（默认 65536），故同样流量必须放行。
+    // 注意槽数恒为 1——聚合槽条目上限（4096）语义不变，不参与本回归。
+    let mut hold = AuditHold::new(1_048_576);
+    let delta = "{\"q\":";
+    for idx in 0..8000u32 {
+        assert_eq!(
+            hold.push_fragment(0, Some("call-big"), Some("get_weather"), delta),
+            HoldVerdict::Approved,
+            "第 {idx} 帧载荷入槽不得拒绝"
+        );
+        assert_eq!(
+            hold.account_pending_frame(delta.len(), 0),
+            HoldVerdict::Approved,
+            "第 {idx} 帧缓冲记账不得拒绝（帧数上限独立于字节）"
+        );
+    }
+    assert!(!hold.is_rejected(), "8000 帧 / 24KB 合法长流不得判溢出");
+    let (frames, bytes) = hold.pending_accounting();
+    assert_eq!(frames, 8000, "记账须覆盖全部缓冲帧");
+    assert_eq!(bytes, 8000 * delta.len(), "字节维度只计载荷");
+    // 同一载荷在 `total_bytes` 与 `pending_bytes` 各计一次但**不求和**，
+    // 否则有效预算会被腰斩：两者恰相等即证明未叠加。
+    assert_eq!(
+        hold.total_bytes, bytes,
+        "聚合与缓冲两视图口径须一致且不求和"
+    );
+    assert_eq!(
+        hold.accumulated(0).map(str::len),
+        Some(bytes),
+        "载荷完整保留"
+    );
+}
+
+#[test]
+fn pending_byte_budget_still_bounds_oversized_buffer() {
+    // 内存有界性：缓冲载荷超过 `audit_hold_max_bytes` 仍须 fail-closed。
+    let mut hold = AuditHold::with_limits(1024, 65_536);
+    let mut accepted = 0usize;
+    for _ in 0..64 {
+        if hold.account_pending_frame(64, 0) == HoldVerdict::Rejected {
+            break;
+        }
+        accepted += 1;
+    }
+    assert_eq!(accepted, 16, "1024/64 恰放行 16 帧");
+    assert!(hold.is_rejected(), "第 17 帧须超限拒绝");
+    assert_eq!(hold.pending_accounting(), (0, 0), "清仓须归零");
+    // 告警快照须保留**清仓前**的现场值（实时计数器已归零，事后读只剩 0）。
+    let stats = hold.last_reject_stats().expect("拒绝后须留存快照");
+    assert_eq!(stats.pending_frames, 17, "快照须含越界的那一帧");
+    assert_eq!(stats.pending_payload_bytes, 17 * 64, "快照须含载荷字节");
+    assert_eq!(stats.pending_envelope_bytes, 0, "本用例信封为 0");
+    assert_eq!(stats.held_payload_bytes, 0, "本用例未入聚合槽");
+    // 聚合字节维度同样保留：载荷累计超限不由缓冲维度先行吞掉。
+    let mut agg = AuditHold::new(16);
+    assert_eq!(
+        agg.push_fragment(0, None, None, "abcdefgh"),
+        HoldVerdict::Approved
+    );
+    assert_eq!(
+        agg.push_fragment(0, None, None, "ijklmnopq"),
+        HoldVerdict::Rejected,
+        "聚合载荷超限须 fail-closed"
+    );
+}
+
+#[test]
+fn zero_payload_frame_flood_still_rejected_regardless_of_frame_cap() {
+    // 原始反洪泛意图：载荷为 0 的帧不增字节，若无独立维度可无限堆积。
+    // 该维度不随 `audit_hold_max_frames` 放大——即便帧数上限调到极大亦然。
+    let mut hold = AuditHold::with_limits(1 << 30, 1 << 30);
+    for _ in 0..PENDING_ZERO_BYTE_FLOOD_CAP {
+        assert_eq!(hold.account_pending_frame(0, 0), HoldVerdict::Approved);
+    }
+    assert_eq!(
+        hold.pending_accounting(),
+        (PENDING_ZERO_BYTE_FLOOD_CAP, 0),
+        "零载荷帧须独立计数"
+    );
+    assert_eq!(
+        hold.account_pending_frame(0, 0),
+        HoldVerdict::Rejected,
+        "零载荷帧超上限须 fail-closed"
+    );
+    assert!(hold.is_rejected());
+}
+
+#[test]
+fn pending_envelope_budget_bounds_frame_overhead() {
+    // 信封（SSE 前缀 + JSON 外壳）与载荷没有重叠，但会随帧数线性增长：
+    // 它受固定的 8MiB 独立预算约束，且**不占用**载荷预算——几千个合法小分片
+    // 不会被自己的信封挤掉参数额度（本缺陷的另一半成因）。
+    let mut hold = AuditHold::new(1 << 30);
+    // 每帧信封略大于 8MiB/1024，故恰好 1023 帧用尽预算、第 1024 帧越界。
+    let per_frame = PENDING_ENVELOPE_BUDGET_BYTES / 1024 + 1;
+    let mut accepted = 0usize;
+    loop {
+        // 载荷恒 1 字节（远低于 1GiB 载荷预算），信封每帧大额占据。
+        if hold.account_pending_frame(1, per_frame) == HoldVerdict::Rejected {
+            break;
+        }
+        accepted += 1;
+        assert!(accepted <= 1024, "信封预算须在 1024 帧内收敛");
+    }
+    assert_eq!(accepted, 1023, "每帧信封略超 8MiB/1024，故 1023 帧即用尽");
+    assert!(hold.is_rejected(), "信封超预算须 fail-closed");
+    let stats = hold.last_reject_stats().expect("须留存快照");
+    assert_eq!(stats.pending_payload_bytes, 1024, "快照须区分载荷与信封");
+    assert_eq!(
+        stats.pending_envelope_bytes,
+        per_frame * 1024,
+        "快照须记信封字节"
+    );
+    // 载荷预算不受信封消耗影响：同样的帧数只要信封小，载荷额度照旧可用。
+    let mut small_envelope = AuditHold::new(4096);
+    for _ in 0..2048 {
+        assert_eq!(
+            small_envelope.account_pending_frame(1, 2),
+            HoldVerdict::Approved,
+            "信封小额时 2048 帧 / 2KB 载荷须全放行"
+        );
+    }
+    assert!(!small_envelope.is_rejected());
 }

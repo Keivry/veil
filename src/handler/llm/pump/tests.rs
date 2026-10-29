@@ -32,10 +32,12 @@ use {
 mod audit_due;
 mod disconnect;
 mod held_output;
+mod hold_budget;
 mod model_bucket;
 mod responses_audit;
 mod terminal_carry;
 mod terminator;
+mod ttft;
 
 #[test]
 fn file_len_redline() {

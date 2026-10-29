@@ -29,7 +29,7 @@
 //! - NonDialog：不合成终端（零帧），`terminal_sent=false`，调用点不 `commit`。
 
 use {
-    super::event::data_event_count,
+    super::{event::data_event_count, ttft::TtftTracker},
     crate::service::{
         llm_gateway::{GatewayMetrics, Protocol},
         sse::TruncatedMode,
@@ -43,16 +43,22 @@ pub(super) async fn flush_pre_terminal(
     agg: &mut String,
     pump_tx: &tokio::sync::mpsc::Sender<String>,
     metrics: &GatewayMetrics,
+    ttft: &TtftTracker,
 ) -> bool {
     if agg.is_empty() {
         return false;
     }
     let events = data_event_count(agg);
+    // 定格判据**不在此处**：滞留帧可能是协议簿记帧（`finish_reason` 块、`[DONE]`、
+    // `message_delta`、`response.completed`），Fast 攒批下它们同样滞留到 EOF。
+    // 真实 token 帧在入 `agg` 时已由 `event_loop` 按 `carries_output_token` 置位 pending，
+    // 此处只负责在**实际下发成功**后落首个时延（`note_sent`）。
     let sent = pump_tx.send(std::mem::take(agg)).await.is_ok();
     if sent {
         for _ in 0..events {
             metrics.add_sse_event();
         }
+        ttft.note_sent();
     }
     sent
 }
@@ -94,15 +100,20 @@ pub(super) async fn midstream_terminal(
     agg: &mut String,
     pump_tx: &tokio::sync::mpsc::Sender<String>,
     metrics: &GatewayMetrics,
+    ttft: &TtftTracker,
 ) -> MidstreamTerminalOutcome {
     // 合成终端前先 flush 待发帧，保证末段增量先于终端帧下行。
-    let flush_ok = flush_pre_terminal(agg, pump_tx, metrics).await;
+    let flush_ok = flush_pre_terminal(agg, pump_tx, metrics, ttft).await;
     let mut forwarded = u64::from(flush_ok);
     let terminal_sent = match protocol {
         Protocol::Chat => {
             // 错误载荷帧已在流内置终端（`upstream_error` 观测），
             // `should_apply_midstream_terminal` 随即短路——本臂不再为其补 `[DONE]`、
             // 不记 `open_ended`；此处仅承载无终端信号的异常断流与干净收尾。
+            //
+            // TTFT 不在此处判定：待发帧由 `flush_pre_terminal` 下发，且由 `event_loop`
+            // 在入 `agg` 时按 `carries_output_token` 置位 pending、flush 成功后
+            // `note_sent` 落首个时延；本臂只补合成终端帧，`[DONE]` 不是 token。
             for f in frames {
                 agg.push_str(f);
             }

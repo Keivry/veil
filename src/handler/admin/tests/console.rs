@@ -122,7 +122,7 @@ fn console_html_request_section_wired() {
         "reloadRequests();",
         "requests: { limit: 50, offset: 0, total: 0,",
         "function renderRequests(d)",
-        "function reloadRequests()",
+        "function reloadRequests(force)",
         "function requestRowModel(item)",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
@@ -131,22 +131,22 @@ fn console_html_request_section_wired() {
 
 #[test]
 fn console_html_request_table_columns_and_filters() {
-    // 9 列顺序与 design §8.2 逐项一致（时间/模型/协议/会话/状态/输入·输出/命中率/耗时/摘要）。
+    // 12 列顺序固定：时间/模型/协议/上游/会话/状态/输入·输出/命中率/耗时/TTFT/TPS/摘要。
     assert!(
         CONSOLE_HTML.contains(
-            "<th>时间</th><th>模型</th><th>协议</th><th>会话</th><th>状态</th>\n                <th class=\"num\">输入·输出</th><th class=\"num\">命中率</th><th class=\"num\">耗时</th><th>摘要</th>"
+            "<th>时间</th><th>模型</th><th>协议</th><th>上游</th><th>会话</th><th>状态</th>\n                <th class=\"num\">输入·输出</th><th class=\"num\">命中率</th><th class=\"num\">耗时</th><th class=\"num\">TTFT</th><th class=\"num\">TPS</th><th>摘要</th>"
         ),
-        "请求表头须为 9 列且顺序固定"
+        "请求表头须为 12 列且顺序固定"
     );
-    // 过滤器取值：protocol 有 chat/responses/messages/other，status 有
-    // 2xx/4xx/5xx/error，session 前缀 ≥4 字符提示，scope 有 会话/用户，limit 有 50/100/200。
+    // 过滤器取值：protocol 有 chat/responses/messages（`other` 随服务端 llm=1 过滤下线），
+    // status 有 2xx/4xx/5xx/error，session 前缀 ≥4 字符提示，scope 有 会话/用户，
+    // limit 有 50/100/200。
     for needle in [
         "id=\"req-model\"",
         "id=\"req-protocol\"",
         "<option value=\"chat\">chat</option>",
         "<option value=\"responses\">responses</option>",
         "<option value=\"anthropic\">messages</option>",
-        "<option value=\"passthrough\">other</option>",
         "id=\"req-status\"",
         "<option value=\"2xx\">2xx</option>",
         "<option value=\"4xx\">4xx</option>",
@@ -169,6 +169,24 @@ fn console_html_request_table_columns_and_filters() {
         CONSOLE_HTML.contains("if (r.session.length >= 4) q += '&session='"),
         "会话前缀须在 ≥4 字符时才作为查询参数发送"
     );
+    // 负向：协议过滤器只留服务端 llm=1 口径下的三种取值，`other`/`passthrough`
+    // 已随「只列真实 LLM 请求」下线，重新加回会让筛选结果为空。断言限定在该
+    // `<select>` 自身，避免命中注释/CSS 里的同名词。
+    let proto_start = CONSOLE_HTML
+        .find("id=\"req-protocol\"")
+        .expect("壳须含 req-protocol 过滤器");
+    let proto_rest = &CONSOLE_HTML[proto_start..];
+    let proto_end = proto_rest
+        .find("</select>")
+        .expect("req-protocol 须以 </select> 收尾");
+    let proto_select = &proto_rest[..proto_end];
+    for absent in ["other", "passthrough"] {
+        let option = format!("<option value=\"{absent}\">");
+        assert!(
+            !proto_select.contains(&option),
+            "请求协议过滤器不得再含已下线的 {option:?}: {proto_select}"
+        );
+    }
 }
 
 #[test]
@@ -231,7 +249,7 @@ fn console_html_range_change_refetches_visible_section() {
     for needle in [
         "} else if (!$('sec-events').hidden) {\n          reloadEventsOnce();",
         "} else if (!$('sec-commands').hidden) {\n          state.cmdOffset = 0;\n          reloadCommands(true);",
-        "restartStream();\n        if (!$('sec-requests').hidden) {\n          state.requests.offset = 0;\n          reloadRequests();",
+        "restartStream();\n        if (!$('sec-requests').hidden) {\n          state.requests.offset = 0;\n          reloadRequests(true);",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
     }
@@ -299,6 +317,68 @@ fn console_html_request_cells_use_escaping_helper() {
 }
 
 #[test]
+fn console_html_req_empty_cols_equals_header_column_count() {
+    // 空态行的 colspan 由 `REQ_EMPTY_COLS` 渲染，必须与 `#req-table` 表头列数
+    // 逐一相等：单改任一侧都会让空态行错位（左对齐到 9 列即漏掉后 3 列）。
+    const NEEDLE: &str = "var REQ_EMPTY_COLS = ";
+    let start = CONSOLE_HTML
+        .find(NEEDLE)
+        .expect("壳须含 REQ_EMPTY_COLS 字面量")
+        + NEEDLE.len();
+    let rest = &CONSOLE_HTML[start..];
+    let end = rest.find(';').expect("REQ_EMPTY_COLS 须以 ; 收尾");
+    let parsed: usize = rest[..end]
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("REQ_EMPTY_COLS 取值非法 {:?}: {e}", &rest[..end]));
+
+    let table_start = CONSOLE_HTML
+        .find("<table id=\"req-table\">")
+        .expect("壳须含 #req-table");
+    let table_rest = &CONSOLE_HTML[table_start..];
+    let head_start = table_rest.find("<thead>").expect("请求表须有 thead");
+    let head_rest = &table_rest[head_start..];
+    let head_end = head_rest.find("</thead>").expect("请求表 thead 须闭合");
+    let row_start = head_rest.find("<tr>").expect("请求表头须有行");
+    let th_count = head_rest[row_start..head_end].matches("<th").count();
+
+    assert_eq!(
+        parsed, th_count,
+        "REQ_EMPTY_COLS 须等于 #req-table 表头列数（否则空态行 colspan 与表头错位）"
+    );
+    assert_eq!(th_count, 12, "请求表头须为 12 列: {th_count}");
+}
+
+#[test]
+fn console_html_sync_poll_clears_timer_when_section_hidden_or_toggle_off() {
+    // `syncPoll` 是切分区/切 Live 时唯一启停轮询定时器的入口：want 为假时必须
+    // 走 clearInterval 分支，否则切走后定时器继续在后台取数。
+    let start = CONSOLE_HTML
+        .find("function syncPoll() {")
+        .expect("壳须含 syncPoll");
+    let rest = &CONSOLE_HTML[start..];
+    let end = rest.find("\n  }\n").expect("syncPoll 须以标准缩进收尾");
+    let body = &rest[..end];
+
+    for needle in [
+        "$('sec-requests').hidden && state.reqLive",
+        "$('sec-commands').hidden && state.cmdLive",
+        "if (state.pollTimer === null) state.pollTimer = setInterval(pollTick, POLL_MS);",
+        "clearInterval(state.pollTimer);",
+        "state.pollTimer = null;",
+    ] {
+        assert!(body.contains(needle), "syncPoll 须含 {needle:?}: {body}");
+    }
+    // 清除分支必须挂在 else 上：want 为真时不得顺手清掉刚建好的定时器。
+    assert!(
+        body.contains(
+            "} else if (state.pollTimer !== null) {\n      clearInterval(state.pollTimer);"
+        ),
+        "syncPoll 的 clearInterval 须仅在不该轮询时执行: {body}"
+    );
+}
+
+#[test]
 fn console_request_row_model_executes_in_node() {
     const START: &str = "/* @veil-testable:start */";
     const END: &str = "/* @veil-testable:end */";
@@ -320,6 +400,13 @@ fn console_request_row_model_executes_in_node() {
     let esc_rest = &CONSOLE_HTML[esc_pos..];
     let esc_end = esc_rest.find("\n  }\n").expect("esc 函数须以标准缩进收尾") + "\n  }\n".len();
     let esc_src = &esc_rest[..esc_end];
+    // `fmtMs` 同在该块之外：抽出真身而非在垫片里重写，否则格式化口径被改写也测不出来。
+    let ms_pos = CONSOLE_HTML
+        .find("function fmtMs(v) {")
+        .expect("壳须含 fmtMs 助手");
+    let ms_rest = &CONSOLE_HTML[ms_pos..];
+    let ms_end = ms_rest.find("\n  }\n").expect("fmtMs 须以标准缩进收尾") + "\n  }\n".len();
+    let ms_src = &ms_rest[..ms_end];
 
     let node_ready = std::process::Command::new("node")
         .arg("--version")
@@ -350,17 +437,12 @@ function makeDoc() {{
 }}
 var document = makeDoc();
 {esc_src}
+{ms_src}
 function fmtNum(n) {{
     if (n == null || n === '') return '—';
     var x = Number(n);
     if (!isFinite(x)) return '—';
     return String(x);
-}}
-function fmtMs(v) {{
-    if (v == null) return '—';
-    var x = Number(v);
-    if (!isFinite(x)) return '—';
-    return Math.round(x) + ' ms';
 }}
 function fmtFullTs(ts) {{
     if (ts == null || ts === '') return '';
@@ -372,6 +454,7 @@ var out = {{}};
 var r = requestRowModel({{ ts_secs: 1700000000, model: '<img src=x onerror=alert(1)>', protocol: 'chat',
   prompt_tokens: 1024, completion_tokens: 256, cache_hit_rate: 0.75, cache_write_rate: 0.125,
   latency_ms: 812, session_id: '9f2c8a1b4d5e6f70', session_source: 'cache_key', session_scope: 'session',
+  upstream: 'api.example.ai:443', ttft_ms: 812, tps: 25.4,
   summary: '<script>x</script>' }});
 out.model = r.model;
 out.session = r.session;
@@ -381,13 +464,25 @@ out.io = r.io;
 out.hit = r.hit;
 out.hitTitle = r.hitTitle;
 out.latency = r.latency;
+out.upstream = r.upstream;
+out.upstreamShort = r.upstreamShort;
+out.ttft = r.ttft;
+out.tps = r.tps;
 out.summary = r.summary;
+var longUp = requestRowModel({{ upstream: 'upstream.internal.example.corp:11434' }});
+out.long_upstream = longUp.upstream;
+out.long_upstream_short = longUp.upstreamShort;
 var nul = requestRowModel({{ ts_secs: 1, cache_hit_rate: null, status: null, error_kind: 'upstream_unreachable',
-  prompt_tokens: 0, completion_tokens: 0, latency_ms: 0, session_id: null, session_scope: 'none' }});
+  prompt_tokens: 0, completion_tokens: 0, latency_ms: 0, session_id: null, session_scope: 'none',
+  upstream: null, ttft_ms: null, tps: null }});
 out.null_hit = nul.hit;
 out.null_status = nul.status;
 out.null_session = nul.session;
 out.null_scope = nul.scope;
+out.null_upstream = nul.upstream;
+out.null_upstream_short = nul.upstreamShort;
+out.null_ttft = nul.ttft;
+out.null_tps = nul.tps;
 var escModel = esc('<img src=x onerror=alert(1)>');
 out.esc_model = escModel;
 out.esc_has_img = escModel.indexOf('<img') >= 0;
@@ -422,11 +517,30 @@ console.log(JSON.stringify(out));
     assert_eq!(verdict["hit"], "75.0%");
     assert_eq!(verdict["hitTitle"], "缓存写比率 12.5%");
     assert_eq!(verdict["latency"], "812 ms");
+    assert_eq!(verdict["upstream"], "api.example.ai:443");
+    assert_eq!(
+        verdict["upstreamShort"], "api.example.ai:443",
+        "不超 18 字符的上游 authority 须原样展示"
+    );
+    assert_eq!(
+        verdict["long_upstream"], "upstream.internal.example.corp:11434",
+        "title 用的完整上游值不得被截断"
+    );
+    assert_eq!(
+        verdict["long_upstream_short"], "upstream.…rp:11434",
+        "超 18 字符的上游须中段省略为 truncMiddle(upstream, 18)"
+    );
+    assert_eq!(verdict["ttft"], "812 ms", "TTFT 须走 fmtMs 口径");
+    assert_eq!(verdict["tps"], "25.4 tok/s", "TPS 须保留一位小数");
     assert_eq!(verdict["summary"], "<script>x</script>");
     assert_eq!(verdict["null_hit"], "—");
     assert_eq!(verdict["null_status"], "upstream_unreachable");
     assert_eq!(verdict["null_session"], "");
     assert_eq!(verdict["null_scope"], "");
+    assert_eq!(verdict["null_upstream"], "", "上游缺失须为空串入口径");
+    assert_eq!(verdict["null_upstream_short"], "");
+    assert_eq!(verdict["null_ttft"], "—", "TTFT 不可测须为占位符而非空串/0");
+    assert_eq!(verdict["null_tps"], "—", "TPS 不可测须为占位符而非空串/0");
     // XSS：模型原文可流出模型层，但经 esc() 后不得再含可执行的标签起始。
     assert_eq!(verdict["esc_has_img"], false, "esc 输出不得含 <img");
     assert_eq!(verdict["esc_has_script"], false, "esc 输出不得含 <script");
@@ -524,6 +638,63 @@ fn console_html_honors_retry_after_backoff() {
 }
 
 #[test]
+fn console_html_poll_budget_guards() {
+    // 管理面通用桶 10 次/分钟：轮询取数间隔须为 30 秒（单分区稳态 2 次/分钟），
+    // 后台标签页不取数；同分区上一轮未落地时不得叠加第二个同源请求；
+    // 429 无 Retry-After 时仍至少退避一个轮询间隔，否则下一拍立刻重撞。
+    for needle in [
+        "var POLL_MS = 5000;",
+        "var POLL_MIN_GAP_MS = 30000;",
+        "if (document.visibilityState !== 'visible') return;",
+        "reqBusy: false, cmdBusy: false,",
+        "if (state.reqBusy) return;",
+        "if (state.cmdBusy) return;",
+        "state.reqBusy = false;",
+        "state.cmdBusy = false;",
+        "var ra = (err.retryAfter > 0) ? err.retryAfter * 1000 : POLL_MIN_GAP_MS;",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    // 手动路径不得被飞行中的上一轮静默丢弃：排队一次重跑（轮询路径仍无 force）。
+    for needle in [
+        "function reloadRequests(force) {",
+        "if (state.reqBusy) { r.pending = true; return; }",
+        "if (r.pending) { r.pending = false; reloadRequests(true); }",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    // SSE 回退轮询的指标 429 分支同样按 POLL_MIN_GAP_MS 兜底退避。
+    assert_eq!(
+        CONSOLE_HTML
+            .matches("var ra = (err.retryAfter > 0) ? err.retryAfter * 1000 : POLL_MIN_GAP_MS;")
+            .count(),
+        3,
+        "请求/命令/回退指标三个 429 分支须共用同一兜底退避"
+    );
+}
+
+#[test]
+fn console_html_polling_keeps_single_request_endpoints() {
+    // 轮询不得另立取数点：两个端点字面量各自唯一，且仍走 reloadRequests/reloadCommands。
+    assert_eq!(
+        CONSOLE_HTML.matches("'/_admin/requests?range='").count(),
+        1,
+        "`/_admin/requests` 的取数点须唯一"
+    );
+    assert_eq!(
+        CONSOLE_HTML.matches("/_admin/commands?range=").count(),
+        1,
+        "`/_admin/commands` 的取数点须唯一"
+    );
+    for needle in [
+        ">= POLL_MIN_GAP_MS) reloadRequests();",
+        ">= POLL_MIN_GAP_MS) reloadCommands();",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+}
+
+#[test]
 fn console_html_self_contained_and_wired_to_sse() {
     for needle in [
         "<!DOCTYPE html",
@@ -608,7 +779,7 @@ fn console_html_layout_toolbar_grouping_and_pager_baseline() {
 
 #[test]
 fn console_html_layout_narrow_viewport_fallback() {
-    // 1024px 下筛选组 min-content ≈764px 而工具栏内宽仅 ≈682px：不放开组内折行必横向溢出。
+    // 1024px 下筛选组宽度远超工具栏内宽：不放开组内折行必横向溢出。
     for needle in [
         "@media (max-width: 1100px) {",
         ".tb-group { flex-wrap: wrap; }",
@@ -617,6 +788,73 @@ fn console_html_layout_narrow_viewport_fallback() {
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
     }
+}
+
+#[test]
+fn console_html_layout_request_filter_group_nowrap_above_1100() {
+    // 规范「在 >1100px 时组内控件 SHALL NOT 折行」：筛选组须靠收窄控件自身宽度在
+    // 1280px（面板内宽 ≈938px）下容身，MUST NOT 用媒体查询放开组内折行。
+    for needle in [
+        "#sec-requests .tb-group:not(.tb-pager) input,",
+        "#sec-requests .tb-group:not(.tb-pager) select { min-width: 0; }",
+        "#sec-requests .tb-group:not(.tb-pager) input { width: 110px; }",
+        "#sec-requests .tb-group:not(.tb-pager) select { width: 120px; }",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    assert!(
+        !CONSOLE_HTML.contains("max-width: 1440px)"),
+        "不得保留任何在 >1100px 放开组内折行的媒体查询"
+    );
+    // 动作控件移入分页组：`#req-apply` / `#req-live` 须位于 `.tb-group.tb-pager` 之内，
+    // 筛选组只剩 6 个过滤控件（组内 min-content 不再含按钮宽度）。
+    let pager = CONSOLE_HTML
+        .find("id=\"req-apply\"")
+        .and_then(|pos| CONSOLE_HTML[..pos].rfind("<div class=\"tb-group tb-pager\">"))
+        .expect("`#req-apply` 须位于请求分页组内");
+    let pager_block = &CONSOLE_HTML[pager..];
+    let pager_end = pager_block
+        .find("</div>\n          </div>")
+        .expect("分页组须以闭合标签收尾");
+    let pager_html = &pager_block[..pager_end];
+    for needle in [
+        "id=\"req-apply\"",
+        "id=\"req-live\"",
+        "id=\"req-prev\"",
+        "id=\"req-next\"",
+        "id=\"req-page-info\"",
+    ] {
+        assert!(
+            pager_html.contains(needle),
+            "请求分页组须含 {needle:?}: {pager_html}"
+        );
+    }
+}
+
+#[test]
+fn console_html_bucket_bounds_match_metrics_latency_bounds() {
+    // 漂移守卫：控制台延迟桶上界字面量与 `metrics::aggregate::LATENCY_BOUNDS_MS` 必须
+    // 逐元素相等，任一侧单改即 `cargo test` 失败（否则图表桶标签与服务端桶口径错位）。
+    const NEEDLE: &str = "var BUCKET_BOUNDS = [";
+    let start = CONSOLE_HTML
+        .find(NEEDLE)
+        .expect("壳须含 BUCKET_BOUNDS 字面量")
+        + NEEDLE.len();
+    let rest = &CONSOLE_HTML[start..];
+    let end = rest.find(']').expect("BUCKET_BOUNDS 须以 ] 收尾");
+    let console_bounds: Vec<u64> = rest[..end]
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("BUCKET_BOUNDS 元素非法 {part:?}: {e}"))
+        })
+        .collect();
+    assert_eq!(
+        console_bounds,
+        crate::service::metrics::aggregate::LATENCY_BOUNDS_MS.to_vec(),
+        "控制台 BUCKET_BOUNDS 须与服务端 LATENCY_BOUNDS_MS 逐元素一致"
+    );
 }
 
 #[test]
@@ -640,8 +878,9 @@ fn console_html_layout_dist_panel_equal_height() {
 #[test]
 fn console_html_layout_summary_column_is_elastic() {
     // 摘要列上限随视口弹性收缩；定长 + white-space:nowrap 的组合是上限生效的前提。
+    // 12 列表头后上限收到 8vw（≤240px），保证 1280px 下不横向溢出。
     assert!(
-        CONSOLE_HTML.contains("td.sum { max-width: clamp(140px, 20vw, 420px);"),
+        CONSOLE_HTML.contains("td.sum { max-width: clamp(96px, 8vw, 240px);"),
         "摘要列须为 clamp 弹性上限"
     );
     assert!(

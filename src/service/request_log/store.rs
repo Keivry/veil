@@ -33,6 +33,10 @@ use {
     },
 };
 
+mod schema;
+
+use schema::{INSERT_SQL, ensure_tables};
+
 /// 待写队列容量（满则丢最旧；design §3）。
 pub const REQUEST_QUEUE_CAP: usize = 4096;
 /// 单批最大行数（驱动提前触发条件）。
@@ -95,6 +99,13 @@ pub struct RequestRow {
     pub truncated_mode: Option<String>,
     /// 脱敏后摘要（`[redaction].enabled=false` 时恒 `None`）。
     pub req_summary: Option<String>,
+    /// 首 token 时延（毫秒）：请求起始 → 首个**生成 token**（内容或推理）真正下行。
+    /// **流式专属**：非流请求无逐 token 时间轴，恒 `None`（见
+    /// `handler/llm/pump/ttft.rs::carries_output_token` 与 `handler/llm/trace.rs`）。
+    pub ttft_ms: Option<u32>,
+    /// 输出 tokens/秒（`[首个生成 token .. 流结束]` 窗口内），保留一位小数；
+    /// 随 `ttft_ms` 不可测（含非流）时为 `None`。
+    pub tps: Option<f64>,
 }
 
 /// 状态类别过滤（`2xx|4xx|5xx|error`）。
@@ -132,6 +143,8 @@ pub struct RequestFilter {
     pub session_prefix: Option<String>,
     /// `Some(SessionScope::Session|User)` 过滤；`None` = any。
     pub scope: Option<super::session::SessionScope>,
+    /// 仅保留真实 LLM 请求（`is_chat = 1`）；默认 `false` = 不限。
+    pub llm_only: bool,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -390,63 +403,26 @@ pub fn cache_input_tokens(protocol: &str, prompt: u64, cached_read: u64, cached_
     }
 }
 
-/// 建表（幂等）：`llm_requests` + 两索引 + `request_model_rollup`。
-pub(crate) fn ensure_tables(conn: &rusqlite::Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS llm_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_secs INTEGER NOT NULL,
-            request_id TEXT NOT NULL,
-            protocol TEXT NOT NULL,
-            model TEXT NOT NULL,
-            upstream TEXT,
-            ingress_port INTEGER,
-            stream INTEGER NOT NULL,
-            is_chat INTEGER NOT NULL,
-            counted_metrics INTEGER NOT NULL,
-            status INTEGER,
-            error_kind TEXT,
-            latency_ms INTEGER NOT NULL,
-            prompt_tokens INTEGER NOT NULL,
-            completion_tokens INTEGER NOT NULL,
-            total_tokens INTEGER NOT NULL,
-            cached_read INTEGER NOT NULL,
-            cached_write INTEGER NOT NULL,
-            cache_input_tokens INTEGER NOT NULL,
-            session_id TEXT,
-            session_source TEXT NOT NULL,
-            session_scope TEXT NOT NULL,
-            upstream_id TEXT,
-            finish_reason TEXT,
-            truncated_mode TEXT,
-            req_summary TEXT);
-         CREATE INDEX IF NOT EXISTS idx_llm_requests_ts ON llm_requests(ts_secs DESC);
-         CREATE INDEX IF NOT EXISTS idx_llm_requests_session
-             ON llm_requests(session_id, ts_secs DESC);
-         CREATE TABLE IF NOT EXISTS request_model_rollup(
-            granularity TEXT NOT NULL,
-            window TEXT NOT NULL,
-            protocol TEXT NOT NULL,
-            model TEXT NOT NULL,
-            count INTEGER NOT NULL,
-            prompt INTEGER NOT NULL,
-            completion INTEGER NOT NULL,
-            total INTEGER NOT NULL,
-            cached_read INTEGER NOT NULL,
-            cached_write INTEGER NOT NULL,
-            cache_input INTEGER NOT NULL,
-            PRIMARY KEY(granularity, window, protocol, model));",
-    )?;
-    Ok(())
+/// 输出速率（tokens/秒），保留一位小数。
+///
+/// 窗口取「首 token 之后」：`latency_ms - ttft_ms`。**口径自洽**：`ttft_ms` 定格在
+/// 首个**生成 token**（内容或推理，见 `handler/llm/pump/ttft.rs::carries_output_token`），
+/// 故窗口是 `[首个生成 token .. 流结束]`；分子 `completion_tokens` 也是全部生成 token
+/// （含推理 token），两端口径一致，不因首 token 是推理而低估速率。
+/// 不可测时返回 `None`——无输出 token（`completion_tokens == 0`）、未记录首 token
+/// 时延（含非流请求，其 TTFT/TPS 恒 `None`）、或窗口为 0/负值。
+pub fn tokens_per_sec(
+    completion_tokens: u64,
+    latency_ms: u64,
+    ttft_ms: Option<u32>,
+) -> Option<f64> {
+    let ttft = ttft_ms?;
+    if completion_tokens == 0 || latency_ms <= u64::from(ttft) {
+        return None;
+    }
+    let window_secs = (latency_ms - u64::from(ttft)) as f64 / 1_000.0;
+    Some((completion_tokens as f64 / window_secs * 10.0).round() / 10.0)
 }
-
-const INSERT_SQL: &str = "INSERT INTO llm_requests(\
-     ts_secs, request_id, protocol, model, upstream, ingress_port, stream, is_chat, \
-     counted_metrics, status, error_kind, latency_ms, prompt_tokens, completion_tokens, \
-     total_tokens, cached_read, cached_write, cache_input_tokens, session_id, session_source, \
-     session_scope, upstream_id, finish_reason, truncated_mode, req_summary)\
-     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,\
-     ?22,?23,?24,?25)";
 
 const ROLLUP_UPSERT_SQL: &str = "INSERT INTO request_model_rollup(\
      granularity, window, protocol, model, count, prompt, completion, total, cached_read, \
@@ -542,6 +518,8 @@ fn write_batch_blocking(db_path: &Path, rows: &[RequestRow]) -> anyhow::Result<(
                 row.finish_reason,
                 row.truncated_mode,
                 row.req_summary,
+                row.ttft_ms.map(i64::from),
+                row.tps,
             ])?;
         }
     }
@@ -646,6 +624,11 @@ fn build_where(filter: &RequestFilter) -> (String, Vec<Value>) {
         clauses.push("session_scope = ?".to_string());
         values.push(Value::Text(scope.as_str().to_string()));
     }
+    // 非 LLM 记录为 `is_chat = 0`（`passthrough` 与非对话 `count_tokens` 均属此列），
+    // 故按判别位过滤，不得改用 `protocol != 'passthrough'`。
+    if filter.llm_only {
+        clauses.push("is_chat = 1".to_string());
+    }
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
@@ -679,7 +662,8 @@ fn query_blocking(db_path: &Path, filter: &RequestFilter) -> anyhow::Result<Requ
         "SELECT ts_secs, request_id, protocol, model, upstream, ingress_port, stream, is_chat, \
          counted_metrics, status, error_kind, latency_ms, prompt_tokens, completion_tokens, \
          total_tokens, cached_read, cached_write, cache_input_tokens, session_id, \
-         session_source, session_scope, upstream_id, finish_reason, truncated_mode, req_summary \
+         session_source, session_scope, upstream_id, finish_reason, truncated_mode, req_summary, \
+         ttft_ms, tps \
          FROM llm_requests{where_sql} ORDER BY ts_secs DESC, id DESC LIMIT ? OFFSET ?"
     ))?;
     let rows = stmt
@@ -742,6 +726,10 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
         finish_reason: row.get(22)?,
         truncated_mode: row.get(23)?,
         req_summary: row.get(24)?,
+        ttft_ms: row
+            .get::<_, Option<i64>>(25)?
+            .and_then(|v| u32::try_from(v).ok()),
+        tps: row.get(26)?,
     })
 }
 

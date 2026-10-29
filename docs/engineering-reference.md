@@ -70,7 +70,8 @@
 | `auth.matrix_access_token` | `MATRIX_ACCESS_TOKEN` | string | Matrix Bot access token；密钥类（须 0600）；概念可选（缺失即关闭 Matrix 通知/审批） |
 | `auth.observability_admin_token` | `OBSERVABILITY_ADMIN_TOKEN` | string | `/_admin` 鉴权 token，建议 ≥32 字符且不得与 Matrix token 相同；密钥类（须 0600）；概念可选（缺失即 `/_admin*` 全 404） |
 | `auth.observability_disable` | `OBSERVABILITY_DISABLE` | bool | `true` → `/_admin*` 全 404 |
-| `limits.audit_hold_max_bytes` | `AUDIT_HOLD_MAX_BYTES` | integer | 审计 hold 字节上限；≥1 |
+| `limits.audit_hold_max_bytes` | `AUDIT_HOLD_MAX_BYTES` | integer | 审计 hold 字节上限（参数载荷累计）；≥1，默认 1MiB |
+| `limits.audit_hold_max_frames` | `AUDIT_HOLD_MAX_FRAMES` | integer | 审计 hold 暂存 tool 缓冲帧数上限；≥1，默认 65536 |
 | `limits.nonstream_max_bytes` | `NONSTREAM_MAX_BYTES` | integer | 非流对话响应体上限；≥1 |
 | `limits.sse_frame_hard_bytes` | `SSE_FRAME_HARD_BYTES` | integer | SSE 单行/单事件硬上限；≥1（默认 8MiB，超限 fail-closed） |
 | `audit.mode` | `AUDIT_MODE` | enum `off`/`block`/`approve` | 见上方审计 mode 层级；`approve` 须配 `approval_whitelist` |
@@ -104,16 +105,16 @@
 | `pii_scope.mode` | `PII_SCOPE_MODE` | enum `request`/`conversation` | 会话级关联开关 |
 | `pii_scope.ttl_secs` | `PII_SCOPE_TTL_SECS` | integer | 会话条目空闲 TTL 秒；≥1 |
 | `pii_scope.max_conversations` | `PII_SCOPE_MAX_CONVERSATIONS` | integer | 会话条目上限；≥1 |
-| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名；保留名拒启动 |
+| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名（最高优先；其后**PII 专用窄链** `x-opencode-session` → `x-opencode-session-id`，刻意不含 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，见 §6）；保留名拒启动 |
 | `pii_scope.prev_id_max_entries` | `PII_PREV_ID_MAX_ENTRIES` | integer | `previous_response_id` 映射上限；缺省联动 `max_conversations` |
 | `llm.default_upstream` | `LLM_UPSTREAM` | string | 缺省上游 URL |
 | `llm.timeout_secs` | `HTTP_TIMEOUT_SECS` | integer | 非流/Dialog 上游整体超时秒；≥1 |
 | `llm.pool_max_idle_per_host` | `HTTP_POOL_MAX_IDLE_PER_HOST` | integer | 每主机空闲连接上限；≥1 |
 | `llm.pool_idle_timeout_secs` | `HTTP_POOL_IDLE_TIMEOUT_SECS` | integer | 空闲连接保活秒；≥1 |
-| `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16 |
+| `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16；每个端口键各派生一条专用监听（见「端口语义」子节） |
 | `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标键、硬拒清单、保留键与三段语义见下 |
 | `command` | `（文件专属）` | table（命令配置分节） | 下游命令执行配置（文件专属，无 env 对应源）；schema 与行为见 command-api 规格 |
-| `server` | `（文件专属）` | table（`bind` → 监听地址） | 监听地址（文件专属，无 env 对应源）：`bind` 须为 `IP:PORT` 字面量（不接受主机名）；缺省 `127.0.0.1:8877`，容器内写 `0.0.0.0:8877` |
+| `server` | `（文件专属）` | table（`bind` → 监听地址） | 主监听地址（文件专属，无 env 对应源）：`bind` 须为 `IP:PORT` 字面量（不接受主机名）；缺省 `127.0.0.1:8877`，容器内写 `0.0.0.0:8877`。已声明上游端口在此 IP 上另开专用监听（见「端口语义」子节） |
 | `keepass.backend` | `VEIL_KEEPASS_BACKEND` | enum `real`/`mock` | `mock` 仅 CI 逃生（生产禁用） |
 
 **[llm.targets] 上游覆盖（文件专属分节，无 env 对应源；未声明时零行为变化）**
@@ -174,18 +175,31 @@
 `CREDENTIAL_MASTER_PASSWORD`、`CREDENTIAL_PORT`、`ENV`、
 `ALLOW_LOOPBACK_NO_TOKEN`、`CREDENTIAL_API_PORT`、`CREDENTIAL_ADMIN_TOKEN`、`AUDIT_ENABLED`。
 
-### 端口语义：单端口运行时 vs compose 三端口映射
+### 端口语义：主监听 + 每上游一条专用监听
 
-**容器内单监听，不存在多端口运行时。**
+**主监听一条，另有若干专用 LLM 监听，全部由同一进程承载。**
 
-- 单进程单监听：二进制与容器内均只监听 `127.0.0.1:8877` 一个端口（见 `src/main.rs`），
-  凭据 API 与 LLM 代理共用该端口（LLM 按路径透传）；不存在多端口运行时。
-- compose 三映射宿主机入口区分：三条映射（宿主机 `PORT_887x` → 容器 `8877`）只是宿主机入口区分；
-  `LLM_8878`/`LLM_8879` 按入口宿主机端口选择上游，`LLM_UPSTREAM` 为缺省上游。宿主机端口可经
-  `PORT_8877/8878/8879` 覆盖，回环绑定不变。
-- 选路上游缺省唯一生效：`resolve_upstream(None)` 恒返回 `LLM_UPSTREAM` 缺省上游（未设则取端口升序
-  首个 `LLM_<port>` 并 warn，序确定不依赖 `HashMap` 迭代），不按端口猜测；`LLM_8878`/`LLM_8879`
-  仅在携带入口宿主机端口上下文时生效。当前行为由 `resolve_upstream` 单测锁定。
+- 主监听：`[server].bind` 一个地址，承载凭据 API、管理面与 LLM 代理（含按 `Host` 头选路）；
+  绑定失败仍为致命错误（启动即退出）。
+- 专用 LLM 监听：对 `[llm.upstreams]` 的每个端口键与 `[llm.targets]` 的每个端口目标键，
+  在 `[server].bind` 的 IP 上额外绑定同号端口（排除与主监听重复者，升序去重）。
+  某端口是否「已声明」只由 `Config::declares_port` 判定，监听派生
+  （`Config::dedicated_listener_addrs`）与请求期选路复用同一判定，两处不会漂移。
+- 每条监听服务同一份 `build_router`：`AppState`、鉴权、管理面与 SSE 行为逐项一致，
+  差别只有请求进入时注入的 `IngressPort` 扩展（承载端口）。
+- 选路优先级：**已声明的专用监听端口 > `Host` 头派生端口 > `None`（缺省上游）**。
+  专用监听端口恒胜冲突的 `Host` 头；旧部署（宿主机 8878/8879 映射到容器 8877）的请求
+  落在主监听上、无专用端口，仍按 `Host` 照常工作。
+- 请求日志的 `ingress_port` 记录上述**生效**选路端口，而非原始 `Host` 端口。
+- 专用监听绑定失败不中止启动：`warn` 指名地址、上游 URL 与「该端口的 LLM 入口不可用，
+  其余入口不受影响」，继续服务其余监听。主监听失败仍为致命错误。
+- 优雅停机：`SIGINT`/`SIGTERM` 经 `tokio::sync::watch` 广播到全部监听，
+  `serve` 各自优雅退出后统一 await 收敛，随后才执行一次刷盘与 `notify.shutdown()`。
+- 选路上游缺省唯一生效：`resolve_target(None)` 恒返回缺省上游（未设则取端口升序
+  首个 `LLM_<port>` 并 warn，序确定不依赖 `HashMap` 迭代），不按端口猜测。
+- compose 三映射：`127.0.0.1:8877`（凭据 API）、`127.0.0.1:8878`、`127.0.0.1:8879`，
+  后两条映射到容器内同名端口（与专用监听一一对应，宿主机端口可经 `PORT_8878/8879` 覆盖）；
+  `docker-compose.yml` 只发布这三条，`Dockerfile` `EXPOSE 8877 8878 8879`。
 
 ### 管理控制台说明（三段静态资产）
 
@@ -249,8 +263,8 @@ docker compose up -d --build
 
 - `./veil.toml` 须先存在（缺失时会以目录形态挂载、配置加载拒启动）；两 token 可缺省：缺省即关闭对应功能（启动期 warn）。
 
-- 三端口默认仅回环：`127.0.0.1:8877`（凭据 API）、`127.0.0.1:8878`、`127.0.0.1:8879`（LLM 代理入口）。
-  容器内服务固定监听 8877，三条映射均指向该端口；宿主机端口可经环境变量覆盖，
+- 三端口默认仅回环：`127.0.0.1:8877`（凭据 API + LLM 代理）、`127.0.0.1:8878`、`127.0.0.1:8879`（LLM 专用入口）。
+  后两条在容器内映射到同名端口（各有独立监听，见「端口语义」子节），宿主机端口可经环境变量覆盖，
   回环绑定语义保持：`PORT_8877=19077 PORT_8878=19078 PORT_8879=19079 docker compose up -d`。
 - 数据卷约定：`${DATA_DIR:-./data}:/data` 父卷在前，`/data/tpm` 与 `/data/db` 只读子卷在后。
 - 默认不监听公网地址；外部访问必须经 TLS 反代。
@@ -612,7 +626,8 @@ veilctl revoke --name "check-mail"
 ### 6.10 非法审计值拒启动
 
 - 审计模式来源为配置文件 `[audit].mode`（另有 `[audit].policy_file` 所指策略文件的 `mode` 兜底，见 §6.11）；遗留 `AUDIT_ENABLED` 不被读取，置位仅启动期 `warn`、不改变生效模式。
-- `[audit].timeout`（须 ≥1 且避开 `110-130` 竞态区间）与 `[limits].audit_hold_max_bytes`（须 ≥1 正整数）取值非法时拒启动，启动错误信息给出合法区间；不静默回落（fail-closed，防静默关闭审计）。
+- `[audit].timeout`（须 ≥1 且避开 `110-130` 竞态区间）与 `[limits].audit_hold_max_bytes`/`[limits].audit_hold_max_frames`（均须 ≥1 正整数）取值非法时拒启动，启动错误信息给出合法区间；不静默回落（fail-closed，防静默关闭审计）。
+- 审计 hold 的四个有界维度各自独立判定、任一超限即 fail-closed 阻断（`[blocked: audit-hold-overflow]`）：① 载荷字节——缓冲帧只按**参数载荷**（真正进审计的 `arguments` 文本）计费，`total_bytes` 与缓冲载荷**共享同一 `audit_hold_max_bytes` 上限但各自判超、不求和**，确保 1MiB 配置即 1MiB 可用；② 帧数——`[limits].audit_hold_max_frames`（默认 65536），与字节维度并行，单个大 tool 调用即使分片上万帧（参数总量仍在字节预算内）也不得被判为洪泛；③ 零载荷帧——载荷为 0 的帧不增字节，另设固定 4096 帧上限约束其洪泛；④ 信封字节——SSE 前缀 + JSON 外壳单独成账，受固定 8MiB 预算约束，**不占用**载荷预算（旧实现把整帧计入载荷预算，几千个合法分片的信封即独吞整份 1MiB，是本缺陷成因）。聚合槽条目（`args_by_index`/`responses_slots`）仍固定受 `AUDIT_HOLD_MAX_ENTRIES`（4096）约束，与该配置键无关。
 
 ### 6.11 审计策略文件 fail-closed
 
@@ -893,7 +908,19 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   还原确定性**、凭据占位符稳定性、零明文常驻、网关重启后 token 稳定、键推导含糊时的任何行为。
 - 前置条件（会话级缓存友好**当且仅当**会话键成功推导时成立）：键按四级优先级首个命中者胜——
   ① 客户端显式头 `[pii_scope].key_header`（默认 `x-veil-conversation-id`，≤256 字节，且经租户命名空间
-  + HMAC，原始值绝不作键）；② 协议原生键（**按协议白名单，不跨协议接受**：仅 Chat/Responses 的
+  + HMAC，原始值绝不作键）；配置头缺席或取值为空串时，按大小写不敏感的
+  **PII 专用窄链**（`src/service/request_log/session.rs::resolve_pii_scope_header`）继续取首个非空头值：
+  `x-opencode-session` → `x-opencode-session-id`。
+  **该链刻意窄于请求日志的遥测链**（见 §7）：`x-opencode-parent-session-id`（指向父会话，非本会话身份）、
+  `x-session-affinity`（路由/亲和性提示，常为固定常量或跨客户端共享）、`x-session-id`（过于通用，代理/
+  sidecar 常自行注入同一值）**一律不参与 PII 键推导**。原因是 PII 作用域的隔离边界只剩会话键值本身：
+  上游 API key 由 `[llm.targets].headers` 注入时客户端不带凭据头，`tenant_fingerprint` 对所有客户端取值
+  相同；若纳入上述基础设施头，两个逻辑客户端会落到同一会话键、共享同一 `PiiScope` 占位符注册表，
+  一方的明文可被还原进另一方响应。**两条链 MUST NOT 重新合并。**
+  已知取舍：客户端若只发 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，日志仍有
+  `session_id`，但 PII 作用域退化为逐请求（按第 4 级降级计数）——宁可损失跨轮 token 稳定，也不让共享头
+  把两个客户端并进同一作用域；
+  ② 协议原生键（**按协议白名单，不跨协议接受**：仅 Chat/Responses 的
   `prompt_cache_key`、仅 Responses 的 `previous_response_id`；Anthropic MUST NOT 接受二者、Chat MUST NOT
   接受 `previous_response_id`；协议不匹配的原生字段**静默忽略**——不命中第 2 级、不改变第 3/4 级
   推导结果、不告警、不计数）；③ 稳定前缀（**要求 `tools` +
@@ -920,10 +947,17 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   说明、前缀字节较前一轮增长（合法增长，非缓存失稳缺陷）。与 §7.7 同口径。
 - 会话键头剔除与保留名校验：会话键头的剔除为**无条件**——独立于 `[pii_scope].mode`
   （默认 `request` 模式同样剔除）且覆盖任意自定义非 `x-veil-` 头名
-  （`src/handler/llm/dispatch.rs::strip_conversation_header`）；其名与值 MUST NOT 转发上游或入日志。
+  （`src/handler/llm/dispatch.rs::strip_session_headers`）；其名与值 MUST NOT 转发上游或入日志。
+  剔除范围是**整条会话头链**：配置头 + 五个内置回退名（`x-opencode-session`、
+  `x-opencode-session-id`、`x-opencode-parent-session-id`、`x-session-affinity`、`x-session-id`，
+  大小写不敏感），与前文 PII 窄链是否命中无关——否则按请求形状会形成变化的泄漏路径。
+  单名剔除函数 `strip_conversation_header` 保留给单独剔除自定义头的调用点，返回值仍只反映
+  「配置头是否被剔除」（既有调用方/日志信号不变）。
   `[pii_scope].key_header` 在启动期做**保留名校验**（fail-closed）：命中真实鉴权/传输头名
   （`authorization`/`x-api-key`/`api-key`/HOP 集/`host`/`content-length`/`content-encoding`/
   `accept-encoding`，大小写不敏感）拒启动；除保留名外的任意自定义名 SHALL 被接受，安全性由**无条件剔除**保证（转发前剥离、不入上游请求头与日志，无需额外 allow-list）。
+  内置回退链头名（`x-opencode-session` 等五个）仅为**读取**来源，不改变转发剔除以外的
+  既有转发语义；它们不参与保留名校验（配置里写这些名仍被接受）。
 - 熵源故障 fail-closed：PII 注册失败区分两类——待注册值**本身即 token 形态/保留前缀**时
   静默跳过（既有语义，不替换、不改写、不失败）；`rand8` 的 `OsRng` **熵源/内部故障**时记 `warn!`
   （不含明文/token/键/头值）并计入指标，且**拒绝以未脱敏正文转发上游**：请求以 HTTP `502` + 错误码
@@ -1195,9 +1229,15 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 本表只存元数据与脱敏摘要，不存请求/响应正文；`upstream` 只记 `host:port`。
 
 `session_id` 取九档优先级中首个命中的会话锚点做 HMAC 摘要（保留 16 hex），来源依次为显式头
-（`[pii_scope].key_header`）、Responses `conversation`、`previous_response_id`、
+（`[pii_scope].key_header`，缺席或空串时按**遥测链** `resolve_session_header` 依次尝试
+`x-opencode-session` → `x-opencode-session-id` → `x-opencode-parent-session-id` →
+`x-session-affinity` → `x-session-id` 取首个非空值，来源仍记为 `header`）、Responses `conversation`、`previous_response_id`、
 `diagnostics.previous_message_id`、`prompt_cache_key`、`metadata.user_id`、`safety_identifier`、
 `user`、无；原始值不落库。摘要域串与 `conversation_key` 不同，同一原文两条路径结果不等。
+**本链只服务遥测**：PII 会话作用域键用更窄的 `resolve_pii_scope_header`（仅配置头 +
+`x-opencode-session`/`x-opencode-session-id`，理由见 §6），故同一请求的 `session_id` 与 PII 分桶
+可能不同源——日志仍记会话标识，而仅发 `x-session-affinity`/`x-session-id` 的请求在 PII 侧落逐请求。
+两条链 MUST NOT 合并。
 未设 `PII_VALUE_SAMPLE_HMAC_KEY` 时该列为 `NULL`、`session_scope` 为 `none`，不退化为无密钥哈希。
 `session_scope` 区分会话级（前五档）与用户级（第六至八档），供 `/_admin/requests?scope=` 过滤。
 
@@ -1249,6 +1289,21 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 - 范围级：`hit_rate = sum_cached_read / sum_cache_input_tokens`，即先分别求和再相除，
   **绝不对逐请求比率取平均**（分母为零的行会让平均失真，且求和口径才与计费侧可对账）。
 - 分母为 `0` 时比率为 `null`，由调用方/前端渲染为 `—`。
+
+**`ttft_ms` / `tps`（流式专属）**：
+
+- `ttft_ms` = 请求起始 → **首个生成 token 真正下行**，由
+  `src/handler/llm/pump/ttft.rs::carries_output_token` 单一判定：只认承载 token 文本的帧，
+  协议簿记帧（Anthropic `message_start`/`content_block_start`、Responses `response.created`/
+  `response.in_progress`/`response.output_item.added`、Chat 仅带 `role` 的增量）与
+  signature/citation/工具参数增量一律不定格，否则 TTFT 退化为首字节时延。
+- 推理 token 视同生成 token（`completion_tokens` 含推理）：Chat `delta.reasoning_content`/
+  `reasoning`、Anthropic `thinking_delta`、Responses `response.reasoning_text.delta` 均定格。
+- `tps = completion_tokens / ((latency_ms - ttft_ms)/1000)`，窗口 `[首个生成 token .. 流结束]`，
+  分子为全部生成 token，两端口径自洽。
+- **非流请求恒为 `null`**：响应体一次性读完、无逐 token 时间轴；若拿整体生成耗时当 TTFT，
+  分母只剩毫秒级残差，会算出数万 tok/s 的假值。`latency_ms` 与 token 计数照常填充。
+- 纯工具调用流（无任何 token 文本帧）同样 `ttft_ms = null`、`tps = null`。
 
 ## 8. 遗留决策记录
 

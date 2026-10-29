@@ -42,7 +42,13 @@ fn service_production_prefix_axum_whitelist() {
     let axum_token = ["axum", "::"].concat();
     let axum_http = ["axum", "::http::"].concat();
     let cfg_test = ["#[cfg", "(test)]"].concat();
-    let allow = ["llm_gateway/hop.rs", "llm_gateway/mod.rs"];
+    // `request_log/session.rs`：会话头解析需要按头名读取入站头，只用纯数据
+    // `axum::http::HeaderMap`（无 `State`/handler 依赖），符合本白名单用途。
+    let allow = [
+        "llm_gateway/hop.rs",
+        "llm_gateway/mod.rs",
+        "request_log/session.rs",
+    ];
     for path in files {
         let rel = path
             .strip_prefix(&root)

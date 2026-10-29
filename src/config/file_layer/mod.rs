@@ -150,6 +150,7 @@ pub struct AuthSection {
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
     pub audit_hold_max_bytes: Option<i64>,
+    pub audit_hold_max_frames: Option<i64>,
     pub nonstream_max_bytes: Option<i64>,
     pub sse_frame_hard_bytes: Option<i64>,
 }
@@ -272,6 +273,11 @@ const MAPPINGS: &[MappingDef] = &[
         "limits.audit_hold_max_bytes",
         "AUDIT_HOLD_MAX_BYTES",
         &["AUDIT_HOLD_MAX_BYTES"],
+    ),
+    env(
+        "limits.audit_hold_max_frames",
+        "AUDIT_HOLD_MAX_FRAMES",
+        &["AUDIT_HOLD_MAX_FRAMES"],
     ),
     env(
         "limits.nonstream_max_bytes",

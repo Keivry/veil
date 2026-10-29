@@ -86,7 +86,7 @@ pub(super) async fn apply_pre_emit_guards(
                 );
                 let err_obj = responses_error_object(parsed);
                 // 合成终端前先 flush 待发帧，保证末段增量先下行。
-                if flush_pre_terminal(&mut state.agg, &env.pump_tx, &env.metrics).await {
+                if flush_pre_terminal(&mut state.agg, &env.pump_tx, &env.metrics, &env.ttft).await {
                     state.forwarded += 1;
                     state.terminator.note_frame_sent();
                 }

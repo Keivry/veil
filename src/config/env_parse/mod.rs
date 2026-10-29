@@ -58,6 +58,12 @@ pub const AUDIT_TIMEOUT_RACE_MIN: i64 = 110;
 pub const AUDIT_TIMEOUT_RACE_MAX: i64 = 130;
 /// `AUDIT_HOLD_MAX_BYTES` 默认值。
 pub const AUDIT_HOLD_MAX_BYTES_DEFAULT: i64 = 1_048_576;
+/// `AUDIT_HOLD_MAX_FRAMES` 默认值：`audit_hold_on` 下暂存的 tool 帧数上限。
+///
+/// 与字节上限分属不同维度：单次大 tool 调用的参数按 token 分片时可达数千帧
+/// （每帧参数仅数字节），只按字节记账会让帧数维度先行触顶；故帧数单独可配，
+/// 默认值取「远超合法长流、又能在异常洪泛下收敛」的 65536。
+pub const AUDIT_HOLD_MAX_FRAMES_DEFAULT: i64 = 65_536;
 /// 管理 token 建议最小长度，不足仅告警不断链。
 pub const ADMIN_TOKEN_MIN_LEN: usize = 32;
 /// 通用网关 ingress JSON 上限 10MB（检查点：`handler::llm` 入口 `to_bytes`；
@@ -180,6 +186,8 @@ pub struct Config {
     pub audit_timeout_secs: i64,
     pub approval_whitelist: Vec<String>,
     pub audit_hold_max_bytes: i64,
+    /// 审计 hold 暂存 tool 帧数上限（`[limits].audit_hold_max_frames`，默认 65536）。
+    pub audit_hold_max_frames: i64,
     /// 非流对话响应体上限（`NONSTREAM_MAX_BYTES`，默认 8MB；严格超限 502）。
     pub nonstream_max_bytes: usize,
     /// SSE 单行/单事件硬上限（`SSE_FRAME_HARD_BYTES`，默认 8MiB；超限 fail-closed）。
@@ -343,6 +351,7 @@ impl Config {
         } = load_auth(&get)?;
         let LimitParts {
             audit_hold_max_bytes,
+            audit_hold_max_frames,
             nonstream_max_bytes,
             sse_frame_hard_bytes,
         } = load_limits(&get)?;
@@ -409,6 +418,7 @@ impl Config {
             audit_timeout_secs,
             approval_whitelist,
             audit_hold_max_bytes,
+            audit_hold_max_frames,
             nonstream_max_bytes,
             sse_frame_hard_bytes,
             data_dir,
@@ -533,6 +543,7 @@ fn load_auth(get: &dyn Fn(&str) -> Option<String>) -> Result<AuthParts> {
 /// 限额域：限额早于审计模式解析，错误顺序与原实现一致。
 struct LimitParts {
     audit_hold_max_bytes: i64,
+    audit_hold_max_frames: i64,
     nonstream_max_bytes: usize,
     sse_frame_hard_bytes: usize,
 }
@@ -543,6 +554,11 @@ fn load_limits(get: &dyn Fn(&str) -> Option<String>) -> Result<LimitParts> {
             get,
             "AUDIT_HOLD_MAX_BYTES",
             AUDIT_HOLD_MAX_BYTES_DEFAULT,
+        )?,
+        audit_hold_max_frames: parse_positive(
+            get,
+            "AUDIT_HOLD_MAX_FRAMES",
+            AUDIT_HOLD_MAX_FRAMES_DEFAULT,
         )?,
         nonstream_max_bytes: parse_positive_usize(
             get,

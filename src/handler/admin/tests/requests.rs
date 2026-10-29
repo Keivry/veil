@@ -101,13 +101,14 @@ async fn invalid_filters_return_400_with_code() {
     let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
     seed(&state, vec![row(60, 0, 100)]);
     // 每例独立源 IP，互不影响限流桶。
-    let cases: [(&str, &str); 6] = [
+    let cases: [(&str, &str); 7] = [
         ("range", "2h"),
         ("status", "3xx"),
         ("scope", "tenant"),
         ("session", "abc"),
         ("limit", "abc"),
         ("offset", "abc"),
+        ("llm", "yes"),
     ];
     let mut ip = 20u8;
     for (key, value) in cases {
@@ -121,6 +122,16 @@ async fn invalid_filters_return_400_with_code() {
     let message = body["error"]["message"].as_str().unwrap_or("");
     for label in ["1h", "24h", "7d", "30d"] {
         assert!(message.contains(label), "消息须列明 {label}: {message}");
+    }
+    // 非法 llm 的消息须列明全部四个合法取值（含与 `1|true` 等价的 `0|false`）。
+    let (status, body) = call(&state, 42, &[("llm", "yes")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    for label in ["1", "true", "0", "false"] {
+        assert!(
+            message.contains(label),
+            "llm 非法取值的消息须列明 {label}: {message}"
+        );
     }
     let (_, body) = call(&state, 41, &[("session", "abc")]).await;
     assert!(
@@ -362,6 +373,8 @@ async fn disabled_log_validates_parameters_before_short_circuit() {
         (114, vec![("status", "3xx")]),
         (115, vec![("session", "abc")]),
         (116, vec![("scope", "tenant")]),
+        // `llm` 的解析同样先于短路：非法取值在日志关闭时也须 400。
+        (118, vec![("llm", "x")]),
     ] {
         let (status, body) = call(&state, ip, &query).await;
         assert_eq!(
@@ -568,6 +581,8 @@ async fn session_scope_and_rows_shape_cover_design_keys() {
         "summary",
         "truncated_mode",
         "error_kind",
+        "ttft_ms",
+        "tps",
     ] {
         assert!(row.get(key).is_some(), "行缺键 {key}: {row}");
     }
@@ -575,6 +590,74 @@ async fn session_scope_and_rows_shape_cover_design_keys() {
     assert_eq!(row["session_id"], "9f2c000000000000");
     // `any` 与缺省等价，`SessionScope` 导入用于显式断言取值集合。
     assert_eq!(SessionScope::Session.as_str(), "session");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn llm_param_filters_non_chat_rows_only() {
+    let dir = metrics_test_dir("requests-llm-filter");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let mut passthrough = row(60, 0, 100);
+    passthrough.request_id = "req-passthrough".to_string();
+    passthrough.protocol = "passthrough".to_string();
+    passthrough.model = "p-1".to_string();
+    passthrough.is_chat = false;
+    passthrough.counted_metrics = false;
+    let mut count_tokens = row(60, 0, 100);
+    count_tokens.request_id = "req-count-tokens".to_string();
+    count_tokens.protocol = "anthropic".to_string();
+    count_tokens.model = "c-1".to_string();
+    count_tokens.is_chat = false;
+    count_tokens.counted_metrics = false;
+    seed(&state, vec![row(60, 40, 100), passthrough, count_tokens]);
+
+    // 无 llm 参数：三行原样返回（含 is_chat=0 的 passthrough / count_tokens）。
+    let (status, body) = call(&state, 140, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 3, "未带 llm 过滤时行数不变: {body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(body["sum_cache_input_tokens"], 300, "{body}");
+
+    // `llm=1`：只留 is_chat=1 行，聚合同 WHERE。
+    for raw in ["1", "true"] {
+        let (status, body) = call(&state, 141, &[("llm", raw)]).await;
+        assert_eq!(status, StatusCode::OK, "llm={raw}: {body}");
+        assert_eq!(body["total"], 1, "llm={raw} 须只留对话行: {body}");
+        let rows = body["rows"].as_array().expect("rows 须为数组");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["request_id"], "req-60");
+        assert_eq!(rows[0]["is_chat"], true);
+        assert_eq!(body["sum_cache_input_tokens"], 100, "{body}");
+    }
+    // `llm=0|false` 与缺省等价：三行全留（合法取值须被接受而非 400）。
+    for raw in ["0", "false"] {
+        let (status, body) = call(&state, 143, &[("llm", raw)]).await;
+        assert_eq!(status, StatusCode::OK, "llm={raw}: {body}");
+        assert_eq!(body["total"], 3, "llm={raw} 须等价于不限: {body}");
+        assert_eq!(body["sum_cache_input_tokens"], 300, "{body}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn row_json_exposes_ttft_and_tps() {
+    let dir = metrics_test_dir("requests-ttft");
+    let state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
+    let mut measured = row(60, 40, 100);
+    measured.completion_tokens = 100;
+    measured.latency_ms = 5_000;
+    measured.ttft_ms = Some(1_000);
+    measured.tps = Some(25.0);
+    let plain = row(120, 40, 100);
+    seed(&state, vec![measured, plain]);
+    let (status, body) = call(&state, 142, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["rows"].as_array().expect("rows 须为数组");
+    assert_eq!(rows[0]["ttft_ms"], 1_000, "{body}");
+    assert_eq!(rows[0]["tps"], 25.0, "{body}");
+    // 不可测时为 JSON null（不伪造 0）。
+    assert!(rows[1]["ttft_ms"].is_null(), "{body}");
+    assert!(rows[1]["tps"].is_null(), "{body}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

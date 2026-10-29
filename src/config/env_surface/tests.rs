@@ -77,13 +77,13 @@ fn auth_config_file(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 #[test]
 fn whitelist_and_migrated_counts_locked() {
     assert_eq!(CONFIG_ENV_WHITELIST.len(), 9, "白名单须恰 9 个具名项");
-    assert_eq!(MIGRATED_ENV_VARS.len(), 48, "迁移清单须恰 48 项");
+    assert_eq!(MIGRATED_ENV_VARS.len(), 49, "迁移清单须恰 49 项");
 
     let whitelist: std::collections::BTreeSet<&str> =
         CONFIG_ENV_WHITELIST.iter().copied().collect();
     assert_eq!(whitelist.len(), 9, "白名单不得有重复项");
     let migrated: std::collections::BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
-    assert_eq!(migrated.len(), 48, "迁移清单不得有重复项");
+    assert_eq!(migrated.len(), 49, "迁移清单不得有重复项");
     assert!(
         whitelist.is_disjoint(&migrated),
         "白名单与迁移清单不得相交（同一名不得两处并存）"

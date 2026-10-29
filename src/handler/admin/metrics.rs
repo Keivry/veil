@@ -91,6 +91,7 @@ pub(super) fn admin_metrics_body(state: &AppState, range: Option<&str>) -> serde
         "per_model": snap.per_model,
         "latency_buckets": snap.latency_buckets,
         "p95_ms": snap.p95_ms,
+        "p95_saturated": snap.p95_saturated,
         "truncated": {
             "silent_discard": snap.truncated_silent_discard,
             "open_ended": snap.truncated_open_ended,

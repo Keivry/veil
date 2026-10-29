@@ -22,33 +22,68 @@ use {
 };
 
 #[test]
-fn latency_12_buckets_match_legacy_bounds() {
+fn latency_12_buckets_cover_long_tail() {
     assert_eq!(
         LATENCY_BOUNDS_MS,
-        [10, 25, 50, 100, 200, 400, 800, 1500, 3000, 5000, 10000]
+        [
+            50, 100, 200, 400, 800, 1500, 3000, 5000, 10000, 20000, 40000
+        ]
     );
     assert_eq!(LATENCY_BUCKETS, 12);
     assert_eq!(bucket_index(3), 0);
-    assert_eq!(bucket_index(10_000), 10);
-    assert_eq!(bucket_index(99_999), 11);
+    assert_eq!(bucket_index(40_000), 10);
+    assert_eq!(bucket_index(120_000), 11);
 }
 
 #[test]
-fn p95_bucket_midpoint_approximation() {
+fn p95_interpolates_within_bucket() {
     let mut buckets = [0u64; LATENCY_BUCKETS];
-    for _ in 0..95 {
+    for _ in 0..90 {
         buckets[bucket_index(8)] += 1;
     }
-    for _ in 0..5 {
+    for _ in 0..10 {
         buckets[bucket_index(9000)] += 1;
     }
-    // 95% 落 [0,10] 桶，中位 5。
-    assert_eq!(p95_approx(&buckets), 5);
+    // 阈值 95 落 [5000,10000) 桶内第 5 名：中点式
+    // 5000 + 5000*(2*5-1)/(2*10) = 5000 + 2250 = 7250。
+    assert_eq!(p95_approx(&buckets), 7250);
+    assert!(!p95_saturated(&buckets));
     assert_eq!(p95_approx(&[0u64; LATENCY_BUCKETS]), 0);
-    // [800,1500) 桶中位 (800+1500)/2=1150。
+    // 单桶 100 样本、阈值 95：[800,1500) 内 800 + 700*(2*95-1)/200 = 800 + 661 = 1461。
     let mut b2 = [0u64; LATENCY_BUCKETS];
     b2[bucket_index(1000)] = 100;
-    assert_eq!(p95_approx(&b2), 1150);
+    assert_eq!(p95_approx(&b2), 1461);
+}
+
+#[test]
+fn p95_single_sample_does_not_snap_to_upper_bound() {
+    // 单样本桶 count=1/rank=1：旧式 `lower + span*rank/count` 恒返回上界（60ms 报 100ms），
+    // 中点式给出区间半程 50 + 50*(2*1-1)/2 = 75。
+    let mut single = [0u64; LATENCY_BUCKETS];
+    single[bucket_index(60)] = 1;
+    assert_eq!(p95_approx(&single), 75);
+    assert_ne!(p95_approx(&single), 100, "单样本不得 snap 到桶上界");
+    // 首桶同样不贴上界：0 + 50*(2*1-1)/2 = 25。
+    let mut first = [0u64; LATENCY_BUCKETS];
+    first[bucket_index(8)] = 1;
+    assert_eq!(p95_approx(&first), 25);
+}
+
+#[test]
+fn p95_overflow_reports_lower_bound_and_saturation() {
+    let mut buckets = [0u64; LATENCY_BUCKETS];
+    for _ in 0..100 {
+        buckets[bucket_index(120_000)] += 1;
+    }
+    // 上溢桶只能给下界（最后一条边界），并显式标记饱和，不再伪装成精确值。
+    assert_eq!(p95_approx(&buckets), 40_000);
+    assert!(p95_saturated(&buckets));
+    // 20s 样本不再落上溢桶（旧口径 10s 上界会把它钉在 10000）。
+    let mut long_tail = [0u64; LATENCY_BUCKETS];
+    long_tail[bucket_index(20_000)] = 100;
+    // [10000,20000) 桶内 10000 + 10000*(2*95-1)/200 = 19450。
+    assert_eq!(p95_approx(&long_tail), 19_450);
+    assert!(!p95_saturated(&long_tail));
 }
 
 #[test]
