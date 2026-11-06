@@ -101,6 +101,9 @@ pub struct TestOpts {
     db: Option<PathBuf>,
     locked: bool,
     cfg_mut: Option<CfgMut>,
+    /// 文件层 TOML 文本：写到临时文件后经 `apply_config_file` → `load_from_with_file`
+    /// 注入（`[session]` 等文件专属概念无 env 名，测试不得用 env 捷径代人）。
+    file_toml: Option<String>,
 }
 
 impl From<&[(&str, &str)]> for TestOpts {
@@ -146,6 +149,12 @@ impl TestOpts {
         self
     }
 
+    /// 经文件层注入文件专属配置（如 `[session]`），走生产同一条装载链。
+    pub fn file_toml(mut self, toml: &str) -> Self {
+        self.file_toml = Some(toml.to_string());
+        self
+    }
+
     fn env(&self) -> HashMap<String, String> {
         let mut env = base_env();
         for (k, v) in &self.extra {
@@ -153,12 +162,32 @@ impl TestOpts {
         }
         env
     }
+
+    fn config(&self) -> Config {
+        let mut env = self.env();
+        let Some(text) = self.file_toml.as_deref() else {
+            return Config::load_from(&env).expect("测试配置须合法");
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "veil-e2e-common-file-{}-{}",
+            std::process::id(),
+            APP_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时配置目录");
+        let path = dir.join("veil.toml");
+        std::fs::write(&path, text).expect("写临时配置文件");
+        env.insert(
+            "VEIL_CONFIG_FILE".to_string(),
+            path.to_string_lossy().into_owned(),
+        );
+        Config::load_from_map_with_file(&env).expect("测试配置须合法")
+    }
 }
 
 /// 建 `(Router, AppState)`：`opts` 可传 `&[(&str, &str)]` 或 [`TestOpts`]。
 pub fn test_app(opts: impl Into<TestOpts>) -> (axum::Router, AppState) {
     let opts = opts.into();
-    let mut config = Config::load_from(&opts.env()).expect("测试配置须合法");
+    let mut config = opts.config();
     if let Some(mutate) = opts.cfg_mut {
         mutate(&mut config);
     }

@@ -41,11 +41,13 @@ use {
 mod entry_mode;
 mod keepass;
 pub(crate) mod pii_scope;
+pub(crate) mod session;
 mod storage;
 pub use {
     entry_mode::{EntryMode, entry_mode_notice},
     keepass::KeepassBackendKind,
     pii_scope::PiiScopeMode,
+    session::{SessionFileConfig, SessionHeaders, SessionParts},
 };
 
 /// 默认监听地址：本机回环（容器部署在 `[server].listen_addr` 显式写 `0.0.0.0:8877`）。
@@ -227,13 +229,11 @@ pub struct Config {
     pub pii_scope_ttl_secs: u64,
     /// 会话条目上限（`PII_SCOPE_MAX_CONVERSATIONS`，默认 1024；非正整数拒启动）。
     pub pii_scope_max_conversations: usize,
-    /// 显式会话键请求头名（`PII_SCOPE_KEY_HEADER`，默认
-    /// `x-veil-conversation-id`；缺省值属 `x-veil-*` 内部命名空间故装配期恒被剔除，
-    /// 自定义非该前缀头名则按出站透传基线原样转发上游；保留鉴权/传输头名拒启动）。
-    pub pii_scope_key_header: String,
-    /// `previous_response_id` 映射容量（`PII_SCOPE_PREV_ID_MAX_ENTRIES`；未设置时取
-    /// `PII_SCOPE_MAX_CONVERSATIONS` 的生效值，非正整数拒启动）。
-    pub pii_prev_id_max_entries: usize,
+    /// 唯一会话头链（文件专属 `[session].headers`）：有序，首个合法非空值胜出；
+    /// PII 作用域、请求记录与 `$conversation` 共用。`Debug` 已脱敏（见 [`SessionHeaders`]）。
+    pub session_headers: SessionHeaders,
+    /// 会话别名表容量（文件专属 `[session].alias_max_entries`，按别名条目计，默认 1024）。
+    pub session_alias_max_entries: usize,
     /// 自定义正则规则文件（`PII_CUSTOM_RULES_FILE` 或 `PII_CUSTOM_RULES`，JSON 数组）。
     pub pii_custom_rules_file: Option<PathBuf>,
     /// 自定义模式文件（`PII_CUSTOM_PATTERNS_FILE` 或 `PII_CUSTOM_PATTERNS`，数组或映射）。
@@ -287,6 +287,9 @@ impl Config {
     /// （warn-before-drop），再按白名单过滤，过滤**先于** `apply_config_file`——
     /// 否则文件注入的 canonical 名会被误判为 env 显式。不触全局 env，供单测直调。
     pub(crate) fn from_env_map(raw: HashMap<String, String>) -> Result<Self> {
+        // fail-closed 预扫描必须先于过滤：两个已删除的会话规范名不属白名单，
+        // 过滤后就再也看不见，静默失效会破坏安全相关的会话隔离配置。
+        session::check_removed_session_env(&raw)?;
         super::env_surface::warn_migrated_and_legacy(&raw);
         let mut map = super::env_surface::filter_process_env(raw);
         let outcome = super::file_layer::apply_config_file(&mut map)?;
@@ -296,6 +299,15 @@ impl Config {
     /// 公开兼容入口：无文件覆盖，逐字等价于扩展入口传空表。
     pub fn load_from(env: &HashMap<String, String>) -> Result<Self> {
         Self::load_from_with_targets(env, LlmTargets::new())
+    }
+
+    /// 公开文件层入口：对给定 env map 走生产同一条「文件层合并 → 既有校验链」
+    /// （引导变量 `VEIL_CONFIG_FILE` 取 map 内的值）。集成测试经此注入 `[session]`
+    /// 等文件专属概念——它们没有 env 名，不能靠 env 捷径代人。
+    pub fn load_from_map_with_file(env: &HashMap<String, String>) -> Result<Self> {
+        let mut merged = env.clone();
+        let outcome = super::file_layer::apply_config_file(&mut merged)?;
+        Self::load_from_with_file(&merged, outcome)
     }
 
     /// 扩展入口（文件层产物）：并入 `[llm.targets]` 与 `[command]`。
@@ -309,6 +321,7 @@ impl Config {
             outcome.command,
             outcome.server_bind,
             outcome.request_log,
+            outcome.session,
         )
     }
 
@@ -324,6 +337,7 @@ impl Config {
             CommandConfig::default(),
             None,
             crate::config::file_layer::RequestLogFileConfig::default(),
+            None,
         )
     }
 
@@ -333,6 +347,7 @@ impl Config {
         command: CommandConfig,
         server_bind: Option<SocketAddr>,
         request_log: crate::config::file_layer::RequestLogFileConfig,
+        session: Option<SessionFileConfig>,
     ) -> Result<Self> {
         let get = |name: &str| env.get(name).map(|v| v.trim().to_string());
         for name in super::validate::legacy_ignored_detected(env) {
@@ -396,9 +411,11 @@ impl Config {
             mode: pii_scope_mode,
             ttl_secs: pii_scope_ttl_secs,
             max_conversations: pii_scope_max_conversations,
-            key_header: pii_scope_key_header,
-            prev_id_max_entries: pii_prev_id_max_entries,
         } = pii_scope::load(&get)?;
+        let SessionParts {
+            headers: session_headers,
+            alias_max_entries: session_alias_max_entries,
+        } = session::load(session)?;
         let LlmParts {
             llm_upstreams,
             llm_default_upstream,
@@ -443,8 +460,8 @@ impl Config {
             pii_scope_mode,
             pii_scope_ttl_secs,
             pii_scope_max_conversations,
-            pii_scope_key_header,
-            pii_prev_id_max_entries,
+            session_headers: SessionHeaders::new(session_headers),
+            session_alias_max_entries,
             pii_custom_rules_file,
             pii_custom_patterns_file,
             pii_custom_dict_file,

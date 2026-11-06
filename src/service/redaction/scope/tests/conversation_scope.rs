@@ -11,7 +11,7 @@ use {
                 ConversationKey,
                 ConversationScopeStore,
                 Scope,
-                derive_conversation_key,
+                scoped_key,
                 tenant_fingerprint,
             },
         },
@@ -223,8 +223,8 @@ fn app_state_carries_conversation_store() {
         "存储句柄须跨请求共享（Arc 指针相等）"
     );
     assert!(Arc::ptr_eq(
-        &state.previous_response_map,
-        &cloned.previous_response_map
+        &state.session_alias_map,
+        &cloned.session_alias_map
     ));
     assert!(!state.conversation_secret.is_empty());
     std::fs::remove_dir_all(&dir).ok();
@@ -440,7 +440,7 @@ fn pii_scope_counters_zero_in_request_mode() {
     let mut headers = HeaderMap::new();
     headers.insert("x-veil-conversation-id", "conv-abc".parse().unwrap());
     let body = serde_json::json!({"prompt_cache_key": "pck-1"});
-    let _ = crate::handler::llm::dispatch::build_request_scope(
+    let _ = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Chat,
@@ -472,14 +472,14 @@ fn differing_session_affinity_yields_distinct_pii_scopes() {
     let mut client_b = HeaderMap::new();
     client_b.insert("x-session-affinity", "affinity-b".parse().unwrap());
 
-    let scope_a = crate::handler::llm::dispatch::build_request_scope(
+    let scope_a = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &client_a,
         crate::service::llm_gateway::Protocol::Chat,
         upstream,
         Some(&body),
     );
-    let scope_b = crate::handler::llm::dispatch::build_request_scope(
+    let scope_b = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &client_b,
         crate::service::llm_gateway::Protocol::Chat,
@@ -492,7 +492,7 @@ fn differing_session_affinity_yields_distinct_pii_scopes() {
         "仅差 x-session-affinity 的请求 MUST NOT 共享 PII 注册表"
     );
     assert!(
-        !scope_a.has_conversation() && !scope_b.has_conversation(),
+        !scope_a.has_writeback() && !scope_b.has_writeback(),
         "PII 链不认 affinity 头，两次均落逐请求"
     );
     assert_eq!(
@@ -509,6 +509,101 @@ fn differing_session_affinity_yields_distinct_pii_scopes() {
         2,
         "两次均计逐请求回退"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// tasks 6.1 / spec「PII 作用域不认路由与通用头」：三者单独出现均不构成身份来源，
+/// 无用户级来源时 PII 落逐请求、日志会话列取 `none`。
+#[test]
+fn untrusted_session_headers_are_not_identity_sources() {
+    use crate::service::session_identity::{SessionScope, SessionSource};
+    let (state, dir) = test_state(Some("conversation"));
+    let upstream = "https://up.example.com/v1";
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+    for name in [
+        "x-session-affinity",
+        "x-session-id",
+        "x-opencode-parent-session-id",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(name, "shared-constant".parse().unwrap());
+        let scope = crate::handler::llm::dispatch::build_request_scope_for_tests(
+            &state,
+            &headers,
+            crate::service::llm_gateway::Protocol::Responses,
+            upstream,
+            Some(&body),
+        );
+        assert!(!scope.has_writeback(), "{name} 不得产生 canonical");
+        assert!(!scope.has_conversation_scope());
+
+        let identity = crate::service::session_identity::resolve(
+            &headers,
+            Some(&body),
+            crate::service::llm_gateway::Protocol::Responses,
+            state.config.session_headers.as_slice(),
+            &state.session_alias_map,
+            state.conversation_secret.as_ref(),
+            &crate::handler::llm::dispatch::request_tenant_fingerprint(&state, &headers, upstream),
+        );
+        assert_eq!(identity.source, SessionSource::None, "{name}");
+        assert_eq!(identity.log_source, SessionSource::None, "{name}");
+        assert_eq!(identity.log_scope, SessionScope::None, "{name}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// spec「共享头不得合并两个客户端」：同一 `x-session-affinity` 常量 + 各自不同的
+/// 可信头 → 不同 canonical；一方注册的占位符在另一方响应中 MUST NOT 被还原。
+#[test]
+fn shared_affinity_constant_does_not_merge_two_clients() {
+    const PLAINTEXT_A: &str = "13800000001";
+    const PLAINTEXT_B: &str = "13800000002";
+    let (state, dir) = test_state(Some("conversation"));
+    let upstream = "https://up.example.com/v1";
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+
+    let mut client_a = HeaderMap::new();
+    client_a.insert("x-session-affinity", "shared-constant".parse().unwrap());
+    client_a.insert("x-veil-conversation-id", "client-A".parse().unwrap());
+    let mut client_b = HeaderMap::new();
+    client_b.insert("x-session-affinity", "shared-constant".parse().unwrap());
+    client_b.insert("x-veil-conversation-id", "client-B".parse().unwrap());
+
+    let scope_a = crate::handler::llm::dispatch::build_request_scope_for_tests(
+        &state,
+        &client_a,
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream,
+        Some(&body),
+    );
+    let scope_b = crate::handler::llm::dispatch::build_request_scope_for_tests(
+        &state,
+        &client_b,
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream,
+        Some(&body),
+    );
+    assert!(
+        !std::ptr::eq(scope_a.pii_scope(), scope_b.pii_scope()),
+        "共享 affinity 常量 + 不同的可信头 MUST NOT 合并两个客户端"
+    );
+    let token_a = scope_a
+        .pii_scope()
+        .register(PLAINTEXT_A)
+        .expect("注册须成功");
+    let token_b = scope_b
+        .pii_scope()
+        .register(PLAINTEXT_B)
+        .expect("注册须成功");
+    assert_eq!(
+        scope_b.pii_scope().restore(&token_a),
+        token_a,
+        "A 的 token MUST NOT 在 B 的作用域内被还原"
+    );
+    assert_eq!(scope_a.pii_scope().restore(&token_b), token_b);
+    assert_eq!(scope_a.pii_scope().restore(&token_a), PLAINTEXT_A);
+    assert_eq!(scope_b.pii_scope().restore(&token_b), PLAINTEXT_B);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -529,14 +624,14 @@ fn same_opencode_session_id_shares_one_pii_scope() {
         "ses_shared_scope_1".parse().unwrap(),
     );
 
-    let first = crate::handler::llm::dispatch::build_request_scope(
+    let first = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Chat,
         upstream,
         Some(&body),
     );
-    let second = crate::handler::llm::dispatch::build_request_scope(
+    let second = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers_again,
         crate::service::llm_gateway::Protocol::Chat,
@@ -562,6 +657,176 @@ fn same_opencode_session_id_shares_one_pii_scope() {
         1,
         "只应有一个会话条目"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// tasks 6.4：同租户 bearer id——客户端 B 携带 A 的 `previous_response_id` /
+/// `conversation.id` 时路由到 A 的 canonical 并共享同一 `Arc<PiiScope>`；
+/// 别名表只做路由，MUST NOT 新增条目或复制/迁移 PII 条目。
+#[test]
+fn same_tenant_bearer_id_routes_to_existing_scope_without_copying_pii() {
+    const PLAINTEXT: &str = "13800138000";
+    let (state, dir) = test_state(Some("conversation"));
+    let upstream = "https://up.example.com/v1";
+
+    // A 轮：头 `H-A` 确定 canonical K1。
+    let mut headers_a = HeaderMap::new();
+    headers_a.insert("x-veil-conversation-id", "H-A".parse().unwrap());
+    let scope_a = crate::handler::llm::dispatch::build_request_scope_for_tests(
+        &state,
+        &headers_a,
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream,
+        Some(&serde_json::json!({"messages": []})),
+    );
+    assert!(scope_a.has_conversation_scope(), "前置：A 须落会话级作用域");
+    let token = scope_a.pii_scope().register(PLAINTEXT).expect("注册须成功");
+    let canonical = crate::service::redaction::scoped_key(
+        state.conversation_secret.as_ref(),
+        &crate::handler::llm::dispatch::request_tenant_fingerprint(
+            &state,
+            &HeaderMap::new(),
+            upstream,
+        ),
+        "H-A",
+    );
+
+    // A 的上游 2xx 响应：按生产同路径绑定 `resp_A` 与 `conv_A`。
+    let metrics = state.gateway_metrics.clone();
+    let mut tracker = crate::service::redaction::CaptureTracker::default();
+    tracker.observe(
+        scope_a.as_ref(),
+        crate::service::llm_gateway::Protocol::Responses,
+        200,
+        &serde_json::json!({"id": "resp_A", "conversation": {"id": "conv_A"}}),
+        metrics.as_ref(),
+    );
+    let aliases_after_a = state.session_alias_map.len();
+    assert_eq!(aliases_after_a, 2, "A 的响应须写两个别名条目");
+
+    // B 同租户：分别只带 `previous_response_id` 与 `conversation.id`。
+    for body in [
+        serde_json::json!({"previous_response_id": "resp_A", "messages": []}),
+        serde_json::json!({"conversation": "conv_A", "messages": []}),
+    ] {
+        let scope_b = crate::handler::llm::dispatch::build_request_scope_for_tests(
+            &state,
+            &HeaderMap::new(),
+            crate::service::llm_gateway::Protocol::Responses,
+            upstream,
+            Some(&body),
+        );
+        assert!(
+            std::ptr::eq(scope_a.pii_scope(), scope_b.pii_scope()),
+            "同租户 bearer id 须路由到 A 的 PiiScope: {body}"
+        );
+        assert_eq!(
+            scope_b.pii_scope().restore(&token),
+            PLAINTEXT,
+            "A 的既有 token 在 B 侧须可还原（同一注册表）"
+        );
+        let new_token = scope_b
+            .pii_scope()
+            .register("13900139000")
+            .expect("注册须成功");
+        assert_eq!(
+            scope_a.pii_scope().restore(&new_token),
+            "13900139000",
+            "B 新注册的值须进入同一 canonical（A 侧可见），不另建条目"
+        );
+    }
+
+    assert_eq!(
+        state.session_alias_map.len(),
+        aliases_after_a,
+        "别名解析 MUST NOT 新增条目（只路由，不复制/迁移）"
+    );
+    assert_eq!(
+        state
+            .conversation_scope_store
+            .as_ref()
+            .expect("conversation 模式须构造存储")
+            .len(),
+        1,
+        "同一 canonical 只有一个作用域"
+    );
+    assert!(
+        state
+            .session_alias_map
+            .resolve(
+                state.conversation_secret.as_ref(),
+                &crate::handler::llm::dispatch::request_tenant_fingerprint(
+                    &state,
+                    &HeaderMap::new(),
+                    upstream,
+                ),
+                "resp_A",
+            )
+            .is_some_and(|k| k == canonical),
+        "A 的别名绑定须保持不变"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// tasks 6.4：跨租户（不同 `tenant_fingerprint`）不得解析他人 bearer id——
+/// `conversation.id` 回退原生派生（新作用域），`previous_response_id` 未命中即回退逐请求。
+#[test]
+fn cross_tenant_bearer_id_does_not_resolve_and_falls_back() {
+    const PLAINTEXT: &str = "13900139000";
+    let (state, dir) = test_state(Some("conversation"));
+    let upstream_a = "https://up.example.com/v1/a";
+    let upstream_b = "https://up.example.com/v1/b";
+
+    let mut headers_a = HeaderMap::new();
+    headers_a.insert("x-veil-conversation-id", "H-X".parse().unwrap());
+    let scope_a = crate::handler::llm::dispatch::build_request_scope_for_tests(
+        &state,
+        &headers_a,
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream_a,
+        Some(&serde_json::json!({"messages": []})),
+    );
+    let _token = scope_a.pii_scope().register(PLAINTEXT).expect("注册须成功");
+    let metrics = state.gateway_metrics.clone();
+    let mut tracker = crate::service::redaction::CaptureTracker::default();
+    tracker.observe(
+        scope_a.as_ref(),
+        crate::service::llm_gateway::Protocol::Responses,
+        200,
+        &serde_json::json!({"id": "resp_X", "conversation": {"id": "conv_X"}}),
+        metrics.as_ref(),
+    );
+
+    // 租户 B 携带 `conversation=conv_X`：因租户分域未命中，回退 `scoped_key(conv_X)`。
+    let scope_b = crate::handler::llm::dispatch::build_request_scope_for_tests(
+        &state,
+        &HeaderMap::new(),
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream_b,
+        Some(&serde_json::json!({"conversation": "conv_X", "messages": []})),
+    );
+    assert!(
+        !std::ptr::eq(scope_a.pii_scope(), scope_b.pii_scope()),
+        "跨租户 MUST NOT 共享 PII 作用域"
+    );
+    assert!(
+        scope_b.has_writeback(),
+        "conversation 未命中仍须按原生派生得出 canonical"
+    );
+
+    // 租户 B 仅带 `previous_response_id=resp_X`：未命中即回退逐请求。
+    let scope_prev = crate::handler::llm::dispatch::build_request_scope_for_tests(
+        &state,
+        &HeaderMap::new(),
+        crate::service::llm_gateway::Protocol::Responses,
+        upstream_b,
+        Some(&serde_json::json!({"previous_response_id": "resp_X", "messages": []})),
+    );
+    assert!(
+        !scope_prev.has_writeback(),
+        "跨租户 previous_response_id 未命中须回退逐请求"
+    );
+    assert!(!scope_prev.has_conversation_scope());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -613,7 +878,7 @@ fn conversation_key_not_logged() {
     let capture = LogCapture::default();
     let sink = capture.0.clone();
     let (scope, token) = crate::test_support::with_capture_subscriber(capture, || {
-        let scope = crate::handler::llm::dispatch::build_request_scope(
+        let scope = crate::handler::llm::dispatch::build_request_scope_for_tests(
             &state,
             &headers,
             crate::service::llm_gateway::Protocol::Responses,
@@ -641,17 +906,7 @@ fn conversation_key_not_logged() {
     );
     let secret = state.conversation_secret.as_ref();
     let fp = tenant_fingerprint(secret, upstream, &[]);
-    let key = derive_conversation_key(
-        secret,
-        &fp,
-        crate::service::llm_gateway::Protocol::Chat,
-        Some(header_value),
-        None,
-        None,
-        &serde_json::json!({}),
-        &state.previous_response_map,
-    )
-    .expect("显式头须可推导会话键");
+    let key = scoped_key(secret, &fp, header_value);
     let lines = sink.lock().unwrap().clone();
     assert!(
         lines.iter().any(|l| l.contains("capture-active")),
@@ -678,7 +933,7 @@ fn responses_scalar_input_falls_to_per_request_counted() {
         "instructions": "be nice",
         "input": "当前轮全文，随轮次增长",
     });
-    let _ = crate::handler::llm::dispatch::build_request_scope(
+    let _ = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Responses,
@@ -704,7 +959,7 @@ fn responses_scalar_input_falls_to_per_request_counted() {
         "instructions": "be nice",
         "input": [{"role": "user", "content": "hello"}],
     });
-    let _ = crate::handler::llm::dispatch::build_request_scope(
+    let _ = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Responses,

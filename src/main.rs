@@ -84,6 +84,7 @@ struct CleanupHandles {
     pending: std::sync::Arc<veil::approval::PendingApprovals>,
     conversation_scope_store:
         Option<std::sync::Arc<veil::service::redaction::ConversationScopeStore>>,
+    session_alias_map: std::sync::Arc<veil::service::redaction::SessionAliasMap>,
 }
 
 impl veil::service::matrix::GatewayCleanup for CleanupHandles {
@@ -103,12 +104,15 @@ impl veil::service::matrix::GatewayCleanup for CleanupHandles {
             .as_ref()
             .map(|store| store.clear())
             .unwrap_or(0);
+        // 别名表与会话作用域分离，但 `lock` SHALL 同时清空两表并分别报条数。
+        let alias_entries_cleared = self.session_alias_map.clear();
         tracing::info!(
-            "lock 清理: 口令缓存 {vault_cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}、PII 会话作用域 {pii_scopes_cleared} 个"
+            "lock 清理: 口令缓存 {vault_cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}、PII 会话作用域 {pii_scopes_cleared} 个、会话别名 {alias_entries_cleared} 条"
         );
         veil::service::matrix::LockCleanupReport {
             vault_cleared,
             pii_scopes_cleared,
+            alias_entries_cleared,
         }
     }
 
@@ -337,6 +341,7 @@ async fn main() -> ExitCode {
                 vault: state.vault.clone(),
                 pending: state.pending.clone(),
                 conversation_scope_store: state.conversation_scope_store.clone(),
+                session_alias_map: state.session_alias_map.clone(),
             });
         sync_bot.spawn_sync_loop(
             std::sync::Arc::clone(&state.approval),
@@ -619,6 +624,50 @@ mod tests {
         let pts = store.query_series("daily", None, None).await.unwrap();
         assert!(!pts.is_empty(), "关闭刷盘后 sqlite 须含窗口");
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// tasks 6.3：`main.rs` 的 `CleanupHandles::lock_cleanup` 实现同样须同时清空
+    /// `ConversationScopeStore` 与 `SessionAliasMap`，并分别报告真实条数。
+    #[test]
+    fn cleanup_handles_lock_clears_both_session_tables() {
+        use veil::service::redaction::{
+            ConversationScopeStore,
+            SessionAliasMap,
+            conversation_key::scoped_key,
+        };
+        const SECRET: &[u8] = b"cleanup-handles-secret";
+        const TENANT: &str = "tenant-cleanup";
+
+        let store = std::sync::Arc::new(ConversationScopeStore::new(
+            8,
+            std::time::Duration::from_secs(1800),
+        ));
+        let scopes = [0u8, 1, 2].map(|i| scoped_key(SECRET, TENANT, &format!("conv-{i}")));
+        for key in &scopes {
+            store.get_or_insert(key);
+        }
+        let alias = std::sync::Arc::new(SessionAliasMap::new(8));
+        let aliases = [0u8, 1].map(|i| scoped_key(SECRET, TENANT, &format!("resp-{i}")));
+        for (i, key) in aliases.iter().enumerate() {
+            alias.bind(SECRET, TENANT, &format!("upstream-{i}"), key);
+        }
+
+        let handles = super::CleanupHandles {
+            keepass: std::sync::Arc::new(veil::keepass::MockKeePass::locked()),
+            vault: std::sync::Arc::new(veil::service::credential_vault::CredentialVault::new()),
+            pending: std::sync::Arc::new(veil::approval::PendingApprovals::default()),
+            conversation_scope_store: Some(std::sync::Arc::clone(&store)),
+            session_alias_map: std::sync::Arc::clone(&alias),
+        };
+        let report = veil::service::matrix::GatewayCleanup::lock_cleanup(&handles);
+        assert_eq!(report.pii_scopes_cleared, 3, "须报真实作用域清理条数");
+        assert_eq!(report.alias_entries_cleared, 2, "须报真实别名清理条数");
+        assert_eq!(store.len(), 0, "lock 后会话作用域须清空");
+        assert_eq!(alias.len(), 0, "lock 后别名表须清空");
+
+        let again = veil::service::matrix::GatewayCleanup::lock_cleanup(&handles);
+        assert_eq!(again.pii_scopes_cleared, 0);
+        assert_eq!(again.alias_entries_cleared, 0);
     }
 
     /// 真实门禁函数行为（非法拒绝/合法放行）+ 生产启动序不变量——门禁调用须早于

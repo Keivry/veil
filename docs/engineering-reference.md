@@ -11,7 +11,7 @@
 进程 env 的允许读取面（配置过滤集合 ∪ Config 外直读）恰为下表各具名变量。按端口选择上游的变量
 （`LLM_` 前缀加端口，如 `LLM_8878`）不在读取面内：其进程 env 置位仅启动期 `warn`，请改用配置文件
 `[llm.upstreams]`。白名单之外的进程 env 不影响生效配置（生效配置即 `Config`）：其中属文件专属清单者置位仅启动期
-`warn` 并指引改用 `VEIL_CONFIG_FILE`，其余名一律不读取（例外仅下方三条）。白名单内的配置概念维持
+`warn` 并指引改用 `VEIL_CONFIG_FILE`，其余名一律不读取（例外见下方四条）。白名单内的配置概念维持
 `env 显式 > 文件 > 内建默认`；`VEIL_CONFIG_FILE` 只从进程 env 读取，不作为文件内可声明键。Fail-closed
 约束：配置文件非法（缺失/语法/未知键/权限）拒启动、自定义 PII 规则文件缺文件或解析失败拒启动、无硬件 TPM 且未显式放行拒启动；Matrix 三要素与管理 token 均可缺省——缺省即关闭对应功能（不拒启动）。
 
@@ -28,7 +28,7 @@
 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 值级采样 HMAC key（密钥注入）；未设退化为 SHA256 |
 
 - compose 专用变量 `PORT_8877`/`PORT_8878`/`PORT_8879`/`TPM_HOST_PATH`/`DB_HOST_PATH` 不经二进制读取，属**容器编排层专用、非二进制读取面**（见 `docker-compose.yml`）。
-- 「未列出的变量二进制不读取」的例外（仅此三处，均不影响 `Config` 生效值、亦不入白名单）：① 审计策略 `$VAR`/`${VAR}`/`~/` 展开快照——`src/service/audit/policy.rs::capture_process_env` 于策略加载时快照进程 env（`HOME` 单列 + 全量 vars），供命令文本展开（`src/service/audit/normalize.rs`）与 `~/` 家目录展开（`src/service/audit/rules.rs`）使用，结果只参与审计判定、不回写配置；② 依赖层进程 env（如 reqwest 系统代理 `HTTP(S)_PROXY`，按依赖默认行为，非本仓代码）；③ 测试期 `std::env::temp_dir`（非生产路径）。
+- 「未列出的变量二进制不读取」的例外（仅此四处，均不影响 `Config` 生效值、亦不入白名单）：① 审计策略 `$VAR`/`${VAR}`/`~/` 展开快照——`src/service/audit/policy.rs::capture_process_env` 于策略加载时快照进程 env（`HOME` 单列 + 全量 vars），供命令文本展开（`src/service/audit/normalize.rs`）与 `~/` 家目录展开（`src/service/audit/rules.rs`）使用，结果只参与审计判定、不回写配置；② 依赖层进程 env（如 reqwest 系统代理 `HTTP(S)_PROXY`，按依赖默认行为，非本仓代码）；③ 测试期 `std::env::temp_dir`（非生产路径）；④ **已删除会话配置名的 fail-closed 预扫描**——`PII_SCOPE_KEY_HEADER` 与 `PII_SCOPE_PREV_ID_MAX_ENTRIES` **不是可读配置面**：二者在进程 env 非空置位时启动 fail-closed 拒启动，错误信息指名该变量与替代文件键（分别为 `[session].headers` / `[session].alias_max_entries`），不进入白名单/迁移清单锁步集合。该预扫描在 `filter_process_env` **之前**读取原始 map；`Config::load_from`/`load_from_with_file` 不重复检查。
 
 ### 配置文件层（TOML）
 
@@ -45,18 +45,21 @@
   即 env 胜并记一条冲突 warn；否则取文件声明值；两处皆缺取内建默认。**文件专属**概念的进程 env 面恒空，文件恒胜。
   文件不引入新概念：下表每个键都对应一个白名单 env 名或一个文件专属概念；例外为三处声明式结构化分节
   ——`[llm.upstreams]`（按端口展开为 `LLM_<port>`）、`[llm.targets]`（文件专属上游目标覆盖，无 env 对应源，见下）与 `[command]`（文件专属下游命令配置，见 command-api 规格）
-  ——以及两个文件专属标量键 `request_log.enabled`/`request_log.retention_days`（无 env 对应源，进程 env 置位不生效）。
+  ——以及四个文件专属标量键 `request_log.enabled`/`request_log.retention_days`/`session.headers`/
+  `session.alias_max_entries`（无 env 对应源，进程 env 置位不生效；`session.*` 的值经
+  `FileLayerOutcome.session` 直达 `Config`，不参与逐键合并）。
 - 过滤边界：白名单过滤只作用于 `Config::from_env` 收集到的**进程 env**；`Config::load_from(&HashMap)` 与文件层
   「映射为规范名后注入」的通道**保持不变**（文件值到达 `Config` 的唯一路径即该注入），故测试/脚本经 map
   注入的键不受过滤影响。
 - 审计 mode 层级：配置文件 `[audit].mode` > `[audit].policy_file` 所指策略文件的 `mode` > `off`
   ；配置文件 `mode` 视同显式，不得被策略文件的 `off` 静默降级为关闭审计。
-- 键裁决只有一条口径：`FileConfig` 各分节 `deny_unknown_fields`。0.1.x 兼容期曾存在的遗留键别名表与其
-  `toml::Value` 预扫描归一已在 0.2.0 发布前移除——旧分节（`auth`/`limits`/`keepass`）与旧键名
-  （`server.bind`、`audit.timeout`、`storage.entry_mode`/`auto_approve`/`credential_block_wait`/
-  `authorization_ttl_secs`/`request_log_*`、`llm.targets.*.override`、`command.block_wait`）
-  与任意未知键同形，一律 fail-closed 拒启动并指名该键；不存在静默归一，也不存在新旧键并存优先级。
-  env 侧同样不做别名：不在白名单的名字一律不读取、不生效、无提示。
+- 键裁决只有一条口径：`FileConfig` 各分节 `deny_unknown_fields`。任何未登记的分节或键名与任意未知键
+  同形，一律 fail-closed 拒启动并在错误中指名该键；不存在遗留键别名表、静默归一，也不存在新旧键并存
+  优先级。唯一例外是 `[pii_scope]` 下两个已删除会话键的**定向预扫描**：错误额外指明替代键
+  `[session].headers` / `[session].alias_max_entries` 与去重后的完整建议 `headers = [...]` 数组
+  （预扫描先于 `toml::from_str`，其余未知键仍由 `deny_unknown_fields` 裁决）。
+  env 侧同样不做别名：不在白名单的名字一律不读取、不生效、无提示（两个已删除会话规范名的
+  fail-closed 例外见「环境变量表」例外④）。
 - 密钥类文件权限门禁：文件声明 `matrix.access_token`/`admin.token`/`storage.veilctl_secret`/
   `storage.veilctl_binary_hash`/`redaction.value_sample_hmac_key` 任一键时，Unix 下要求 `mode & 0o077 == 0`（即 `chmod 600`），
   否则拒绝启动并给出修正指引；env 覆盖不豁免该门禁（密钥文本已落盘）。非 Unix 平台该检查不适用。
@@ -67,11 +70,11 @@
 - 示例：`examples/veil.toml`（各分节代表键 + 中文注释；不含密钥类键，`0644` 权限即可加载）。
 
 文件 schema 键表（TOML 分节写法；键集由锁步测试与 `src/config/file_layer/mod.rs` 的封闭映射表逐项绑定，
-`llm.targets`/`command`/`server` 为文件专属键根，`request_log.enabled`/`request_log.retention_days` 为文件专属标量键（均无 env 对应源，增删须同步本表）。`server` 根下仅 `listen_addr` 属纯文件专属，`server.surface_mode` 有 env 映射（`VEIL_ENTRY_MODE`），故两者分别成行；
+`llm.targets`/`command`/`server` 为文件专属键根，`request_log.enabled`/`request_log.retention_days`/`session.headers`/`session.alias_max_entries` 为文件专属标量键（均无 env 对应源，增删须同步本表）。`server` 根下仅 `listen_addr` 属纯文件专属，`server.surface_mode` 有 env 映射（`VEIL_ENTRY_MODE`），故两者分别成行；
 
 | 文件键 | 规范 env 名 | TOML 类型 | 说明 |
 |:--|:--|:--|:--|
-| `server.surface_mode` | `VEIL_ENTRY_MODE` | enum `full`/`llm_only` | 暴露面模式；只接受这两个规范拼写，集合外取值（含 0.1.x 的连字符写法）拒启动；不改变任何审批口径 |
+| `server.surface_mode` | `VEIL_ENTRY_MODE` | enum `full`/`llm_only` | 暴露面模式；只接受这两个规范拼写，集合外取值拒启动；不改变任何审批口径 |
 | `admin.enabled` | `ADMIN_ENABLED` | bool（正向） | `true` 才挂载 `/_admin*`；缺省 `true`。极性反向于旧 `auth.observability_disable`（旧 `true` = 新 `false`） |
 | `admin.token` | `OBSERVABILITY_ADMIN_TOKEN` | string | `/_admin` 鉴权 token，建议 ≥32 字符且不得与 Matrix token 相同；密钥类（须 0600）；为空即 `/_admin*` 全 404 |
 | `matrix.homeserver` | `HOMESERVER` | string | Matrix homeserver URL（概念可选：缺失即关闭 Matrix 通知/审批，不拒启动） |
@@ -102,12 +105,12 @@
 | `llm.nonstream_max_bytes` | `NONSTREAM_MAX_BYTES` | u64 | 非流对话响应体上限（软限，严格 `len >` 即 502）；须 ≥1，默认 8MiB |
 | `llm.sse_frame_hard_bytes` | `SSE_FRAME_HARD_BYTES` | u64 | SSE 单帧/单行硬上限；须 ≥1，默认 8MiB，超限 fail-closed 并合成终止帧 |
 | `llm.upstreams` | `LLM_<port>` | table（端口字符串 → URL） | 按入口端口逐键合并，与 env 互不整表覆盖；端口须为合法 u16；每个端口键各派生一条专用监听（见「端口语义」子节） |
-| `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标内键为 `headers`/`params`/`override_existing`/`user_agent`/`drop_headers`；目标键、硬拒清单、保留键与三段语义见下 |
+| `llm.targets` | `（文件专属）` | table（目标键 → 目标） | 上游请求头/请求体参数覆盖（文件专属，无 env 对应源）；目标内键为 `headers`/`params`/`override_existing`/`user_agent`/`drop_headers`/`header_replace`；目标键、硬拒清单、保留键、三段语义与条件替换见下 |
 | `pii_scope.mode` | `PII_SCOPE_MODE` | enum `request`/`conversation` | 会话级关联开关 |
 | `pii_scope.ttl_secs` | `PII_SCOPE_TTL_SECS` | u64 | 会话条目空闲 TTL 秒；须 ≥1（`0` 拒启动） |
-| `pii_scope.max_conversations` | `PII_SCOPE_MAX_CONVERSATIONS` | usize | 会话条目上限；须 ≥1 |
-| `pii_scope.key_header` | `PII_SCOPE_KEY_HEADER` | string | 会话键请求头名（最高优先；其后**PII 专用窄链** `x-opencode-session` → `x-opencode-session-id`，刻意不含 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，见 §6）；仅用于推导会话作用域与展开 `$conversation`，**不因配置而隐式从上游请求剔除**（普通客户端头名原样转发；`x-veil-*` 仍按内部命名空间规则移除，需剔除普通名时用目标级 `drop_headers`）；保留名拒启动 |
-| `pii_scope.prev_id_max_entries` | `PII_SCOPE_PREV_ID_MAX_ENTRIES` | usize | `previous_response_id` 映射上限；缺省联动 `max_conversations` |
+| `pii_scope.max_conversations` | `PII_SCOPE_MAX_CONVERSATIONS` | usize | PII 会话条目上限；须 ≥1 |
+| `session.headers` | `（文件专属）` | array of string | **唯一**会话头链（有序，首个合法非空值胜出；PII 作用域、请求记录与 `$conversation` 共用）；非空数组，每项须为合法 HTTP 头名，大小写归一后不得重复；拒绝保留鉴权/传输头（含 `cookie`）与 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`；缺省 `["x-veil-conversation-id", "x-opencode-session", "x-opencode-session-id"]`。头名不因配置而隐式从上游请求剔除（`x-veil-*` 仍按内部命名空间规则移除，需剔除普通名时用目标级 `drop_headers`） |
+| `session.alias_max_entries` | `（文件专属）` | usize | 会话别名表容量（**按别名条目计**，须 ≥1，缺省 `1024`）；每个 Responses 响应最多写 `response.id` 与 `conversation.id` 两条，故 1024 约覆盖 512 个响应会话；与 `pii_scope.max_conversations` 解耦（需对齐时设为 2 × 会话数） |
 | `redaction.enabled` | `REDACTION_ENABLED` | bool | 脱敏总开关；env 别名 `PII_REDACTION_ENABLED` |
 | `redaction.fuzzy_restore` | `PII_FUZZY_RESTORE` | bool | 残缺占位符按序号回查还原 |
 | `redaction.detection_hardening` | `PII_DETECTION_HARDENING` | bool | 严格边界复核（丢弃 ASCII 粘连与前导零 IPv4） |
@@ -139,7 +142,7 @@
   未发送同名头时新增，客户端自带的同名头（如 opencode 的动态 `x-opencode-session`）逐值保留，`params` 的 `default` 与 `override` 两段均仅在请求体原文缺失该顶层键时写入（客户端已有值恒保留），
     `drop` 不受开关影响（两态均删除所列顶层键）；合并模式下同一键跨段仍「后段生效」，但仅限配置段之间，绝不覆盖客户端值。
 - 头值动态插值（仅 `headers` 表的值；`user_agent` 恒为字面值、不参与插值）：值内 `$` 触发展开，三种来源——
-  `$conversation`（展开为会话键请求头首值，头名取 `pii_scope.key_header`，默认 `x-veil-conversation-id`）、
+  `$conversation`（展开为会话身份的出站标识；客户端声明的锚点输出原值、服务端锚点输出 `veil-outbound-v1` 域分离 HMAC，头名取自 `[session].headers` 首项，默认 `x-veil-conversation-id`）、
   `$request-id`（入站 `x-request-id` 首值）、`$header(<入站头名>)`（镜像任意入站头首值，头名大小写不敏感）；
   `$$` 转义为字面 `$`；一个值内允许多片段与字面混排；不含 `$` 的值走静态路径逐项零变化。
   来源缺失时该条目跳过不注入（不写、不改、不删——客户端同名头按未声明语义保留；不产生空值、不使请求失败）；
@@ -156,14 +159,27 @@
   归一后为 `user-agent` 的键并存拒启动（两条 UA 通道语义不同，并存歧义）。opencode zen/go 兼容配方：
   `override_existing = false` + `user_agent = "opencode/<实际安装版本>"` + `headers` 补 `x-opencode-client` 等静态身份头——
   opencode CLI 的动态身份头保留、第三方客户端缺项补齐且 UA 恒被替换。
+- 条件值替换（`params.<proto>.replace` 与 `header_replace`，本 change 新增）：仅当客户端值**精确等于** `from` 时改写为 `to`；这是“值相关兼容垫片”，用于静态 `override` 无法表达的兼容差异。
+  - **body 规则**（`[[llm.targets."<port>".params.<proto>.replace]]`，字段 `field`/`from`/`to`/`models`）：只做**顶层标量**精确替换。`field` 须为非空顶层键、不含 `.`、不命中基线 7 保留键与 `replace` 扩展保留清单（`tools`/`previous_response_id`/`conversation`/`prompt_cache_key`/`metadata`/`user`/`safety_identifier`）、且不得与同协议 `default`/`override`/`drop` 的键重名（同字段歧义；扩展清单**仅**施加于 `replace.field`，既有 `params.chat.drop = ["tools"]` 仍可加载）。`from`/`to` 仅字符串/数字/布尔（类型保持、比较为 JSON 类型 + 值精确相等、大小写敏感），且不得相等；同一协议子表内 `(field, from)` 不得重复（`"none"` 与 `"None"`、字符串 `"1"` 与数字 `1` 视为不同规则）。
+  - **header 规则**（`[[llm.targets."<port>".header_replace]]`，字段 `name`/`from`/`to`/`models`）：`name` 须为合法 HTTP 头名、不得命中硬拒清单（同 `headers`，含 `authorization`/`x-api-key`/`api-key`/`cookie`/全部 HOP 头/全部 `x-veil-*`）、不得与同目标 `headers` 或 `drop_headers` 归一后重名；目标声明 `user_agent` 时归一后不得为 `user-agent`（否则规则会被 UA 恒胜覆盖，属死配置）。`from`/`to` 须通过 HTTP 头值语义（禁 CR/LF 与非法字节）、不得相等、不得为实际 PII 占位符形态；同一目标内 `(name, from)` 不得重复（头名归一后比较）。
+  - **共享语义**：`models` 省略 = 对全部模型生效；声明则须为非空字符串数组且元素非空、**精确且大小写敏感**地匹配请求体顶层 `model`（请求体无 `model` / 非字符串 / 不匹配 → 该规则跳过，不报错不告警）；`to` 为**字面值**，不做 `$` 插值（需要动态值请用 `headers` 模板）；`from`/`to` 为实际 PII 占位符形态（`__PII_<alnum/underscore>__` 或凭据私有前缀 `` + `<alnum/underscore>__`）拒启动，泛化 `*__`（如 `"v1__"`）**不**拒。
+  - **执行时序**：body 为 `replace` → `default` → `override` → `drop`，在脱敏替换与占位符说明注入**之后**执行；header 为 剥离/逐跳过滤 → `drop_headers` → `header_replace` → 配置 `headers` → `user_agent`。
+  - **不级联**：所有规则基于应用前的客户端值快照匹配，一条规则的 `to` 不会成为另一条规则的 `from`。
+  - **只替换不注入**：字段/头缺失、类型不符或值不等一律 no-op；不新增缺失字段、不新增缺失头，不做嵌套/路径表达式、不做正则或子串匹配、不做键重命名、不做跨协议字段映射、不按模型建独立配置节、不改写响应体。
+  - **多值头**：按 `HeaderMap` 的**每个值条目**逐值比较替换，未匹配值保留；逗号拼接的单个值（如 `"none, high"`）**不拆分**，按整值精确匹配，不命中即 no-op。
+  - **与 `[session].headers` 的关系**：`header_replace` **可以**显式改写 `[session].headers` 中的**非 `x-veil-*`** 会话头——这是“客户端会话链头原样转发”的唯一有意例外；会话身份在到达时已确定，出站改写只影响上游缓存亲和（缓存亲和可能变化）。`x-veil-*`（含默认 `x-veil-conversation-id`）在加载期即被硬拒，规则无法声明，且默认 `x-veil-conversation-id` 在装配期已被剥离，规则不会命中。
+  - **合并模式**：`override_existing = false` 与任一非空 `replace`/`header_replace` 并存**拒启动**（该模式承诺不覆盖客户端值，条件替换会静默破坏该承诺），错误指名 `override_existing` 与规则位置；`override_existing = true` 或缺省时规则合法。
+  - **NonDialog / count_tokens**：NonDialog 字节透传路径只应用 `header_replace` 与 `headers`，跳过 `params`/`params.replace`（请求体字节不变）；带 `models` 的 header 规则在 NonDialog（无 body）下跳过，不带 `models` 的仍生效。`count_tokens`（redact-only）同样跳过 `params`/`params.replace`，`header_replace` 与 `headers` 照常。
+  - **脱敏交互与风险登记**：规则在脱敏**之后**执行，若 `from` 的明文已被脱敏则规则不会命中——规则值**不得依赖 PII 明文**。`models` 使用客户端原始 `model`，模型改名会使规则**静默失效**（无自动告警）。`content-type` 改写**不做硬拒**：改写可能改变上游对请求体的解析语义，操作者须自行保证与请求体一致（若未来硬拒另立 change）。
 - 缺省回退不命中覆盖：无端口专用上游且无缺省上游时按端口升序选 URL（端口升序兼容路径）不命中任何目标覆盖（行为不变）。
 - 硬拒清单（任一项即拒启动）：`host`、`content-length`、`content-encoding`、`accept-encoding`、`transfer-encoding`、
   逐跳头（`connection`/`keep-alive`/`proxy-authenticate`/`proxy-authorization`/`te`/`trailer`/`upgrade`）、
   `x-veil-*` 前缀、鉴权身份类（`authorization`/`x-api-key`/`api-key`/`cookie`）；头名须为合法 HTTP 头名、头值禁 CR/LF、
   大小写归一后的重复头名拒启动。`accept-encoding` 由装配期剔除以保证网关仅声明自身支持集（上游只回可解码编码），
   配置重注入会破坏该不变量。
-- 保留键（任一段出现即拒启动）：`model`/`stream`/`messages`/`input`/`instructions`/`system`/`stream_options`。
-- 豁免：NonDialog 字节透传路径与 `count_tokens`（redact-only）仅注入请求头、忽略 `params` 并记一次 warn。
+- 保留键（`default`/`override`/`drop` 任一段出现即拒启动）：`model`/`stream`/`messages`/`input`/`instructions`/`system`/`stream_options`。
+  `replace.field` 在此基础上**额外**拒绝 `tools`/`previous_response_id`/`conversation`/`prompt_cache_key`/`metadata`/`user`/`safety_identifier`；该扩展清单**仅**施加于 `replace.field`，不扩大到 `default`/`override`/`drop`。
+- 豁免：NonDialog 字节透传路径与 `count_tokens`（redact-only）仅注入请求头（`headers` 与 `header_replace`），忽略 `params`/`params.replace` 并记一次 warn；NonDialog 无 body，带 `models` 的 header 规则跳过。
 - 结构性键（闭集，由锁步测试与 `src/config/targets.rs` 绑定，增删须同步本表；端口号/头名/参数名等用户自定义键不参与键集比较）：
 
 | 结构键 | 出现层级 | 说明 |
@@ -173,12 +189,22 @@
 | `override_existing` | 目标内 | 冲突策略：`true`（缺省）= 恒胜；`false` = 合并模式（仅补缺，`drop` 不受影响）。原键名 `override` 已随 0.2.0 移除（出现即拒启动），与协议段 `params.<proto>.override` 表的命名碰撞随之消失 |
 | `user_agent` | 目标内 | 出站 `User-Agent` 恒胜覆盖值（与 `override_existing` 正交；未声明零变化；与 `headers."user-agent"` 归一后互斥） |
 | `drop_headers` | 目标内 | 出站头删除清单（数组；在隐式过滤之后、`headers` 注入之前按名删除全部值，大小写不敏感，`override_existing` 两态均生效；空数组等价于未声明） |
+| `header_replace` | 目标内 | 出站头条件替换规则数组（`name`/`from`/`to`/`models`；逐值精确匹配替换、只替换不注入、不级联、`to` 为字面值；在 `drop_headers` 之后、`headers` 之前应用；`override_existing = false` 时拒启动） |
 | `chat` | params 内 | OpenAI Chat Completions 协议规则 |
 | `anthropic` | params 内 | Anthropic Messages 协议规则 |
 | `responses` | params 内 | OpenAI Responses 协议规则 |
 | `default` | 协议段内 | 缺则补：仅当请求体缺少该顶层键时写入 |
 | `override` | 协议段内 | 恒写：`override = true`（含缺省）时始终覆盖请求体同名字段；合并模式（`override = false`）降级为缺则补 |
 | `drop` | 协议段内 | 删除：移除列出的请求体顶层键（缺失静默） |
+| `replace` | 协议段内 | 条件替换规则数组（`field`/`from`/`to`/`models`；顶层标量精确替换、只替换不注入、不级联；与同协议 `default`/`override`/`drop` 同字段即拒启动） |
+| `field` | body replace 规则内 | 请求体顶层键名（非空、无 `.`、非基线/扩展保留键、不与同协议三段重名） |
+| `from` | body replace 规则内 | 命中值（JSON 字符串/数字/布尔，类型 + 值精确相等；不可为 PII 占位符形态） |
+| `to` | body replace 规则内 | 替换值（同上标量约束；字面值，不做 `$` 插值） |
+| `models` | body replace 规则内 | 模型门控（省略 = 全模型；声明则非空字符串数组、精确且大小写敏感；声明为空数组或含空串拒启动） |
+| `name` | header replace 规则内 | 出站头名（合法、非硬拒头、不与 `headers`/`drop_headers` 重叠、声明 `user_agent` 时非 `user-agent`） |
+| `from` | header replace 规则内 | 命中头值（HTTP 头值语义、精确字节相等；不可为 PII 占位符形态） |
+| `to` | header replace 规则内 | 替换头值（HTTP 头值语义；字面值，不做 `$` 插值） |
+| `models` | header replace 规则内 | 模型门控（语义同 body 规则；NonDialog 无 body 时带 `models` 的规则跳过） |
 
 ### 遗留变量清单
 
@@ -229,7 +255,7 @@ env 一律不做别名：不在白名单的名字（含 0.2.0 改名前的 4 个
 - 界面结构：控制台采用左侧分区导航（概览 / 脱敏 / 性能 / 事件 / 命令调用 / LLM 请求）与明暗双主题。首屏默认跟随系统 `prefers-color-scheme`，侧栏按钮手动切换并以 `veil_theme` Cookie 记忆（不写 `localStorage`/`sessionStorage`）；窄屏（<860px）下侧栏折叠为顶部横排。
 - 事件过滤：按 `kind`（可附 `since`）与 `limit`（默认 50、上限 200）；不提供 `model`/`upstream` 过滤。
 - 范围切换：`?range=1h|24h|7d|30d`，同时作用于 SSE 重连与当前分区的数据请求。
-- 「LLM 请求」分区：消费 `/_admin/requests`，九列（时间 / 模型 / 协议 / 会话 / 状态 / 输入·输出 / 命中率 / 耗时 / 摘要）；会话列展示前 12 位加作用域与链徽标，`null` 一律渲染 `—`；分页并给出「共 N 条」，空态区分「记录功能未启用」与「范围内无请求」。全部单元格先经 `esc()` 转义再拼接（含 `title` 属性位），不对未转义文本直接拼 `innerHTML`。
+- 「LLM 请求」分区：消费 `/_admin/requests`，十二列（时间 / 模型 / 协议 / 上游 / 会话 / 状态 / 输入·输出 / 命中率 / 耗时 / TTFT / TPS / 摘要）；会话列只展示 16-hex 摘要的前 12 位，并附人类可读的来源说明（`title`，例如「来源：显式会话头」）与作用域徽标（「会话」/「用户」，`none` 不渲染徽标）；来源文案恰为 `header`→显式会话头、`conversation`→Responses 会话对象、`prev_response`→前驱响应、`cache_key`→prompt_cache_key、`user_id`→用户标识、`safety_identifier`→安全标识、`user`→用户、`none`→无来源，旧库中被废弃的来源值回退为「历史来源」；`title` 只含人类可读说明，不输出原枚举、原始会话头值、上游 `conversation.id`/`response.id` 或 64-hex 键；`request` 模式下提示行明示 PII 逐请求隔离，不暗示跨请求共享；`null` 一律渲染 `—`；分页并给出「共 N 条」，空态区分「记录功能未启用」与「范围内无请求」。全部单元格先经 `esc()` 转义再拼接（含 `title` 属性位），不对未转义文本直接拼 `innerHTML`。
 - 数据绑定（时间轴与 KPI）：图表 X 轴与 tooltip 以 series 点的 `ts_start`（窗口起始 Unix 秒）按浏览器本地时间渲染，`window` 仅作内部键、不作可读标签；KPI 总量取自 `/_admin/metrics` 与 SSE `metrics` 快照的 `pii_hits`/`pii_miss`/`cred_hits` 三个 additive 字段（命中率 = `pii_hits/(pii_hits+pii_miss)`，分母为 0 显示 `—`）。
 - 指标字段兼容：上述新增字段只增不改；控制台不依赖任何字段的移除或改名，旧调用方可忽略新字段。新增的「LLM 请求」分区消费 `/_admin/requests`，不改变既有分区的取数路径。
 - 事件空态说明：事件表为空且 `[audit].mode` 为默认 `off` 时，页面展示说明性空态文案——审计默认关闭时事件环仅承载截断/故障类事件，属设计语义而非故障。
@@ -923,34 +949,34 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
 - MUST NOT 承诺清单：不承诺 provider 缓存命中率可测量的提升（wont-measure 保持）、跨会话 token
   稳定性、**Responses 标量 `input` 形态的会话级 token 稳定**、**序号空间饱和后的 `fuzzy`
   还原确定性**、凭据占位符稳定性、零明文常驻、网关重启后 token 稳定、键推导含糊时的任何行为。
-- 前置条件（会话级缓存友好**当且仅当**会话键成功推导时成立）：键按四级优先级首个命中者胜——
-  ① 客户端显式头 `[pii_scope].key_header`（默认 `x-veil-conversation-id`，≤256 字节，且经租户命名空间
-  + HMAC，原始值绝不作键）；配置头缺席或取值为空串时，按大小写不敏感的
-  **PII 专用窄链**（`src/service/request_log/session.rs::resolve_pii_scope_header`）继续取首个非空头值：
-  `x-opencode-session` → `x-opencode-session-id`。
-  **该链刻意窄于请求日志的遥测链**（见 §7）：`x-opencode-parent-session-id`（指向父会话，非本会话身份）、
-  `x-session-affinity`（路由/亲和性提示，常为固定常量或跨客户端共享）、`x-session-id`（过于通用，代理/
-  sidecar 常自行注入同一值）**一律不参与 PII 键推导**。原因是 PII 作用域的隔离边界只剩会话键值本身：
-  上游 API key 由 `[llm.targets].headers` 注入时客户端不带凭据头，`tenant_fingerprint` 对所有客户端取值
-  相同；若纳入上述基础设施头，两个逻辑客户端会落到同一会话键、共享同一 `PiiScope` 占位符注册表，
-  一方的明文可被还原进另一方响应。**两条链 MUST NOT 重新合并。**
-  已知取舍：客户端若只发 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`，日志仍有
-  `session_id`，但 PII 作用域退化为逐请求（按第 4 级降级计数）——宁可损失跨轮 token 稳定，也不让共享头
-  把两个客户端并进同一作用域；
-  ② 协议原生键（**按协议白名单，不跨协议接受**：仅 Chat/Responses 的
-  `prompt_cache_key`、仅 Responses 的 `previous_response_id`；Anthropic MUST NOT 接受二者、Chat MUST NOT
-  接受 `previous_response_id`；协议不匹配的原生字段**静默忽略**——不命中第 2 级、不改变第 3/4 级
-  推导结果、不告警、不计数）；③ 稳定前缀（**要求 `tools` +
-  `system` + 首个 user turn 三者齐备**，对脱敏前规范化前缀做 HMAC；字段提取同按协议白名单——
-  Anthropic 取原生顶层 `system` 或 `messages` 首条；Chat 仅 `messages`；Responses 取 `instructions`
-  （首个 user turn 取**数组形** `input`），协议外字段不越界参与）。
-  级别 1/2 依赖客户端配合（显式头 / `prompt_cache_key` / `previous_response_id`），级别 3 依赖请求形态齐备。
+- 前置条件（会话级缓存友好**当且仅当**会话键成功推导时成立）：键按统一优先级首个命中者胜——
+  同一个 `SessionIdentity` 同时服务 PII 作用域、请求记录与 `$conversation`，不再区分 PII 窄链与遥测宽链：
+  ① `[session].headers` 有序链首个合法非空值（≤256 字节、可见 ASCII；经租户命名空间 + HMAC，原值绝不作键）；
+  ② Responses `conversation`（字符串或 `{id}`；**先经别名表解析**，命中返回绑定 canonical，未命中才按
+  `scoped_key` 派生）；
+  ③ Responses `previous_response_id`（**仅别名表命中**；未命中视为该来源未命中并继续下一级，不设锚点、
+  不新建键）；
+  ④ Chat/Responses `prompt_cache_key`（≤256 字节、可见 ASCII；Anthropic 不接受）；
+  ⑤ 稳定前缀（要求 `tools` + `system` + 首个 user turn 三者齐备，对脱敏前规范化前缀做 HMAC；**只产生 PII 键**，
+  不产生日志会话来源与出站锚点）；
+  ⑥ 逐请求。
+  三个不可信客户端标识头 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id` **没有 opt-in
+  路径**（启动期即拒绝）；只发送它们的请求日志 `session_source=none`、PII 逐请求——宁可损失跨轮 token 稳定，
+  也不让共享头把两个客户端并进同一作用域。原因是 PII 作用域的隔离边界只剩会话键值本身：上游 API key 由
+  `[llm.targets].headers` 注入时客户端不带凭据头，`tenant_fingerprint` 对所有客户端取值相同；若纳入上述
+  基础设施头，两个逻辑客户端会落到同一会话键、共享同一 `PiiScope` 占位符注册表，一方的明文可被还原进
+  另一方响应；
+  ②–④ 协议原生键**按协议白名单，不跨协议接受**：Anthropic MUST NOT 接受 `prompt_cache_key`/
+  `previous_response_id`；Chat MUST NOT 接受 `previous_response_id`；协议不匹配的原生字段**静默忽略**
+  （不命中、不改变后续级别、不告警、不计数）。⑤ 的字段提取同样按协议白名单——Anthropic 取原生顶层
+   `system` 或 `messages` 首条（索引 0）；Chat 仅 `messages` 首条（索引 0）；Responses 取 `instructions`（首个 user turn 取**数组形**
+  `input`），协议外字段不越界参与。①②④ 依赖客户端配合，⑤ 依赖请求形态齐备。
 - 降级行为：**纯多轮 `messages` 请求（无工具、无会话键头、无协议原生键）即便
-  `[pii_scope].mode = "conversation"` 亦落第 4 级逐请求**，不获跨轮 token 稳定；**Responses 标量（字符串）
-  `input` 简写形态的第 3 级不可命中**（标量 `input` 是「当前轮全文」、随轮次增长，不作稳定 turn 锚点），
-  同样落第 4 级逐请求并由既有 `record_request_fallback()` 计入观测；以上降级**不报错、不伪造键**
+  `[pii_scope].mode = "conversation"` 亦落第 ⑥ 级逐请求**，不获跨轮 token 稳定；**Responses 标量（字符串）
+  `input` 简写形态的第 ⑤ 级不可命中**（标量 `input` 是「当前轮全文」、随轮次增长，不作稳定 turn 锚点），
+  同样落第 ⑥ 级逐请求并由既有 `record_request_fallback()` 计入观测；以上降级**不报错、不伪造键**
   （缓存失配属预期降级，非缺陷）。
-- 缓存稳定性边界（已成立但 MUST NOT 作为稳定承诺）：(a) 第 3 级要求 `tools` + `system` +
+- 缓存稳定性边界（已成立但 MUST NOT 作为稳定承诺）：(a) 第 ⑤ 级要求 `tools` + `system` +
   首个 user turn 的**内容跨轮冻结**，改写其内容即换键（键序/工具序扰动已由规范化归一，不在此列）；
   (b) 租户指纹纳入**完整上游基址（含 path/query）**与归一化客户端凭据头，切换上游基址或轮换凭据
   即换命名空间、此前铸造的键不可解析（缓存失配/重新铸造，不报错）；(c) 会话期间修改
@@ -964,39 +990,43 @@ provider 侧计费指标，网关侧不可见真值，即使代价未知也不�
   说明、前缀字节较前一轮增长（合法增长，非缓存失稳缺陷）。与 §7.7 同口径。
 - 会话键头转发与保留名校验：客户端请求头默认**逐值原样转发上游**——包括整个会话头链
   （`x-opencode-session`、`x-opencode-session-id`、`x-opencode-parent-session-id`、
-  `x-session-affinity`、`x-session-id`）与普通客户端头名形态的 `[pii_scope].key_header`，
+  `x-session-affinity`、`x-session-id`）与 `[session].headers` 中声明的任意普通客户端头名，
   行为与 `[pii_scope].mode` 取值无关（默认 `request` 模式同样转发）。
   仅有的隐式移除是传输层口径：逐跳头（§7.1）、`host`/`content-length`/`content-encoding`/`accept-encoding`
-  与 `x-veil-*` 内部命名空间（默认键头 `x-veil-conversation-id` 属该命名空间，故恒被移除）。
+  与 `x-veil-*` 内部命名空间（默认链首项 `x-veil-conversation-id` 属该命名空间，故恒被移除）。
   需要上游看不到某个头时，由**目标级 `drop_headers` 显式声明**（大小写不敏感、删除全部值，
   在隐式过滤之后、`headers` 注入之前生效，`override_existing` 两态均生效）。
   `override_existing` 只决定配置头与客户端同名头冲突时的取舍（`true` = 配置恒胜，`false` = 保留客户端副本、仅补缺），
   不删除任何客户端头。
-  `[pii_scope].key_header` 仅用于推导会话作用域与展开 `$conversation`；其名与值 MUST NOT 出现在任何日志行
-  （与是否转发无关，日志隐私口径不变）。该键在启动期做**保留名校验**（fail-closed）：命中真实鉴权/传输头名
+  `[session].headers` 中的头名仅用于推导会话作用域与展开 `$conversation`；头名与取值 MUST NOT 出现在任何日志行
+  （与是否转发无关，日志隐私口径不变；`Config` 的 debug 输出亦对头链脱敏）。该键在启动期做完整校验
+  （fail-closed）：非空数组、每项须为合法 HTTP 头名、大小写归一后不得重复、命中保留鉴权/传输头名
   （`authorization`/`x-api-key`/`api-key`/HOP 集/`host`/`content-length`/`content-encoding`/
-  `accept-encoding`，大小写不敏感）拒启动；除保留名外的任意自定义名 SHALL 被接受。
-  内置回退链头名（`x-opencode-session` 等五个）仅为**读取**来源，不改变转发语义；它们不参与保留名校验
-  （配置里写这些名仍被接受）。
+  `accept-encoding`/`transfer-encoding`/`cookie`）或不可信客户端标识头
+  （`x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id`）即拒启动。
 - 熵源故障 fail-closed：PII 注册失败区分两类——待注册值**本身即 token 形态/保留前缀**时
   静默跳过（既有语义，不替换、不改写、不失败）；`rand8` 的 `OsRng` **熵源/内部故障**时记 `warn!`
   （不含明文/token/键/头值）并计入指标，且**拒绝以未脱敏正文转发上游**：请求以 HTTP `502` + 错误码
   `E_PII_UNAVAILABLE`（码字面定义于 `src/error.rs`）收敛。
-- `previous_response_id` 映射容量与写回观测：映射容量由 `[pii_scope].prev_id_max_entries`
-  承载（**未声明时取 `[pii_scope].max_conversations` 的生效值**，任意配置下零行为变化），与 PII 会话容量
-  解耦；因达容量逐出最旧条目时计映射逐出计数。写回仅限 `Protocol::Responses` 的响应完成处
-  （`src/handler/llm/pump/spawn/event_loop.rs` 与 `src/handler/llm/nonstream.rs`，
-  门控在 `src/service/redaction/conversation_key.rs::record_response_id`），仅「响应 id 缺失/为空」
-  计一次 `conversation_writeback_miss`，无写回上下文与非 Responses 门控不计入。计数范围：**至多每响应一次**；
-  流式仅在官方 Responses 终端帧（`response.completed`/`response.failed`/`response.incomplete`）处判定且该流**从未见 id** 时计一次；
-  非流仅对 `status < 400` 的 JSON 响应体缺 id 计一次；`status >= 400` 错误响应与**流中段截断**声明为范围之外、不计入。
+- 会话别名表容量与写回观测：容量由 `[session].alias_max_entries` 承载（按**别名条目**计，缺省 `1024`，
+  与 `pii_scope.max_conversations` 解耦；每个 Responses 响应最多写 `response.id` 与 `conversation.id` 两条，
+  故 1024 约覆盖 512 个响应会话）；达容量逐出最旧条目时计 `session_alias_evict`。写回仅限 Responses **2xx**
+  响应（`src/service/redaction/writeback.rs::ConversationWriteback` 绑定，`CaptureTracker` 计数；
+  入口为 `src/handler/llm/pump/spawn/event_loop.rs`、`src/handler/llm/nonstream.rs` 与
+  `dispatch::stream_upstream_passthrough`）：`response.id` 恒绑定到请求时 canonical，`conversation.id` 仅在请求
+  未携带 `conversation` 字段时绑定；错误响应、`error.id`/`message.id`/`data.id` 与非 Responses 响应一律不写。
+  `conversation_writeback_miss` 仅在「Responses 2xx 缺 `response.id` 且存在会话级 `PiiScope`」时每响应计一次；
+  `session_bind_miss` 仅在「已取得可用上游 id 但无 canonical」时每响应计一次；二者互斥、不双计。
+  流式仅在**干净完成**（非截断、非传输错误、非 hold 溢出）时判定；`status >= 400` 与流中段截断不计入。
 - 会话键回退可观测：仅三类**可判定**降级事件记 `tracing::warn!`（不含键/头值/明文/token）
-  与内部计数——键推导返 `None` 落第 4 级、`ConversationScopeStore` 缺失、显式会话键头存在但非法被
+  与内部计数——键推导返 `None` 落第 ⑥ 级、`ConversationScopeStore` 缺失、显式会话键头存在但非法被
   静默丢弃；「中途换键/变级」因键推导为逐请求无状态纯函数而不可观测，登记为非目标，**不新增**下游
   可观测响应头（`x-veil-scope` 及等价物非目标）。
 - 模式开关：`[pii_scope].mode` 默认 `request`；`[pii_scope].ttl_secs`
-  （默认 `1800`）、`[pii_scope].max_conversations`（默认 `1024`）、`[pii_scope].key_header`
-  （默认 `x-veil-conversation-id`）为 `conversation` 模式参数；非法值拒启动（fail-closed）。
+  （默认 `1800`）、`[pii_scope].max_conversations`（默认 `1024`）为 `conversation` 模式参数；
+  会话头链 `[session].headers`（默认 `["x-veil-conversation-id", "x-opencode-session",
+  "x-opencode-session-id"]`）与别名容量 `[session].alias_max_entries`（默认 `1024`）与模式正交生效；
+  非法值一律拒启动（fail-closed）。
 
 凭据还原授权：响应侧凭据
 还原为**请求级授权**——仅当 token 属「本请求脱敏实际产出」（minted-set，随请求销毁）时才
@@ -1041,12 +1071,11 @@ PII 与凭据计数口径：
 上表 7 项是**检出置位即 warn、一律不读取**的遗留名，与 `LEGACY_IGNORED_VARS` 逐项锁步；
 须改用「改用」列给出的新形态。
 
-0.2.0 改名前的 4 个旧变量名（审计超时、JSON 空白归一、前驱 id 上限、
-管理面关闭开关）自 0.2.0 起没有任何「已改名」提示：它们与任意未知 env 无区别，置位既不改生效值、
-也不再产生告警。这四个概念已不读进程 env，须写入配置文件：`AUDIT_TIMEOUT` →
-`[audit].timeout_secs`、`NORMALIZE_JSON_WHITESPACE` → `[redaction].normalize_json_whitespace`、
-`PII_PREV_ID_MAX_ENTRIES` → `[pii_scope].prev_id_max_entries`、
-`OBSERVABILITY_DISABLE` → `[admin].enabled = false`（**极性相反**，缺省 `true`）。
+四个非规范拼写（`AUDIT_TIMEOUT`、`NORMALIZE_JSON_WHITESPACE`、`PII_PREV_ID_MAX_ENTRIES`、
+`OBSERVABILITY_DISABLE`）与任意未知 env **完全不可区分**：不在白名单、不在迁移清单，置位既不改变生效值、
+也不产生任何告警。对应概念只由配置文件承载（规范键见 §1 键表）；管理面为**正向**开关
+`[admin].enabled`（缺省 `true`，`false` 才关闭）。另有两个已删除会话规范名不属此列——它们非空置位即
+fail-closed 拒启动（见 §1 例外④）。
 
 ### 7.5 吊销与注册鉴权声明
 
@@ -1256,18 +1285,19 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 （默认 `7`，`0` = 不清理）删除；`request_model_rollup` 随窗口数驱逐（`d` 32 / `h` 170 / `m` 13）。
 本表只存元数据与脱敏摘要，不存请求/响应正文；`upstream` 只记 `host:port`。
 
-`session_id` 取九档优先级中首个命中的会话锚点做 HMAC 摘要（保留 16 hex），来源依次为显式头
-（`[pii_scope].key_header`，缺席或空串时按**遥测链** `resolve_session_header` 依次尝试
-`x-opencode-session` → `x-opencode-session-id` → `x-opencode-parent-session-id` →
-`x-session-affinity` → `x-session-id` 取首个非空值，来源仍记为 `header`）、Responses `conversation`、`previous_response_id`、
-`diagnostics.previous_message_id`、`prompt_cache_key`、`metadata.user_id`、`safety_identifier`、
-`user`、无；原始值不落库。摘要域串与 `conversation_key` 不同，同一原文两条路径结果不等。
-**本链只服务遥测**：PII 会话作用域键用更窄的 `resolve_pii_scope_header`（仅配置头 +
-`x-opencode-session`/`x-opencode-session-id`，理由见 §6），故同一请求的 `session_id` 与 PII 分桶
-可能不同源——日志仍记会话标识，而仅发 `x-session-affinity`/`x-session-id` 的请求在 PII 侧落逐请求。
-两条链 MUST NOT 合并。
+`session_id` 取同一个 `SessionIdentity` 做带域分离的 HMAC 摘要（保留 16 hex）：会话级来源
+（① `[session].headers` 有序链 ② Responses `conversation` ③ 别名命中的 `previous_response_id`
+④ `prompt_cache_key`）对 `identity.canonical` 计算；用户级来源（`metadata.user_id`/`safety_identifier`/
+`user`）对 `log_user.value` 计算同一公式。`session_source` 恰为
+`header`/`conversation`/`prev_response`/`cache_key`/`user_id`/`safety_identifier`/`user`/`none`
+八档（旧库遗留的 `prev_message` 由控制台显示为「历史来源」，不作为现行来源）；原始值不落库。
+摘要域串与 `conversation_key` 不同，同一原文两条路径结果不等。
+**日志与 PII 同源**：`conversation` 模式下会话级来源使用同一 canonical；`request` 模式允许日志显示会话来源
+而 PII 逐请求（预期语义）；稳定前缀级只产生 PII canonical，日志回落到用户级或 `none`。仅发送
+`x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id` 的请求不产生会话来源（三者无 opt-in 路径）。
 未设 `PII_VALUE_SAMPLE_HMAC_KEY` 时该列为 `NULL`、`session_scope` 为 `none`，不退化为无密钥哈希。
-`session_scope` 区分会话级（前五档）与用户级（第六至八档），供 `/_admin/requests?scope=` 过滤。
+`session_scope` 区分会话级来源（头 / `conversation` / `previous_response_id` / `prompt_cache_key`）
+与用户级来源（`metadata.user_id` / `safety_identifier` / `user`），供 `/_admin/requests?scope=` 过滤。
 
 **`range` 分档**（`/_admin/metrics`、`/_admin/requests`、`/_admin/events`、`/_admin/commands`
 及 SSE 快照共用；`/_admin/series` 只把 `range` 折算为窗口键 `since`）：

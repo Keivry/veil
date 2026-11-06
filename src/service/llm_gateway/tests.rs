@@ -615,3 +615,26 @@ fn strip_veil_internal_headers_case_insensitive_and_selective() {
     );
     assert_eq!(headers.len(), 1, "仅非 x-veil-* 头保留");
 }
+
+#[test]
+fn session_metrics_default_zero_and_record_independently() {
+    // 新计数默认 0；各记录方法只影响自身（互不串扰）。
+    let metrics = GatewayMetrics::default();
+    assert_eq!(metrics.session_alias_hit_count(), 0);
+    assert_eq!(metrics.session_alias_conflict_count(), 0);
+    assert_eq!(metrics.session_alias_evict_count(), 0);
+    assert_eq!(metrics.session_bind_miss_count(), 0);
+    assert_eq!(metrics.session_outbound_hmac_count(), 0);
+
+    metrics.record_session_alias_hit();
+    metrics.record_session_alias_conflict();
+    metrics.record_session_alias_evict();
+    metrics.record_session_bind_miss();
+    metrics.record_session_outbound_hmac();
+
+    assert_eq!(metrics.session_alias_hit_count(), 1);
+    assert_eq!(metrics.session_alias_conflict_count(), 1);
+    assert_eq!(metrics.session_alias_evict_count(), 1);
+    assert_eq!(metrics.session_bind_miss_count(), 1);
+    assert_eq!(metrics.session_outbound_hmac_count(), 1);
+}

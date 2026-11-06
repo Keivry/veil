@@ -224,23 +224,32 @@ pub(super) async fn handle_event(
     // 产物供本函数各判定复用；空帧/`[DONE]`/非法 JSON 为 `None`。
     let parsed: Option<Value> = parse_event_data(&ev.data);
     if let Some(v) = parsed.as_ref() {
-        let response_id = llm_gateway::extract_conv_id(v);
-        let wrote = response_id
-            .as_deref()
-            .is_some_and(|id| env.resp_scope.record_response_id(env.protocol, id));
-        // 写回失败仅「响应 id 缺失/为空」计一次；无写回上下文（`request`
-        // 模式/键未推导）与非 Responses 协议门控 MUST NOT 计入。计数点取 Responses
-        // 官方终端帧且本流从未见过 id，保证一次响应恰一次（不回退为逐帧误计）。
-        if !wrote
-            && env.protocol.is_responses()
-            && response_id.is_none()
-            && env.resp_scope.has_conversation()
-            && state.conv_id.is_none()
-            && is_terminal_event(env.protocol, v)
-        {
-            env.metrics.record_conversation_writeback_miss();
-        }
-        if let Some(id) = response_id {
+        // 响应捕获 + 别名绑定：仅 `Protocol::Responses` 且 2xx 才有内容
+        // （`capture_response_ids` 内门控），MUST NOT 回退
+        // `error.id`/`message.id`/`data.id`；Chat/Anthropic 恒不绑定。
+        // 写回失败/绑定缺失的**一次性**计数在 `finish.rs` 收尾完成，
+        // 逐帧不做，故重复帧/终端帧不会多计。
+        // 上游状态取落行快照（缺省 200，单测直调泵时无落行上下文）；
+        // 泵只在 `< 400` 时被分派进入，故此处非 2xx 仅可能来自单测构造。
+        let upstream_status = env
+            .stream_log
+            .as_ref()
+            .map_or(200u16, |log| log.upstream_status);
+        state
+            .capture
+            .observe_frame(env.resp_scope.as_ref(), env.protocol, upstream_status, v);
+        // 展示锚点：Responses 与绑定路径同口径，只认 `response.id`；
+        // 事件顶层 `id` 可能来自非会话字段，MUST NOT 污染请求日志/合成终端。
+        let display_id = if env.protocol.is_responses() {
+            v.get("response")
+                .and_then(|r| r.get("id"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        } else {
+            llm_gateway::extract_conv_id(v)
+        };
+        if let Some(id) = display_id {
             if state.stream_first_id.is_none() {
                 state.stream_first_id = Some(id.clone());
             }

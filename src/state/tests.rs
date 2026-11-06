@@ -620,6 +620,34 @@ fn app_state_debug_redacts_conversation_secret() {
 }
 
 #[test]
+fn conversation_secret_generated_in_request_mode() {
+    // `request` 模式同样无条件生成 32 字节会话密钥（别名表键与出站 HMAC 依赖它，
+    // 空密钥会让域分离失效）。
+    let state = AppState::try_new(
+        Config::load_from(&minimal_env()).unwrap(),
+        outcome_for(Path::new("/tmp")),
+    )
+    .expect("AppState 装配须成功");
+    assert!(
+        !state.config.pii_scope_mode.is_conversation(),
+        "前置：默认 request 模式"
+    );
+    assert!(
+        state.conversation_scope_store.is_none(),
+        "request 模式 MUST NOT 装配 ConversationScopeStore"
+    );
+    assert_eq!(
+        state.conversation_secret.len(),
+        32,
+        "request 模式亦须 32 字节密钥"
+    );
+    assert!(
+        state.conversation_secret.iter().any(|b| *b != 0),
+        "密钥不得全零"
+    );
+}
+
+#[test]
 fn request_log_shares_metrics_db_path() {
     // 请求日志与 metrics 同库同文件（不同表），且沿用配置面的开关与保留期。
     let dir = unique_temp_dir();
@@ -685,6 +713,10 @@ async fn lock_cleanup_reports_zero_pii_scopes_in_request_mode() {
         reply.contains("PII 会话作用域 0 个"),
         "request 模式下回执须报 0 个作用域: {reply}"
     );
+    assert!(
+        reply.contains("会话别名 0 条"),
+        "request 模式下别名表亦为空，回执须报 0 条: {reply}"
+    );
 }
 
 #[tokio::test]
@@ -709,9 +741,34 @@ async fn lock_cleanup_clears_pii_conversation_scopes() {
     let mut sampled = state.clone();
     sampled.conversation_scope_store = Some(Arc::clone(&store));
 
+    // 别名表：预置条目以断言「lock 同时清空两表并分别报条数」。
+    let alias = sampled.session_alias_map.clone();
+    let alias_keys = [0u8, 1].map(|i| {
+        crate::service::redaction::conversation_key::scoped_key(
+            b"lock-alias-secret",
+            "tenant-lock",
+            &format!("resp-lock-{i}"),
+        )
+    });
+    for key in &alias_keys {
+        alias.bind(
+            b"lock-alias-secret",
+            "tenant-lock",
+            &format!("upstream-{}", key.as_str()),
+            key,
+        );
+    }
+    assert_eq!(alias.len(), alias_keys.len(), "前置：须有 2 条别名");
+
     let report = crate::service::matrix::GatewayCleanup::lock_cleanup(&sampled);
     assert_eq!(report.pii_scopes_cleared, keys.len(), "须报真实清理条数");
     assert_eq!(store.len(), 0, "lock 后会话作用域须清空");
+    assert_eq!(
+        report.alias_entries_cleared,
+        alias_keys.len(),
+        "别名表清理条数须与作用域条数分别可观测"
+    );
+    assert_eq!(alias.len(), 0, "lock 后别名表须清空");
 
     let reply = crate::service::matrix::MatrixBot::handle_text_command_full(
         &sampled.approval,
@@ -723,6 +780,10 @@ async fn lock_cleanup_clears_pii_conversation_scopes() {
     assert!(
         reply.contains("PII 会话作用域 0 个"),
         "二次 lock 时作用域已空，回执须报 0: {reply}"
+    );
+    assert!(
+        reply.contains("会话别名 0 条"),
+        "二次 lock 时别名表已空，回执须报 0: {reply}"
     );
     assert!(
         reply.contains("口令缓存"),

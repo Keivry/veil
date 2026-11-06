@@ -894,16 +894,29 @@ async fn restore_unauthorized_token_passthrough() {
 #[test]
 fn scope_debug_redacts_conversation_context() {
     // FIX 2：`Scope` 手工 `Debug` 不得泄漏会话键 hex/租户指纹/密钥字节。
-    let key = ConversationKey::for_test(
+    let key = crate::service::redaction::ConversationKey::for_test(
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
     );
     let tenant = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     let secret: Arc<[u8]> = Arc::from(vec![0x5Au8; 32].into_boxed_slice());
+    let identity = crate::service::session_identity::SessionIdentity {
+        anchor: None,
+        canonical: Some(key.clone()),
+        tenant_fingerprint: tenant.to_string(),
+        scope: crate::service::session_identity::SessionScope::Session,
+        source: crate::service::session_identity::SessionSource::None,
+        log_source: crate::service::session_identity::SessionSource::None,
+        log_scope: crate::service::session_identity::SessionScope::None,
+        log_user: None,
+        request_carried_conversation: false,
+    };
     let scope = Scope::new().with_conversation(
-        key.clone(),
-        tenant.to_string(),
-        secret.clone(),
-        Arc::new(PreviousResponseMap::new(4)),
+        crate::service::redaction::writeback::ConversationWriteback::new(
+            identity,
+            secret.clone(),
+            Arc::new(crate::service::redaction::session_alias::SessionAliasMap::new(4)),
+        ),
+        true,
     );
     let debug = format!("{scope:?}");
     assert!(!debug.contains(key.as_str()), "不得泄漏会话键 hex: {debug}");

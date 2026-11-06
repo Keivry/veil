@@ -13,6 +13,7 @@ fn file_len_redline() {
 mod nondialog_params;
 mod pii_fail_closed;
 mod read_error;
+mod replace;
 
 use {
     super::{

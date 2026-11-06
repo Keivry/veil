@@ -198,8 +198,9 @@ impl MatrixBot {
                 };
                 let cleared = report.vault_cleared;
                 let scopes = report.pii_scopes_cleared;
+                let aliases = report.alias_entries_cleared;
                 Some(format!(
-                    "🧹 已清除内存口令材料（口令缓存 {cleared} 条、主密码缓存: {master_state}、未决 {count} 单已按拒绝落定、PII 会话作用域 {scopes} 个）"
+                    "🧹 已清除内存口令材料（口令缓存 {cleared} 条、主密码缓存: {master_state}、未决 {count} 单已按拒绝落定、PII 会话作用域 {scopes} 个、会话别名 {aliases} 条）"
                 ))
             }
             TextCommand::Status => {

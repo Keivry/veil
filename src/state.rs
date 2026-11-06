@@ -71,8 +71,9 @@ pub struct AppState {
     /// 会话级 PII 作用域存储（`PII_SCOPE_MODE=conversation` 时构造并跨请求
     /// 共享；`request` 模式为 `None` 且不使用）。
     pub conversation_scope_store: Option<Arc<crate::service::redaction::ConversationScopeStore>>,
-    /// `previous_response_id` → 会话键映射（第 2 级，租户分域、跨请求共享）。
-    pub previous_response_map: Arc<crate::service::redaction::PreviousResponseMap>,
+    /// 会话别名表：上游标识（`conversation.id`/`response.id`）→ canonical 会话键
+    /// （租户分域、跨请求共享；`request` 模式同样可用，仅不建会话作用域）。
+    pub session_alias_map: Arc<crate::service::redaction::SessionAliasMap>,
     /// 会话键/租户指纹 HMAC 密钥（进程内随机、跨请求稳定；不落盘、不进日志）。
     pub conversation_secret: Arc<[u8]>,
     /// 失败/审批通知统一有界 spool（单 Bot + 有界队列 + 常驻消费者）。
@@ -113,7 +114,7 @@ impl std::fmt::Debug for AppState {
             .field("vault", &self.vault)
             .field("detector", &self.detector)
             .field("conversation_scope_store", &self.conversation_scope_store)
-            .field("previous_response_map", &self.previous_response_map)
+            .field("session_alias_map", &self.session_alias_map)
             .field("conversation_secret", &"[redacted]")
             .field("notify", &self.notify)
             .field("command", &self.command)
@@ -211,13 +212,13 @@ impl AppState {
                     .with_metrics(gateway_metrics.clone()),
             )
         });
-        let conversation_secret = if config.pii_scope_mode.is_conversation() {
-            generate_conversation_secret()
-        } else {
-            Arc::<[u8]>::from(&[][..])
-        };
-        let previous_response_map = Arc::new(
-            crate::service::redaction::PreviousResponseMap::new(config.pii_prev_id_max_entries)
+        // 会话密钥**无条件生成**：`request` 模式同样需要它做别名表键与出站标识
+        // 的域分离 HMAC（否则空密钥）。
+        let conversation_secret: Arc<[u8]> = generate_conversation_secret();
+        // 别名表容量来自 `[session].alias_max_entries`（按别名条目计，与
+        // `[pii_scope].max_conversations` 解耦）；两种模式都装配。
+        let session_alias_map = Arc::new(
+            crate::service::redaction::SessionAliasMap::new(config.session_alias_max_entries)
                 .with_metrics(gateway_metrics.clone()),
         );
         let command = Arc::new(crate::service::command::CommandRuntime::new(
@@ -251,7 +252,7 @@ impl AppState {
             vault,
             detector,
             conversation_scope_store,
-            previous_response_map,
+            session_alias_map,
             conversation_secret,
             notify,
             command,
@@ -353,12 +354,15 @@ impl crate::service::matrix::GatewayCleanup for AppState {
             .as_ref()
             .map(|store| store.clear())
             .unwrap_or(0);
+        // 别名表与会话作用域分离，但 `lock` SHALL 同时清空两表并分别报条数。
+        let alias_entries_cleared = self.session_alias_map.clear();
         tracing::info!(
-            "lock 清理: 口令缓存 {vault_cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}、PII 会话作用域 {pii_scopes_cleared} 个"
+            "lock 清理: 口令缓存 {vault_cleared} 条、内存待审 {pending} 条、KeePass 会话已清、TPM 主密码缓存清 {master_cleared}、PII 会话作用域 {pii_scopes_cleared} 个、会话别名 {alias_entries_cleared} 条"
         );
         crate::service::matrix::LockCleanupReport {
             vault_cleared,
             pii_scopes_cleared,
+            alias_entries_cleared,
         }
     }
 

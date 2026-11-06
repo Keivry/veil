@@ -42,7 +42,7 @@ impl TargetKey {
 pub type RawTargets = BTreeMap<String, TargetSection>;
 
 /// 单个目标声明：仅 `headers` / `params` / `override_existing` / `user_agent` /
-/// `drop_headers`，未知键（含错误嵌套层级）拒启动。
+/// `drop_headers` / `header_replace`，未知键（含错误嵌套层级）拒启动。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetSection {
@@ -60,6 +60,9 @@ pub struct TargetSection {
     /// 显式剔除的出站头名列表（装配期在内部头/逐跳头过滤之后、配置头注入之前
     /// 逐名删除，两态均生效；合法性与冲突规则见 [`validate_drop_headers`]）。
     pub drop_headers: Option<Vec<String>>,
+    /// 出站头条件替换规则数组（`[[...header_replace]]`）；合法性与冲突规则见
+    /// [`rules::validate_header_replace`]。
+    pub header_replace: Option<Vec<rules::HeaderReplaceRule>>,
 }
 
 /// `params` 协议子表：协议键集合受限，其余键拒启动。
@@ -71,7 +74,8 @@ pub struct TargetParams {
     pub responses: Option<ParamSegments>,
 }
 
-/// 单协议三段覆盖：`default`（缺则补）/ `override`（恒写）/ `drop`（删顶层键）。
+/// 单协议三段覆盖：`default`（缺则补）/ `override`（恒写）/ `drop`（删顶层键）/
+/// `replace`（条件替换规则）。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSegments {
@@ -81,6 +85,9 @@ pub struct ParamSegments {
     pub r#override: Option<BTreeMap<String, Value>>,
     /// 删除的顶层键（键不存在时静默忽略）。
     pub drop: Option<Vec<String>>,
+    /// 条件替换规则数组（`[[...params.<proto>.replace]]`）；合法性与冲突规则见
+    /// [`rules::validate_replace`]。
+    pub replace: Option<Vec<rules::ReplaceRule>>,
 }
 
 /// 校验后的目标覆盖表：`Config::llm_targets` 的载荷类型。
@@ -92,6 +99,8 @@ pub struct ParamOverrides {
     pub default: BTreeMap<String, Value>,
     pub r#override: BTreeMap<String, Value>,
     pub drop: Vec<String>,
+    /// 条件替换规则（加载期已完成字段/标量/重复/占位符形态校验）。
+    pub replace: Vec<rules::ReplaceRule>,
 }
 
 /// 单个目标的上游覆盖：静态出站头 + 按协议分表的参数覆盖 + 冲突策略 + UA 恒胜覆盖。
@@ -110,6 +119,9 @@ pub struct UpstreamOverrides {
     /// 显式剔除的出站头名（装配期在内部头/逐跳头过滤之后、配置头注入之前删除，
     /// 两态均生效）；空表 = 未声明。已过加载期合法性与冲突校验，故装配期不再判定。
     pub drop_headers: Vec<HeaderName>,
+    /// 出站头条件替换规则（已过加载期校验；空表 = 未声明）。装配期在 `drop_headers`
+    /// 之后、配置 `headers` 注入之前逐值应用。
+    pub header_replace: Vec<rules::HeaderReplaceRule>,
 }
 
 impl Default for UpstreamOverrides {
@@ -124,6 +136,7 @@ impl Default for UpstreamOverrides {
             override_existing: true,
             user_agent: None,
             drop_headers: Vec::new(),
+            header_replace: Vec::new(),
         }
     }
 }
@@ -133,7 +146,7 @@ impl Default for UpstreamOverrides {
 pub enum HeaderValueSegment {
     /// 字面段（`$$` 转义产生的 `$` 并入相邻字面）。
     Literal(String),
-    /// `$conversation`：会话键头（`PII_SCOPE_KEY_HEADER` 所指入站头）的原始值。
+    /// `$conversation`：会话头链首项（`[session].headers[0]`）所指入站头的原始值。
     Conversation,
     /// `$request-id`：入站 `x-request-id` 的首个值。
     RequestId,
@@ -284,15 +297,34 @@ fn parse_target_key(raw: &str) -> Result<TargetKey> {
     })
 }
 
-/// 单目标全量校验：头表 + 协议参数表 + 冲突策略 + UA 恒胜覆盖 + 显式剔除头。
+/// 单目标全量校验：头表 + 协议参数表 + 冲突策略 + UA 恒胜覆盖 + 显式剔除头 +
+/// 出站头条件替换。合并模式（`override_existing = false`）与任一非空条件替换规则并存
+/// 时拒启动（该模式承诺不覆盖客户端值，条件替换会静默破坏该承诺）。
 fn validate_target(key: TargetKey, section: &TargetSection) -> Result<UpstreamOverrides> {
     let headers = validate_headers(key, section.headers.as_ref())?;
+    let user_agent = validate_user_agent(key, section.user_agent.as_deref(), &headers)?;
+    let drop_headers = validate_drop_headers(key, section.drop_headers.as_deref(), &headers)?;
+    let header_replace = rules::validate_header_replace(
+        key,
+        section.header_replace.as_deref(),
+        &rules::HeaderChannels {
+            headers: &headers,
+            drop_headers: &drop_headers,
+            has_user_agent: user_agent.is_some(),
+        },
+    )?;
+    let params = validate_params(key, section.params.as_ref())?;
+    let override_existing = section.override_existing.unwrap_or(true);
+    if !override_existing {
+        rules::ensure_merge_mode_has_no_rules(key, &params, &header_replace)?;
+    }
     Ok(UpstreamOverrides {
-        user_agent: validate_user_agent(key, section.user_agent.as_deref(), &headers)?,
-        drop_headers: validate_drop_headers(key, section.drop_headers.as_deref(), &headers)?,
+        user_agent,
+        drop_headers,
+        header_replace,
         headers,
-        params: validate_params(key, section.params.as_ref())?,
-        override_existing: section.override_existing.unwrap_or(true),
+        params,
+        override_existing,
     })
 }
 
@@ -603,16 +635,23 @@ fn validate_params(
     Ok(params)
 }
 
-/// 单协议三段校验：`default` / `override` 逐键保留键检查，`drop` 逐元素检查。
+/// 单协议校验：`default` / `override` 逐键保留键检查，`drop` 逐元素检查，
+/// `replace` 逐规则检查（含与前三段的同字段歧义）。
 fn validate_segments(
     key: TargetKey,
     protocol: ParamProtocol,
     raw: &ParamSegments,
 ) -> Result<ParamOverrides> {
+    let replace_path = format!(
+        "{}.params.{}.replace",
+        key.path_prefix(),
+        protocol.wire_name()
+    );
     Ok(ParamOverrides {
         default: validate_segment_map(key, protocol, "default", raw.default.as_ref())?,
         r#override: validate_segment_map(key, protocol, "override", raw.r#override.as_ref())?,
         drop: validate_drop(key, protocol, raw.drop.as_deref())?,
+        replace: rules::validate_replace(&replace_path, raw.replace.as_deref(), raw)?,
     })
 }
 
@@ -677,11 +716,20 @@ pub(crate) const TARGETS_STRUCTURAL_KEYS: &[(&str, &[&str])] = &[
             "override_existing",
             "user_agent",
             "drop_headers",
+            "header_replace",
         ],
     ),
     ("params 内", &["chat", "anthropic", "responses"]),
-    ("协议段内", &["default", "override", "drop"]),
+    ("协议段内", &["default", "override", "drop", "replace"]),
+    ("body replace 规则内", &["field", "from", "to", "models"]),
+    ("header replace 规则内", &["name", "from", "to", "models"]),
 ];
+
+pub mod rules;
+
+pub use rules::{HeaderReplaceRule, ReplaceRule};
+#[cfg(test)]
+pub(crate) use rules::{RuleSite, validate_replace_scalar};
 
 #[cfg(test)]
 mod tests;

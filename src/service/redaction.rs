@@ -15,8 +15,18 @@ pub mod conversation_store;
 pub mod leaf;
 pub mod restore_guard;
 pub mod scope;
+/// 会话别名表（上游标识 → canonical 会话键的路由映射）。
+pub mod session_alias;
+/// 响应侧会话写回与响应级捕获计数（`ConversationWriteback` / `CaptureTracker`）。
+pub mod writeback;
 
-pub use {conversation_key::*, conversation_store::*, scope::*};
+pub use {
+    conversation_key::*,
+    conversation_store::*,
+    scope::*,
+    session_alias::SessionAliasMap,
+    writeback::CaptureTracker,
+};
 
 /// 上游 prompt cache 保真与注入位置测试（4.1–4.4，聚合单测入口）。
 #[cfg(test)]

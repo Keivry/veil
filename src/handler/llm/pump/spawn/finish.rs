@@ -49,6 +49,23 @@ pub(super) async fn finish(
     })
     .await;
     env.hold_gate.store(false, Ordering::Relaxed);
+    // 会话捕获的**一次性**收尾计数（每响应至多一次，且与 writeback miss 互斥）。
+    // 仅「非截断 + 无传输错误 + 无 hold 阻断 + 上游 2xx」的干净完成才计数：
+    // 截断/中断流 MUST NOT 计 `conversation_writeback_miss`（design D8 边界）。
+    let upstream_status = env
+        .stream_log
+        .as_ref()
+        .map_or(200u16, |log| log.upstream_status);
+    let clean_completion =
+        !transport_error && state.meta.truncated_mode.is_none() && !state.audit_hold_overflow;
+    if clean_completion {
+        state.capture.finish(
+            env.resp_scope.as_ref(),
+            env.protocol,
+            upstream_status,
+            &env.metrics,
+        );
+    }
     let counted = env.admin_metrics.record_chat(ChatRecord {
         protocol: env.protocol,
         model: state.stream_model.as_deref().unwrap_or(""),

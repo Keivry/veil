@@ -8,19 +8,37 @@ use {
     },
     crate::service::{
         llm_gateway::{GatewayMetrics, Protocol},
-        redaction::{ConversationKey, PreviousResponseMap, Scope},
+        redaction::{Scope, session_alias::SessionAliasMap, writeback::ConversationWriteback},
+        session_identity::{AnchorSource, SessionAnchor, SessionScope, SessionSource},
     },
     axum::http::HeaderMap,
     std::sync::Arc,
 };
 
+/// 会话级作用域：canonical 存在 → 挂写回且 `conversation_scope = true`
+/// （与生产 `build_request_scope` 的 `conversation` 模式分支同形）。
 fn conversation_scope() -> Arc<Scope> {
-    Arc::new(Scope::new().with_conversation(
-        ConversationKey::for_test("test-conversation-key"),
-        "tenant-fp".to_string(),
+    let canonical = crate::service::redaction::scoped_key(b"secret", "tenant-fp", "anchor-1");
+    let identity = crate::service::session_identity::SessionIdentity {
+        anchor: Some(SessionAnchor {
+            value: "anchor-1".to_string(),
+            source: AnchorSource::Header,
+        }),
+        canonical: Some(canonical),
+        tenant_fingerprint: "tenant-fp".to_string(),
+        scope: SessionScope::Session,
+        source: SessionSource::Header,
+        log_source: SessionSource::Header,
+        log_scope: SessionScope::Session,
+        log_user: None,
+        request_carried_conversation: false,
+    };
+    let writeback = ConversationWriteback::new(
+        identity,
         Arc::<[u8]>::from(&b"secret"[..]),
-        Arc::new(PreviousResponseMap::new(8)),
-    ))
+        Arc::new(SessionAliasMap::new(8)),
+    );
+    Arc::new(Scope::new().with_conversation(writeback, true))
 }
 
 async fn run_nonstream(

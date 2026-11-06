@@ -5,6 +5,7 @@
 use {
     crate::{
         config::{
+            HeaderReplaceRule,
             HeaderValueSegment,
             HeaderValueSpec,
             UpstreamOverrides,
@@ -13,6 +14,7 @@ use {
         service::{
             llm_gateway::{self, GatewayMetrics, Protocol},
             redaction::leaf::PROTOCOL_HEADER_NAME,
+            session_identity::OutboundId,
         },
     },
     axum::{
@@ -39,16 +41,24 @@ pub use crate::config::{AUDIT_SUBLIMIT_CEILING_BYTES, GATEWAY_BODY_LIMIT_BYTES};
 #[cfg(test)]
 pub(crate) fn audit_scan_body_over_limit(len: usize) -> bool { len > AUDIT_SUBLIMIT_CEILING_BYTES }
 
-/// 头值插值展开的只读上下文（design D3）：原始入站头 + 会话键头生效名。
+/// 头值插值展开的只读上下文（design D5）：原始入站头 + 预计算的出站标识 + 请求模型。
 ///
-/// `$conversation` / `$header(名)` / `$request-id` 三种来源均从 `inbound` 读取——
-/// 原始 `parts.headers` 不受出站装配剔除（协议必要头/hop 头/`drop_headers`）影响；
-/// `$header(名)` 来源限入站请求自身，与透传同信任边界。
+/// `$header(名)` / `$request-id` 从 `inbound` 读取——原始 `parts.headers` 不受出站
+/// 装配剔除（协议必要头/hop 头/`drop_headers`）影响；`$header(名)` 来源限入站请求
+/// 自身，与透传同信任边界。
+///
+/// `outbound_id` 在 `SessionIdentity` 解析完成后由
+/// `session_identity::outbound_id(&identity, secret)` 预计算并 owned 持有——避免
+/// 借用随后会被 move 的 identity，也避免在展开时重新解析身份。`model` 同理由
+/// dispatch 写入（对话路径 `Some`，NonDialog `None`）。
+#[derive(Clone)]
 pub struct ExpandCtx<'a> {
     /// 原始入站请求头（`parts.headers`）。
     pub inbound: &'a HeaderMap,
-    /// 会话键头生效名（`PII_SCOPE_KEY_HEADER`），`$conversation` 读取用。
-    pub conversation_key_header: &'a str,
+    /// `$conversation` 的预计算出站标识（`None` = 无锚点，按来源缺失跳过）。
+    pub outbound_id: Option<OutboundId>,
+    /// 本次请求的 `model`（`$model` 类展开使用；NonDialog 为 `None`）。
+    pub model: Option<String>,
 }
 
 /// 上游转发头：透传客户端入站头——仅剔除协议必要项（`host`/`content-length`/
@@ -57,7 +67,7 @@ pub struct ExpandCtx<'a> {
 /// 再做 hop 头过滤并计数；随后按目标 `drop_headers` 显式剔除，最后注入目标配置头
 /// （design D3/D4）。
 ///
-/// 会话键头（含 `SESSION_HEADER_FALLBACKS` 五名回退链）不再被隐式剔除：客户端动态
+/// 会话类头（`[session].headers` 链与历史回退名）不再被隐式剔除：客户端动态
 /// 身份头按 D1 原样上游，需剔除时由操作者显式声明 `drop_headers`。
 ///
 /// 配置头注入两态策略：
@@ -76,6 +86,12 @@ pub struct ExpandCtx<'a> {
 ///
 /// 配置头与 `drop_headers` 已过加载期校验（同名互斥、`x-veil-*` 拒绝等），故此处
 /// 不再二次过滤。
+///
+/// `header_replace` 在 `drop_headers` 删除之后、配置 `headers` 注入之前逐值应用
+/// （design D3）：按 `HeaderMap` 每个值条目精确匹配 `from`（大小写敏感）后改为字面
+/// `to`（不做 `$` 插值），未匹配值及其顺序保留；头缺失即 no-op，绝不注入。同一
+/// 头名的全部命中改动一次性写回，故规则顺序无关、不级联。`models` 门控读取
+/// [`ExpandCtx::model`]（dispatch 在脱敏/重写前快照的客户端原始模型）。
 pub fn forward_headers(
     incoming: &HeaderMap,
     metrics: &GatewayMetrics,
@@ -101,11 +117,12 @@ pub fn forward_headers(
         for name in &overrides.drop_headers {
             fwd.remove(name);
         }
+        apply_header_replace(&mut fwd, &overrides.header_replace, expand.model.as_deref());
         let config_wins = overrides.override_existing;
         for (name, value) in overrides.headers.iter() {
             // 恒胜模式直接覆盖；合并模式仅当客户端未发送同名头时新增。
             if config_wins || !fwd.contains_key(name) {
-                let Some(resolved) = resolve_header_value(value, expand) else {
+                let Some(resolved) = resolve_header_value(value, expand, metrics) else {
                     continue;
                 };
                 fwd.insert(name.clone(), resolved);
@@ -118,34 +135,87 @@ pub fn forward_headers(
     fwd
 }
 
+/// 出站头条件替换：按头名分组，逐**值条目**精确匹配 `from` 后改写为字面 `to`。
+///
+/// 每个头名先取 `get_all` 快照（应用前客户端值），随后一次性重建该头名条目——
+/// 未匹配值原样保序保留，故规则顺序无关、不级联；不拆分逗号拼接的单值。头名
+/// 缺失即整个头名跳过（不注入）。运行期非法规则名/值按跳过处理（加载期已校验）。
+fn apply_header_replace(fwd: &mut HeaderMap, rules: &[HeaderReplaceRule], model: Option<&str>) {
+    let mut names: Vec<header::HeaderName> = Vec::new();
+    for rule in rules {
+        let Ok(name) = header::HeaderName::from_bytes(rule.name.as_bytes()) else {
+            continue;
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    for name in names {
+        let values: Vec<header::HeaderValue> = fwd.get_all(&name).iter().cloned().collect();
+        if values.is_empty() {
+            continue;
+        }
+        let mut rebuilt: Vec<header::HeaderValue> = Vec::with_capacity(values.len());
+        let mut changed = false;
+        for value in values {
+            let hit = rules.iter().find(|rule| {
+                rule.name.eq_ignore_ascii_case(name.as_str())
+                    && llm_gateway::models_gate_matches(rule.models.as_deref(), model)
+                    && rule.from.as_bytes() == value.as_bytes()
+            });
+            match hit.and_then(|rule| header::HeaderValue::from_str(&rule.to).ok()) {
+                Some(to) => {
+                    rebuilt.push(to);
+                    changed = true;
+                }
+                None => rebuilt.push(value),
+            }
+        }
+        if changed {
+            fwd.remove(&name);
+            for value in rebuilt {
+                fwd.append(&name, value);
+            }
+        }
+    }
+}
+
 /// 单条配置值求值：`Static` 原样；`Template` 展开（来源缺失或展开结果防御性
 /// 校验失败返回 `None`，调用方按「跳过该条目」处理）。
 fn resolve_header_value(
     value: &HeaderValueSpec,
     ctx: &ExpandCtx<'_>,
+    metrics: &GatewayMetrics,
 ) -> Option<header::HeaderValue> {
     match value {
         HeaderValueSpec::Static(value) => Some(value.clone()),
-        HeaderValueSpec::Template(segments) => expand_template(segments, ctx),
+        HeaderValueSpec::Template(segments) => expand_template(segments, ctx, metrics),
     }
 }
 
 /// 模板段展开：字面拼接 + 三种来源取入站首值；任一来源缺失即整条 `None`。
 /// 展开结果由「合法来源 + 启动期校验字面 + `$$` 转义」结构性保证可解析，
 /// 防御性构造失败（理论不可达）记 warn 后按跳过处理（design D5）。
+///
+/// `session_outbound_hmac` 计数点（design D5）：一个 header 值内每个**成功建出整条
+/// 头值**的 `Conversation` 服务端 HMAC 段各计一次；客户端原值、无锚点跳过、构造失败
+/// 均不计数，故计数在 `from_str` 成功之后按累计段数一次性递增。
 fn expand_template(
     segments: &[HeaderValueSegment],
     ctx: &ExpandCtx<'_>,
+    metrics: &GatewayMetrics,
 ) -> Option<header::HeaderValue> {
     let mut out = String::new();
+    let mut server_hmac_segments: u32 = 0;
     for segment in segments {
         match segment {
             HeaderValueSegment::Literal(text) => out.push_str(text),
             HeaderValueSegment::Conversation => {
-                out.push_str(inbound_first_value(
-                    ctx.inbound,
-                    ctx.conversation_key_header,
-                )?);
+                let outbound = ctx.outbound_id.as_ref()?;
+                out.push_str(outbound.as_str());
+                if outbound.is_server_hmac() {
+                    server_hmac_segments = server_hmac_segments.saturating_add(1);
+                }
             }
             HeaderValueSegment::RequestId => {
                 out.push_str(inbound_first_value(ctx.inbound, REQUEST_ID_HEADER)?);
@@ -156,7 +226,12 @@ fn expand_template(
         }
     }
     match header::HeaderValue::from_str(&out) {
-        Ok(value) => Some(value),
+        Ok(value) => {
+            for _ in 0..server_hmac_segments {
+                metrics.record_session_outbound_hmac();
+            }
+            Some(value)
+        }
         Err(_) => {
             tracing::warn!("动态头值展开结果不符合 http 头值语义，跳过该条目（理论不可达）");
             None
@@ -231,7 +306,7 @@ pub use {
 pub(crate) mod test_support {
     use {
         super::ExpandCtx,
-        crate::config::{Config, env_parse::pii_scope::PII_SCOPE_KEY_HEADER_DEFAULT},
+        crate::config::Config,
         axum::http::HeaderMap,
         std::collections::HashMap,
     };
@@ -261,20 +336,34 @@ pub(crate) mod test_support {
         Config::load_from(&env).expect("测试配置须合法")
     }
 
-    /// 零来源展开上下文（空头表 + 默认会话键头名），静态条目测试用。
+    /// 零来源展开上下文（空头表 + 无出站标识），静态条目测试用。
     pub(crate) fn no_expand() -> ExpandCtx<'static> {
         static EMPTY: std::sync::OnceLock<HeaderMap> = std::sync::OnceLock::new();
         ExpandCtx {
             inbound: EMPTY.get_or_init(HeaderMap::new),
-            conversation_key_header: PII_SCOPE_KEY_HEADER_DEFAULT,
+            outbound_id: None,
+            model: None,
         }
     }
 
-    /// 以给定入站头为来源的展开上下文（会话键头取默认名），动态条目测试用。
+    /// 以给定入站头为来源、无出站标识的展开上下文（`$header`/`$request-id` 测试用）。
     pub(crate) fn expand_ctx(inbound: &HeaderMap) -> ExpandCtx<'_> {
         ExpandCtx {
             inbound,
-            conversation_key_header: PII_SCOPE_KEY_HEADER_DEFAULT,
+            outbound_id: None,
+            model: None,
+        }
+    }
+
+    /// 以给定入站头与预计算出站标识构造的展开上下文（`$conversation` 测试用）。
+    pub(crate) fn expand_ctx_with(
+        inbound: &HeaderMap,
+        outbound_id: Option<crate::service::session_identity::OutboundId>,
+    ) -> ExpandCtx<'_> {
+        ExpandCtx {
+            inbound,
+            outbound_id,
+            model: None,
         }
     }
 }

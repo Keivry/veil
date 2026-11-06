@@ -108,8 +108,17 @@ pub struct GatewayMetrics {
     conversation_header_invalid: AtomicU64,
     /// Responses 响应 id 缺失/为空的写回失败次数（仅真实写回失败）。
     conversation_writeback_miss: AtomicU64,
-    /// `PreviousResponseMap` 达容量逐出最旧条目的累计次数。
-    previous_response_eviction: AtomicU64,
+    /// 会话别名表——`upstream_id` 解析命中既有绑定的累计次数。
+    session_alias_hit: AtomicU64,
+    /// 会话别名表——同一 `upstream_id` 已绑定到不同 canonical 键、拒绝覆盖的次数
+    /// （每响应内同一 `upstream_id` 至多计一次）。
+    session_alias_conflict: AtomicU64,
+    /// 会话别名表——达容量逐出最旧条目的累计次数。
+    session_alias_evict: AtomicU64,
+    /// 响应阶段拿到可用上游 id 但无 canonical 可绑定的累计次数（每响应至多一次）。
+    session_bind_miss: AtomicU64,
+    /// `$conversation` 实际展开为服务端锚点域分离 HMAC 的累计次数。
+    session_outbound_hmac: AtomicU64,
 }
 
 impl Default for GatewayMetrics {
@@ -136,7 +145,11 @@ impl Default for GatewayMetrics {
             conversation_store_missing: AtomicU64::new(0),
             conversation_header_invalid: AtomicU64::new(0),
             conversation_writeback_miss: AtomicU64::new(0),
-            previous_response_eviction: AtomicU64::new(0),
+            session_alias_hit: AtomicU64::new(0),
+            session_alias_conflict: AtomicU64::new(0),
+            session_alias_evict: AtomicU64::new(0),
+            session_bind_miss: AtomicU64::new(0),
+            session_outbound_hmac: AtomicU64::new(0),
         }
     }
 }
@@ -293,12 +306,6 @@ impl GatewayMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `PreviousResponseMap` 逐出最旧条目一次。
-    pub fn record_previous_response_eviction(&self) {
-        self.previous_response_eviction
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn conversation_store_missing_count(&self) -> u64 {
         self.conversation_store_missing.load(Ordering::Relaxed)
     }
@@ -311,7 +318,44 @@ impl GatewayMetrics {
         self.conversation_writeback_miss.load(Ordering::Relaxed)
     }
 
-    pub fn previous_response_eviction_count(&self) -> u64 {
-        self.previous_response_eviction.load(Ordering::Relaxed)
+    /// 会话别名解析命中既有绑定一次。
+    pub fn record_session_alias_hit(&self) {
+        self.session_alias_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 会话别名冲突一次（同一上游 id 已绑定不同 canonical，拒绝覆盖）。
+    pub fn record_session_alias_conflict(&self) {
+        self.session_alias_conflict.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 会话别名表逐出最旧条目一次。
+    pub fn record_session_alias_evict(&self) {
+        self.session_alias_evict.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 响应阶段无 canonical 可绑定一次（调用方保证每响应至多一次）。
+    pub fn record_session_bind_miss(&self) {
+        self.session_bind_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `$conversation` 展开为服务端锚点 HMAC 一次。
+    pub fn record_session_outbound_hmac(&self) {
+        self.session_outbound_hmac.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn session_alias_hit_count(&self) -> u64 { self.session_alias_hit.load(Ordering::Relaxed) }
+
+    pub fn session_alias_conflict_count(&self) -> u64 {
+        self.session_alias_conflict.load(Ordering::Relaxed)
+    }
+
+    pub fn session_alias_evict_count(&self) -> u64 {
+        self.session_alias_evict.load(Ordering::Relaxed)
+    }
+
+    pub fn session_bind_miss_count(&self) -> u64 { self.session_bind_miss.load(Ordering::Relaxed) }
+
+    pub fn session_outbound_hmac_count(&self) -> u64 {
+        self.session_outbound_hmac.load(Ordering::Relaxed)
     }
 }

@@ -60,6 +60,7 @@ pub use {
         RedactionSection,
         RequestLogSection,
         ServerSection,
+        SessionSection,
     },
     storage::{RequestLogFileConfig, StorageSection},
 };
@@ -239,7 +240,7 @@ const MAPPINGS: &[MappingDef] = &[
         env_explicit_names: &[],
         coercion: Coercion::Plain,
     },
-    // ── pii_scope（5）──
+    // ── pii_scope（3）──
     env("pii_scope.mode", "PII_SCOPE_MODE", &["PII_SCOPE_MODE"]),
     env(
         "pii_scope.ttl_secs",
@@ -251,16 +252,19 @@ const MAPPINGS: &[MappingDef] = &[
         "PII_SCOPE_MAX_CONVERSATIONS",
         &["PII_SCOPE_MAX_CONVERSATIONS"],
     ),
-    env(
-        "pii_scope.key_header",
-        "PII_SCOPE_KEY_HEADER",
-        &["PII_SCOPE_KEY_HEADER"],
-    ),
-    env(
-        "pii_scope.prev_id_max_entries",
-        "PII_SCOPE_PREV_ID_MAX_ENTRIES",
-        &["PII_SCOPE_PREV_ID_MAX_ENTRIES"],
-    ),
+    // ── session（2，文件专属标量键）──
+    MappingDef {
+        key: "session.headers",
+        target: MappingTarget::FileOnly,
+        env_explicit_names: &[],
+        coercion: Coercion::Plain,
+    },
+    MappingDef {
+        key: "session.alias_max_entries",
+        target: MappingTarget::FileOnly,
+        env_explicit_names: &[],
+        coercion: Coercion::Plain,
+    },
     // ── redaction（12）──
     env(
         "redaction.enabled",
@@ -355,6 +359,9 @@ pub struct FileLayerOutcome {
     pub command: CommandConfig,
     pub server_bind: Option<SocketAddr>,
     pub request_log: RequestLogFileConfig,
+    /// `[session]` 原始声明（**未校验**；[`MappingTarget::FileOnly`] 的值不进 env map，
+    /// 只能经本字段直达 `Config`，由 `env_parse::session::load` 补默认并校验）。
+    pub session: Option<super::env_parse::SessionFileConfig>,
 }
 
 /// 文件补充层入口：引导读取 → fail-closed 解析 → 密钥权限门禁 →
@@ -375,12 +382,20 @@ pub fn apply_config_file(env: &mut HashMap<String, String>) -> Result<FileLayerO
     let command = validate_command(cfg.command.as_ref())?;
     let server_bind = cfg.server.as_ref().and_then(|section| section.listen_addr);
     let request_log = RequestLogFileConfig::from_request_log(cfg.request_log.as_ref());
+    let session = cfg
+        .session
+        .as_ref()
+        .map(|section| super::env_parse::SessionFileConfig {
+            headers: section.headers.clone(),
+            alias_max_entries: section.alias_max_entries,
+        });
     merge_entries(env, resolve_entries(&cfg)?);
     Ok(FileLayerOutcome {
         llm_targets,
         command,
         server_bind,
         request_log,
+        session,
     })
 }
 
@@ -439,6 +454,15 @@ fn load_file_config(path: &Path) -> Result<FileConfig> {
         );
         return Ok(FileConfig::default());
     }
+    reject_removed_session_keys(&text).map_err(|message| {
+        config_error(
+            BOOTSTRAP_VAR,
+            &format!(
+                "{BOOTSTRAP_VAR} 文件 {} {message}，拒绝启动",
+                path.display()
+            ),
+        )
+    })?;
     toml::from_str::<FileConfig>(&text).map_err(|e| {
         config_error(
             BOOTSTRAP_VAR,
@@ -448,6 +472,41 @@ fn load_file_config(path: &Path) -> Result<FileConfig> {
             ),
         )
     })
+}
+
+/// 旧会话键预扫描（**先于** `toml::from_str`）：`[pii_scope]` 下两个已删除键须指名替代
+/// 键与完整建议数组，而非落到 `deny_unknown_fields` 的「unknown field」。
+///
+/// 先做廉价子串闸门：既不声明这两个键名时零额外解析开销（绝大多数配置）。
+/// 语法错误不在此处拦：预扫描解析失败时直接放行，交给随后的强类型解析报错（错误
+/// 归属与措辞保持既有单点）。
+fn reject_removed_session_keys(text: &str) -> std::result::Result<(), String> {
+    if !text.contains("key_header") && !text.contains("prev_id_max_entries") {
+        return Ok(());
+    }
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return Ok(());
+    };
+    let Some(section) = value.get("pii_scope").filter(|v| v.is_table()) else {
+        return Ok(());
+    };
+    if let Some(raw) = section.get("key_header") {
+        let old = raw.as_str();
+        return Err(format!(
+            "声明了已删除的文件键 pii_scope.key_header（旧值 {}）：该键不在 [pii_scope] 内，\
+             已迁移至 [session].headers；{}",
+            old.map_or_else(|| format!("{raw}"), |v| format!("{v:?}")),
+            super::env_parse::session::headers_migration_suggestion(old)
+        ));
+    }
+    if let Some(raw) = section.get("prev_id_max_entries") {
+        return Err(format!(
+            "声明了已删除的文件键 pii_scope.prev_id_max_entries（旧值 {raw}）：该键不在 [pii_scope] \
+             内，已迁移至 [session].alias_max_entries；{}",
+            super::env_parse::session::alias_migration_suggestion(raw.as_integer())
+        ));
+    }
+    Ok(())
 }
 
 /// 把 `FileConfig` 的 serde 值展平为「点分键 → 叶子值」；`None`（null）跳过。

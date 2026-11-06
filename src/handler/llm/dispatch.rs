@@ -32,22 +32,16 @@ use {
             llm_gateway::{self, Protocol, resolve_protocol, resolve_target},
             metrics::SampleBinding,
             redaction::{
+                CaptureTracker,
                 Scope,
-                derive_conversation_key,
-                explicit_header,
                 leaf::{
                     NORMALIZED_HEADER_NAME,
                     NORMALIZED_HEADER_VALUE,
                     PROTOCOL_HEADER_NAME,
                     RedactionTally,
                 },
-                tenant_fingerprint,
             },
-            request_log::{
-                pii_scope_header_name,
-                pii_scope_header_present,
-                resolve_pii_scope_header,
-            },
+            session_identity,
         },
         state::AppState,
     },
@@ -61,6 +55,10 @@ use {
     serde_json::json,
     std::{sync::Arc, time::Instant},
 };
+
+mod scope;
+
+pub(crate) use scope::{build_request_scope, request_tenant_fingerprint};
 
 /// 通用 ingress 超限响应：413 + 错误码 `E_PAYLOAD_TOO_LARGE`。
 fn payload_too_large(limit: usize) -> Response {
@@ -185,112 +183,6 @@ pub fn resolve_ingress_port(
     }
 }
 
-/// 租户指纹可区分凭据头（可选次判别项）：Authorization / api-key。
-const CREDENTIAL_HEADER_NAMES: [&str; 3] = ["authorization", "x-api-key", "api-key"];
-
-/// 作用域选择：`request` 逐请求 `PiiScope`；`conversation` 按四级推导
-/// 会话键并从共享存储取 `Arc<PiiScope>`，键不可推导时回退逐请求（缓存失配、不报错）。
-/// `conversation` 模式下的逐请求回退计入 `request_fallback`（`request` 模式不计）。
-/// `protocol` 传入键推导，原生键按协议白名单收窄（Anthropic 忽略
-/// `prompt_cache_key`/`previous_response_id`；Chat 忽略 `previous_response_id`）。
-///
-/// 可判定降级事件：仅三类记内部计数 + `warn!`（不含键/头值/明文/token）——
-/// ① 键推导返 `None` 落第 4 级；② `ConversationScopeStore` 缺失回退；③ 显式会话键头
-/// 存在但非法被丢弃。
-///
-/// 非目标：键推导为**逐请求无状态纯函数**，网关不保留「上次命中级别/
-/// 上次键」状态，故「同一会话在非首轮静默换键或级别变化」**不可观测**；本函数不提供
-/// 该信号（须新增每租户/会话状态面并另行交付），亦不新增下游可观测响应头。
-pub(crate) fn build_request_scope(
-    state: &AppState,
-    headers: &HeaderMap,
-    protocol: Protocol,
-    upstream_base: &str,
-    body: Option<&serde_json::Value>,
-) -> Arc<Scope> {
-    let fuzzy_restore = state.config.pii_fuzzy_restore;
-    let per_request = || Arc::new(Scope::with_opts(fuzzy_restore));
-    if !state.config.pii_scope_mode.is_conversation() {
-        return per_request();
-    }
-    let Some(store) = state.conversation_scope_store.as_ref() else {
-        // `conversation` 模式但存储缺失——回退逐请求。
-        state.gateway_metrics.record_request_fallback();
-        state.gateway_metrics.record_conversation_store_missing();
-        tracing::warn!("conversation 模式会话存储缺失，回退逐请求作用域（缓存失配属预期降级）");
-        return per_request();
-    };
-    let secret = state.conversation_secret.as_ref();
-    // PII 隔离口径：配置头优先，其后**只**接受 opencode 明确表达「本会话」的两个头
-    // （`x-opencode-session` / `x-opencode-session-id`），刻意窄于遥测链
-    // [`resolve_session_header`]（后者还认 parent-session/affinity/中间代理常用头）。
-    //
-    // 隔离边界只剩会话键值本身：上游 key 由 `[llm.targets].headers` 注入时客户端不发
-    // 凭据头，`tenant_fingerprint` 对所有客户端相同。因此路由/通用头（`x-session-affinity`
-    // 常为固定常量、`x-session-id` 常被代理复用）一旦纳入键，两个逻辑客户端会共用一个
-    // `PiiScope` 注册表，一方的明文可被还原进另一方响应。
-    //
-    // 已知取舍：只发 `x-session-affinity` 的客户端仍有日志 `session_id`，但此处键推导
-    // 落空→逐请求作用域（按既有第 4 级降级计数）。丢失跨轮 token 稳定性优于跨客户端串味。
-    let explicit_raw =
-        resolve_pii_scope_header(headers, state.config.pii_scope_key_header.as_str());
-    let explicit = explicit_header(true, explicit_raw);
-    // 显式会话键头存在但非法（超长/控制字符/非 UTF-8）
-    // 被静默丢弃——记内部计数 + warn（头名可现，头值/明文/token MUST NOT 出现）。
-    // 告警指名**实际被拒的头**：配置头缺席时值来自回退头，只打配置头名会误导排查。
-    if explicit.is_none()
-        && pii_scope_header_present(headers, state.config.pii_scope_key_header.as_str())
-    {
-        let rejected = pii_scope_header_name(headers, state.config.pii_scope_key_header.as_str())
-            .unwrap_or(state.config.pii_scope_key_header.as_str());
-        state.gateway_metrics.record_conversation_header_invalid();
-        tracing::warn!(
-            header = %rejected,
-            "显式会话键头存在但非法，已丢弃且不参与键推导"
-        );
-    }
-    let prompt_cache_key = body
-        .and_then(|v| v.get("prompt_cache_key"))
-        .and_then(serde_json::Value::as_str);
-    let previous_response_id = body
-        .and_then(|v| v.get("previous_response_id"))
-        .and_then(serde_json::Value::as_str);
-    let credentials: Vec<&str> = CREDENTIAL_HEADER_NAMES
-        .iter()
-        .filter_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
-        .collect();
-    let tenant_fp = tenant_fingerprint(secret, upstream_base, &credentials);
-    // 请求体非 JSON 时以 `Null` 参与推导（稳定前缀不可得），显式头仍可命中第 1 级
-    // （保持既有语义：显式头键不依赖请求体）。
-    let null_body = serde_json::Value::Null;
-    let body_value = body.unwrap_or(&null_body);
-    let Some(key) = derive_conversation_key(
-        secret,
-        &tenant_fp,
-        protocol,
-        explicit.as_deref(),
-        prompt_cache_key,
-        previous_response_id,
-        body_value,
-        &state.previous_response_map,
-    ) else {
-        // 键推导失败（纯多轮 messages、Responses 标量
-        // `input` 等）回退逐请求，不伪造键；记回退计数 + warn（不含键/头值/明文/token）。
-        state.gateway_metrics.record_request_fallback();
-        tracing::warn!("会话键推导失败，回退逐请求作用域（缓存失配属预期降级）");
-        return per_request();
-    };
-    let pii = store.get_or_insert(&key);
-    Arc::new(
-        Scope::with_shared_pii(pii, fuzzy_restore).with_conversation(
-            key,
-            tenant_fp,
-            state.conversation_secret.clone(),
-            state.previous_response_map.clone(),
-        ),
-    )
-}
-
 /// 非流落行参数：响应 + 终态详情（`gateway_serve` 在此之外唯一落行）。
 struct NonStreamServed {
     resp: Response,
@@ -397,12 +289,6 @@ async fn serve_inner(
     };
     trace.set_upstream(trace_authority(target.base_url));
     let url = build_upstream_url(target.base_url, path, parts.uri.query());
-    // 动态头值展开上下文（design D3）：原始入站头 + 会话键头生效名。
-    // 原始 `parts.headers` 不受下游出站装配剔除（协议必要头/hop 头/`drop_headers`）影响。
-    let expand = ExpandCtx {
-        inbound: &parts.headers,
-        conversation_key_header: &state.config.pii_scope_key_header,
-    };
     let client: &reqwest::Client = &state.http_client;
     // 流式（SSE）分支用无总超时的独立 client，长流不被 `HTTP_TIMEOUT_SECS` 截断；
     // 非流与 NonDialog 透传保持既有总超时 client。
@@ -434,8 +320,28 @@ async fn serve_inner(
         // 上游意外回 SSE 亦按字节透传，类型即契约。传客户端入站头的克隆体。
         let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::GET);
-        // 非对话请求体不做脱敏，故摘要恒 `NULL`（design §6）；会话标识仍按显式头派生。
-        trace.attach_identity(None, &parts.headers, &state.config);
+        // 非对话请求体不做脱敏、也不解析——身份仅由头链解析（`body=None`），
+        // 租户指纹与对话路径同口径计算，保证同来源的日志摘要一致。
+        let tenant_fp = request_tenant_fingerprint(state, &parts.headers, target.base_url);
+        let identity = Arc::new(session_identity::resolve(
+            &parts.headers,
+            None,
+            protocol,
+            state.config.session_headers.as_slice(),
+            &state.session_alias_map,
+            state.conversation_secret.as_ref(),
+            &tenant_fp,
+        ));
+        // 请求体不脱敏，故摘要恒 `NULL`（design §6）；会话列仍按身份写入。
+        trace.attach_identity(&identity, state.config.pii_value_sample_hmac_key.as_deref());
+        let expand = ExpandCtx {
+            inbound: &parts.headers,
+            outbound_id: session_identity::outbound_id(
+                &identity,
+                state.conversation_secret.as_ref(),
+            ),
+            model: None,
+        };
         let (resp, detail) = serve_nondialog_detailed(
             client,
             upstream_method,
@@ -462,16 +368,32 @@ async fn serve_inner(
         .filter(|m| !m.is_empty())
         .unwrap_or("")
         .to_string();
-    trace.attach_identity(req_value.as_ref(), &parts.headers, &state.config);
-    // 作用域选择：`request` 逐请求、
-    // `conversation` 取存储共享的 `Arc<PiiScope>`；脱敏前 `req_value` 供键推导。
-    let scope = build_request_scope(
-        state,
+    trace.set_req_model(&req_model);
+    // 单一身份解析点（design D1/D2）：租户指纹只算一次，随后解析一次
+    // `SessionIdentity`；PII 作用域、请求记录与 `$conversation` 共用该结果，
+    // 响应阶段 MUST NOT 重新解析。
+    let tenant_fp = request_tenant_fingerprint(state, &parts.headers, target.base_url);
+    let identity = Arc::new(session_identity::resolve(
         &parts.headers,
-        protocol,
-        target.base_url,
         req_value.as_ref(),
-    );
+        protocol,
+        state.config.session_headers.as_slice(),
+        &state.session_alias_map,
+        state.conversation_secret.as_ref(),
+        &tenant_fp,
+    ));
+    trace.attach_identity(&identity, state.config.pii_value_sample_hmac_key.as_deref());
+    // 动态头值展开上下文（design D5）：身份解析完成后预计算 `$conversation` 出站标识，
+    // 之后三路径只读该 owned 值，不再借用 identity。
+    let outbound_id = session_identity::outbound_id(&identity, state.conversation_secret.as_ref());
+    let expand = ExpandCtx {
+        inbound: &parts.headers,
+        outbound_id,
+        model: Some(req_model.clone()),
+    };
+    // 作用域选择：`request` 逐请求、`conversation` 取存储共享的 `Arc<PiiScope>`；
+    // 两种模式在 canonical 存在时都挂载会话写回（别名绑定与模式正交）。
+    let scope = build_request_scope(state, &identity, &parts.headers);
     // 采样绑定单一装配点——`is_chat` 即 `is_chat_tail`（`NonDialog` 为唯一非对话，
     // 与 `is_chat_tail` 返回值等价且不重复计入宽容命中）；`upstream` 取入口端口字符串。
     scope.configure_sampling(SampleBinding {
@@ -589,6 +511,7 @@ async fn serve_inner(
                         protocol,
                         state.config.nonstream_max_bytes,
                         &state.gateway_metrics,
+                        &scope,
                     )
                     .await;
                     return Served::NonStream(NonStreamServed {
@@ -674,12 +597,18 @@ async fn serve_inner(
 /// `x-veil-protocol`，对齐非流错误/非 JSON 透传口径；不进入 SSE 泵。
 /// 非错误状态严格超限走 502 `response_too_large`（与非流一致），4xx/5xx 错误体
 /// 不因体大改写。
+///
+/// 会话捕获（design D4）：`stream:true` 但上游回 2xx JSON 时，按非流响应形态解析
+/// 有界字节并**实际绑定**（不是解析后丢弃）；下游仍收到**同一份字节与头**
+/// （字节保真）。非 JSON/2xx、4xx/5xx、Chat/Anthropic 的捕获在
+/// [`capture_response_ids`] 内即为空，故不绑定也不计数。
 pub(super) async fn stream_upstream_passthrough(
     up: reqwest::Response,
     normalized_out: bool,
     protocol: Protocol,
     max_bytes: usize,
     metrics: &llm_gateway::GatewayMetrics,
+    scope: &Scope,
 ) -> Response {
     // 上游状态码经受约束类型承载；非法值按现状回退 `502`。
     let upstream_status = llm_gateway::UpstreamStatus::new(up.status().as_u16());
@@ -738,9 +667,40 @@ pub(super) async fn stream_upstream_passthrough(
             return super::nonstream::oversize_response(protocol);
         }
     };
+    // 会话捕获：仅在可解析为 JSON 时按非流形态捕获并绑定一次；解析失败（非 JSON）
+    // 不绑定、不计数。下游字节不受影响。
+    if let Some(value) = parse_request_json(&bytes) {
+        let mut tracker = CaptureTracker::default();
+        tracker.observe(scope, protocol, status.as_u16(), &value, metrics);
+    }
     builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream").into_response())
+}
+
+/// 仅测试：按生产同序（租户指纹 → 身份解析 → 作用域）构造请求作用域。
+///
+/// 生产路径在 [`serve_inner`] 中单点解析身份；单测需要直接验证作用域选择时经本
+/// 辅助函数走同一序列，避免测试绕过统一解析器。
+#[cfg(test)]
+pub(crate) fn build_request_scope_for_tests(
+    state: &AppState,
+    headers: &HeaderMap,
+    protocol: Protocol,
+    upstream_base: &str,
+    body: Option<&serde_json::Value>,
+) -> Arc<Scope> {
+    let tenant_fp = request_tenant_fingerprint(state, headers, upstream_base);
+    let identity = session_identity::resolve(
+        headers,
+        body,
+        protocol,
+        state.config.session_headers.as_slice(),
+        &state.session_alias_map,
+        state.conversation_secret.as_ref(),
+        &tenant_fp,
+    );
+    build_request_scope(state, &identity, headers)
 }
 
 /// `build_request_scope` 降级计数、fail-closed 守门与

@@ -77,13 +77,13 @@ fn auth_config_file(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 #[test]
 fn whitelist_and_migrated_counts_locked() {
     assert_eq!(CONFIG_ENV_WHITELIST.len(), 9, "白名单须恰 9 个具名项");
-    assert_eq!(MIGRATED_ENV_VARS.len(), 49, "迁移清单须恰 49 项");
+    assert_eq!(MIGRATED_ENV_VARS.len(), 47, "迁移清单须恰 47 项");
 
     let whitelist: std::collections::BTreeSet<&str> =
         CONFIG_ENV_WHITELIST.iter().copied().collect();
     assert_eq!(whitelist.len(), 9, "白名单不得有重复项");
     let migrated: std::collections::BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
-    assert_eq!(migrated.len(), 49, "迁移清单不得有重复项");
+    assert_eq!(migrated.len(), 47, "迁移清单不得有重复项");
     assert!(
         whitelist.is_disjoint(&migrated),
         "白名单与迁移清单不得相交（同一名不得两处并存）"
@@ -279,20 +279,26 @@ const RENAMED_OLD_NAMES: [&str; 4] = [
     "OBSERVABILITY_DISABLE",
 ];
 
-/// 对应的规范名（仍在迁移清单内，作为对照锚点）。
-const RENAMED_NEW_NAMES: [&str; 4] = [
+/// 与之配对的规范名（三项仍在迁移清单；`PII_SCOPE_PREV_ID_MAX_ENTRIES` 已被删除，
+/// 改为 fail-closed 预扫描，不在读取集合）。
+const RENAMED_NEW_NAMES: [&str; 3] = [
     "AUDIT_TIMEOUT_SECS",
     "PII_NORMALIZE_JSON_WHITESPACE",
-    "PII_SCOPE_PREV_ID_MAX_ENTRIES",
     "ADMIN_ENABLED",
 ];
 
+/// 三组正常改名逐一断言：旧名缺席、新名在迁移清单内。
 #[test]
 fn renamed_env_names_are_absent_and_silent() {
     let migrated: std::collections::BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
     let whitelist: std::collections::BTreeSet<&str> =
         CONFIG_ENV_WHITELIST.iter().copied().collect();
-    for (old, new) in RENAMED_OLD_NAMES.into_iter().zip(RENAMED_NEW_NAMES) {
+    let pairs = [
+        ("AUDIT_TIMEOUT", RENAMED_NEW_NAMES[0]),
+        ("NORMALIZE_JSON_WHITESPACE", RENAMED_NEW_NAMES[1]),
+        ("OBSERVABILITY_DISABLE", RENAMED_NEW_NAMES[2]),
+    ];
+    for (old, new) in pairs {
         assert!(
             !migrated.contains(old) && !whitelist.contains(old),
             "旧名 {old} 不得出现在迁移清单或白名单中"
@@ -323,6 +329,42 @@ fn renamed_env_names_are_absent_and_silent() {
     // 旧名也不属白名单，进程 env 路径上被 `filter_process_env` 剔除。
     let filtered = filter_process_env(map);
     assert!(filtered.is_empty(), "旧名须被 `filter_process_env` 剔除");
+}
+
+/// 两个已删除会话规范名：不在迁移清单/白名单，且非空置位 fail-closed 拒启动。
+#[test]
+fn removed_session_env_names_fail_closed() {
+    // PII_PREV_ID_MAX_ENTRIES（旧拼写）与两个规范名彻底不同：它不在清单、也不拒启动。
+    let mut silent = crate::config::env_parse::test_support::base_env();
+    silent.insert("PII_PREV_ID_MAX_ENTRIES".to_string(), "64".to_string());
+    let cfg = crate::config::Config::from_env_map(silent).expect("旧拼写须完全静默");
+    assert_eq!(
+        cfg.session_alias_max_entries, 1024,
+        "旧拼写不得影响别名容量"
+    );
+
+    let (auth, dir) = auth_config_file("removed-session-env");
+    for (name, replacement) in [
+        ("PII_SCOPE_KEY_HEADER", "[session].headers"),
+        (
+            "PII_SCOPE_PREV_ID_MAX_ENTRIES",
+            "[session].alias_max_entries",
+        ),
+    ] {
+        let mut map = crate::config::env_parse::test_support::base_env();
+        map.insert(
+            "VEIL_CONFIG_FILE".to_string(),
+            auth.to_string_lossy().into_owned(),
+        );
+        map.insert(name.to_string(), "x-whatever".to_string());
+        let err = crate::config::Config::from_env_map(map).expect_err("已删除规范名非空须拒启动");
+        let message = err.to_string();
+        assert!(
+            message.contains(name) && message.contains(replacement),
+            "错误须指名 {name} 与替代键 {replacement}: {message}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 告警函数签名返回 `()`，结构上不存在 `Err` 路径；空 map 亦不 panic。

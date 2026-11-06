@@ -22,6 +22,7 @@ fn overrides_with_params() -> UpstreamOverrides {
             .into_iter()
             .collect(),
         drop: Vec::new(),
+        replace: Vec::new(),
     };
     UpstreamOverrides {
         headers: HeaderMap::with_capacity(0),
@@ -29,6 +30,7 @@ fn overrides_with_params() -> UpstreamOverrides {
         override_existing: true,
         user_agent: None,
         drop_headers: Vec::new(),
+        header_replace: Vec::new(),
     }
 }
 
@@ -195,5 +197,83 @@ fn nondialog_params_ignored_warns_once_and_keeps_bytes() {
         hits.len(),
         1,
         "命中 params 的 NonDialog 请求须恰一次 warn（去重）: {messages:?}"
+    );
+}
+
+/// 仅声明 `params.<proto>.replace`（default/override/drop 全空）的覆盖：仍须视为
+/// 「声明了 params」并触发一次 warn（task 4.1）。
+fn overrides_with_replace_only() -> UpstreamOverrides {
+    let rules = ParamOverrides {
+        default: BTreeMap::new(),
+        r#override: BTreeMap::new(),
+        drop: Vec::new(),
+        replace: vec![crate::config::ReplaceRule {
+            field: "reasoningEffort".to_string(),
+            from: serde_json::json!("none"),
+            to: serde_json::json!("off"),
+            models: None,
+        }],
+    };
+    UpstreamOverrides {
+        headers: HeaderMap::with_capacity(0),
+        params: BTreeMap::from([(ParamProtocol::Chat, rules)]),
+        override_existing: true,
+        user_agent: None,
+        drop_headers: Vec::new(),
+        header_replace: Vec::new(),
+    }
+}
+
+#[test]
+fn nondialog_replace_only_params_declaration_warns_and_keeps_bytes() {
+    let _warn_guard = crate::test_support::nondialog_params_warn_lock();
+    crate::handler::llm::nonstream::reset_nondialog_params_ignored_warning();
+    let capture = MessageCapture::default();
+    let subscriber = capture.clone();
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试运行时须可构造");
+        let (url, captured, server) = rt.block_on(capture_loopback(b"{}".to_vec()));
+        let overrides = overrides_with_replace_only();
+        let client = reqwest::Client::new();
+        let metrics = Arc::new(GatewayMetrics::default());
+        let client_body = br#"{"probe":"replace-only-original"}"#.to_vec();
+        crate::test_support::with_capture_subscriber(subscriber, || {
+            let ctx = NondialogCtx {
+                protocol: Protocol::NonDialog,
+                metrics: &metrics,
+                overrides: Some(&overrides),
+                expand: crate::handler::llm::test_support::no_expand(),
+            };
+            let resp = rt.block_on(serve_nondialog_passthrough(
+                &client,
+                reqwest::Method::POST,
+                &url,
+                HeaderMap::new(),
+                client_body.clone(),
+                ctx,
+            ));
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        });
+        let raw = captured.lock().expect("捕获锁不得中毒").clone();
+        assert!(
+            raw.windows(client_body.len())
+                .any(|window| window == client_body.as_slice()),
+            "仅声明 replace 也不得改写 NonDialog 请求体"
+        );
+        server.abort();
+    });
+    handle.join().expect("测试线程不得 panic");
+    let messages = capture.0.lock().expect("捕获锁不得中毒").clone();
+    let hits: Vec<&String> = messages
+        .iter()
+        .filter(|message| message.contains("NonDialog") && message.contains("params.replace"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "仅声明 params.replace 也须触发一次 warn: {messages:?}"
     );
 }

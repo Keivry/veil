@@ -30,6 +30,7 @@ fn params_for(
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect(),
         drop: drop.iter().map(|key| (*key).to_string()).collect(),
+        replace: Vec::new(),
     };
     UpstreamOverrides {
         headers: axum::http::HeaderMap::<HeaderValueSpec>::with_capacity(0),
@@ -37,6 +38,7 @@ fn params_for(
         override_existing: true,
         user_agent: None,
         drop_headers: Vec::new(),
+        header_replace: Vec::new(),
     }
 }
 
@@ -793,4 +795,126 @@ async fn param_injection_merge_mode_adds_missing_key_and_declares_normalized() {
         v.get("service_tier").is_none(),
         "drop 不受开关影响，须照常删除"
     );
+}
+
+#[tokio::test]
+async fn param_replace_uses_original_model_before_body_rewrite() {
+    // task 2.1/2.2/3.2：`replace` 在脱敏/重写后应用，但 `models` 门控读取客户端原始
+    // 模型——即使 `override` 段落同时改写了 `model`，门控仍按原文命中。
+    let config = test_config(&[("REDACTION_ENABLED", "0"), ("PII_PLACEHOLDER_PROMPT", "0")]);
+    let mut overrides = params_for(
+        ParamProtocol::Chat,
+        &[],
+        &[("model", serde_json::json!("renamed-model"))],
+        &[],
+    );
+    overrides
+        .params
+        .get_mut(&ParamProtocol::Chat)
+        .expect("chat 子表须存在")
+        .replace = vec![crate::config::ReplaceRule {
+        field: "reasoningEffort".to_string(),
+        from: serde_json::json!("none"),
+        to: serde_json::json!("off"),
+        models: Some(vec!["original-model".to_string()]),
+    }];
+    let (scope, vault, detector) = fresh_arcs();
+    let raw = br#"{"model":"original-model","reasoningEffort":"none","messages":[]}"#;
+    let out = request_rewrite_with_overrides(
+        raw.to_vec(),
+        Protocol::Chat,
+        &config,
+        scope,
+        vault,
+        detector,
+        Some(&overrides),
+    )
+    .await;
+    assert!(out.normalized_out, "实际改写须置位 normalized_out");
+    let v: serde_json::Value = serde_json::from_slice(&out.body).expect("改写后须为合法 JSON");
+    assert_eq!(
+        v["reasoningEffort"],
+        serde_json::json!("off"),
+        "门控按原始模型命中"
+    );
+    assert_eq!(
+        v["model"],
+        serde_json::json!("renamed-model"),
+        "override 照常生效"
+    );
+
+    // 原始模型不匹配时规则跳过（即便 `override` 把 model 改成了匹配值）。
+    let mut overrides = params_for(
+        ParamProtocol::Chat,
+        &[],
+        &[("model", serde_json::json!("deepseek-chat"))],
+        &[],
+    );
+    overrides
+        .params
+        .get_mut(&ParamProtocol::Chat)
+        .expect("chat 子表须存在")
+        .replace = vec![crate::config::ReplaceRule {
+        field: "reasoningEffort".to_string(),
+        from: serde_json::json!("none"),
+        to: serde_json::json!("off"),
+        models: Some(vec!["deepseek-chat".to_string()]),
+    }];
+    let (scope, vault, detector) = fresh_arcs();
+    let raw = br#"{"model":"other-model","reasoningEffort":"none","messages":[]}"#;
+    let out = request_rewrite_with_overrides(
+        raw.to_vec(),
+        Protocol::Chat,
+        &config,
+        scope,
+        vault,
+        detector,
+        Some(&overrides),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&out.body).expect("改写后须为合法 JSON");
+    assert_eq!(
+        v["reasoningEffort"],
+        serde_json::json!("none"),
+        "门控不得使用 override 改写后的 model"
+    );
+    assert_eq!(v["model"], serde_json::json!("deepseek-chat"));
+}
+
+#[tokio::test]
+async fn param_replace_non_object_body_stays_byte_identical() {
+    // task 2.3：数组/标量/非法 JSON 体不触发 replace、不报错、字节与标志不变。
+    let config = test_config(&[("REDACTION_ENABLED", "0"), ("PII_PLACEHOLDER_PROMPT", "0")]);
+    let mut overrides = params_for(ParamProtocol::Chat, &[], &[], &[]);
+    overrides
+        .params
+        .get_mut(&ParamProtocol::Chat)
+        .expect("chat 子表须存在")
+        .replace = vec![crate::config::ReplaceRule {
+        field: "reasoningEffort".to_string(),
+        from: serde_json::json!("none"),
+        to: serde_json::json!("off"),
+        models: None,
+    }];
+    for raw in [
+        b"[1,2,3]".to_vec(),
+        b"42".to_vec(),
+        b"\"reasoningEffort\"".to_vec(),
+        b"not json {{{".to_vec(),
+    ] {
+        let (scope, vault, detector) = fresh_arcs();
+        let expected = raw.clone();
+        let out = request_rewrite_with_overrides(
+            raw,
+            Protocol::Chat,
+            &config,
+            scope,
+            vault,
+            detector,
+            Some(&overrides),
+        )
+        .await;
+        assert_eq!(out.body, expected, "非对象体须逐字节不变: {expected:?}");
+        assert!(!out.normalized_out, "跳过替换不得置位: {expected:?}");
+    }
 }

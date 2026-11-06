@@ -295,7 +295,7 @@ async fn pii_fail_closed_writes_row_and_forwards_nothing() {
         "x-veil-conversation-id",
         "conv-log-e2e".parse().expect("头值须合法"),
     );
-    let scope = crate::handler::llm::dispatch::build_request_scope(
+    let scope = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Chat,

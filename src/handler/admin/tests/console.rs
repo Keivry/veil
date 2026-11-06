@@ -4,53 +4,9 @@
 //! `ADMIN_ENABLED` 门控由 `tests/http_e2e_admin_console.rs` 端到端锁定。
 
 use {
-    crate::handler::admin::console::{CONSOLE_HTML, console_response, wants_html},
-    axum::http::{HeaderMap, HeaderValue, StatusCode, header},
+    crate::handler::admin::console::{CONSOLE_HTML, console_response},
+    axum::http::{StatusCode, header},
 };
-
-/// 仅携带 `Accept` 的请求头。
-fn accept(value: &str) -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert(header::ACCEPT, value.parse().unwrap());
-    h
-}
-
-#[test]
-fn wants_html_accepts_exact_html_media_types() {
-    for value in [
-        "text/html",
-        "application/xhtml+xml",
-        "TEXT/HTML",
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    ] {
-        assert!(wants_html(&accept(value)), "Accept={value:?} 须命中 HTML");
-    }
-}
-
-#[test]
-fn wants_html_rejects_missing_wildcard_json_and_zero_q() {
-    for value in [
-        "*/*",
-        "text/*",
-        "application/json",
-        "text/html;q=0",
-        "text/html;Q=0.0",
-        "text/html;q=0, */*;q=0.8",
-    ] {
-        assert!(
-            !wants_html(&accept(value)),
-            "Accept={value:?} 不得命中 HTML"
-        );
-    }
-    assert!(!wants_html(&HeaderMap::new()), "缺 Accept 头不得命中");
-    // 非 UTF-8 头值：`HeaderMap::get(...).to_str()` 失败 → 不命中。
-    let mut non_utf8 = HeaderMap::new();
-    non_utf8.insert(
-        header::ACCEPT,
-        HeaderValue::from_bytes(b"text/html;profile=\xff").unwrap(),
-    );
-    assert!(!wants_html(&non_utf8), "非 UTF-8 Accept 不得命中");
-}
 
 #[tokio::test]
 async fn console_response_headers_and_body() {
@@ -123,7 +79,7 @@ fn console_html_request_section_wired() {
         "requests: { limit: 50, offset: 0, total: 0,",
         "function renderRequests(d)",
         "function reloadRequests(force)",
-        "function requestRowModel(item)",
+        "function requestRowModel(item, piiMode)",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
     }
@@ -290,15 +246,22 @@ fn console_html_request_cells_use_escaping_helper() {
         "'<td>' + esc(x.ts) + '</td>'",
         "'<td>' + esc(x.model) + '</td>'",
         "'<td>' + esc(x.protocol) + '</td>'",
-        "'<td>' + esc(x.session) +",
         "'<td>' + esc(x.status) + '</td>'",
         "'<td class=\"num\">' + esc(x.io) + '</td>'",
         "'<td class=\"num\" title=\"' + esc(x.hitTitle) + '\">' + esc(x.hit) + '</td>'",
         "'<td class=\"num\">' + esc(x.latency) + '</td>'",
         "'<td class=\"sum\" title=\"' + esc(x.summary) + '\">' + esc(x.summary) + '</td>'",
-        "'<span class=\"badge\" title=\"' + esc(x.source) + '\">' + esc(x.scope) + '</span>'",
+        "'<span class=\"badge\" title=\"' + esc(x.sourceTitle) + '\">' + esc(x.scope) + '</span>'",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
+    }
+    // 会话单元格的 title 用人类可读来源说明，不用原枚举。
+    for needle in [
+        "var titleAttr = x.sourceTitle ? ' title=\"' + esc(x.sourceTitle) + '\"' : '';",
+        "var badge = (x.session && x.scope)",
+        "'<td class=\"sess\"' + titleAttr + '>' + esc(x.session) + badge",
+    ] {
+        assert!(CONSOLE_HTML.contains(needle), "会话单元格须含 {needle:?}");
     }
     assert!(
         !CONSOLE_HTML.contains("+ x.summary +") && !CONSOLE_HTML.contains("+ x.model +"),
@@ -460,6 +423,7 @@ out.model = r.model;
 out.session = r.session;
 out.scope = r.scope;
 out.source = r.source;
+out.source_title = r.sourceTitle;
 out.io = r.io;
 out.hit = r.hit;
 out.hitTitle = r.hitTitle;
@@ -469,6 +433,29 @@ out.upstreamShort = r.upstreamShort;
 out.ttft = r.ttft;
 out.tps = r.tps;
 out.summary = r.summary;
+var reqMode = requestRowModel({{ session_id: '9f2c8a1b4d5e6f70', session_source: 'header', session_scope: 'session' }}, 'request');
+out.req_mode_title = reqMode.sourceTitle;
+var convMode = requestRowModel({{ session_id: '9f2c8a1b4d5e6f70', session_source: 'header', session_scope: 'session' }}, 'conversation');
+out.conv_mode_title = convMode.sourceTitle;
+var sources = {{}};
+var rawSources = ['header', 'conversation', 'prev_response', 'cache_key', 'user_id', 'safety_identifier', 'user', 'none', 'prev_message'];
+for (var i = 0; i < rawSources.length; i++) {{
+  var m = requestRowModel({{ session_id: '9f2c8a1b4d5e6f70', session_source: rawSources[i], session_scope: 'session' }});
+  sources[rawSources[i]] = {{ label: m.source, title: m.sourceTitle }};
+}}
+out.sources = sources;
+var userScope = requestRowModel({{ session_id: '9f2c8a1b4d5e6f70', session_source: 'user_id', session_scope: 'user' }});
+out.user_scope = userScope.scope;
+out.user_scope_source = userScope.source;
+out.user_scope_session = userScope.session;
+var emptySess = requestRowModel({{ session_id: '', session_source: 'none', session_scope: 'none' }});
+out.empty_session = emptySess.session;
+out.empty_scope = emptySess.scope;
+out.empty_source = emptySess.source;
+out.empty_title = emptySess.sourceTitle;
+var rawId = requestRowModel({{ session_id: '9f2c8a1b4d5e6f70112233445566778899aabbccddeeff00', session_source: 'conversation', session_scope: 'session' }});
+out.raw_id_session = rawId.session;
+out.raw_id_title = rawId.sourceTitle;
 var longUp = requestRowModel({{ upstream: 'upstream.internal.example.corp:11434' }});
 out.long_upstream = longUp.upstream;
 out.long_upstream_short = longUp.upstreamShort;
@@ -512,7 +499,75 @@ console.log(JSON.stringify(out));
     assert_eq!(verdict["model"], "<img src=x onerror=alert(1)>");
     assert_eq!(verdict["session"], "9f2c8a1b4d5e");
     assert_eq!(verdict["scope"], "会话");
-    assert_eq!(verdict["source"], "cache_key");
+    assert_eq!(verdict["source"], "prompt_cache_key");
+    assert_eq!(verdict["source_title"], "来源：prompt_cache_key");
+    assert_eq!(
+        verdict["req_mode_title"], "来源：显式会话头（request 模式：PII 逐请求）",
+        "request 模式 title 须明示 PII 逐请求，且来源为人类可读文案"
+    );
+    assert_eq!(
+        verdict["conv_mode_title"], "来源：显式会话头",
+        "conversation 模式 title 不得出现逐请求提示"
+    );
+    // 8 个现行来源的人类可读映射须逐字准确，且 title 不输出原枚举。
+    let sources = &verdict["sources"];
+    let expected_sources = [
+        ("header", "显式会话头"),
+        ("conversation", "Responses 会话对象"),
+        ("prev_response", "前驱响应"),
+        ("cache_key", "prompt_cache_key"),
+        ("user_id", "用户标识"),
+        ("safety_identifier", "安全标识"),
+        ("user", "用户"),
+        ("none", "无来源"),
+    ];
+    for (raw, label) in expected_sources {
+        assert_eq!(
+            sources[raw]["label"], label,
+            "来源 {raw} 须映射为「{label}」"
+        );
+        if raw == "none" {
+            assert_eq!(sources[raw]["title"], "", "无来源行不得渲染来源 title");
+        } else {
+            assert_eq!(
+                sources[raw]["title"],
+                format!("来源：{label}"),
+                "来源 {raw} 的 title 须为人类可读文案"
+            );
+            assert!(
+                !sources[raw]["title"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("{raw}：")),
+                "title 不得以原枚举开头: {}",
+                sources[raw]["title"]
+            );
+        }
+    }
+    // 旧库 `prev_message` 只作兼容 fallback：显示「历史来源（旧版本数据）」。
+    assert_eq!(sources["prev_message"]["label"], "历史来源");
+    assert_eq!(
+        sources["prev_message"]["title"], "来源：历史来源（旧版本数据）",
+        "旧库行 title 须标注旧版本数据"
+    );
+    assert_eq!(verdict["user_scope"], "用户", "user 作用域徽标为「用户」");
+    assert_eq!(verdict["user_scope_source"], "用户标识");
+    assert_eq!(
+        verdict["user_scope_session"], "9f2c8a1b4d5e",
+        "用户级摘要同样只展示前 12 hex 字符"
+    );
+    assert_eq!(verdict["empty_session"], "", "空会话单元格须为空");
+    assert_eq!(verdict["empty_scope"], "", "scope=none 不得渲染徽标");
+    assert_eq!(verdict["empty_source"], "无来源");
+    assert_eq!(verdict["empty_title"], "", "空会话行不得写 title");
+    assert_eq!(
+        verdict["raw_id_session"], "9f2c8a1b4d5e",
+        "64-hex 会话键只展示前 12 位"
+    );
+    assert_eq!(
+        verdict["raw_id_title"], "来源：Responses 会话对象",
+        "title 不得含上游 id 或 64-hex 键"
+    );
     assert_eq!(verdict["io"], "1,024 · 256");
     assert_eq!(verdict["hit"], "75.0%");
     assert_eq!(verdict["hitTitle"], "缓存写比率 12.5%");

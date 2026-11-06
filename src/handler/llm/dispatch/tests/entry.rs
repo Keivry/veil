@@ -205,10 +205,17 @@ fn body_limits_tiered_values_match_spec() {
 
 #[test]
 fn forward_headers_baseline_preserves_whole_session_chain() {
-    // D1 出站基线：不再隐式剔除会话头链——客户端五个回退链头与自定义会话键头
+    // D1 出站基线：不再隐式剔除会话头链——客户端会话类头与自定义会话键头
     // 均原样转发上游（含多值）；仅协议必要头与 `x-veil-*` 内部命名空间被剔除。
+    const CLIENT_SESSION_HEADERS: [&str; 5] = [
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "x-opencode-parent-session-id",
+        "x-session-affinity",
+        "x-session-id",
+    ];
     let mut client = HeaderMap::new();
-    for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
+    for name in CLIENT_SESSION_HEADERS {
         client.insert(name, axum::http::HeaderValue::from_static("client-leak"));
     }
     client.insert(
@@ -227,11 +234,11 @@ fn forward_headers_baseline_preserves_whole_session_chain() {
         None,
         &crate::handler::llm::test_support::no_expand(),
     );
-    for name in crate::service::request_log::SESSION_HEADER_FALLBACKS {
+    for name in CLIENT_SESSION_HEADERS {
         assert_eq!(
             fwd.get(name).and_then(|v| v.to_str().ok()),
             Some("client-leak"),
-            "回退链头 {name} 须原样转发上游"
+            "会话类头 {name} 须原样转发上游"
         );
     }
     assert_eq!(

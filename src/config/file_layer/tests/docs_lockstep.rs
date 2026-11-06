@@ -6,7 +6,7 @@
 //! 1. §1 点键表全量重排为迁移后布局（51 行 = MAPPINGS 48 + 文件专属键根 3）；
 //! 2. 结构键清单仍为 `llm.targets` / `command` / `server`（`[audit]` / `[credential]` /
 //!    `[request_log]` 有 env 映射，**不进**）；
-//! 3. 迁移 env 并集换名 4 项后仍恰 49（旧名告警集合已随 0.2.0 移除，不再叠加）。
+//! 3. 迁移 env 并集移出两个会话规范名后恰 47（旧名告警集合已随 0.2.0 移除，不再叠加）。
 
 use {
     super::{
@@ -250,7 +250,7 @@ fn doc_targets_structural_keys_match_schema_closed_list() {
 }
 
 /// 迁移清单等式（可机检）：`MIGRATED == (⋃ MAPPINGS.env_explicit_names) − WHITELIST`
-/// 且恰 49 项。任一迁移名或其 MAPPINGS 映射增删即失败。
+/// 且恰 47 项。任一迁移名或其 MAPPINGS 映射增删即失败。
 #[test]
 fn migrated_list_equals_mapping_union_minus_whitelist() {
     let whitelist: BTreeSet<&str> = CONFIG_ENV_WHITELIST.iter().copied().collect();
@@ -260,8 +260,8 @@ fn migrated_list_equals_mapping_union_minus_whitelist() {
         .collect();
     let want: BTreeSet<&str> = union.difference(&whitelist).copied().collect();
     let got: BTreeSet<&str> = MIGRATED_ENV_VARS.iter().copied().collect();
-    assert_eq!(MIGRATED_ENV_VARS.len(), 49, "迁移清单须恰 49 项");
-    assert_eq!(got.len(), 49, "迁移清单不得有重复项");
+    assert_eq!(MIGRATED_ENV_VARS.len(), 47, "迁移清单须恰 47 项");
+    assert_eq!(got.len(), 47, "迁移清单不得有重复项");
     assert_eq!(
         got, want,
         "迁移清单须等于「映射 env 显式名并集 − 白名单」（任一侧增删须同步）"
@@ -567,7 +567,7 @@ fn example_comments_are_complete_and_accurate() {
                 "{name} 的 custom_rules_file 注释须提到 {format}: {rules_comment}"
             );
         }
-        // 点名键须有注释（含迁移后新增路径）。
+        // 点名键须有注释（含迁移后新增路径与条件替换示例）。
         for needle in [
             "timeout_secs",
             "pool_max_idle_per_host",
@@ -577,8 +577,10 @@ fn example_comments_are_complete_and_accurate() {
             "hold_max_frames",
             "ttl_secs",
             "max_conversations",
-            "prev_id_max_entries",
+            "alias_max_entries",
             "block_wait",
+            "params.chat.replace",
+            "header_replace",
         ] {
             assert!(text.contains(needle), "{name} 须声明并注释 {needle}");
         }
@@ -667,6 +669,26 @@ fn example_file_loads_and_applies_from_disk() {
     );
     assert_eq!(chat.r#override.get("top_p"), Some(&serde_json::json!(0.9)));
     assert_eq!(chat.drop, vec!["presence_penalty".to_string()]);
+    assert_eq!(
+        chat.replace,
+        vec![crate::config::ReplaceRule {
+            field: "reasoningEffort".to_string(),
+            from: serde_json::json!("none"),
+            to: serde_json::json!("off"),
+            models: None,
+        }],
+        "示例的 chat.replace 规则须进入强类型载荷"
+    );
+    assert_eq!(
+        port.header_replace,
+        vec![crate::config::HeaderReplaceRule {
+            name: "x-reasoning-effort".to_string(),
+            from: "none".to_string(),
+            to: "off".to_string(),
+            models: None,
+        }],
+        "示例的 header_replace 规则须进入强类型载荷"
+    );
     let anthropic = port
         .params
         .get(&ParamProtocol::Anthropic)

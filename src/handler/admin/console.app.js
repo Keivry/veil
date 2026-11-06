@@ -1116,7 +1116,47 @@
     return s.slice(0, head) + '…' + (tail > 0 ? s.slice(s.length - tail) : '');
   }
 
-  function requestRowModel(item) {
+  // 会话来源的人类可读文案：恰为后端现行 8 个取值，逐字对应、不输出原枚举。
+  var REQUEST_SOURCE_LABELS = {
+    header: '显式会话头',
+    conversation: 'Responses 会话对象',
+    prev_response: '前驱响应',
+    cache_key: 'prompt_cache_key',
+    user_id: '用户标识',
+    safety_identifier: '安全标识',
+    user: '用户',
+    none: '无来源'
+  };
+  // 旧库兼容：仅 `prev_message` 行回退为「历史来源」，不作为现行来源参与聚合。
+  var REQUEST_SOURCE_LEGACY = { prev_message: '历史来源' };
+
+  function requestSourceLabel(raw) {
+    var key = raw == null ? '' : String(raw);
+    if (!key) return '';
+    if (Object.prototype.hasOwnProperty.call(REQUEST_SOURCE_LABELS, key)) {
+      return REQUEST_SOURCE_LABELS[key];
+    }
+    if (Object.prototype.hasOwnProperty.call(REQUEST_SOURCE_LEGACY, key)) {
+      return REQUEST_SOURCE_LEGACY[key];
+    }
+    // 未知取值只给中性文案：绝不把原枚举拼进界面。
+    return '未知来源';
+  }
+
+  // `title` 只承载人类可读来源说明；旧库行标注「旧版本数据」，request 模式下
+  // 补一句「PII 逐请求」，避免读者误以为跨请求共享 PII。`none`（无来源）不写 title。
+  function requestSourceTitle(raw, piiMode) {
+    var key = raw == null ? '' : String(raw);
+    if (!key || key === 'none') return '';
+    var title = '来源：' + requestSourceLabel(key);
+    if (Object.prototype.hasOwnProperty.call(REQUEST_SOURCE_LEGACY, key)) {
+      title += '（旧版本数据）';
+    }
+    if (piiMode === 'request') title += '（request 模式：PII 逐请求）';
+    return title;
+  }
+
+  function requestRowModel(item, piiMode) {
     var it = item || {};
     var sid = it.session_id == null ? '' : String(it.session_id);
     var scope = it.session_scope === 'session' ? '会话' :
@@ -1125,6 +1165,7 @@
       (it.completion_tokens == null ? '—' : Number(it.completion_tokens).toLocaleString('en-US'));
     // 上游只显示 authority（去 scheme/路径），超长时中段省略，完整值进 title。
     var upstream = it.upstream == null ? '' : String(it.upstream);
+    var sourceRaw = it.session_source == null ? '' : String(it.session_source);
     return {
       ts: fmtFullTs(it.ts_secs),
       model: it.model == null ? '' : String(it.model),
@@ -1133,7 +1174,8 @@
       upstreamShort: truncMiddle(upstream, 18),
       session: sid ? sid.slice(0, 12) : '',
       scope: scope,
-      source: it.session_source == null ? '' : String(it.session_source),
+      source: requestSourceLabel(sourceRaw),
+      sourceTitle: requestSourceTitle(sourceRaw, piiMode),
       status: it.status == null ? (it.error_kind ? String(it.error_kind) : '—') : String(it.status),
       io: io,
       hit: fmtPct(it.cache_hit_rate),
@@ -1202,20 +1244,32 @@
         hint.textContent = '';
       }
     }
-    var rows = Array.isArray(d.rows) ? d.rows.map(requestRowModel) : [];
+    var piiMode = (state.metrics && state.metrics.pii_scope && state.metrics.pii_scope.mode) || '';
+    var srcHint = $('req-source-hint');
+    if (srcHint) {
+      srcHint.textContent = '会话列仅展示 12 位摘要与来源说明' +
+        (piiMode === 'request' ? '；request 模式下 PII 按逐请求隔离，不跨请求共享。' :
+          (piiMode === 'conversation' ? '；conversation 模式下 PII 在同一会话内共享。' : '。'));
+    }
+    var rows = Array.isArray(d.rows) ? d.rows.map(function (item) {
+      return requestRowModel(item, piiMode);
+    }) : [];
     if (!rows.length) {
       setReqTbody(reqEmptyRow(REQ_EMPTY_RANGE));
       updateReqPager(0);
       return;
     }
     setReqTbody(rows.map(function (x) {
+      var titleAttr = x.sourceTitle ? ' title="' + esc(x.sourceTitle) + '"' : '';
+      var badge = (x.session && x.scope)
+        ? '<span class="badge" title="' + esc(x.sourceTitle) + '">' + esc(x.scope) + '</span>'
+        : '';
       return '<tr>' +
         '<td>' + esc(x.ts) + '</td>' +
         '<td>' + esc(x.model) + '</td>' +
         '<td>' + esc(x.protocol) + '</td>' +
         '<td class="up" title="' + esc(x.upstream) + '">' + esc(x.upstreamShort) + '</td>' +
-        '<td>' + esc(x.session) +
-          (x.scope ? '<span class="badge" title="' + esc(x.source) + '">' + esc(x.scope) + '</span>' : '') +
+        '<td class="sess"' + titleAttr + '>' + esc(x.session) + badge +
         '</td>' +
         '<td>' + esc(x.status) + '</td>' +
         '<td class="num">' + esc(x.io) + '</td>' +

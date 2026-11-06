@@ -44,10 +44,14 @@ fn service_production_prefix_axum_whitelist() {
     let cfg_test = ["#[cfg", "(test)]"].concat();
     // `request_log/session.rs`：会话头解析需要按头名读取入站头，只用纯数据
     // `axum::http::HeaderMap`（无 `State`/handler 依赖），符合本白名单用途。
+    // `session_identity/{mod,input}.rs`：会话身份解析同样只按头名读入站头，仅用纯数据
+    // `axum::http::HeaderMap`（`resolve` 签名由 tasks 2.1 固定，无 `State`/handler 依赖）。
     let allow = [
         "llm_gateway/hop.rs",
         "llm_gateway/mod.rs",
         "request_log/session.rs",
+        "session_identity/input.rs",
+        "session_identity/mod.rs",
     ];
     for path in files {
         let rel = path

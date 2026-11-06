@@ -5,12 +5,11 @@ use {
         super::{
             credential_vault::{CredentialVault, TOKEN_PREFIX, strip_cred_partials},
             json_walk,
-            llm_gateway::Protocol,
             lock_recover::lock_or_recover,
             metrics::{SampleBinding, SampleCtx},
             pii::{PiiDetector, PiiScope},
+            session_identity::CapturedIds,
         },
-        conversation_key::{ConversationKey, ConversationWriteback, PreviousResponseMap},
         leaf::{
             RedactionTally,
             find_sub_spans,
@@ -18,6 +17,7 @@ use {
             redact_leaf_tracked,
             scan_token_forms,
         },
+        writeback::ConversationWriteback,
     },
     std::sync::{
         Arc,
@@ -56,8 +56,13 @@ pub struct Scope {
     fuzzy_restore: bool,
     /// 本请求脱敏实际产出的凭据 token（响应还原授权域，恒逐请求）。
     minted: MintedSet,
-    /// 会话写回上下文：仅 `conversation` 模式且键推导成功时存在。
+    /// 会话写回上下文：请求解析出 canonical 时存在（两种模式均挂载）。
     conversation: Option<ConversationWriteback>,
+    /// 本次请求是否落在会话级共享 `PiiScope` 上（`conversation` 模式且键可推导）。
+    ///
+    /// 与 `conversation.is_some()` 分离：`request` 模式也挂载写回（仅供别名绑定），
+    /// 但 MUST NOT 使 `conversation_writeback_miss` 开始计数。
+    conversation_scope: bool,
     /// side-channel 失败标志：脱敏链中 rand8 熵源/内部故障置位；
     /// 调用方据此 fail-closed（`502 + E_PII_UNAVAILABLE`），MUST NOT 转发未脱敏正文。
     pii_unavailable: AtomicBool,
@@ -78,6 +83,7 @@ impl std::fmt::Debug for Scope {
                 "conversation",
                 &self.conversation.as_ref().map(|_| "[redacted]"),
             )
+            .field("conversation_scope", &self.conversation_scope)
             .field("pii_unavailable", &self.pii_unavailable())
             .field("sample_configured", &self.sample.get().is_some())
             .finish()
@@ -91,6 +97,7 @@ impl Default for Scope {
             fuzzy_restore: false,
             minted: MintedSet::default(),
             conversation: None,
+            conversation_scope: false,
             pii_unavailable: AtomicBool::new(false),
             sample: OnceLock::new(),
         }
@@ -109,6 +116,7 @@ impl Scope {
             fuzzy_restore,
             minted: MintedSet::default(),
             conversation: None,
+            conversation_scope: false,
             pii_unavailable: AtomicBool::new(false),
             sample: OnceLock::new(),
         }
@@ -122,33 +130,31 @@ impl Scope {
             fuzzy_restore,
             minted: MintedSet::default(),
             conversation: None,
+            conversation_scope: false,
             pii_unavailable: AtomicBool::new(false),
             sample: OnceLock::new(),
         }
     }
 
-    /// 挂载会话写回上下文：响应完成处据本会话键把上游响应 id 写入映射。
-    pub fn with_conversation(
+    /// 挂载会话写回上下文：响应完成处把上游标识绑定到请求时 canonical。
+    ///
+    /// `conversation_scope` 表示本次请求是否落在会话级共享 `PiiScope` 上；
+    /// `request` 模式为 `false`（仍挂写回，供别名绑定/解析）。
+    pub(crate) fn with_conversation(
         mut self,
-        key: ConversationKey,
-        tenant_fingerprint: String,
-        secret: Arc<[u8]>,
-        previous_map: Arc<PreviousResponseMap>,
+        writeback: ConversationWriteback,
+        conversation_scope: bool,
     ) -> Self {
-        self.conversation = Some(ConversationWriteback::new(
-            key,
-            tenant_fingerprint,
-            secret,
-            previous_map,
-        ));
+        self.conversation = Some(writeback);
+        self.conversation_scope = conversation_scope;
         self
     }
 
-    /// 响应完成写回（仅 `Protocol::Responses` 写入映射；无写回上下文时 no-op）。
-    pub fn record_response_id(&self, protocol: Protocol, response_id: &str) -> bool {
-        self.conversation
-            .as_ref()
-            .is_some_and(|wb| wb.record(protocol, response_id))
+    /// 响应侧捕获绑定（无写回上下文时 no-op；协议/状态门控在捕获阶段完成）。
+    pub(crate) fn record_capture(&self, captured: &CapturedIds) {
+        if let Some(wb) = self.conversation.as_ref() {
+            wb.record(captured);
+        }
     }
 
     /// 脱敏链是否发生 rand8 熵源/内部故障（调用方据此 fail-closed）。
@@ -164,9 +170,14 @@ impl Scope {
             .map_or_else(SampleCtx::disabled, SampleBinding::ctx)
     }
 
-    /// 是否挂载了会话写回上下文（仅 `conversation` 模式且键推导成功）。
+    /// 是否挂载了会话写回上下文（canonical 存在即挂载，两种模式均可能为真）。
     /// 只暴露「有无」，MUST NOT 泄露会话键或租户指纹。
-    pub fn has_conversation(&self) -> bool { self.conversation.is_some() }
+    pub fn has_writeback(&self) -> bool { self.conversation.is_some() }
+
+    /// 本次请求是否落在会话级共享 `PiiScope`（`conversation` 模式且键可推导）。
+    ///
+    /// `conversation_writeback_miss` MUST 以本判据门控，而非 [`Self::has_writeback`]。
+    pub fn has_conversation_scope(&self) -> bool { self.conversation_scope }
 
     /// 底层的请求级 PII 容器（高级用法/断言）。
     #[cfg(test)]

@@ -10,8 +10,8 @@
 # fail-closed：文件缺失/不可读/超过 1MB/TOML 语法错误/未知键/类型错误/取值越界，
 # 一律拒绝启动；空文件合法（等价于无文件覆盖）。
 #
-# 严格键面：本示例只使用 0.2.0 的规范键名与规范枚举拼写。0.1.x 的旧分节
-# （auth / limits / keepass）与旧键名已随兼容层移除，出现即按未知键拒启动。
+# 严格键面：本示例只使用规范键名与规范枚举拼写；任何未列出的分节或键名
+# 一律按未知键 fail-closed 拒启动（不存在兼容读取或静默归一）。
 #
 # 密钥类键（matrix.access_token、admin.token、storage.veilctl_secret、
 # storage.veilctl_binary_hash、redaction.value_sample_hmac_key）一旦写入本文件，Unix 下
@@ -25,7 +25,7 @@
 # 本机直跑保持回环；容器内需改为 0.0.0.0（见 examples/veil.container.toml）。
 listen_addr = "127.0.0.1:8877"
 # 暴露面模式：full（默认，凭据 API + 管理面 + LLM 代理）| llm_only（纯代理，凭据面不可用）。
-# 只接受 full / llm_only；其它拼写（含 0.1.x 的连字符写法）拒启动。
+# 只接受 full / llm_only；其它拼写拒启动。
 # 注意：本键不改变任何审批口径——allow_mode = "pending" 的条目在任一取值下都每次建票；
 #       需要自动放行请在条目上显式声明 allow_mode = "allow"。
 surface_mode = "full"
@@ -75,7 +75,7 @@ vault_backend = "real"
 block_wait = false
 
 [credential.authorization]
-# 授权窗口秒数；0 = 无期限（缺省，行为同升级前）。
+# 授权窗口秒数；0 = 无期限（缺省）。
 # 非 0 时授权到期即转审批（建票 + 阻塞至 300s 超时），无人值守脚本必须配置审批人；
 # 每次到期或续期都会写一次注册表。设过小（<60）会在启动期 warn。
 ttl_secs = 0
@@ -125,13 +125,18 @@ mode = "request"
 ttl_secs = 3600
 # 会话条目数上限（≥1）。
 max_conversations = 1024
-# 会话键请求头名（最高优先）；保留鉴权/传输头名拒启动。仅用于推导会话作用域与展开 `$conversation`，
-# 不因此从上游请求剔除（普通头名原样转发）。PII 会话作用域回退窄链（仅两名）：
-# x-opencode-session -> x-opencode-session-id
-# 遥测 session_id 另用五名宽链（x-opencode-parent-session-id / x-session-affinity / x-session-id），见工程参考 §6。
-key_header = "x-veil-conversation-id"
-# previous_response_id 映射上限（≥1）；缺省联动 max_conversations 生效值。
-# prev_id_max_entries = 1024
+
+# ── 会话身份（文件专属，无 env 名）──
+[session]
+# 唯一会话头链（PII 作用域、请求记录与 `$conversation` 共用）：有序，首个非空胜出（非法值跳过）。
+# 每个头名须为合法 HTTP 头名，大小写归一后不得重复；被拒绝的头名（启动即拒）：
+# 保留鉴权/传输头（authorization / x-api-key / api-key / host / content-length /
+# content-encoding / accept-encoding / transfer-encoding / 逐跳头）与 cookie，
+# 以及不可信客户端标识头（x-opencode-parent-session-id / x-session-affinity / x-session-id）。
+headers = ["x-veil-conversation-id", "x-opencode-session", "x-opencode-session-id"]
+# 会话别名表容量（≥1，按**别名条目**计，缺省 1024）；每个 Responses 响应最多写 2 条
+# （response.id 与 conversation.id），故 1024 约覆盖 512 个响应会话；与 max_conversations 解耦。
+alias_max_entries = 1024
 
 # ── LLM 网关 ──
 [llm]
@@ -169,6 +174,12 @@ nonstream_max_bytes = 8388608
 # default（缺则补）→ override（恒写）→ drop（删顶层键，缺失静默）；
 # 保留键 model/stream/messages/input/instructions/system/stream_options 任一段出现即拒启动。
 # NonDialog 字节透传与 count_tokens（redact-only）仅注入头、忽略 params（各记一次 warn）；参数值为配置原文。
+# 端口 8878 的目标级声明。
+[llm.targets."8878"]
+# 条件替换（replace / header_replace）要求恒胜模式；true 是缺省值，这里显式写出：
+# 合并模式（false）与任一条件替换规则并存会拒启动。
+override_existing = true
+
 # 端口 8878 目标：给该入口补一个静态协议版本头与一个特性标记头。
 [llm.targets."8878".headers]
 # Anthropic 协议版本头（静态值，恒按目标级 override_existing 语义注入）。
@@ -185,6 +196,30 @@ override = { top_p = 0.9 }
 # 删除：移除顶层 presence_penalty（不存在时静默）。
 drop = ["presence_penalty"]
 
+# 条件值替换（端口 8878，chat 协议）：仅当请求体顶层字段值与 from 精确相等（类型 + 值，
+# 大小写敏感）时改为 to；字段缺失/值不等/类型不符一律 no-op，不注入缺失字段、不级联。
+# 本条修正上游只认 "off" 而客户端发 "none" 的兼容差异；models 省略 = 对本目标全部模型生效
+# （声明 models = ["deepseek-chat"] 可限定模型，精确且大小写敏感；模型改名会让规则静默失效）。
+# 规则在脱敏之后执行，故 from/to 不得依赖 PII 明文；不可为 __PII_*__ 等占位符形态。
+[[llm.targets."8878".params.chat.replace]]
+# 请求体顶层键名（仅顶层标量；不可为保留键，也不可与同协议 default/override/drop 的键重名）。
+field = "reasoningEffort"
+# 命中值：JSON 标量（字符串/数字/布尔），类型保持，比较为精确相等。
+from = "none"
+# 替换值：字面值，不做 $ 插值。
+to = "off"
+
+# 出站头条件替换（端口 8878）：按 HeaderMap 每个值条目逐值精确匹配 from 后改为 to；
+# 头缺失 no-op、只替换不注入、不级联；逗号拼接的单个值不拆分（按整值比较，不命中即 no-op）。
+# 在 drop_headers 之后、配置 headers 注入之前应用；name 不可命中硬拒头（含 cookie 与 x-veil-*）。
+[[llm.targets."8878".header_replace]]
+# 出站头名（合法 HTTP 头名；不得与同目标 headers/drop_headers 重名）。
+name = "x-reasoning-effort"
+# 命中值：精确字节相等（大小写敏感）。
+from = "none"
+# 替换值：字面值（不做 $ 插值）。
+to = "off"
+
 # 端口 8878 的 anthropic 协议参数：恒写 max_tokens。
 [llm.targets."8878".params.anthropic]
 # 恒写：max_tokens 一律改为 1024。
@@ -197,7 +232,7 @@ drop = ["store"]
 
 # 合并模式示例：仅补缺，客户端显式给定的头/参数优先。
 # 注意目标级布尔键名为 override_existing；协议段内的 params.<proto>.override 是**参数表**，
-# 两者旧版同名会歧义，本版已把布尔键改名，故可在同一目标下共存。
+# 两者命名不同，故可在同一目标下共存。
 [llm.targets.default]
 # 目标级冲突策略：false = 合并模式（客户端已有值恒保留，仅补缺；drop 不受影响）。
 override_existing = false

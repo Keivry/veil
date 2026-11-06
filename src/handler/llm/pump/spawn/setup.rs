@@ -90,6 +90,9 @@ pub(super) struct PumpLoopState {
     /// 阻断不属截断，故不写 `truncated_mode`（`阻断非截断` 不变量）；改由请求行
     /// `error_kind = "audit_hold_overflow"` 承载，使 `/_admin/requests` 可见。
     pub audit_hold_overflow: bool,
+    /// 响应级捕获状态（别名绑定 + 每响应至多一次的 miss 计数）；
+    /// 一次性计数在 `finish.rs` 收尾完成（截断流不计写回失败）。
+    pub capture: crate::service::redaction::CaptureTracker,
 }
 
 /// setup 构造器——解构 `StreamPumpCtx`，钳位配置，装配环境、循环状态与解析器。
@@ -149,6 +152,7 @@ pub(super) fn setup(
         chat_finish_seen: false,
         stream_finish_reason: None,
         audit_hold_overflow: false,
+        capture: crate::service::redaction::CaptureTracker::default(),
     };
     let env = PumpEnv {
         protocol,

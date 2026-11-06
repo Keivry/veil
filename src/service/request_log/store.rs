@@ -142,7 +142,7 @@ pub struct RequestFilter {
     /// `session_id` 前缀（大小写敏感，最少 [`MIN_SESSION_PREFIX_CHARS`] 字符）。
     pub session_prefix: Option<String>,
     /// `Some(SessionScope::Session|User)` 过滤；`None` = any。
-    pub scope: Option<super::session::SessionScope>,
+    pub scope: Option<crate::service::session_identity::SessionScope>,
     /// 仅保留真实 LLM 请求（`is_chat = 1`）；默认 `false` = 不限。
     pub llm_only: bool,
     pub limit: Option<usize>,

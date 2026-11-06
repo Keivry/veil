@@ -1,6 +1,12 @@
-//! `overrides` 纯应用逻辑单测（协议映射、三段覆盖矩阵与合并模式两态）。
+//! `overrides` 纯应用逻辑单测（协议映射、三段覆盖矩阵、合并模式两态与条件替换）。
 
-use {super::*, axum::http::HeaderMap, serde_json::json, std::collections::BTreeMap};
+use {
+    super::*,
+    crate::config::ReplaceRule,
+    axum::http::HeaderMap,
+    serde_json::json,
+    std::collections::BTreeMap,
+};
 
 /// 空头表（`HeaderValueSpec` 泛型），测试构造用。
 fn empty_headers() -> HeaderMap<crate::config::HeaderValueSpec> { HeaderMap::with_capacity(0) }
@@ -17,6 +23,7 @@ fn rules(default: &[(&str, Value)], override_: &[(&str, Value)], drop: &[&str]) 
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect(),
         drop: drop.iter().map(|key| (*key).to_string()).collect(),
+        replace: Vec::new(),
     }
 }
 
@@ -30,6 +37,7 @@ fn target_with(protocol: ParamProtocol, rules: ParamOverrides) -> UpstreamOverri
         override_existing: true,
         user_agent: None,
         drop_headers: Vec::new(),
+        header_replace: Vec::new(),
     }
 }
 
@@ -41,10 +49,34 @@ fn object(pairs: &[(&str, Value)]) -> Map<String, Value> {
         .collect()
 }
 
+/// 构造单条条件替换规则（`models` 缺省 = 全模型）。
+fn replace_rule(field: &str, from: Value, to: Value) -> ReplaceRule {
+    ReplaceRule {
+        field: field.to_string(),
+        from,
+        to,
+        models: None,
+    }
+}
+
+/// 在 `rules` 上追加条件替换规则（测试用）。
+fn with_replace(mut rules: ParamOverrides, replace: Vec<ReplaceRule>) -> ParamOverrides {
+    rules.replace = replace;
+    rules
+}
+
+fn apply_ungated(
+    body: &mut Map<String, Value>,
+    rules: &ParamOverrides,
+    override_existing: bool,
+) -> bool {
+    super::apply_param_overrides(body, rules, override_existing, None)
+}
+
 #[test]
 fn default_fills_only_missing_and_preserves_client_value() {
     let mut body = object(&[("temperature", json!(0.2))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(
             &[("temperature", json!(0.7)), ("top_p", json!(0.9))],
@@ -59,7 +91,7 @@ fn default_fills_only_missing_and_preserves_client_value() {
 
     // 全部键已存在（值不同）时 default 不覆盖、不报变化。
     let mut body = object(&[("temperature", json!(0.2))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[("temperature", json!(0.7))], &[], &[]),
         true,
@@ -71,7 +103,7 @@ fn default_fills_only_missing_and_preserves_client_value() {
 #[test]
 fn override_always_replaces_even_when_present() {
     let mut body = object(&[("reasoning_effort", json!("low"))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[], &[("reasoning_effort", json!("high"))], &[]),
         true,
@@ -80,7 +112,7 @@ fn override_always_replaces_even_when_present() {
     assert_eq!(body.get("reasoning_effort"), Some(&json!("high")));
 
     let mut body = object(&[("temperature", json!(0.7))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[], &[("temperature", json!(0.7))], &[]),
         true,
@@ -92,7 +124,7 @@ fn override_always_replaces_even_when_present() {
 #[test]
 fn drop_removes_present_key_and_ignores_absent() {
     let mut body = object(&[("service_tier", json!("auto")), ("model", json!("m"))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[], &[], &["service_tier", "absent"]),
         true,
@@ -102,7 +134,7 @@ fn drop_removes_present_key_and_ignores_absent() {
     assert_eq!(body.get("model"), Some(&json!("m")), "未列键须保留");
 
     let mut body = object(&[("model", json!("m"))]);
-    let changed = apply_param_overrides(&mut body, &rules(&[], &[], &["absent"]), true);
+    let changed = apply_ungated(&mut body, &rules(&[], &[], &["absent"]), true);
     assert!(!changed, "缺失键静默忽略且不报告变化");
 }
 
@@ -110,7 +142,7 @@ fn drop_removes_present_key_and_ignores_absent() {
 fn later_section_wins_for_same_key() {
     // default → override：override 胜。
     let mut body = Map::new();
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(
             &[("temperature", json!(0.1))],
@@ -124,7 +156,7 @@ fn later_section_wins_for_same_key() {
 
     // override → drop：drop 胜（最终删除）。
     let mut body = object(&[("temperature", json!(0.1))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[], &[("temperature", json!(0.9))], &["temperature"]),
         true,
@@ -136,7 +168,7 @@ fn later_section_wins_for_same_key() {
 #[test]
 fn empty_rules_report_unchanged() {
     let mut body = object(&[("model", json!("m"))]);
-    let changed = apply_param_overrides(&mut body, &rules(&[], &[], &[]), true);
+    let changed = apply_ungated(&mut body, &rules(&[], &[], &[]), true);
     assert!(!changed, "空规则不得报告变化");
 }
 
@@ -145,7 +177,7 @@ fn merge_mode_preserves_client_values_and_adds_missing_keys() {
     // 合并模式（override_existing = false）：客户端已有键（值不同）恒保留；
     // 缺失键新增（default 与 override 两段同权，均为「仅补缺」）。
     let mut body = object(&[("temperature", json!(0.5)), ("model", json!("m"))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(
             &[("top_p", json!(0.9)), ("temperature", json!(0.7))],
@@ -168,7 +200,7 @@ fn merge_mode_preserves_client_values_and_adds_missing_keys() {
 fn merge_mode_missing_key_uses_later_config_segment() {
     // 客户端未带该键时，同键 default + override 取后段值（仅配置段之间后段生效）。
     let mut body = Map::new();
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(
             &[("temperature", json!(0.1))],
@@ -182,7 +214,7 @@ fn merge_mode_missing_key_uses_later_config_segment() {
 
     // 两段值相同：仅新增一次、不重复改写。
     let mut body = Map::new();
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(
             &[("temperature", json!(0.9))],
@@ -199,26 +231,246 @@ fn merge_mode_missing_key_uses_later_config_segment() {
 fn merge_mode_drop_still_removes_and_noop_reports_false() {
     // drop 不受开关影响（两态均删除）。
     let mut body = object(&[("service_tier", json!("auto"))]);
-    let changed = apply_param_overrides(&mut body, &rules(&[], &[], &["service_tier"]), false);
+    let changed = apply_ungated(&mut body, &rules(&[], &[], &["service_tier"]), false);
     assert!(changed, "drop 在合并模式仍须删除");
     assert!(body.get("service_tier").is_none());
 
     // 客户端已有值：无论与配置同值还是不同值，均保留且不报变化。
     let mut body = object(&[("temperature", json!(0.7))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[], &[("temperature", json!(0.7))], &[]),
         false,
     );
     assert!(!changed, "客户端已有值且与配置同值：无实际变化");
     let mut body = object(&[("temperature", json!(0.5))]);
-    let changed = apply_param_overrides(
+    let changed = apply_ungated(
         &mut body,
         &rules(&[], &[("temperature", json!(0.7))], &[]),
         false,
     );
     assert!(!changed, "客户端值须原样保留且不报变化");
     assert_eq!(body.get("temperature"), Some(&json!(0.5)));
+}
+
+#[test]
+fn replace_hits_only_on_exact_value_and_scalar_type() {
+    let rule = replace_rule("reasoningEffort", json!("none"), json!("off"));
+    let cfg = with_replace(rules(&[], &[], &[]), vec![rule]);
+
+    let mut body = object(&[("reasoningEffort", json!("none"))]);
+    let changed = apply_param_overrides(&mut body, &cfg, true, None);
+    assert!(changed, "精确命中须报告变化");
+    assert_eq!(body.get("reasoningEffort"), Some(&json!("off")));
+
+    // 值不等 / 大小写差异 / 类型不符 / null：一律 no-op，不改类型、不报变化。
+    for client_value in [
+        json!("high"),
+        json!("None"),
+        json!(1),
+        json!(true),
+        json!(null),
+    ] {
+        let mut body = object(&[("reasoningEffort", client_value.clone())]);
+        let changed = apply_param_overrides(&mut body, &cfg, true, None);
+        assert!(!changed, "未命中不得报告变化: {client_value}");
+        assert_eq!(
+            body.get("reasoningEffort"),
+            Some(&client_value),
+            "未命中不得改写: {client_value}"
+        );
+    }
+}
+
+#[test]
+fn replace_matches_numeric_and_boolean_scalars_exactly() {
+    let mut body = object(&[("level", json!(1))]);
+    let changed = apply_param_overrides(
+        &mut body,
+        &with_replace(
+            rules(&[], &[], &[]),
+            vec![replace_rule("level", json!(1), json!(2))],
+        ),
+        true,
+        None,
+    );
+    assert!(changed);
+    assert_eq!(body.get("level"), Some(&json!(2)));
+
+    // `1` 与 `1.0` 在 serde_json 中不相等：类型精确，不得误命中。
+    let mut body = object(&[("level", json!(1.0))]);
+    let changed = apply_param_overrides(
+        &mut body,
+        &with_replace(
+            rules(&[], &[], &[]),
+            vec![replace_rule("level", json!(1), json!(2))],
+        ),
+        true,
+        None,
+    );
+    assert!(!changed, "1.0 不得命中整数 1");
+    assert_eq!(body.get("level"), Some(&json!(1.0)));
+
+    let mut body = object(&[("flag", json!(false))]);
+    let changed = apply_param_overrides(
+        &mut body,
+        &with_replace(
+            rules(&[], &[], &[]),
+            vec![replace_rule("flag", json!(false), json!(true))],
+        ),
+        true,
+        None,
+    );
+    assert!(changed, "布尔标量须参与精确替换");
+    assert_eq!(body.get("flag"), Some(&json!(true)));
+}
+
+#[test]
+fn replace_missing_field_is_never_inserted() {
+    let mut body = object(&[("model", json!("m"))]);
+    let changed = apply_param_overrides(
+        &mut body,
+        &with_replace(
+            rules(&[], &[], &[]),
+            vec![replace_rule("reasoningEffort", json!("none"), json!("off"))],
+        ),
+        true,
+        None,
+    );
+    assert!(!changed, "缺失字段不得注入、不得报变化");
+    assert!(body.get("reasoningEffort").is_none(), "缺失字段不得注入");
+}
+
+#[test]
+fn replace_does_not_cascade_and_is_order_independent() {
+    let a_to_b = replace_rule("effort", json!("A"), json!("B"));
+    let b_to_c = replace_rule("effort", json!("B"), json!("C"));
+
+    for order in [
+        vec![a_to_b.clone(), b_to_c.clone()],
+        vec![b_to_c.clone(), a_to_b.clone()],
+    ] {
+        let mut body = object(&[("effort", json!("A"))]);
+        let changed = apply_param_overrides(
+            &mut body,
+            &with_replace(rules(&[], &[], &[]), order),
+            true,
+            None,
+        );
+        assert!(changed);
+        assert_eq!(
+            body.get("effort"),
+            Some(&json!("B")),
+            "仅首层命中，不得级联到 C（与规则顺序无关）"
+        );
+    }
+
+    // 客户端值为 B：只有 B→C 命中，结果为 C（仍不级联回 A→B）。
+    let mut body = object(&[("effort", json!("B"))]);
+    let changed = apply_param_overrides(
+        &mut body,
+        &with_replace(rules(&[], &[], &[]), vec![a_to_b, b_to_c]),
+        true,
+        None,
+    );
+    assert!(changed);
+    assert_eq!(body.get("effort"), Some(&json!("C")));
+}
+
+#[test]
+fn replace_runs_before_default_and_override_on_distinct_fields() {
+    let mut body = object(&[("reasoningEffort", json!("none"))]);
+    let cfg = with_replace(
+        rules(
+            &[("top_p", json!(0.9))],
+            &[("temperature", json!(0.3))],
+            &[],
+        ),
+        vec![replace_rule("reasoningEffort", json!("none"), json!("off"))],
+    );
+    let changed = apply_param_overrides(&mut body, &cfg, true, None);
+    assert!(changed);
+    assert_eq!(body.get("reasoningEffort"), Some(&json!("off")));
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "default 照常补齐");
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(0.3)),
+        "override 照常写入"
+    );
+}
+
+#[test]
+fn replace_models_gate_uses_exact_client_model() {
+    let gated = ReplaceRule {
+        models: Some(vec!["deepseek-chat".to_string()]),
+        ..replace_rule("reasoningEffort", json!("none"), json!("off"))
+    };
+    let cfg = with_replace(rules(&[], &[], &[]), vec![gated]);
+
+    let mut body = object(&[("reasoningEffort", json!("none"))]);
+    assert!(apply_param_overrides(
+        &mut body,
+        &cfg,
+        true,
+        Some("deepseek-chat")
+    ));
+    assert_eq!(body.get("reasoningEffort"), Some(&json!("off")));
+
+    // 不匹配 / 大小写不同 / 模型缺失：跳过且不报变化。
+    for model in [Some("deepseek-reasoner"), Some("DeepSeek-Chat"), None] {
+        let mut body = object(&[("reasoningEffort", json!("none"))]);
+        let changed = apply_param_overrides(&mut body, &cfg, true, model);
+        assert!(!changed, "模型门控不匹配须跳过: {model:?}");
+        assert_eq!(
+            body.get("reasoningEffort"),
+            Some(&json!("none")),
+            "门控不匹配不得改写: {model:?}"
+        );
+    }
+
+    // 省略 models = 全模型生效（含模型缺失）。
+    let ungated = with_replace(
+        rules(&[], &[], &[]),
+        vec![replace_rule("reasoningEffort", json!("none"), json!("off"))],
+    );
+    let mut body = object(&[("reasoningEffort", json!("none"))]);
+    assert!(apply_param_overrides(&mut body, &ungated, true, None));
+    assert_eq!(body.get("reasoningEffort"), Some(&json!("off")));
+}
+
+#[test]
+fn models_gate_matches_semantics() {
+    let list = vec!["a".to_string(), "b".to_string()];
+    assert!(models_gate_matches(None, None), "省略 models 即全模型");
+    assert!(models_gate_matches(None, Some("x")));
+    assert!(models_gate_matches(Some(&list), Some("a")));
+    assert!(models_gate_matches(Some(&list), Some("b")));
+    assert!(!models_gate_matches(Some(&list), Some("A")), "大小写敏感");
+    assert!(!models_gate_matches(Some(&list), Some("c")));
+    assert!(!models_gate_matches(Some(&list), None), "模型缺失须跳过");
+    assert!(
+        !models_gate_matches(Some(&[]), Some("a")),
+        "空数组防御性跳过（加载期已拒绝）"
+    );
+}
+
+#[test]
+fn params_declaration_detects_replace_only_config() {
+    let empty = rules(&[], &[], &[]);
+    assert!(!params_declared(&empty));
+    let mut overrides = target_with(ParamProtocol::Chat, empty);
+    assert!(!has_params_declaration(Some(&overrides)));
+
+    if let Some(chat) = overrides.params.get_mut(&ParamProtocol::Chat) {
+        chat.replace = vec![replace_rule("effort", json!("none"), json!("off"))];
+    }
+    let chat = overrides
+        .params
+        .get(&ParamProtocol::Chat)
+        .expect("chat 子表须存在");
+    assert!(params_declared(chat), "仅声明 replace 也须视为声明");
+    assert!(has_params_declaration(Some(&overrides)));
+    assert!(!has_params_declaration(None));
 }
 
 #[test]
@@ -257,5 +509,42 @@ fn matched_params_requires_matching_protocol_declaration() {
     assert!(
         matched_params(None, Protocol::Chat).is_none(),
         "无覆盖须为 None"
+    );
+}
+
+#[test]
+fn redact_only_message_covers_replace_only_declaration() {
+    // 仅有空协议子表：不告警。
+    let empty_section = UpstreamOverrides {
+        params: BTreeMap::from([(ParamProtocol::Chat, rules(&[], &[], &[]))]),
+        ..UpstreamOverrides::default()
+    };
+    assert!(
+        redact_only_params_ignored_message(Some(&empty_section)).is_none(),
+        "空协议子表不算声明"
+    );
+    assert!(redact_only_params_ignored_message(None).is_none());
+
+    // 仅声明 `replace`：须告警，且文案提及 `params`/`params.replace`。
+    let replace_only = UpstreamOverrides {
+        params: BTreeMap::from([(
+            ParamProtocol::Chat,
+            with_replace(
+                rules(&[], &[], &[]),
+                vec![replace_rule("effort", json!("none"), json!("off"))],
+            ),
+        )]),
+        ..UpstreamOverrides::default()
+    };
+    let message =
+        redact_only_params_ignored_message(Some(&replace_only)).expect("仅 replace 也须告警");
+    assert!(message.contains("params"), "文案须提及 params: {message}");
+    assert!(
+        message.contains("params.replace"),
+        "文案须提及 params.replace: {message}"
+    );
+    assert!(
+        message.contains("header_replace"),
+        "文案须说明头注入照常: {message}"
     );
 }

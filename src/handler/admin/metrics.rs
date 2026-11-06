@@ -118,13 +118,19 @@ pub(super) fn admin_metrics_body(state: &AppState, range: Option<&str>) -> serde
         "admin_rate_evicted": gm.admin_rate_evicted_count(),
         "aggs_evicted": snap.aggs_evicted,
         "pii_value_samples": pii_value_samples_json(&samples),
-        // 只读会话作用域观测——模式 + 三计数。计数为无锁原子读，恒可用
-        // （缺失/锁不可用即降级为 0，绝不使请求失败）；既有键名与语义不变。
+        // 只读会话作用域观测——模式 + 既有三计数（四键不变）+ 会话身份/别名五计数。
+        // 计数为无锁原子读，恒可用（缺失/锁不可用即降级为 0，绝不使请求失败）；
+        // 既有键名与语义不变，别名逐出统一由 `session_alias_evict` 承载。
         "pii_scope": {
             "mode": if state.config.pii_scope_mode.is_conversation() { "conversation" } else { "request" },
             "conversation_reuse": gm.conversation_reuse_count(),
             "conversation_eviction": gm.conversation_eviction_count(),
             "request_fallback": gm.request_fallback_count(),
+            "session_alias_hit": gm.session_alias_hit_count(),
+            "session_alias_conflict": gm.session_alias_conflict_count(),
+            "session_alias_evict": gm.session_alias_evict_count(),
+            "session_bind_miss": gm.session_bind_miss_count(),
+            "session_outbound_hmac": gm.session_outbound_hmac_count(),
         },
         "requests_dropped": snap.requests_dropped,
         "requests_aborted": snap.requests_aborted,

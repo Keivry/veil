@@ -2,6 +2,10 @@
 //!
 //! 默认 `request` 即现行为（逐请求作用域，零行为变化）；`conversation` 启用
 //! 会话级 PII 共享。合法值以外的取值 fail-closed 拒启动，不静默回退。
+//!
+//! 会话头链与别名容量已迁至 `[session]`（见 `env_parse::session`）：本模块不再读取
+//! `PII_SCOPE_KEY_HEADER` / `PII_SCOPE_PREV_ID_MAX_ENTRIES`；这两个旧规范名在进程 env
+//! 非空置位时由 `Config::from_env_map` 的 fail-closed 预扫描拒绝启动。
 
 use {
     super::super::validate::{parse_positive_u64, parse_positive_usize},
@@ -12,8 +16,6 @@ use {
 pub const PII_SCOPE_TTL_SECS_DEFAULT: u64 = 1800;
 /// `PII_SCOPE_MAX_CONVERSATIONS` 默认值（会话条目上限）。
 pub const PII_SCOPE_MAX_CONVERSATIONS_DEFAULT: usize = 1024;
-/// `PII_SCOPE_KEY_HEADER` 默认头名（属 `x-veil-*` 内部命名空间，转发前剔除）。
-pub const PII_SCOPE_KEY_HEADER_DEFAULT: &str = "x-veil-conversation-id";
 
 /// PII 作用域模式：`request`（默认，逐请求）/ `conversation`（会话级共享）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,35 +49,9 @@ pub struct PiiScopeParts {
     pub mode: PiiScopeMode,
     pub ttl_secs: u64,
     pub max_conversations: usize,
-    pub key_header: String,
-    pub prev_id_max_entries: usize,
 }
 
-/// 保留会话键头名（大小写不敏感对比）：与真实鉴权头冲突者。
-/// HOP 集经 `service::llm_gateway::HOP_HEADERS` 单一来源并入，避免两处漂移。
-const RESERVED_KEY_HEADERS: [&str; 7] = [
-    "authorization",
-    "x-api-key",
-    "api-key",
-    "host",
-    "content-length",
-    "content-encoding",
-    "accept-encoding",
-];
-
-/// 会话键头保留名判定：命中即拒启动——保留名不作会话键的双重理由：
-/// (a) hop/传输头在出站装配期被移除，其值不稳定，作为跨轮会话键不可靠；
-/// (b) 鉴权头作 PII 会话键会把凭据卷入键派生，并令共享同一凭据的请求坍缩为
-/// 单一 PII 作用域。
-fn is_reserved_key_header(name: &str) -> bool {
-    let lower = name.trim().to_ascii_lowercase();
-    RESERVED_KEY_HEADERS.contains(&lower.as_str())
-        || crate::service::llm_gateway::HOP_HEADERS.contains(&lower.as_str())
-}
-
-/// 解析 `PII_SCOPE_*`：模式非法与 TTL/上限非正整数一律拒启动并指明变量；
-/// 保留会话键头名拒启动。`PII_SCOPE_PREV_ID_MAX_ENTRIES` 未设置时取
-/// `PII_SCOPE_MAX_CONVERSATIONS` 的**生效值**（配置相关默认，非钉死 1024）。
+/// 解析 `PII_SCOPE_*`：模式非法与 TTL/上限非正整数一律拒启动并指明变量。
 pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
     let mode = match get("PII_SCOPE_MODE").filter(|v| !v.is_empty()) {
         Some(v) => v.parse().map_err(|message| VeilError::Config {
@@ -90,27 +66,10 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Result<PiiScopeParts> {
         "PII_SCOPE_MAX_CONVERSATIONS",
         PII_SCOPE_MAX_CONVERSATIONS_DEFAULT,
     )?;
-    let key_header = get("PII_SCOPE_KEY_HEADER")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| PII_SCOPE_KEY_HEADER_DEFAULT.to_string());
-    if is_reserved_key_header(&key_header) {
-        return Err(VeilError::Config {
-            var: "PII_SCOPE_KEY_HEADER".to_string(),
-            message: format!(
-                "PII_SCOPE_KEY_HEADER 取值 {key_header:?} 与保留鉴权/传输头名冲突，拒绝启动\
-                （hop/传输头在装配期被移除故不适合作会话键；鉴权头作 PII 会话键会把凭据\
-                卷入键派生并使共享同一凭据的请求坍缩为单一 PII 作用域）"
-            ),
-        });
-    }
-    let prev_id_max_entries =
-        parse_positive_usize(get, "PII_SCOPE_PREV_ID_MAX_ENTRIES", max_conversations)?;
     Ok(PiiScopeParts {
         mode,
         ttl_secs,
         max_conversations,
-        key_header,
-        prev_id_max_entries,
     })
 }
 

@@ -938,13 +938,15 @@ fn expected_fields<T: serde::de::DeserializeOwned>(toml_text: &str) -> BTreeSet<
 
 #[test]
 fn structural_key_set_matches_schema_field_sets() {
-    // task 6.3：schema 侧结构性键闭集须与结构体实际接受字段逐组相等——任一字段
+    // task 1.2：schema 侧结构性键闭集须与结构体实际接受字段逐组相等——任一字段
     // 新增/改名/删除而未同步 `TARGETS_STRUCTURAL_KEYS` 即失败；端口号/头名/参数名
     // 等用户自定义键不参与（探针只看固定字段集）。
     let probed = [
         expected_fields::<TargetSection>("bogus = 1\n"),
         expected_fields::<TargetParams>("bogus = 1\n"),
         expected_fields::<ParamSegments>("bogus = 1\n"),
+        expected_fields::<ReplaceRule>("bogus = 1\n"),
+        expected_fields::<HeaderReplaceRule>("bogus = 1\n"),
     ];
     assert_eq!(
         probed.len(),
@@ -953,14 +955,47 @@ fn structural_key_set_matches_schema_field_sets() {
     );
     assert_eq!(
         probed.iter().map(BTreeSet::len).collect::<Vec<_>>(),
-        vec![5, 3, 3],
-        "结构性键分组规模须为 5/3/3（目标内 / params 内 / 协议段内）"
+        vec![6, 3, 4, 4, 4],
+        "结构性键分组规模须为 6/3/4/4/4（目标内 / params 内 / 协议段内 / body 规则内 / header 规则内）"
     );
     for (group, (layer, closed)) in TARGETS_STRUCTURAL_KEYS.iter().enumerate() {
         let want: BTreeSet<String> = closed.iter().map(|key| (*key).to_string()).collect();
         assert_eq!(
             probed[group], want,
             "「{layer}」结构性键集须与 schema 字段集逐项相等（增删改须同步闭集）"
+        );
+    }
+}
+
+/// 闭集须以「出现层级 + 键名」二元组唯一：`from`/`to`/`models` 在两个规则层级各出现
+/// 一次不得被判重复，同时任一 (层级, 键) 缺失即失败。
+#[test]
+fn structural_key_pairs_are_unique_across_layers() {
+    let pairs: Vec<(String, String)> = TARGETS_STRUCTURAL_KEYS
+        .iter()
+        .flat_map(|(layer, keys)| {
+            keys.iter()
+                .map(|key| ((*layer).to_string(), (*key).to_string()))
+        })
+        .collect();
+    let mut unique = pairs.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        pairs.len(),
+        unique.len(),
+        "结构性键 (层级, 键) 二元组不得重复"
+    );
+    for key in ["from", "to", "models"] {
+        let layers: Vec<&str> = TARGETS_STRUCTURAL_KEYS
+            .iter()
+            .filter(|(_, keys)| keys.contains(&key))
+            .map(|(layer, _)| *layer)
+            .collect();
+        assert_eq!(
+            layers,
+            vec!["body replace 规则内", "header replace 规则内"],
+            "键 {key} 须恰在两个规则层级各出现一次"
         );
     }
 }
@@ -1100,3 +1135,6 @@ fn drop_headers_error_messages_name_default_target_path() {
         "default 目标错误须指名完整键路径：{msg}"
     );
 }
+
+/// 构造单条 body 规则声明的 TOML（协议与规则体由调用方给出）。
+mod replace;

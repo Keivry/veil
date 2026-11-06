@@ -148,16 +148,23 @@ pub async fn request_rewrite_with_overrides(
     }
     // 目标参数注入（design D4/D6/D7）：在脱敏替换与占位符说明注入**之后**、最终体
     // 确定之前执行；参数值为配置原文（不参与脱敏），已铸造的占位符 token 与说明
-    // 不被改写。仅当协议命中 `params` 子表、请求体可解析为 JSON 对象且三段覆盖
-    // 实际改变对象时紧凑重序列化并置位 `normalized_out`（与 stream_options 注入
-    // 同口径）；非对象体或未发生变化时保持字节与标志不变，绝不拒绝请求。
+    // 不被改写。仅当协议命中 `params` 子表、请求体可解析为 JSON 对象且四段覆盖
+    // （replace → default → override → drop）实际改变对象时紧凑重序列化并置位
+    // `normalized_out`（与 stream_options 注入同口径）；非对象体或未发生变化时保持
+    // 字节与标志不变，绝不拒绝请求。
     // 冲突策略随目标命中（`override_existing`）：恒胜（缺省）或合并（仅补缺）。
+    // `models` 门控读取客户端**原始**模型：取自动/脱敏/改写前解析的 `body_value`，
+    // 不从重写后的 `body_bytes` 重新解析（模型改名或 `override` 改写不得影响门控）。
     let override_existing = overrides.is_none_or(|o| o.override_existing);
     let param_rules = llm_gateway::matched_params(overrides, protocol);
+    let client_model = body_value
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str());
     if let Some(rules) = param_rules
         && let Some(mut value) = parse_body_json(&body_bytes)
         && value.as_object_mut().is_some_and(|object| {
-            llm_gateway::apply_param_overrides(object, rules, override_existing)
+            llm_gateway::apply_param_overrides(object, rules, override_existing, client_model)
         })
         && let Some(bytes) = encode_json_body(&value)
     {

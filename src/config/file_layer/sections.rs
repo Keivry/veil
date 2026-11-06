@@ -1,13 +1,13 @@
 //! 文件层各分节 schema（自 `file_layer/mod.rs` 拆出，导出路径不变）。
 //!
 //! 分节按迁移后的语义布局组织：`server` / `admin` / `matrix` / `audit` /
-//! `credential` / `request_log` / `storage` / `llm` / `pii_scope` / `redaction` /
-//! `command`。每个分节 `deny_unknown_fields`；取值受限的分节用封闭枚举钉死
+//! `credential` / `request_log` / `storage` / `llm` / `pii_scope` / `session` /
+//! `redaction` / `command`。每个分节 `deny_unknown_fields`；取值受限的分节用封闭枚举钉死
 //! （枚举空串/集合外取值在反序列化阶段即失败）。旧分节（`auth` / `limits` /
 //! `keepass`）与旧键名已删除，现按未知键/非法枚举值 fail-closed 拒启动。
 //!
 //! 数值宽度：时长/字节/天数类一律 `u64`（负值在反序列化阶段即失败），
-//! 计数类（`max_conversations` / `prev_id_max_entries` / `pool_max_idle_per_host`）
+//! 计数类（`max_conversations` / `alias_max_entries` / `pool_max_idle_per_host`）
 //! 为 `usize`（容器容量语义，非时长/字节预算）。
 
 use {
@@ -189,7 +189,7 @@ pub struct RedactionSection {
     pub normalize_json_whitespace: Option<bool>,
 }
 
-/// `[pii_scope]`：PII 会话作用域域。
+/// `[pii_scope]`：PII 会话作用域域（会话头链与别名容量已迁至 `[session]`）。
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiiScopeSection {
@@ -197,8 +197,16 @@ pub struct PiiScopeSection {
     /// 会话条目空闲 TTL 秒；须 ≥ 1（`0` 拒启动）。
     pub ttl_secs: Option<u64>,
     pub max_conversations: Option<usize>,
-    pub key_header: Option<String>,
-    pub prev_id_max_entries: Option<usize>,
+}
+
+/// `[session]`：唯一会话头链与别名表容量（文件专属，无 env 名）。
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSection {
+    /// 有序头名数组，首个合法非空值胜出；非空、合法头名、归一后不重复、非保留/不可信名。
+    pub headers: Option<Vec<String>>,
+    /// 别名表容量（按条目计，≥1，缺省 1024）。
+    pub alias_max_entries: Option<usize>,
 }
 
 /// `[llm]`：LLM 网关域；`upstreams` 为端口表（端口字符串 → URL）。
@@ -233,6 +241,7 @@ pub struct FileConfig {
     pub storage: Option<StorageSection>,
     pub llm: Option<LlmSection>,
     pub pii_scope: Option<PiiScopeSection>,
+    pub session: Option<SessionSection>,
     pub redaction: Option<RedactionSection>,
     pub command: Option<CommandSection>,
 }

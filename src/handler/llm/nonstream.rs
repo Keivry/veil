@@ -49,8 +49,9 @@ pub struct NonstreamCtx<'a> {
     pub stream_flag: bool,
     /// 非流对话响应体上限（`NONSTREAM_MAX_BYTES`，严格超限 502）。
     pub nonstream_max_bytes: usize,
-    /// 单次 `resolve_target` 命中的目标覆盖（同源传递；仅 headers 注入生效，
-    /// `params` 由 `request_rewrite` 消费，本单元不读取）。
+    /// 单次 `resolve_target` 命中的目标覆盖（同源传递；本单元只消费 `headers`/
+    /// `header_replace`/`user_agent`/`drop_headers`，`params` 由 `request_rewrite`
+    /// 在对话路径消费）。
     pub overrides: Option<&'a UpstreamOverrides>,
     /// 动态头值展开上下文（原始入站头 + 会话键头生效名）。
     pub expand: ExpandCtx<'a>,
@@ -304,22 +305,18 @@ pub async fn serve_detailed(
                 }
             }
         }
+        // 会话捕获 + 别名绑定 + 一次性 miss 计数（design D4/D8）：
+        // 绑定**只用** `capture_response_ids`（仅 Responses 2xx；MUST NOT 回退
+        // `error.id`/`message.id`/`data.id`），展示锚点仍走既有提取器。
         let response_id = llm_gateway::extract_conv_id(&v);
-        let wrote = response_id
-            .as_deref()
-            .is_some_and(|id| ctx.req.scope.record_response_id(ctx.req.protocol, id));
-        // 写回失败仅「响应 id 缺失/为空」这一真实失败计一次；无写回上下文
-        // （`request` 模式/键未推导）与非 Responses 协议门控 MUST NOT 计入。
-        // 仅成功响应（`status<400`）计入——`status>=400` 错误体（如 400）本就不承载
-        // 可写回的响应 id，非真实写回失败，不得虚计。
-        if !wrote
-            && status_u16 < 400
-            && ctx.req.protocol.is_responses()
-            && response_id.is_none()
-            && ctx.req.scope.has_conversation()
-        {
-            ctx.req.gateway_metrics.record_conversation_writeback_miss();
-        }
+        let mut capture = crate::service::redaction::CaptureTracker::default();
+        capture.observe(
+            ctx.req.scope.as_ref(),
+            ctx.req.protocol,
+            status_u16,
+            &v,
+            &ctx.req.gateway_metrics,
+        );
         let conv_id = response_id.unwrap_or_else(|| {
             llm_gateway::resolve_conv_id(
                 None,
@@ -496,8 +493,9 @@ pub(crate) fn reset_nondialog_params_ignored_warning() {
 
 /// NonDialog 专用透传入口——类型即契约（返回 `Response`，无 `Stream` 臂），
 /// 非对话臂不再经 `serve_nonstream` 的 `NonstreamOutcome` 分派；与兼容分支共用
-/// `passthrough_upstream_response` 装配，字节语义不变。命中声明了 `params` 的
-/// 目标时按豁免语义忽略并记单次 warn（字节透传，仅注入 headers，design D8）。
+/// `passthrough_upstream_response` 装配，字节语义不变。命中声明了 `params`（含
+/// 仅 `params.replace` 的声明）的目标时按豁免语义忽略参数注入并记单次 warn
+/// （字节透传，仅应用 `header_replace`/`headers`，design D7）。
 pub async fn serve_nondialog_passthrough(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -521,11 +519,11 @@ pub async fn serve_nondialog_detailed(
     ctx: NondialogCtx<'_>,
 ) -> (Response, NonstreamDetail) {
     let mut detail = NonstreamDetail::default();
-    if ctx.overrides.is_some_and(|o| !o.params.is_empty())
+    if llm_gateway::has_params_declaration(ctx.overrides)
         && !NONDIALOG_PARAMS_IGNORED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
         tracing::warn!(
-            "NonDialog 透传路径命中 [llm.targets] 的 params 声明：按字节透传契约忽略参数注入（仅注入 headers；本进程仅提示一次）"
+            "NonDialog 透传路径命中 [llm.targets] 的 params 声明（含 params.replace）：按字节透传契约忽略参数注入（仅应用 header_replace/headers；本进程仅提示一次）"
         );
     }
     let fwd_headers = forward_headers(&headers, ctx.metrics, ctx.overrides, &ctx.expand);

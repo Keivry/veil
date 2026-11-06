@@ -1,11 +1,14 @@
 //! 网关改写/非流集成单测（自 `mod.rs` 拆出；`#[cfg(test)]` 门控，见 `mod.rs` 声明）。
 
+mod expand;
+mod replace;
+
 use {
     super::super::{
         RequestCtx,
         nonstream::{NonstreamCtx, NonstreamOutcome, serve_nonstream},
         rewrite::request_rewrite,
-        test_support::{expand_ctx, no_expand, test_config},
+        test_support::{expand_ctx, expand_ctx_with, no_expand, test_config},
     },
     crate::{
         approval::PendingApprovals,
@@ -16,6 +19,7 @@ use {
             metrics::MetricsStore,
             pii::PiiDetector,
             redaction::Scope,
+            session_identity::OutboundId,
         },
     },
     axum::http::{HeaderMap, StatusCode},
@@ -995,7 +999,7 @@ fn forward_headers_template_expands_from_inbound_sources() {
         &HeaderMap::new(),
         &metrics,
         Some(&overrides),
-        &expand_ctx(&inbound),
+        &expand_ctx_with(&inbound, Some(OutboundId::Client("conv-1".to_string()))),
     );
     assert_eq!(
         fwd.get("x-opencode-session").and_then(|v| v.to_str().ok()),
@@ -1088,52 +1092,6 @@ fn forward_headers_template_missing_source_skips_entry_in_both_modes() {
             "客户端未携带时同样不得注入"
         );
     }
-}
-
-#[test]
-fn forward_headers_template_present_empty_source_injects_empty_value() {
-    // Oracle 复审 NIT：来源头存在但值为空 →
-    // 按「存在」处理，展开为空值并照常注入（与缺失跳过区分）。
-    use axum::http::HeaderValue;
-    let metrics = GatewayMetrics::default();
-    let mut inbound = HeaderMap::new();
-    inbound.insert("x-veil-conversation-id", HeaderValue::from_static(""));
-    let mut overrides = UpstreamOverrides::default();
-    overrides.headers.insert(
-        "x-opencode-session"
-            .parse::<axum::http::HeaderName>()
-            .expect("合法头名"),
-        HeaderValueSpec::Template(vec![HeaderValueSegment::Conversation]),
-    );
-    overrides.headers.insert(
-        "x-prefixed"
-            .parse::<axum::http::HeaderName>()
-            .expect("合法头名"),
-        HeaderValueSpec::Template(vec![
-            HeaderValueSegment::Literal("pre-".to_string()),
-            HeaderValueSegment::Conversation,
-        ]),
-    );
-    let fwd = super::super::forward_headers(
-        &HeaderMap::new(),
-        &metrics,
-        Some(&overrides),
-        &expand_ctx(&inbound),
-    );
-    assert!(
-        fwd.contains_key("x-opencode-session"),
-        "空来源按存在处理：须照常注入（不跳过）"
-    );
-    assert_eq!(
-        fwd.get("x-opencode-session").and_then(|v| v.to_str().ok()),
-        Some(""),
-        "空来源展开为空值"
-    );
-    assert_eq!(
-        fwd.get("x-prefixed").and_then(|v| v.to_str().ok()),
-        Some("pre-"),
-        "混排模板中字面段照常呈现"
-    );
 }
 
 #[test]

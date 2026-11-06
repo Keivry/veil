@@ -204,8 +204,12 @@ pub use {
     hop::{DECODE_ENABLED, HOP_HEADERS, downstream_decode_enabled, filter_hop_headers_counted},
     overrides::{
         apply_param_overrides,
+        has_params_declaration,
         matched_params,
+        models_gate_matches,
         param_protocol,
+        params_declared,
+        redact_only_params_ignored_message,
         warn_redact_only_params_ignored_once,
     },
     placeholder::{

@@ -6,7 +6,7 @@
 //!
 //! 冻结接口（跨 agent 锁步测试依赖这些精确名字与语义）：
 //! - [`CONFIG_ENV_WHITELIST`]：9 个具名环境变量；
-//! - [`MIGRATED_ENV_VARS`]：49 个迁移清单变量（含全部兼容别名）；
+//! - [`MIGRATED_ENV_VARS`]：47 个迁移清单变量（含全部兼容别名）；
 //! - [`parse_llm_port`]：`LLM_<port>` 解析唯一实现（`load_llm` 复用同一语义）；
 //! - [`filter_process_env`]：仅保留白名单名，其余（含 `LLM_<port>` 模式键）剔除；
 //! - [`warn_migrated_and_legacy`]：迁移/`LLM_<port>`/遗留置位告警，绝不返回 `Err`、绝不拒启动。
@@ -41,18 +41,22 @@ pub(crate) const CONFIG_ENV_WHITELIST: [&str; 9] = [
     "PII_VALUE_SAMPLE_HMAC_KEY",
 ];
 
-/// 迁移清单：49 个已迁移到配置文件、不再从进程 env 读取的变量名（含全部兼容别名）。
+/// 迁移清单：47 个已迁移到配置文件、不再从进程 env 读取的变量名（含全部兼容别名）。
 ///
-/// 分组（与 `specs/config-env-surface` 及 design D11 逐项一致）：脱敏 20、
-/// PII 作用域 5、审计 6、认证/入口/存储 12、LLM/限额 6。任一置位仅告警、不生效。
+/// 分组（与 `specs/config-env-surface` 逐项一致）：脱敏 20、PII 作用域 3、
+/// 审计 6、认证/入口/存储 12、LLM/限额 6。任一置位仅告警、不生效。
 ///
-/// 0.2.0 换掉了 4 个名字（数量不变，仍 49）。那 4 个旧名自此不再被识别为
-/// 「已改名的旧名」：它们不在本清单、也不在白名单，因此与任意未知 env 同形。
+/// `PII_SCOPE_KEY_HEADER` / `PII_SCOPE_PREV_ID_MAX_ENTRIES` 已移出本清单：它们不再
+/// 「置位仅告警」，而是由 `env_parse::session::check_removed_session_env` 在过滤前
+/// **fail-closed** 预扫描拒启动（安全相关的会话隔离配置不得静默失效）。
+///
+/// 0.2.0 换掉了 4 个名字（数量不变）。那 4 个旧名自此不再被识别为「已改名的旧名」：
+/// 它们不在本清单、也不在白名单，因此与任意未知 env 同形。
 ///
 /// **已识别、未执行**：`NONSTREAM_MAX_BYTES` / `SSE_FRAME_HARD_BYTES` 迁入 `[llm]`
 /// 后 env 前缀本应为 `LLM_*`，但改名会同时牵动 §1 键表、`docs_lockstep` 迁移 env
 /// 并集与全部容器模板，故本变更显式冻结（design 5.3），留作后续独立条目。
-pub(crate) const MIGRATED_ENV_VARS: [&str; 49] = [
+pub(crate) const MIGRATED_ENV_VARS: [&str; 47] = [
     // 脱敏 20（含全部兼容别名）
     "REDACTION_ENABLED",
     "PII_REDACTION_ENABLED",
@@ -74,12 +78,10 @@ pub(crate) const MIGRATED_ENV_VARS: [&str; 49] = [
     "PII_PLACEHOLDER_PROMPT",
     "PII_PLACEHOLDER_PROMPT_TEXT",
     "PII_NORMALIZE_JSON_WHITESPACE",
-    // PII 作用域 5
+    // PII 作用域 3（会话头链与别名容量已迁至 [session]，改为 fail-closed 预扫描）
     "PII_SCOPE_MODE",
     "PII_SCOPE_TTL_SECS",
     "PII_SCOPE_MAX_CONVERSATIONS",
-    "PII_SCOPE_PREV_ID_MAX_ENTRIES",
-    "PII_SCOPE_KEY_HEADER",
     // 审计 6
     "AUDIT_MODE",
     "AUDIT_TIMEOUT_SECS",

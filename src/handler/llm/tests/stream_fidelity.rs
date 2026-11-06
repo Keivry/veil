@@ -995,12 +995,15 @@ async fn passthrough_response(
     let client = reqwest::Client::new();
     let upstream = client.get(&url).send().await.expect("回环上游须可达");
     let metrics = GatewayMetrics::default();
+    // 无写回上下文的逐请求作用域：透传路径的会话捕获不会绑定/计数。
+    let scope = crate::service::redaction::Scope::with_opts(false);
     let resp = super::super::dispatch::stream_upstream_passthrough(
         upstream,
         false,
         Protocol::Chat,
         max_bytes,
         &metrics,
+        &scope,
     )
     .await;
     let status = resp.status();
@@ -1114,3 +1117,5 @@ async fn stream_passthrough_error_preserves_multi_value_headers() {
         "错误透传路径同名多值头须逐值保留（2 值）"
     );
 }
+
+mod session_bind;

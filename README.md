@@ -47,34 +47,12 @@ docker compose up -d
   podman unshare chown -R 999:999 ./data
   ```
   rootless 下改完后宿主 `ls -ln ./data` 显示的是高位 subuid（如 `100998`）而非 `999`，这是 uid 映射的正常表现，不影响容器内读写。换用命名卷（`volumes: veil_data:/data`）时由引擎自动继承镜像内属主，可跳过此步。
-- **从旧版本升级**：两处默认值变了，都表现为"容器是绿的但不可用"。① `[server].listen_addr` 自 0.2.0 起替代旧 `bind`：若实际挂载的 TOML（例如升级前自己维护的 `veil.toml`）完全没声明该键，容器会回退到缺省 `127.0.0.1:8877`（若仍写着旧键 `bind`，0.2.0 起直接拒启动）——容器内 `/health` 仍然 `ok:true`（健康检查在容器内跑），但宿主机发布端口一律被 reset。② `docker-compose.yml` 的默认挂载已从 `./veil.toml` 改为只读的 `examples/veil.container.toml`；旧部署里自己维护的 `./veil.toml` 不再被挂载，私有的 homeserver/room_id/data_dir 会被示例占位值取代（审批相关请求转 403）。升级后须确认实际挂载的 TOML 是你自己的配置且含 `[server].listen_addr = "0.0.0.0:8877"`。③ `/health` 的 `ok` 不再是恒真字面量，改为 `sqlite_ok && tpm_ok` 派生：TPM 在启动后被移除（设备权限丢失、`tpm2d` 挂掉）或密封对象被删时，容器会转 `unhealthy` 并可能被重启策略拉起，读 `tpm_error` 可定位原因。④ 旧 `[storage].entry_mode` 的审批豁免已删除：`allow_mode = "pending"` 的条目每次取用都建票，依赖旧豁免的无人值守脚本会阻塞至 300s 超时；把条目改为 `allow_mode = "allow"` 即可（该旧键本身自 0.2.0 起不再被接受，见下方「从旧版本升级」）。⑤ 授权 TTL 缺省为 `0`（无期限，行为与升级前完全一致）；设为非 0 后条目授权到期即转审批（建票并阻塞至 300s 超时），无人值守脚本必须配置审批人，且 `GET /health` 的 `authorization_expiring` 会预告 24h 内到期的生效条目数。⑥ **回滚前须先备份注册表**：本版给 `caller_registry.json` 的条目新增 `authorized_at` / `authorized_ttl_secs` 两个键。升级方向已做兼容（`None` 不落盘，旧文件的完整性哈希保持有效，直接可读）；但一旦新版本写入过授权窗口，旧二进制会因完整性哈希不匹配而拒启动（`注册表解析失败（新旧格式均不匹配）`）。回滚前请备份并删除 `caller_registry.json`（或手工移除这两个键并重算 `sha256`），否则旧版本无法启动。⑦ 文本指令现已受 `[audit].approval_whitelist` 约束：非白名单成员发送 `lock`/`status`/`forget` 会被静默丢弃（无回执）。若此前依赖「房间里任何成员都能发运维指令」，升级后须把运维 MXID 显式加入白名单，否则运维指令全部失效。⑧ **配置键全面改名（本版最大破坏面）**：`[auth]` → `[matrix]` / `[admin]`、`[limits]` → `[audit]` / `[llm]`、`[keepass]` → `[credential]`，`[storage]` 只留路径与部署密钥；键名同步（`server.bind` → `server.listen_addr`、`storage.entry_mode` → `server.surface_mode`、`audit.timeout` → `audit.timeout_secs`、`storage.auto_approve` → `credential.default_decision`、`llm.targets.*.override` → `llm.targets.*.override_existing`、`command.block_wait` → `command.approval.block_wait` 等，全表见 `docs/engineering-reference.md` §1）。0.1.x 的旧键拼写一律按未知键拒启动（改名与兼容层移除同批发生在 0.2.0，不存在承接旧键的中间版本），升级前须先把 `config.toml` 改写成规范键名，详见下方「从旧版本升级（0.1.x → 0.2.0）」。
+- **容器侧配置要点（现状口径）**：① 实际挂载的 TOML 必须声明 `[server].listen_addr = "0.0.0.0:8877"`——容器内监听回环会导致宿主机发布端口一律被 reset（容器内 `/health` 仍可能报 `ok:true`，因为健康检查在容器内跑）；`docker-compose.yml` 默认只读挂载 `examples/veil.container.toml`，需要私有 homeserver/room_id/data_dir 时改挂自己的 TOML。② `/health` 的 `ok` 是派生值 `sqlite_ok && tpm_ok`：TPM 在启动后被移除（设备权限丢失、`tpm2d` 挂掉）或密封对象被删时容器转 `unhealthy`，读 `tpm_error` 可定位原因。③ 授权 TTL 缺省 `0`（无期限）；设为非 0 后条目授权到期即转审批（建票并阻塞至 300s 超时），无人值守脚本必须配置审批人，`GET /health` 的 `authorization_expiring` 会预告 24h 内到期的生效条目数。④ 文本指令受 `[audit].approval_whitelist` 约束：非白名单成员发送 `lock`/`status`/`forget` 会被静默丢弃（无回执），运维 MXID 须显式加入白名单。⑤ 配置键以 `docs/engineering-reference.md` §1 的键表为准，`[server].surface_mode` 只接受 `full` / `llm_only`。
 - compose 把配置文件只读挂到 `/etc/veil/veil.toml` 并设 `VEIL_CONFIG_FILE`；数据卷父卷 `${DATA_DIR:-./data}` 是**宿主机侧**的卷路径（仅 compose 变量），与配置文件的 `[storage].data_dir`（默认 `/data`）相互独立。
 - 监听地址分两层：容器内必须 `[server].listen_addr = "0.0.0.0:8877"`（bridge 网络的 DNAT 目标不是回环，写回环收不到），宿主机侧仍只发布到 `127.0.0.1`（见 `ports`）——对外不暴露到局域网。
 - `cap_add: IPC_LOCK` 与 `ulimits.memlock: -1` 让 `mlockall` 成功；若受限 daemon 拒绝 `ulimits`，删除该段只保留 `cap_add` 即可（`mlockall` 检查的是 `CAP_IPC_LOCK`）。
 - `8877` 是主监听（凭据 API + LLM 代理，按 `Host` 头选路），`8878`/`8879` 映射到容器内同名端口（各自一条专用监听，已声明端口恒胜 `Host` 头）；`[llm].default_upstream` 是缺省上游。宿主机端口可经 `PORT_8877`/`PORT_8878`/`PORT_8879` 覆盖。
 - 无 TPM 硬件：注释掉 `devices` 两行，设置 `VEIL_ALLOW_MOCK_TPM=1`，并用 `TPM_GID=$(id -g)` 满足 compose 必填校验（mock 路径不需要真实设备属组）。
-
-### 从旧版本升级（0.1.x → 0.2.0）
-
-**0.2.0 同批完成配置键改名与兼容层移除：没有承接旧键的中间版本，也没有自动迁移。**
-旧二进制只认旧键、新二进制只认规范键，两者无法共用同一份 `config.toml`——升级须「停旧进程 → 改写配置与部署 env → 启动新二进制」一次切换；回滚同样须把二进制与配置一起退回。
-
-被移除、现在一律**启动期拒绝**的面（错误信息指名具体键或分节）：
-
-- **旧分节**：`[auth]`、`[limits]`、`[keepass]`。
-- **旧键名**：`server.bind`、`storage.entry_mode`、`storage.auto_approve`、`storage.credential_block_wait`、
-  `storage.authorization_ttl_secs`、`storage.request_log_enabled`、`storage.request_log_retention_days`、
-  `audit.timeout`、`limits.*`（hold 与 LLM 四个限额）、`keepass.backend`、`command.block_wait`、
-  `llm.targets.*.override`。
-- **旧枚举拼写**：`surface_mode` 的 `credential-only` / `credential_only` / `llm-only`，现在只接受
-  `full` 与 `llm_only`。`credential-only` 的语义一直是「等价于 `full`」，改写成 `full` 不改任何行为。
-- **4 个改名的 env 变量**：`AUDIT_TIMEOUT`、`NORMALIZE_JSON_WHITESPACE`、`PII_PREV_ID_MAX_ENTRIES`、
-  `OBSERVABILITY_DISABLE` 现在**完全不被读取**，与任意未知变量同形——不再有「旧名已改名」的告警。
-  这四个概念已不读进程 env；沿用旧 env 名不会有任何提示，也不会生效，必须写入配置文件
-  （映射见「核心配置 → 环境变量表」下的旧名迁移表）。
-
-没有自动迁移、没有兼容开关、没有降级路径：把 `config.toml` 改写完、并清掉部署 env 中已不读取的旧名后升级即可。
-规范键名与默认值一字未改，已使用规范拼写的部署在本版本零行为变化。
 
 ### 健康检查与停止
 
@@ -119,15 +97,7 @@ docker compose up -d
 
 上表即进程 env 的全部**读取面**（9 个具名变量），白名单之外的名字一律不读取、不生效。
 
-0.2.0 起这 4 个概念**不再读进程 env**：旧名置位不改变任何生效值、也不产生任何提示，
-必须写入配置文件才生效：
-
-| 旧 env 名（0.2.0 起完全忽略） | 应写入的 TOML 键 | 说明 |
-| :-- | :-- | :-- |
-| `AUDIT_TIMEOUT` | `[audit].timeout_secs` | 时长键统一 `_secs` 后缀；沿用旧 env 名不会有任何提示，审计超时静默回落 90s |
-| `NORMALIZE_JSON_WHITESPACE` | `[redaction].normalize_json_whitespace` | 加 `PII_` 领域前缀后迁入文件层 |
-| `PII_PREV_ID_MAX_ENTRIES` | `[pii_scope].prev_id_max_entries` | 与 `[pii_scope]` 同族 |
-| `OBSERVABILITY_DISABLE` | `[admin].enabled = false` | **极性相反**；缺省 `true`，置 `false` 才关闭管理面 |
+上表之外的概念**只由配置文件承载**：同名进程 env 置位不生效，其中列入迁移清单的项仅启动期告警、未列入者连告警都不产生。会话配置（`[session].headers` / `[session].alias_max_entries`）为纯文件专属概念、无 env 名；两个已删除的会话规范 env 名属例外——非空置位即启动期 fail-closed 拒启动并指名替代文件键（现状说明见 `docs/engineering-reference.md` §1 例外④）。
 
 五个密钥注入变量名（`MATRIX_ACCESS_TOKEN`、`OBSERVABILITY_ADMIN_TOKEN`、`VEILCTL_SECRET`、`VEILCTL_BINARY_HASH`、`PII_VALUE_SAMPLE_HMAC_KEY`）已冻结，不在改名之列。
 
@@ -140,17 +110,20 @@ docker compose up -d
 | 文件键 | 默认 | 作用 |
 | :-- | :-- | :-- |
 | `[server].listen_addr` | `127.0.0.1:8877` | 监听地址（文件专属，须 `IP:PORT` 字面量）；容器内写 `0.0.0.0:8877` |
-| `[server].surface_mode` | `"full"` | 暴露面模式：只接受 `"full"` / `"llm_only"`，其它拼写（含 0.1.x 的连字符写法）拒启动 |
+| `[server].surface_mode` | `"full"` | 暴露面模式：只接受 `"full"` / `"llm_only"`，其它拼写拒启动 |
 | `[admin].enabled`（env 名 `ADMIN_ENABLED`） | `true` | 管理面**正向**开关；`false` 时 `/_admin*` 全 404 |
 | `[admin].token` / `[matrix].access_token` | 空（可 env 注入） | 密钥类；写入文件须 `0600` |
 | `[matrix].homeserver` / `[matrix].room_id` | 空（可选） | Matrix homeserver 与审批房间；缺失即关闭 Matrix 通知/审批（不拒启动） |
 | `[storage].data_dir` | `/data` | sqlite 与审计日志父目录；派生 `db_dir`/`tpm_dir`/`caller_registry_path` |
 | `[llm].default_upstream` / `[llm.upstreams."<port>"]` | 空 | 缺省上游与按入口端口选路 |
+| `[llm.targets."<port>"].header_replace` / `.params.<proto>.replace` | 空 | **条件值替换**（文件专属，无 env 名）：仅当出站头值 / 请求体顶层标量**精确等于** `from`（类型与大小写敏感）时改为 `to`；缺失或不匹配即 no-op，不注入、不级联；`models` 精确门控（省略为全模型）；`to` 为字面值（不做 `$` 插值）。**合并模式**（`override_existing = false`）与此类规则并存会拒启动；规则值不得为 `__PII_*__` 形态，且因在脱敏后执行而不得依赖 PII 明文。详见 `docs/engineering-reference.md` §1「[llm.targets] 上游覆盖」 |
 | `[credential].default_decision`（env 名 `AUTO_APPROVE`） | `allow` | 未声明 `allow_mode` 的条目取用时的缺省裁决：`allow` / `deny` / `pending` |
 | `[credential.authorization].ttl_secs`（env 名 `AUTHORIZATION_TTL_SECS`） | `0` | 授权窗口（秒）；`0` = 无期限；非 0 时到期转审批 |
 | `[request_log].enabled` / `[request_log].retention_days` | `true` / `7` | 逐请求落 `llm_requests` 表；天数 `0` = 不清理（文件专属，无 env 名） |
 | `[redaction].enabled` | `true` | 脱敏总开关 |
 | `[pii_scope].mode` | `"request"` | 逐请求隔离；`"conversation"` 启用有界的会话级关联 |
+| `[session].headers` | `["x-veil-conversation-id", "x-opencode-session", "x-opencode-session-id"]` | **唯一**会话头链（文件专属，无 env 名）：有序，首个合法非空值胜出；非空、合法头名、归一后不重复；拒绝保留鉴权/传输头（含 `cookie`）与 `x-opencode-parent-session-id`/`x-session-affinity`/`x-session-id` |
+| `[session].alias_max_entries` | `1024` | 会话别名表容量（文件专属，无 env 名；按别名条目计，≥1）；每个 Responses 响应最多写 2 条，与 `[pii_scope].max_conversations` 解耦 |
 | `[llm].sse_frame_hard_bytes` | `8388608`（8MiB） | SSE 单帧/单行硬上限（字节，≥1）；超限 fail-closed 并按协议合成终止帧 |
 | `[audit].mode` | `"off"` | `"off"` / `"block"` / `"approve"`；`"approve"` 必须配 `[audit].approval_whitelist`；生产部署必须显式配置 `[audit].approval_whitelist` |
 | `[audit].approval_whitelist` | 空（不过滤） | 审批人 MXID 列表（精确匹配）；空白名单＝房间内任意成员可审批，Matrix 面启用时启动期打印不可被 `RUST_LOG` 抑制的告警；生产部署必须显式配置；同时约束 `lock`/`status`/`forget` 文本指令（非成员静默丢弃） |

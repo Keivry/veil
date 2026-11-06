@@ -251,8 +251,10 @@ normalize_json_whitespace = true
 mode = "conversation"
 ttl_secs = 1800
 max_conversations = 2048
-key_header = "x-veil-conversation-id"
-prev_id_max_entries = 2048
+
+[session]
+headers = ["x-client-session", "x-opencode-session"]
+alias_max_entries = 2048
 
 [llm]
 default_upstream = "http://127.0.0.1:11434"
@@ -318,8 +320,8 @@ const EXPECTED_KEYS: [&str; 51] = [
     "pii_scope.mode",
     "pii_scope.ttl_secs",
     "pii_scope.max_conversations",
-    "pii_scope.key_header",
-    "pii_scope.prev_id_max_entries",
+    "session.headers",
+    "session.alias_max_entries",
     "llm.default_upstream",
     "llm.timeout_secs",
     "llm.pool_max_idle_per_host",
@@ -646,7 +648,8 @@ fn alias_env_explicit_name_sets_match_design() {
 fn resolve_coerces_scalar_types() {
     let cfg = parse(
         "[redaction]\nenabled = true\nfuzzy_restore = false\n\
-         [pii_scope]\nttl_secs = 1800\nkey_header = \"x-veil-conversation-id\"\n\
+         [pii_scope]\nttl_secs = 1800\n\
+         [session]\nheaders = [\"x-client-session\"]\nalias_max_entries = 2048\n\
          [audit]\napproval_whitelist = [\"@a:example.com\", \"@b:example.com\"]\n\
          [storage]\ndata_dir = \"/srv/veil\"\n",
     )
@@ -654,10 +657,8 @@ fn resolve_coerces_scalar_types() {
     assert_eq!(resolved_value(&cfg, "redaction.enabled"), "1");
     assert_eq!(resolved_value(&cfg, "redaction.fuzzy_restore"), "0");
     assert_eq!(resolved_value(&cfg, "pii_scope.ttl_secs"), "1800");
-    assert_eq!(
-        resolved_value(&cfg, "pii_scope.key_header"),
-        "x-veil-conversation-id"
-    );
+    assert_eq!(resolved_value(&cfg, "session.headers"), "x-client-session");
+    assert_eq!(resolved_value(&cfg, "session.alias_max_entries"), "2048");
     assert_eq!(
         resolved_value(&cfg, "audit.approval_whitelist"),
         "@a:example.com,@b:example.com"
@@ -863,14 +864,24 @@ fn file_data_dir_derives_db_tpm_and_registry_paths() {
 }
 
 #[test]
-fn file_max_conversations_defaults_prev_id_entries() {
+fn session_alias_capacity_is_independent_of_max_conversations() {
+    // 新默认固定 1024，不再联动 `[pii_scope].max_conversations`（按别名条目计）。
     let file = TempFile::new("max-conv.toml", "[pii_scope]\nmax_conversations = 2000\n");
     let mut env = with_config_file(&file);
     let cfg = apply_and_load(&mut env);
     assert_eq!(cfg.pii_scope_max_conversations, 2000);
     assert_eq!(
-        cfg.pii_prev_id_max_entries, 2000,
-        "prev_id 默认须联动生效值"
+        cfg.session_alias_max_entries,
+        crate::config::env_parse::session::SESSION_ALIAS_MAX_ENTRIES_DEFAULT,
+        "别名容量须取固定默认，不联动 max_conversations"
+    );
+    assert_eq!(
+        cfg.session_headers.as_slice(),
+        crate::config::env_parse::session::SESSION_HEADER_DEFAULTS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>(),
+        "未声明 [session] 时取默认链"
     );
 }
 
@@ -883,4 +894,5 @@ mod limits_hold;
 mod merge;
 mod redline;
 mod secrets;
+mod session;
 mod storage;

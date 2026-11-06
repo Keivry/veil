@@ -1,23 +1,16 @@
-//! 会话键分层推导与租户命名空间。
+//! 会话键派生原语与租户命名空间。
 //!
-//! 纯函数单元（不触网络）：按四级优先级返回 `Option<ConversationKey>`——
-//! 显式头优先于协议原生（`prompt_cache_key` / Responses `previous_response_id`
-//! 映射），其后为稳定前缀 HMAC，末级 `None`（回退逐请求）。原始客户端值绝不
-//! 直接作键，一律经 `HMAC(secret, tenant_fingerprint || conversation_id)` 命名空间化。
+//! 本模块只保留**纯函数**成分：租户指纹、会话键 HMAC 派生、稳定前缀规范化与
+//! 别名表共用的 LRU 顺序辅助。分层身份推导已迁至 `service::session_identity`
+//! （单一解析器），响应侧别名绑定见 `service::redaction::writeback` 与
+//! `session_alias`。
+//!
+//! 原始客户端值绝不直接作键，一律经
+//! `HMAC(secret, tenant_fingerprint || conversation_id)` 命名空间化。
 
-use {
-    crate::service::{
-        llm_gateway::{GatewayMetrics, Protocol},
-        lock_recover::lock_or_recover,
-    },
-    serde_json::Value,
-    std::{
-        collections::{HashMap, VecDeque},
-        sync::{Arc, Mutex},
-    },
-};
+use {crate::service::llm_gateway::Protocol, serde_json::Value, std::collections::VecDeque};
 
-/// 显式会话键头上限（字节）：超长/非法不命中，`MUST NOT` 截断或哈希原始超长值。
+/// 会话头候选上限（字节）：超长/非法不命中，`MUST NOT` 截断或哈希原始超长值。
 pub const EXPLICIT_HEADER_MAX_BYTES: usize = 256;
 /// 分量分隔符（固定单一字面量，界定 HMAC 输入各拼接边界）。
 const SEPARATOR: &[u8] = b"\x1f";
@@ -47,7 +40,10 @@ impl ConversationKey {
 }
 
 /// 通用 HMAC-SHA256（hex），复用 `service::metrics::sample` 既有模式。
-fn hmac_hex(secret: &[u8], parts: &[&[u8]]) -> String {
+///
+/// `pub(crate)`：会话别名表（[`super::session_alias`]）与出站标识
+/// （`service::session_identity::outbound`）复用本实现，不另复制 HMAC 代码。
+pub(crate) fn hmac_hex(secret: &[u8], parts: &[&[u8]]) -> String {
     use hmac::{KeyInit as _, Mac as _};
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC key 恒可载入");
     for part in parts {
@@ -57,7 +53,7 @@ fn hmac_hex(secret: &[u8], parts: &[&[u8]]) -> String {
 }
 
 /// 会话键派生：`HMAC(secret, tenant_fingerprint || SEP || conversation_id)`。
-/// 所有级别（含显式头/协议原生键）均经本函数命名空间化。
+/// 所有级别（含头链/协议原生键）均经本函数命名空间化。
 pub fn scoped_key(
     secret: &[u8],
     tenant_fingerprint: &str,
@@ -95,25 +91,6 @@ pub fn tenant_fingerprint(secret: &[u8], upstream_base: &str, credentials: &[&st
         secret,
         &[upstream_base.as_bytes(), SEPARATOR, normalized.as_bytes()],
     )
-}
-
-/// 显式会话键头值校验：≤256 字节且无控制字符；否则不命中（不截断、不哈希原文）。
-pub fn valid_explicit_header(value: &str) -> Option<&str> {
-    if value.is_empty() || value.len() > EXPLICIT_HEADER_MAX_BYTES {
-        return None;
-    }
-    if value.chars().any(char::is_control) {
-        return None;
-    }
-    Some(value)
-}
-
-/// 采用显式会话键头值：`enabled=false`（`request` 模式）时一律不读头。
-pub fn explicit_header(enabled: bool, raw: Option<&str>) -> Option<String> {
-    if !enabled {
-        return None;
-    }
-    raw.and_then(valid_explicit_header).map(str::to_string)
 }
 
 /// 对象键递归升序、`tools` 按工具名稳定排序、其余数组保序的确定性规范化。
@@ -175,20 +152,18 @@ fn extract_system(body: &Value, protocol: Protocol) -> Option<Value> {
     {
         return Some(canonicalize(s.clone()));
     }
-    let messages = body.get("messages")?.as_array()?;
-    messages.iter().find_map(|m| {
-        matches!(
-            m.get("role").and_then(Value::as_str),
-            Some("system") | Some("developer")
-        )
-        .then(|| canonicalize(m.clone()))
-    })
+    let first = body.get("messages")?.as_array()?.first()?;
+    matches!(
+        first.get("role").and_then(Value::as_str),
+        Some("system") | Some("developer")
+    )
+    .then(|| canonicalize(first.clone()))
 }
 
 /// 首个 user turn 提取（按协议白名单）：Chat/Anthropic 取
 /// `messages` 数组首条 `role=user`；Responses 取**数组形** `input` 首条
-/// `role=user`。Responses **标量（字符串）`input`** 不参与第 3 级，返回 `None`
-/// （其内容随轮次增长、无法作稳定 turn 锚点），使推导落第 4 级逐请求并由
+/// `role=user`。Responses **标量（字符串）`input`** 不参与稳定前缀级，返回 `None`
+/// （其内容随轮次增长、无法作稳定 turn 锚点），使推导落逐请求并由
 /// 既有 `record_request_fallback()` 计入观测。协议外字段 MUST NOT 越界参与——
 /// Responses 的 `messages` MUST NOT 被当作首个 user turn。
 fn extract_first_user(body: &Value, protocol: Protocol) -> Option<Value> {
@@ -209,8 +184,8 @@ fn extract_first_user(body: &Value, protocol: Protocol) -> Option<Value> {
 }
 
 /// 稳定前缀规范化串：`tools`+`system`+首个 user turn **三者齐备**才产出；
-/// 任一缺失返回 `None`（落第 4 级，不伪造键）。字段提取按协议白名单
-/// 字段提取按协议白名单，标量 Responses `input` 在此不命中。
+/// 任一缺失返回 `None`（不伪造键）。字段提取按协议白名单，
+/// 标量 Responses `input` 在此不命中。
 fn canonical_stable_prefix(body: &Value, protocol: Protocol) -> Option<String> {
     let tools = body.get("tools")?.as_array().filter(|a| !a.is_empty())?;
     let system = extract_system(body, protocol)?;
@@ -222,7 +197,7 @@ fn canonical_stable_prefix(body: &Value, protocol: Protocol) -> Option<String> {
     serde_json::to_string(&canonicalize(Value::Object(obj))).ok()
 }
 
-/// 稳定前缀 HMAC 键（第 3 级）：对**脱敏前**规范化前缀做 HMAC。
+/// 稳定前缀 HMAC 键：对**脱敏前**规范化前缀做 HMAC。
 /// 字段提取按协议白名单。
 pub fn stable_prefix_key(
     secret: &[u8],
@@ -241,211 +216,12 @@ pub fn stable_prefix_key(
     )))
 }
 
-/// 四级分层推导（首个可命中者胜）：
-/// ① 显式头 → ② 协议原生键（`prompt_cache_key` / `previous_response_id` 映射，
-/// **按协议白名单**）→ ③ 稳定前缀 → ④ `None`（回退逐请求）。**MUST NOT** 使用
-/// `user` 字段。原生键白名单：Anthropic 忽略二者；Chat 忽略
-/// `previous_response_id`；Responses 二者皆接受。
-// 签名定为 8 参（供 `build_request_scope` 单点调用），不另加包装结构体。
-#[allow(clippy::too_many_arguments)]
-pub fn derive_conversation_key(
-    secret: &[u8],
-    tenant_fp: &str,
-    protocol: Protocol,
-    explicit: Option<&str>,
-    prompt_cache_key: Option<&str>,
-    previous_response_id: Option<&str>,
-    body: &Value,
-    previous_map: &PreviousResponseMap,
-) -> Option<ConversationKey> {
-    if let Some(v) = explicit.and_then(valid_explicit_header) {
-        return Some(scoped_key(secret, tenant_fp, v));
-    }
-    if !protocol.is_anthropic()
-        && let Some(k) = prompt_cache_key.filter(|s| !s.is_empty())
-    {
-        return Some(scoped_key(secret, tenant_fp, k));
-    }
-    if protocol.is_responses()
-        && let Some(id) = previous_response_id.filter(|s| !s.is_empty())
-        && let Some(key) = previous_map.resolve(secret, tenant_fp, id)
-    {
-        return Some(key);
-    }
-    stable_prefix_key(secret, tenant_fp, protocol, body)
-}
-
 /// LRU 顺序提升：命中即移到队尾，队首为最久未用。
 pub(crate) fn touch_order(order: &mut VecDeque<String>, key: &str) {
     if let Some(pos) = order.iter().position(|v| v == key) {
         order.remove(pos);
     }
     order.push_back(key.to_string());
-}
-
-#[derive(Default)]
-struct PrevInner {
-    map: HashMap<String, ConversationKey>,
-    order: VecDeque<String>,
-}
-
-/// `previous_response_id` → 会话键进程内映射（租户分域）：映射键 =
-/// `HMAC(secret, tenant_fingerprint || previous_response_id)`，跨租户 MUST NOT 解析。
-pub struct PreviousResponseMap {
-    inner: Mutex<PrevInner>,
-    max_entries: usize,
-    /// 映射逐出计数落点（`[pii_scope].prev_id_max_entries` 达上限逐出最旧条目时）。
-    metrics: Option<Arc<GatewayMetrics>>,
-}
-
-/// 手工 `Debug`：映射键（HMAC hex）与会话键不得经 `{:?}` 泄漏，仅暴露条目数。
-impl std::fmt::Debug for PreviousResponseMap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreviousResponseMap")
-            .field("entries", &self.len())
-            .field("max_entries", &self.max_entries)
-            .finish()
-    }
-}
-
-impl PreviousResponseMap {
-    pub fn new(max_entries: usize) -> Self {
-        Self {
-            inner: Mutex::new(PrevInner::default()),
-            max_entries: max_entries.max(1),
-            metrics: None,
-        }
-    }
-
-    /// 挂逐出计数落点（启动装配传入网关指标）。
-    pub fn with_metrics(mut self, metrics: Arc<GatewayMetrics>) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-
-    /// 容量（仅测试口径：断言配置驱动生效）。
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> usize { self.max_entries }
-
-    /// 记录响应 id → 会话键（已存在则覆盖并提升 LRU）；达容量逐出最旧条目并计数。
-    pub fn record(
-        &self,
-        secret: &[u8],
-        tenant_fingerprint: &str,
-        response_id: &str,
-        key: &ConversationKey,
-    ) {
-        if response_id.is_empty() {
-            return;
-        }
-        let map_key = scoped_key(secret, tenant_fingerprint, response_id);
-        let mut inner = lock_or_recover(self.inner.lock());
-        if !inner.map.contains_key(map_key.as_str())
-            && inner.map.len() >= self.max_entries
-            && let Some(oldest) = inner.order.pop_front()
-        {
-            inner.map.remove(&oldest);
-            if let Some(metrics) = &self.metrics {
-                metrics.record_previous_response_eviction();
-            }
-        }
-        touch_order(&mut inner.order, map_key.as_str());
-        inner.map.insert(map_key.0, key.clone());
-    }
-
-    /// 解析响应 id → 会话键（未命中返回 `None`，调用方继续下一级）。
-    pub fn resolve(
-        &self,
-        secret: &[u8],
-        tenant_fingerprint: &str,
-        response_id: &str,
-    ) -> Option<ConversationKey> {
-        if response_id.is_empty() {
-            return None;
-        }
-        let map_key = scoped_key(secret, tenant_fingerprint, response_id);
-        let mut inner = lock_or_recover(self.inner.lock());
-        let found = inner.map.get(map_key.as_str()).cloned();
-        if found.is_some() {
-            touch_order(&mut inner.order, map_key.as_str());
-        }
-        found
-    }
-
-    /// 当前条目数（有界断言用）。
-    pub fn len(&self) -> usize { lock_or_recover(self.inner.lock()).map.len() }
-
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-}
-
-/// 响应完成写入点：仅 `Protocol::Responses` 且 id 非空时写入；Chat（`chatcmpl-*`）
-/// / Anthropic（`msg_*`）的响应 id **MUST NOT** 进入映射。返回是否写入。
-pub fn record_response_id(
-    map: &PreviousResponseMap,
-    secret: &[u8],
-    tenant_fingerprint: &str,
-    protocol: Protocol,
-    response_id: Option<&str>,
-    key: &ConversationKey,
-) -> bool {
-    if !protocol.is_responses() {
-        return false;
-    }
-    let Some(id) = response_id.filter(|s| !s.is_empty()) else {
-        return false;
-    };
-    map.record(secret, tenant_fingerprint, id, key);
-    true
-}
-
-/// 请求级会话写回上下文（挂在 [`super::Scope`] 上，供响应完成处写映射）。
-/// 仅 `conversation` 模式且键推导成功时存在。
-#[derive(Clone)]
-pub(crate) struct ConversationWriteback {
-    key: ConversationKey,
-    tenant_fingerprint: String,
-    secret: Arc<[u8]>,
-    previous_map: Arc<PreviousResponseMap>,
-}
-
-/// 手工 `Debug`：会话键/租户指纹/HMAC 密钥均为敏感值，派生 `Debug` 会泄漏；一律脱敏。
-impl std::fmt::Debug for ConversationWriteback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConversationWriteback")
-            .field("key", &"[redacted]")
-            .field("tenant_fingerprint", &"[redacted]")
-            .field("secret", &"[redacted]")
-            .field("previous_map", &"[redacted]")
-            .finish()
-    }
-}
-
-impl ConversationWriteback {
-    pub(crate) fn new(
-        key: ConversationKey,
-        tenant_fingerprint: String,
-        secret: Arc<[u8]>,
-        previous_map: Arc<PreviousResponseMap>,
-    ) -> Self {
-        Self {
-            key,
-            tenant_fingerprint,
-            secret,
-            previous_map,
-        }
-    }
-
-    /// 响应完成写回（协议门控在 [`record_response_id`] 内）。
-    pub(crate) fn record(&self, protocol: Protocol, response_id: &str) -> bool {
-        record_response_id(
-            &self.previous_map,
-            &self.secret,
-            &self.tenant_fingerprint,
-            protocol,
-            Some(response_id),
-            &self.key,
-        )
-    }
 }
 
 #[cfg(test)]

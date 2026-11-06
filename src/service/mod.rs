@@ -21,6 +21,8 @@ pub mod metrics;
 pub mod pii;
 pub mod redaction;
 pub mod request_log;
+/// 统一会话身份解析器（PII/日志/出站共用一次解析）。
+pub mod session_identity;
 pub mod sse;
 pub mod tpm;
 

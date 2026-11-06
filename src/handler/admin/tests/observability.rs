@@ -412,7 +412,8 @@ fn pii_scope_conversation_state(dir: &std::path::Path) -> AppState {
 
 #[tokio::test]
 async fn admin_metrics_expose_pii_scope_mode() {
-    // `/_admin/metrics` 只读暴露当前作用域模式 + 复用/淘汰/回退三计数。
+    // `/_admin/metrics` 只读暴露当前作用域模式 + 复用/淘汰/回退三计数
+    // （既有四键 `mode` 在内不变）+ 五个会话身份/别名计数。
     let dir = metrics_test_dir("pii-scope-mode");
     let request_state = admin_test_state(dir.clone(), dir.join("m.sqlite"));
     let body = metrics_body(request_state.clone()).await;
@@ -421,9 +422,36 @@ async fn admin_metrics_expose_pii_scope_mode() {
         "conversation_reuse",
         "conversation_eviction",
         "request_fallback",
+        "session_alias_hit",
+        "session_alias_conflict",
+        "session_alias_evict",
+        "session_bind_miss",
+        "session_outbound_hmac",
     ] {
         assert!(body["pii_scope"][k].is_u64(), "缺计数 {k}: {body}");
+        assert_eq!(body["pii_scope"][k], 0, "新计数默认须为 0（{k}）: {body}");
     }
+    // 键集合精确断言：既有四键 + 新增五键，无死指标残留。
+    let mut actual: Vec<&str> = body["pii_scope"]
+        .as_object()
+        .expect("pii_scope 须为对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut expected = [
+        "mode",
+        "conversation_reuse",
+        "conversation_eviction",
+        "request_fallback",
+        "session_alias_hit",
+        "session_alias_conflict",
+        "session_alias_evict",
+        "session_bind_miss",
+        "session_outbound_hmac",
+    ];
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "pii_scope 键集合须恰为既定键: {body}");
 
     let conv_dir = metrics_test_dir("pii-scope-mode-conv");
     let conv_state = pii_scope_conversation_state(&conv_dir);
@@ -550,7 +578,7 @@ async fn admin_metrics_exposes_aux_totals() {
 #[tokio::test]
 async fn admin_metrics_scope_no_secret_leak() {
     // 指标层：模式/计数输出不含头值、会话键、明文或 token 原值。
-    use crate::service::redaction::{derive_conversation_key, tenant_fingerprint};
+    use crate::service::redaction::{scoped_key, tenant_fingerprint};
     let dir = metrics_test_dir("pii-scope-noleak");
     let state = pii_scope_conversation_state(&dir);
     let upstream = "https://up.example.com/v1";
@@ -559,7 +587,7 @@ async fn admin_metrics_scope_no_secret_leak() {
     let mut headers = HeaderMap::new();
     headers.insert("x-veil-conversation-id", header_value.parse().unwrap());
     let body = serde_json::json!({"messages": [{"role": "user", "content": plaintext}]});
-    let scope = crate::handler::llm::dispatch::build_request_scope(
+    let scope = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Chat,
@@ -568,7 +596,7 @@ async fn admin_metrics_scope_no_secret_leak() {
     );
     let token = scope.pii_scope().register(plaintext).unwrap();
     // 第二轮命中同一会话键，确保复用计数路径确实执行（计数 > 0 才可断言无泄露）。
-    let _ = crate::handler::llm::dispatch::build_request_scope(
+    let _ = crate::handler::llm::dispatch::build_request_scope_for_tests(
         &state,
         &headers,
         crate::service::llm_gateway::Protocol::Chat,
@@ -577,17 +605,7 @@ async fn admin_metrics_scope_no_secret_leak() {
     );
     let secret = state.conversation_secret.as_ref();
     let fp = tenant_fingerprint(secret, upstream, &[]);
-    let key = derive_conversation_key(
-        secret,
-        &fp,
-        crate::service::llm_gateway::Protocol::Chat,
-        Some(header_value),
-        None,
-        None,
-        &serde_json::json!({}),
-        &state.previous_response_map,
-    )
-    .unwrap();
+    let key = scoped_key(secret, &fp, header_value);
     let v = metrics_body(state.clone()).await;
     let text = serde_json::to_string(&v).unwrap();
     assert!(

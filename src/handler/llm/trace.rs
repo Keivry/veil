@@ -7,7 +7,8 @@
 //! - [`NonstreamDetail`]：`serve_nonstream` / `serve_nondialog_passthrough` 的写回点，
 //!   承载响应侧用量、回显模型、上游标识、结束原因与 `record_chat*` 的计入返回值；
 //! - [`RequestTrace`]：`req_start` 之后立即创建（早于 `resolve_target` 与 NonDialog 分支），
-//!   请求体解析后补齐 `model`/会话标识，脱敏后补摘要，终态投影为 [`RequestRow`]；
+//!   请求体解析后由 dispatch 写入 `model`、用已解析的 `SessionIdentity` 补齐会话列，
+//!   脱敏后补摘要，终态投影为 [`RequestRow`]；本层不读请求体；
 //! - [`StreamLog`]：流式泵的落行凭据（守卫 + 存储句柄 + 真实上游状态）。流式完成点在
 //!   派生任务里，故由 `pump/spawn/finish.rs` 调 `StreamGuard::finish` 落行。
 //!
@@ -16,26 +17,13 @@
 //! `[redaction].enabled=false` 时恒 `NULL`。
 
 use {
-    crate::{
-        config::Config,
-        service::{
-            audit::log::sanitize_for_log,
-            llm_gateway::{Protocol, Usage, is_passthrough},
-            metrics::normalize_model,
-            request_log::{
-                RequestLog,
-                RequestRow,
-                SessionInputs,
-                SessionScope,
-                SessionSource,
-                StreamGuard,
-                cache_input_tokens,
-                derive_session,
-                resolve_session_header,
-            },
-        },
+    crate::service::{
+        audit::log::sanitize_for_log,
+        llm_gateway::{Protocol, Usage, is_passthrough},
+        metrics::normalize_model,
+        request_log::{RequestLog, RequestRow, StreamGuard, cache_input_tokens, session_digest},
+        session_identity::{SessionIdentity, SessionScope, SessionSource},
     },
-    axum::http::HeaderMap,
     serde_json::Value,
     std::{sync::Arc, time::Instant},
 };
@@ -206,41 +194,39 @@ impl RequestTrace {
     /// 客户端是否要求流式（`redact_only` 恒走非流有界读，故不置位）。
     pub fn mark_stream(&mut self, stream: bool) { self.stream = stream; }
 
-    /// 请求体解析后补齐 `model` 与会话标识（design §4）。
+    /// 写入请求侧 `model`：由 dispatch 在解析出 `req_model` 后调用（design D7）。
     ///
-    /// 会话解析与 PII 作用域解耦：`request` 模式下同样能取到显式头与各协议标识字段；
-    /// 原文不落库，只留 HMAC 摘要。`body` 为 `None` 时（非对话端点）仅显式头可派生。
-    pub fn attach_identity(&mut self, body: Option<&Value>, headers: &HeaderMap, config: &Config) {
-        // 配置头优先，其后走内置回退链（opencode 非 `opencode*` provider 只发
-        // `x-opencode-session-id` 等头，见 [`resolve_session_header`]）。
-        let header = resolve_session_header(headers, config.pii_scope_key_header.as_str());
-        // `conversation` 的 `{id}` 形态需折算为字符串，故在此持有所有权。
-        let conversation = body.and_then(|v| match v.get("conversation") {
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(Value::Object(o)) => o.get("id").and_then(Value::as_str).map(str::to_owned),
-            _ => None,
-        });
-        let inputs = SessionInputs {
-            header,
-            conversation: conversation.as_deref(),
-            previous_response_id: text_at(body, &["previous_response_id"]),
-            previous_message_id: text_at(body, &["diagnostics", "previous_message_id"]),
-            prompt_cache_key: text_at(body, &["prompt_cache_key"]),
-            metadata_user_id: text_at(body, &["metadata", "user_id"]),
-            safety_identifier: text_at(body, &["safety_identifier"]),
-            user: text_at(body, &["user"]),
-        };
-        // 密钥只取既有可选 env（空串已由配置层过滤为 `None`）——缺失即「无会话」，
-        // 不退化为无密钥哈希或进程随机盐（design §4）。
-        let key = config
-            .pii_value_sample_hmac_key
-            .as_deref()
-            .map(str::as_bytes);
-        match derive_session(&inputs, key, self.protocol.wire_name()) {
-            Some((id, source, scope)) => {
+    /// 本方法取代旧 `attach_identity` 内的 body 解析——追踪层不再读请求体。
+    pub fn set_req_model(&mut self, model: &str) { self.req_model = model.to_string(); }
+
+    /// 用**已解析**的会话身份补齐日志口径（design D7）。
+    ///
+    /// 签名不含请求体：来源/作用域取 `identity.log_source`/`identity.log_scope`，
+    /// 用户级取 `identity.log_user`，MUST NOT 二次解析 body，MUST NOT 重新解析头链。
+    ///
+    /// 摘要口径（spec「会话标识派生与作用域」）：会话作用域对 `identity.canonical`
+    /// 计算，用户作用域对 `log_user.value` 计算，同为
+    /// `hex(HMAC(key, "veil-session-v1" || 0x1f || protocol || 0x1f || raw))[..16]`。
+    /// 摘要密钥只取 `PII_VALUE_SAMPLE_HMAC_KEY`；无密钥即「无会话」，不退化为
+    /// 无密钥哈希或进程随机盐。
+    pub fn attach_identity(&mut self, identity: &SessionIdentity, digest_key: Option<&str>) {
+        let digest = digest_key
+            .map(str::as_bytes)
+            .filter(|key| !key.is_empty())
+            .and_then(|key| match identity.log_scope {
+                SessionScope::Session => identity.canonical.as_ref().and_then(|canonical| {
+                    session_digest(key, self.protocol.wire_name(), canonical.as_str())
+                }),
+                SessionScope::User => identity.log_user.as_ref().and_then(|user| {
+                    session_digest(key, self.protocol.wire_name(), user.value.as_str())
+                }),
+                SessionScope::None => None,
+            });
+        match digest {
+            Some(id) => {
                 self.session_id = Some(id);
-                self.session_source = source;
-                self.session_scope = scope;
+                self.session_source = identity.log_source;
+                self.session_scope = identity.log_scope;
             }
             None => {
                 self.session_id = None;
@@ -248,12 +234,6 @@ impl RequestTrace {
                 self.session_scope = SessionScope::None;
             }
         }
-        self.req_model = body
-            .and_then(|v| v.get("model"))
-            .and_then(Value::as_str)
-            .filter(|m| !m.is_empty())
-            .unwrap_or("")
-            .to_string();
     }
 
     /// 拿到脱敏后请求体后立即生成摘要（design §6）；脱敏关闭时恒 `None`。
@@ -339,15 +319,6 @@ fn apply_usage(row: &mut RequestRow, usage: Option<&Usage>) {
 }
 
 fn elapsed_ms(start: Instant) -> u64 { start.elapsed().as_millis() as u64 }
-
-/// 按路径取非空字符串叶子（缺失/非字符串/空串一律 `None`）。
-fn text_at<'a>(body: Option<&'a Value>, path: &[&str]) -> Option<&'a str> {
-    let mut cur = body?;
-    for key in path {
-        cur = cur.get(*key)?;
-    }
-    cur.as_str().filter(|s| !s.is_empty())
-}
 
 /// 上游 `host:port`（剥 scheme、路径、查询串与 userinfo；design §6）。
 pub fn upstream_authority(url: &str) -> Option<String> {

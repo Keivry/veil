@@ -4,7 +4,7 @@
 //! （含原文 phone 未脱敏证明）。
 
 use {
-    common::{serve, test_app},
+    common::{TestOpts, serve, test_app},
     std::sync::{Arc, Mutex},
     veil::service::credential::AppStateParts,
 };
@@ -467,11 +467,13 @@ async fn nondialog_custom_conversation_header_is_forwarded() {
     // 原值转发上游——不再被隐式剔除；显式剔除须由目标 `drop_headers` 声明。
     let captured = Arc::new(Mutex::new(Vec::new()));
     let (upstream, uhandle) = mock_upstream(captured.clone()).await;
-    let (app, _state) = test_app(&[
-        ("LLM_UPSTREAM", upstream.as_str()),
-        ("PII_SCOPE_MODE", "conversation"),
-        ("PII_SCOPE_KEY_HEADER", "x-custom-conv-key"),
-    ]);
+    let (app, _state) = test_app(
+        TestOpts::new(&[
+            ("LLM_UPSTREAM", upstream.as_str()),
+            ("PII_SCOPE_MODE", "conversation"),
+        ])
+        .file_toml("[session]\nheaders = [\"x-custom-conv-key\"]\n"),
+    );
     let (base, handle) = serve(app).await;
     let client = reqwest::Client::new();
 
