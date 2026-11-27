@@ -1,6 +1,6 @@
 [package]
 name = "veil"
-version = "0.2.0"
+version = "0.2.3"
 edition = "2024"
 # 构建工具链下限（MSRV）：源码使用 `str::floor_char_boundary`/`ceil_char_boundary`，
 # 旧工具链只会在编译期抛晦涩的 E0658；此处声明后，任何更旧工具链（含 Dockerfile
@@ -20,7 +20,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "stream",
 ] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # TOML 配置文件层（可选补充层，env 恒优先）：serde 原生强类型反序列化 +
