@@ -148,6 +148,30 @@ async fn shutdown_signal() {
     }
 }
 
+/// 把 Unix `SIGHUP` 事件经单飞闸转发进有界队列；重载进行中的事件直接丢弃。
+#[cfg(unix)]
+async fn forward_hangup(
+    mut signal: tokio::signal::unix::Signal,
+    sender: tokio::sync::mpsc::Sender<()>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    while signal.recv().await.is_some() {
+        match veil::state::forward_if_idle(&busy, &sender) {
+            Ok(()) => {}
+            Err(veil::state::ForwardSkip::Busy) => {
+                tracing::warn!("重载进行中收到 SIGHUP，已跳过（单飞）");
+            }
+            Err(veil::state::ForwardSkip::QueueFull) => {
+                tracing::warn!("SIGHUP 转发队列已满，已跳过本次事件");
+            }
+            Err(veil::state::ForwardSkip::Closed) => {
+                tracing::warn!("SIGHUP 转发通道已关闭，停止转发");
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     logging::init();
@@ -294,12 +318,14 @@ async fn main() -> ExitCode {
         };
         let (provider, password_cache) =
             tpm_password_provider_with_cache(state.config.tpm_dir.clone(), allow_mock_tpm);
+        let db_dir = state.config.db_dir.clone();
         state = state.with_keepass(Arc::new(
             RealKeePass::new(db_path, keyfile_path, provider)
+                .with_db_dir(db_dir)
                 .with_master_password_cache(password_cache),
         ));
     } else {
-        tracing::warn!("VEIL_KEEPASS_BACKEND=mock：以 Mock KeePass 运行，禁止生产使用");
+        tracing::warn!("凭据后端为 mock（[credential].vault_backend）：禁止生产使用");
         state = state.with_keepass(Arc::new(veil::keepass::MockKeePass::unlocked()));
     }
     let _orphan_sweeper = state.approval.spawn_sweeper();
@@ -407,6 +433,27 @@ async fn main() -> ExitCode {
                 );
             }
         }
+    }
+    #[cfg(unix)]
+    {
+        // 注册失败时拒绝启动：不安装处理器会让 SIGHUP 保持默认处置（终止进程），
+        // 与「重载不得终止服务」的契约冲突。
+        let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                tracing::error!("SIGHUP 监听注册失败，拒绝启动（避免默认终止语义）: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        let (hangup_tx, hangup_rx) = tokio::sync::mpsc::channel(1);
+        let hangup_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(forward_hangup(hangup, hangup_tx, hangup_busy.clone()));
+        tokio::spawn(veil::state::hangup_reload_loop(
+            state.clone(),
+            hangup_busy,
+            hangup_rx,
+            shutdown_rx.clone(),
+        ));
     }
     drop(shutdown_rx);
     tracing::info!("已启动 {} 条监听（主监听 {bind_addr}）", serves.len());
@@ -569,6 +616,42 @@ mod tests {
         assert!(
             src.contains("CleanupHandles"),
             "清理须复用既有 AppState 的共享子句柄"
+        );
+    }
+
+    #[test]
+    fn sighup_is_separate_from_shutdown_and_register_failure_exits() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("生产段须存在");
+        let start = production
+            .find("async fn shutdown_signal(")
+            .expect("shutdown_signal 须存在");
+        let end = production
+            .find("/// 把 Unix `SIGHUP`")
+            .expect("SIGHUP 转发函数须存在");
+        let shutdown = &production[start..end];
+        assert!(
+            shutdown.contains("ctrl_c") && shutdown.contains("terminate"),
+            "优雅关闭仍须只 select ctrl_c 与 terminate"
+        );
+        assert!(
+            !shutdown.contains("hangup") && !shutdown.contains("SIGHUP"),
+            "SIGHUP 不得并入 shutdown_signal"
+        );
+        let reg = production
+            .find("SignalKind::hangup()")
+            .expect("SIGHUP 注册点须存在");
+        let branch = &production[reg..(reg + 600).min(production.len())];
+        assert!(
+            branch.contains("SIGHUP 监听注册失败，拒绝启动"),
+            "注册失败须记录拒绝启动原因"
+        );
+        assert!(
+            branch.contains("ExitCode::from(1)"),
+            "注册失败须以退出码 1 拒绝启动"
         );
     }
 

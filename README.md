@@ -77,6 +77,29 @@ docker compose up -d
 
 `ok` 是**派生值**：`ok = sqlite_ok && tpm_ok`，`status` 跟随同一判据（`"ok"` / `"degraded"`）。HTTP 状态码恒为 200——判活请只看 `ok` 字段（容器 `HEALTHCHECK` 即 `grep '"ok":true'`），不要把「有响应」当成「可用」。`tpm_ok` 来自启动期门禁结果加 60s 周期后台探测（探 `tpm2_pcrread` 与密封对象 `seal.pub`/`seal.priv` 在位），不可用时 `tpm_error` 给出因由；`VEIL_ALLOW_MOCK_TPM=1` 下恒为 `true`（Mock 无真实设备可探）。`unlocked` 仅反映 .kdbx 库文件是否在位（`RealKeePass::is_unlocked` 只做 `is_file()` 快检，不触发解密、无副作用），`false` 表示库文件未就位，**不代表"需要人工解锁"**；`master_password_cached` 才是 TPM 派生主密码是否已载入内存。`pending` 是待审批数，`pii_custom_disabled` 是被停用的自定义 PII 规则数。停止：二进制是前台进程，`Ctrl-C` 即退出；容器用 `docker compose down`；`[storage].data_dir` 下 sqlite 与审计日志会自己收尾，无需额外清理。
 
+### KeePass 热重载
+
+KDBX 库在首次取用后整库快照常驻内存，运行期改密、增删条目不会自动可见。需要让新库生效时执行一次显式热重载：成功才替换内存快照，失败则旧快照继续服务，代价远小于重启进程。三种等价触发面：
+
+- `POST /reload`：顶层路由（不在 `/_admin` 之下），仅接受 `X-Admin-Token` 请求头；`__Host-admin_token` Cookie 与 query token 一律 `401`，非 `POST` 返回 `405`。
+- Unix `SIGHUP`：不终止进程，只执行一次重载。容器内用 `docker kill -s HUP <container>` 或 `docker compose kill -s HUP [<service>]`（镜像 `ENTRYPOINT` 为 exec 形式，veil 是 PID 1）；systemd 用 `ExecReload=/bin/kill -HUP $MAINPID`。
+- `veilctl reload`：向 `POST /reload` 发请求，从**客户端**环境变量 `PROXY_ADMIN_TOKEN` 取头。该变量只属 `veilctl`，不是 veil 服务端 env，服务端 9 项 env 白名单不变。
+
+管理面未启用（`[admin].enabled = false` 或 `OBSERVABILITY_ADMIN_TOKEN` 为空）时 `POST /reload` 返回 `404`，与 `/_admin*` 同门禁。它与通用 admin 数据接口共用 `10/min`/IP 速率桶（限流判定先于鉴权），超限 `429` + `Retry-After`。
+
+状态码：`401 E_UNAUTHORIZED`（token 缺失、为空、不符，含仅 Cookie/query）、`405`（非 `POST`）、`409 E_CONFLICT`（并发重载、`db_dir` 下多于一个 `.kdbx`、或与 `lock` 竞争）、`429 E_RATE_LIMITED`、`500 E_KEEPASS`（读文件/主密码派生/解密失败，对外 message 固定为「内部错误」）、`503 E_UNAVAILABLE`（无 `.kdbx`）。成功 `200` 返回 `{ok, db_path, tokens_invalidated, elapsed_ms}`；Mock 后端 `db_path` 为 `null`。
+
+语义要点：
+
+- 全有或全无：解密成功后才原子替换快照；失败保留旧快照与旧 token 映射，不会先清空。
+- 重载重新解析 `db_dir`，要求**恰一个** `.kdbx`（启动期多库按排序取末位，重载更严格：多个直接 `409` 且不加载）；零个 `503`；同名 `.key` 会重新读取，重命名或替换单个库文件受支持。
+- 成功即清空全部凭据 token 映射并推进代际：旧 token 不再还原，同一明文重查会得到新 token 且编号不复用（方案 B）。失败不清 token。
+- 重载**不**清理审批 pending、PII 会话作用域、会话别名表（这些只有 `lock` 清）。
+- 重载失败不发 Matrix 失败通知；`lock` 与重载竞争时重载在替换前放弃并返回 `409`，不会在 `lock` 之后复活快照。
+- 在途对话的响应可能收到字面 token（不再还原），客户端应重新查询凭据；条目被重查之前，其旧明文在请求侧不再被脱敏（与进程启动、`forget` 后一致）。
+
+不新增任何配置键。`lock` / `forget` / 热重载的清理范围对比见 `docs/engineering-reference.md` §8.4。
+
 ## 核心配置
 
 配置分两层：**环境变量表**（进程 env 白名单，变量逐名见下表）与 **TOML 配置文件**（其余设置的唯一来源）。优先级：白名单概念维持 `env 显式 > 文件 > 内建默认`；非白名单概念只由文件承载（同名 env 置位不生效：列入迁移清单的项仅启动期告警，未列入者连告警都不产生）。

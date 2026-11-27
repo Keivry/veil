@@ -794,3 +794,276 @@ async fn lock_cleanup_clears_pii_conversation_scopes() {
         "既有未决票数文案须保留: {reply}"
     );
 }
+
+#[derive(Debug, Default)]
+struct ReloadProbeKeePass {
+    reloads: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl KeePassBackend for ReloadProbeKeePass {
+    fn is_unlocked(&self) -> bool { true }
+
+    fn fetch_entry(
+        &self,
+        title: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::keepass::EntrySnapshot>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            Ok(crate::keepass::EntrySnapshot {
+                title,
+                username: String::new(),
+                password: String::new(),
+                url: String::new(),
+                custom: Vec::new(),
+            })
+        })
+    }
+
+    fn reload(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<crate::keepass::ReloadOutcome>>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.reloads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let fail = self.fail.load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if fail {
+                return Err(crate::error::VeilError::KeePass {
+                    message: "probe reload failure".to_string(),
+                });
+            }
+            Ok(None)
+        })
+    }
+}
+
+#[tokio::test]
+async fn reload_keepass_clears_vault_and_reports_count() {
+    let backend = Arc::new(ReloadProbeKeePass::default());
+    let state = state_with_keepass(backend.clone());
+    state.vault.register("reload-secret-1234").unwrap();
+    state.vault.register("reload-secret-5678").unwrap();
+    let report = state.reload_keepass().await.expect("重载须成功");
+    assert_eq!(backend.reloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(report.tokens_invalidated, 2);
+    assert_eq!(report.db_path, None);
+    assert!(state.vault.is_empty(), "成功重载须作废全部 token");
+}
+
+#[tokio::test]
+async fn reload_keepass_failure_keeps_tokens() {
+    let backend = Arc::new(ReloadProbeKeePass::default());
+    backend
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let state = state_with_keepass(backend);
+    let token = state.vault.register("reload-secret-9012").unwrap();
+    assert!(state.reload_keepass().await.is_err(), "失败重载须返回错误");
+    assert_eq!(
+        state.vault.restore_one(&token).as_deref(),
+        Some("reload-secret-9012"),
+        "失败重载不得清空既有 token 映射"
+    );
+}
+
+#[tokio::test]
+async fn reload_keepass_elapsed_covers_backend_wait() {
+    let backend = Arc::new(BlockingReloadKeePass::new());
+    let state = state_with_keepass(backend.clone());
+    let task = tokio::spawn({
+        let state = state.clone();
+        async move { state.reload_keepass().await }
+    });
+    let _started = backend.started.acquire().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    backend.release.add_permits(1);
+    let report = task.await.expect("重载任务须完成").expect("重载须成功");
+    assert!(
+        report.elapsed_ms >= 50,
+        "elapsed_ms 须覆盖后端等待（实际 {}ms）",
+        report.elapsed_ms
+    );
+}
+
+#[derive(Debug)]
+struct BlockingReloadKeePass {
+    calls: std::sync::atomic::AtomicUsize,
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl BlockingReloadKeePass {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+impl KeePassBackend for BlockingReloadKeePass {
+    fn is_unlocked(&self) -> bool { true }
+
+    fn fetch_entry(
+        &self,
+        title: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::keepass::EntrySnapshot>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            Ok(crate::keepass::EntrySnapshot {
+                title,
+                username: String::new(),
+                password: String::new(),
+                url: String::new(),
+                custom: Vec::new(),
+            })
+        })
+    }
+
+    fn reload(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<crate::keepass::ReloadOutcome>>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.add_permits(1);
+            let _permit = release.acquire().await;
+            Ok(None)
+        })
+    }
+}
+
+#[tokio::test]
+async fn hangup_loop_reloads_each_event_and_stops_on_shutdown() {
+    let backend = Arc::new(ReloadProbeKeePass::default());
+    let state = state_with_keepass(backend.clone());
+    state.vault.register("signal-secret-1234").unwrap();
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(crate::state::hangup_reload_loop(
+        state.clone(),
+        busy.clone(),
+        events_rx,
+        shutdown_rx,
+    ));
+    events_tx.send(()).await.unwrap();
+    for _ in 0..200 {
+        if backend.reloads.load(std::sync::atomic::Ordering::SeqCst) >= 1
+            && !busy.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(crate::state::forward_if_idle(&busy, &events_tx).is_ok());
+    for _ in 0..100 {
+        if backend.reloads.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        backend.reloads.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "每个信号事件恰触发一次重载"
+    );
+    assert!(state.vault.is_empty());
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("停机广播后 SIGHUP 循环须退出")
+        .expect("循环任务不得 panic");
+}
+
+#[tokio::test]
+async fn hangup_loop_skips_events_while_reload_is_running() {
+    let backend = Arc::new(BlockingReloadKeePass::new());
+    let state = state_with_keepass(backend.clone());
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(crate::state::hangup_reload_loop(
+        state,
+        busy.clone(),
+        events_rx,
+        shutdown_rx,
+    ));
+    assert!(crate::state::forward_if_idle(&busy, &events_tx).is_ok());
+    let _started = backend.started.acquire().await.unwrap();
+    assert_eq!(
+        crate::state::forward_if_idle(&busy, &events_tx),
+        Err(crate::state::ForwardSkip::Busy),
+        "重载进行中信号须被单飞闸丢弃"
+    );
+    backend.release.add_permits(1);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "重载进行中收到的信号须跳过，不得叠加解密"
+    );
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("停机广播后 SIGHUP 循环须退出")
+        .expect("循环任务不得 panic");
+}
+
+#[tokio::test]
+async fn reload_keepass_leaves_pending_pii_and_aliases_intact() {
+    let mut env = minimal_env();
+    env.insert("PII_SCOPE_MODE".to_string(), "conversation".to_string());
+    let state = AppState::new(
+        Config::load_from(&env).unwrap(),
+        outcome_for(Path::new("/tmp")),
+    )
+    .with_keepass(Arc::new(ReloadProbeKeePass::default()));
+    state
+        .pending
+        .insert(crate::approval::PendingRecord::new("reload-k", "reason"));
+    let store = state
+        .conversation_scope_store
+        .as_ref()
+        .expect("conversation 模式须装配会话作用域");
+    let key = crate::service::redaction::conversation_key::ConversationKey::for_test("reload-conv");
+    let _ = store.get_or_insert(&key);
+    let _ = state.session_alias_map.bind(
+        state.conversation_secret.as_ref(),
+        "tenant",
+        "$upstream",
+        &key,
+    );
+    let before = (
+        state.pending.len(),
+        store.len(),
+        state.session_alias_map.len(),
+    );
+    assert_eq!(before, (1, 1, 1), "前置：三类状态各 1 条");
+    state.reload_keepass().await.expect("重载须成功");
+    assert_eq!(
+        (
+            state.pending.len(),
+            store.len(),
+            state.session_alias_map.len()
+        ),
+        before,
+        "重载不得清理 pending / PII 会话作用域 / 会话别名"
+    );
+}

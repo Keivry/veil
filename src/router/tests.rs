@@ -994,3 +994,90 @@ fn request_id_validation_rejects_unsafe_values() {
         assert!(is_valid_request_id(value), "须接受 {value:?}");
     }
 }
+
+#[tokio::test]
+async fn reload_requires_header_token_only() {
+    let (base, handle) = serve_and_client(test_app(&[])).await;
+    let client = reqwest::Client::new();
+    let ok = client
+        .post(format!("{base}/reload"))
+        .header("X-Admin-Token", "observability-admin-token-0123456789")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    let body: serde_json::Value = ok.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert!(body["db_path"].is_null(), "Mock 后端须返回 null 路径");
+    assert_eq!(body["tokens_invalidated"], 0);
+    assert!(body["elapsed_ms"].is_u64());
+
+    let missing = client.post(format!("{base}/reload")).send().await.unwrap();
+    assert_eq!(missing.status().as_u16(), 401);
+
+    let cookie = client
+        .post(format!("{base}/reload"))
+        .header(
+            "Cookie",
+            "__Host-admin_token=observability-admin-token-0123456789",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cookie.status().as_u16(), 401, "Cookie 不得通过写动作鉴权");
+
+    let query = client
+        .post(format!(
+            "{base}/reload?access_token=observability-admin-token-0123456789"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(query.status().as_u16(), 401, "query token 不得通过鉴权");
+
+    let wrong_method = client
+        .get(format!("{base}/reload"))
+        .header("X-Admin-Token", "observability-admin-token-0123456789")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_method.status().as_u16(), 405);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn reload_returns_404_when_admin_surface_disabled() {
+    let (base, handle) = serve_and_client(test_app_missing_admin_token()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/reload"))
+        .header("X-Admin-Token", "any")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn reload_rate_limit_counts_unauthenticated_probes() {
+    let (base, handle) = serve_and_client(test_app(&[])).await;
+    let client = reqwest::Client::new();
+    for _ in 0..10 {
+        let resp = client
+            .post(format!("{base}/reload"))
+            .header("X-Admin-Token", "wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+    let limited = client
+        .post(format!("{base}/reload"))
+        .header("X-Admin-Token", "wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status().as_u16(), 429);
+    assert!(limited.headers().contains_key("retry-after"));
+    handle.abort();
+}

@@ -123,6 +123,17 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// 一次成功重载的可观测结果（编排层产出，处理器直接序列化）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// 生效库路径；Mock/测试后端为 `None`。
+    pub db_path: Option<PathBuf>,
+    /// 本次作废的凭据 token 映射条数。
+    pub tokens_invalidated: usize,
+    /// 从进入编排到快照替换 + token 作废完成（含等待串行点）的毫秒数。
+    pub elapsed_ms: u64,
+}
+
 impl AppState {
     /// 生产入口：以 fail-fast 语义构造。任一辈子系统加载失败（注册表损坏、
     /// 自定义 PII 文件再读失败）记 `error` 日志并 panic 终止启动。
@@ -277,6 +288,105 @@ impl AppState {
     pub fn with_audit_policy(mut self, policy: Arc<crate::service::audit::AuditPolicy>) -> Self {
         self.audit_policy = policy;
         self
+    }
+
+    /// 显式重载 KeePass 快照：成功后作废全部凭据 token（方案 B）。
+    /// `Ok(None)`（Mock/测试后端）同样视为成功并作废 token。
+    /// 失败时后端保证旧快照仍在；本函数不触碰 pending/PII/会话别名。
+    pub async fn reload_keepass(&self) -> Result<ReloadReport> {
+        let started = std::time::Instant::now();
+        let outcome = self.keepass.reload().await?;
+        let tokens_invalidated = self.vault.clear();
+        Ok(ReloadReport {
+            db_path: outcome.map(|outcome| outcome.db_path),
+            tokens_invalidated,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// 信号转发失败原因：供调用方输出准确的跳过日志，避免把「队列满/通道关闭」
+/// 误报成「重载进行中」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardSkip {
+    /// 已有重载在跑（信号单飞闸）。
+    Busy,
+    /// 有界队列（cap 1）已满。
+    QueueFull,
+    /// 接收端已关闭（停机后）。
+    Closed,
+}
+
+/// 信号转发闸：重载进行中或队列已满时不入队。
+pub fn forward_if_idle(
+    busy: &std::sync::atomic::AtomicBool,
+    sender: &tokio::sync::mpsc::Sender<()>,
+) -> std::result::Result<(), ForwardSkip> {
+    if busy.load(Ordering::SeqCst) {
+        return Err(ForwardSkip::Busy);
+    }
+    match sender.try_send(()) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(ForwardSkip::QueueFull),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ForwardSkip::Closed),
+    }
+}
+
+/// `busy` 的 RAII 复位：循环体 panic 展开时也不会把单飞闸永久留在 true。
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl<'a> BusyGuard<'a> {
+    fn set(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+}
+
+/// SIGHUP 重载循环：每次事件执行一次重载；重载进行中的事件由转发闸跳过。
+/// 收到停机广播后退出。事件源抽成参数，生产由 `main` 把 Unix 信号转发进来。
+pub async fn hangup_reload_loop(
+    state: AppState,
+    busy: Arc<AtomicBool>,
+    mut events: tokio::sync::mpsc::Receiver<()>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            event = events.recv() => {
+                if event.is_none() {
+                    break;
+                }
+                let _busy = BusyGuard::set(&busy);
+                let mut skipped = 0usize;
+                while events.try_recv().is_ok() {
+                    skipped += 1;
+                }
+                if skipped > 0 {
+                    tracing::warn!("重载启动前已排队的 {skipped} 次 SIGHUP，已跳过（单飞）");
+                }
+                match state.reload_keepass().await {
+                    Ok(report) => tracing::info!(
+                        trigger = "signal",
+                        tokens_invalidated = report.tokens_invalidated,
+                        elapsed_ms = report.elapsed_ms,
+                        db_path = ?report.db_path,
+                        "KeePass 重载成功"
+                    ),
+                    Err(err) => tracing::warn!(
+                        "SIGHUP 触发的 KeePass 重载失败（忽略本次，旧快照继续服务）: {err}"
+                    ),
+                }
+            }
+        }
     }
 }
 

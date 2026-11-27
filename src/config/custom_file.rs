@@ -40,6 +40,61 @@ pub fn resolve_kdbx(db_dir: &std::path::Path) -> Option<ResolvedKdbx> {
         keyfile_path,
     })
 }
+
+/// 严格库选择的失败原因：供运行期重载区分「无库（503）」「多库（409）」
+/// 与「目录不可读（500）」，避免复用宽松版「排序取末位」的静默切换。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveKdbxError {
+    /// `DB_DIR` 下没有任何 `.kdbx`。
+    Empty,
+    /// `DB_DIR` 下存在多个 `.kdbx`（已排序，供错误信息指名候选）。
+    Ambiguous(Vec<PathBuf>),
+    /// `DB_DIR` 不可读（`read_dir` 失败）。
+    Io(String),
+}
+
+/// 严格扫描 `DB_DIR`：恰一个 `.kdbx` 才返回（允许与启动期路径不同名），
+/// 同名 `.key` 存在即为 keyfile；零个返回 `Empty`，多个返回 `Ambiguous`，
+/// 其余目录读取失败返回 `Io`。目录不存在（`ENOENT`）按零库处理，便于未挂载
+/// 卷与「无库」共用 503。运行期重载 MUST 使用本函数，MUST NOT 回退宽松版。
+pub fn resolve_kdbx_strict(
+    db_dir: &std::path::Path,
+) -> std::result::Result<ResolvedKdbx, ResolveKdbxError> {
+    let entries = std::fs::read_dir(db_dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ResolveKdbxError::Empty
+        } else {
+            ResolveKdbxError::Io(e.to_string())
+        }
+    })?;
+    let mut kdbx: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("kdbx"))
+        })
+        .collect();
+    kdbx.sort();
+    let mut candidates = kdbx.into_iter();
+    match (candidates.next(), candidates.next()) {
+        (None, _) => Err(ResolveKdbxError::Empty),
+        (Some(db_path), None) => {
+            let key_path = db_path.with_extension("key");
+            let keyfile_path = key_path.is_file().then_some(key_path);
+            Ok(ResolvedKdbx {
+                db_path,
+                keyfile_path,
+            })
+        }
+        (Some(first), Some(second)) => {
+            let mut paths = vec![first, second];
+            paths.extend(candidates);
+            Err(ResolveKdbxError::Ambiguous(paths))
+        }
+    }
+}
+
 /// 自定义 PII 文件读取上限（1MB）。
 pub const CUSTOM_FILE_MAX_BYTES: u64 = 1_048_576;
 

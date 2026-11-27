@@ -28,6 +28,7 @@
 | `PII_VALUE_SAMPLE_HMAC_KEY` | 空 | 值级采样 HMAC key（密钥注入）；未设退化为 SHA256 |
 
 - compose 专用变量 `PORT_8877`/`PORT_8878`/`PORT_8879`/`TPM_HOST_PATH`/`DB_HOST_PATH` 不经二进制读取，属**容器编排层专用、非二进制读取面**（见 `docker-compose.yml`）。
+- `PROXY_ADMIN_TOKEN` 只被 `veilctl reload` 客户端读取（用作 `X-Admin-Token` 头），**不是** veil 进程 env，不在上表 9 项白名单内；在服务端进程置位不改变任何配置或行为。
 - 「未列出的变量二进制不读取」的例外（仅此四处，均不影响 `Config` 生效值、亦不入白名单）：① 审计策略 `$VAR`/`${VAR}`/`~/` 展开快照——`src/service/audit/policy.rs::capture_process_env` 于策略加载时快照进程 env（`HOME` 单列 + 全量 vars），供命令文本展开（`src/service/audit/normalize.rs`）与 `~/` 家目录展开（`src/service/audit/rules.rs`）使用，结果只参与审计判定、不回写配置；② 依赖层进程 env（如 reqwest 系统代理 `HTTP(S)_PROXY`，按依赖默认行为，非本仓代码）；③ 测试期 `std::env::temp_dir`（非生产路径）；④ **已删除会话配置名的 fail-closed 预扫描**——`PII_SCOPE_KEY_HEADER` 与 `PII_SCOPE_PREV_ID_MAX_ENTRIES` **不是可读配置面**：二者在进程 env 非空置位时启动 fail-closed 拒启动，错误信息指名该变量与替代文件键（分别为 `[session].headers` / `[session].alias_max_entries`），不进入白名单/迁移清单锁步集合。该预扫描在 `filter_process_env` **之前**读取原始 map；`Config::load_from`/`load_from_with_file` 不重复检查。
 
 ### 配置文件层（TOML）
@@ -230,6 +231,7 @@ env 一律不做别名：不在白名单的名字（含 0.2.0 改名前的 4 个
   （`Config::dedicated_listener_addrs`）与请求期选路复用同一判定，两处不会漂移。
 - 每条监听服务同一份 `build_router`：`AppState`、鉴权、管理面与 SSE 行为逐项一致，
   差别只有请求进入时注入的 `IngressPort` 扩展（承载端口）。
+- 顶层路由 `POST /reload`（KeePass 热重载）与 `/_admin*` 一样在**所有**监听可见，不因专用 LLM 入口做 404 例外；它不在 `/_admin` 八路由表内，契约见 §8.4。
 - 选路优先级：**已声明的专用监听端口 > `Host` 头派生端口 > `None`（缺省上游）**。
   专用监听端口恒胜冲突的 `Host` 头；旧部署（宿主机 8878/8879 映射到容器 8877）的请求
   落在主监听上、无专用端口，仍按 `Host` 照常工作。
@@ -367,6 +369,7 @@ curl -fsS http://127.0.0.1:8877/credential \
 ## 3. 限流规则
 
 - 通用 admin 接口按源 IP 限流 `10/min`，超限返回 `429` 并携带 `Retry-After` 头（头名大小写不敏感， wire 形态为小写 `retry-after`）。
+- 顶层 `POST /reload`（KeePass 热重载）与通用 admin 数据接口共用同一个 `10/min`/IP 桶（`admin::check_admin_rate`），且限流判定**先于**鉴权——携带错误 token 的探测同样计入，超限返回 `429` + `Retry-After`。它不是 `/_admin` 路由，但限流与豁免口径按本条一致。
 - 豁免集为四条路径，`src/service/admin/ratelimit.rs::admin_rate_exempt_paths()` 是唯一
   **声明清单**（仅作声明/测试与文档用途，不被生产路径消费，故非运行时真源）：
   `/_admin` 与 `/_admin/`（控制台壳，`router.rs` 两条注册指向同一 handler）、
@@ -506,8 +509,11 @@ done
 | 命令调用 | `POST /commands/{id}/invoke` | 三因子写口径 + `downstreams.allow_commands` 授权 |
 | 命令调用日志 | `GET /_admin/commands` | 管理面鉴权（同其余 `/_admin` 路由） |
 | 逐请求明细 | `GET /_admin/requests` | 管理面鉴权（通用 `10/min`/IP 限流，**不**豁免；响应统一 `Cache-Control: no-store`） |
+| KeePass 热重载 | `POST /reload` | 仅管理面 `X-Admin-Token` 头（Cookie/query 不放行，非 `POST` 405；管理面未启用 404；共享 `10/min`/IP 桶） |
 | LLM 代理透传 | 任意 `/{tail}`（含 `GET`；未知 admin 子路径除外） | 无（上游透传） |
 | 存活探针 | `GET /health` | 无 |
+
+`POST /reload` 是**顶层路由，不属于 `/_admin` 八条路由**；其鉴权、限流、库选择、失败语义与响应字段的完整契约见 §8.4。
 
 `GET /_admin/requests` 是管理面第八条路由，读 `metrics.sqlite` 的 `llm_requests` 表（口径与字段语义见 §7.14）。参数：
 
@@ -577,6 +583,7 @@ veilctl revoke --name "check-mail"
   `VEIL_APPROVAL_E2E_URL`（网关基址）与 `VEIL_APPROVAL_E2E_CALLER`（一次性调用方名）共同启用，
   二者未同时设置即 `t.Skip`；该用例会向网关提交对 `VEIL_APPROVAL_E2E_CALLER` 的**真实吊销审批单**
   （破坏性，仅限可弃用调用方）。
+- `veilctl reload` 专用客户端变量 `PROXY_ADMIN_TOKEN`：作为 `X-Admin-Token` 头调用 `POST /reload`；未设置时子命令以非零退出并给出提示。它只属 `veilctl` 客户端，**不是** veil 服务端 env，§1 的 9 项服务端 env 白名单不变。
 - SSE 语义对 Go 透明：被审计阻断的流恒以终止帧闭合，客户端视为正常结束，不重试、不挂起。
 
 ### 5.1 下游命令执行（`[command]`）
@@ -1401,6 +1408,39 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
 - 文本指令 `lock`/`forget` 经网关侧清理接线：
   `lock` 清口令缓存 + KeePass 会话 + TPM 派生主密码缓存（清除并零化，**不阻止下次取用**——再次取用仍经 TPM 解封）+ 内存/矩阵 pending + PII 会话作用域（`pii_scope_mode = conversation` 时的跨请求共享存储，`request` 模式无该存储、回执报 `0`）；`forget` 清 token 映射并以真实条数回执。
   明确不在 `lock` 清理范围的两项：`DecisionTable`（已落定的审批结论，条目本身按 TTL 自然过期，清它等于让「已批准」变成「无记录」）与 `previous_response_map`（只存 HMAC 派生会话键、不含明文 PII 或口令材料）。清理范围以 `service::matrix::GatewayCleanup::lock_cleanup` 的 `LockCleanupReport` 为准，回执条数取自其真实返回值。发送者须经与 reaction 相同的白名单判定（`[audit].approval_whitelist`）；非成员发送的 `lock`/`status`/`forget` 在指令解析前被丢弃（`debug` 日志），不产生回执。
+
+**KeePass 热重载（`POST /reload`、Unix `SIGHUP`、`veilctl reload`）**：三种触发面调用同一实现，失败不改变旧快照的服务状态。
+
+- 鉴权与暴露面：`POST /reload` 是顶层路由（不占 `/_admin` 八路由表）；仅接受 `X-Admin-Token` 请求头，`__Host-admin_token` Cookie 与 query token 恒 `401`（写端点不接受 Cookie 通道，消除 CSRF 面）；非 `POST` 返回 `405`；管理面未启用（`[admin].enabled = false` 或 `OBSERVABILITY_ADMIN_TOKEN` 为空）时与 `/_admin*` 同门禁返回 `404`。与通用 admin 数据接口共用 `10/min`/IP 桶且限流先于鉴权，超限 `429` + `Retry-After`。
+- 库选择：重载重新解析 `db_dir`，恰一个 `.kdbx` 才继续（同名 `.key` 重新读取，允许重命名或替换单个库文件）；零个或目录不存在（`ENOENT`，如卷未挂载）为 `503`（`E_UNAVAILABLE`）；目录存在但读取失败（权限等非 `ENOENT`）为 `500`（`E_KEEPASS`）；多于一个 `409`（`E_CONFLICT`）并指名候选、不重载。这比启动期「排序取末位」更严格，避免误加载备份/测试库。
+- 全有或全无：与取用共用同一 permit-1 串行点；解密成功后才原子替换内存快照，读文件/TPM 解封/主密码派生/解密任一失败保留旧快照，且不清 token 映射。
+- 方案 B（token 失效）：成功替换后清空全局凭据 token 映射并推进代际，旧 token 不再还原、同一明文重查得到新 token 且编号不复用；失败不清。重载与 token 铸造之间允许极短窗口的过度失效，不承诺跨线程线性化。
+- 清理范围与 `lock` 的差异：重载**不**清理审批 pending、PII 会话作用域、会话别名表（这些仅 `lock` 清）；重载失败不发 Matrix 失败通知。
+- TPM 主密码：重载为按**当前** seal 重新解封，会先清主密码缓存；若本次已解封成功则缓存保留本次新派生值，失败不回退旧派生值。这不属于 `lock` 式清理，pending/PII/别名均不受影响。
+- 竞争与在途：`lock` 在重载解密期间清空快照时，重载在替换前放弃并返回 `409`，MUST NOT 在 `lock` 之后写回快照；冷缓存取用解密期间发生 `lock` 时，该次取用返回 `503`（`E_UNAVAILABLE`，message「KeePass 已锁定」）且不回填快照。在途对话的响应可能收到字面 token（客户端应重查凭据），条目被重查之前其旧明文在请求侧不再脱敏（与进程启动、`forget` 后一致）。
+
+`POST /reload` 唯一状态表（契约以 `code` 为准）：
+
+| 场景 | 状态 | code |
+|:--|:--|:--|
+| 管理面未启用 | 404 | `E_NOT_FOUND` |
+| token 缺失/为空/不符（含仅 Cookie/query） | 401 | `E_UNAUTHORIZED` |
+| 非 `POST` | 405 | 无 |
+| 多 `.kdbx`、并发重载、`lock` 竞争中止 | 409 | `E_CONFLICT` |
+| 超 `10/min`/IP | 429 | `E_RATE_LIMITED` |
+| 无 `.kdbx`（含目录不存在） | 503 | `E_UNAVAILABLE` |
+| 目录不可读、读文件/派生/解密失败 | 500 | `E_KEEPASS` |
+
+`500` 的对外 message 固定为「内部错误」，具体原因只进日志；不引入 `400`。成功响应为 `200` JSON，含 `ok`、`db_path`（Mock 后端为 `null`）、`tokens_invalidated`（本次作废的映射条数）、`elapsed_ms`（从进入编排到替换与作废完成的整数毫秒，含等待 permit 的时间）。信号触发遇到进行中重载时记 warn 并跳过；`veilctl reload` 按 HTTP 状态映射退出码，`PROXY_ADMIN_TOKEN` 仅属客户端，不是 veil 服务端 env。本变更不新增配置键，服务端 9 项 env 白名单不变，`GET /health` 与 `/_admin/health` 的字段集合不变。
+
+清理范围对比（`lock` / `forget` / `reload`）：
+
+| 动作 | KeePass 快照 | token 映射 | TPM 主密码缓存 | 审批 pending | PII 会话作用域 | 会话别名 |
+|:--|:--|:--|:--|:--|:--|:--|
+| `lock` | 清 | 清 | 清（并零化） | 清 | 清 | 清 |
+| `forget` | 保留 | 清 | 保留 | 保留 | 保留 | 保留 |
+| `reload` | 成功时原子替换；失败保留 | 成功时清空并推进代际；失败保留 | 重载前清以便按当前 seal 重新解封；失败不回退旧派生值 | 保留 | 保留 | 保留 |
+
 - `MatrixBranch::Unlock` 已删除：`unlock`/`解锁` 前缀原因在 `from_reason` 直接返回错误，
   `record_pending` fail-closed（不建一张永远不可决的票）。
 - `[credential].default_decision` 三态：`allow` 放行 / `deny` 拒绝 / `pending` 转 Matrix 审批（见 §2）。

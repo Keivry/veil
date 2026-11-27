@@ -653,3 +653,73 @@ fn yaml_unquote_equivalence() {
         );
     }
 }
+
+fn strict_dir(name: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "veil-resolve-strict-{}-{name}-{n}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn resolve_kdbx_strict_three_states_and_ordering() {
+    let empty = strict_dir("empty");
+    assert_eq!(resolve_kdbx_strict(&empty), Err(ResolveKdbxError::Empty));
+    std::fs::remove_dir_all(&empty).ok();
+
+    let missing = strict_dir("missing");
+    std::fs::remove_dir_all(&missing).unwrap();
+    assert_eq!(
+        resolve_kdbx_strict(&missing),
+        Err(ResolveKdbxError::Empty),
+        "目录不存在须按零库处理（503），不得报 IO 500"
+    );
+
+    let single = strict_dir("single");
+    std::fs::write(single.join("vault.kdbx"), b"db").unwrap();
+    std::fs::write(single.join("vault.key"), b"key").unwrap();
+    std::fs::write(single.join("notes.txt"), b"ignored").unwrap();
+    let resolved = resolve_kdbx_strict(&single).expect("恰一个 .kdbx 须成功");
+    assert_eq!(resolved.db_path, single.join("vault.kdbx"));
+    assert_eq!(resolved.keyfile_path, Some(single.join("vault.key")));
+    std::fs::remove_dir_all(&single).ok();
+
+    let no_key = strict_dir("no-key");
+    std::fs::write(no_key.join("only.kdbx"), b"db").unwrap();
+    let resolved = resolve_kdbx_strict(&no_key).expect("无 keyfile 也须成功");
+    assert_eq!(resolved.keyfile_path, None);
+    std::fs::remove_dir_all(&no_key).ok();
+
+    let many = strict_dir("many");
+    for name in ["z.kdbx", "a.kdbx", "m.kdbx"] {
+        std::fs::write(many.join(name), b"db").unwrap();
+    }
+    let err = resolve_kdbx_strict(&many).unwrap_err();
+    assert_eq!(
+        err,
+        ResolveKdbxError::Ambiguous(vec![
+            many.join("a.kdbx"),
+            many.join("m.kdbx"),
+            many.join("z.kdbx"),
+        ]),
+        "多库候选须完整且按字典序"
+    );
+    std::fs::remove_dir_all(&many).ok();
+
+    let not_a_dir = strict_dir("not-a-dir");
+    let file_as_dir = not_a_dir.join("plain.txt");
+    std::fs::write(&file_as_dir, b"x").unwrap();
+    assert!(
+        matches!(
+            resolve_kdbx_strict(&file_as_dir),
+            Err(ResolveKdbxError::Io(_))
+        ),
+        "非 ENOENT 的 read_dir 失败须归 Io（500），不得吞成无库"
+    );
+    std::fs::remove_dir_all(&not_a_dir).ok();
+}

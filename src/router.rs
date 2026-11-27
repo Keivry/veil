@@ -104,7 +104,9 @@ async fn request_context(mut req: Request, next: Next) -> Response {
 }
 
 async fn observability_gate(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if !state.config().admin_surface_enabled() && req.uri().path().starts_with("/_admin") {
+    let path = req.uri().path();
+    if !state.config().admin_surface_enabled() && (path.starts_with("/_admin") || path == "/reload")
+    {
         // 未启用期 404 复用管理面统一安全头（五项通用头，不泄露
         // 管理面存在性；与 `admin_not_found` 同语义）。
         return admin::with_security_headers(
@@ -123,10 +125,12 @@ pub fn build_router(state: AppState) -> Router {
         let cfg = state.config();
         if !cfg.admin_enabled {
             tracing::warn!(
-                "admin.enabled=false（或 ADMIN_ENABLED 显式关闭）：管理面已禁用，/_admin 全返回 404"
+                "admin.enabled=false（或 ADMIN_ENABLED 显式关闭）：管理面已禁用，/_admin 与 /reload 全返回 404"
             );
         } else if !cfg.admin_surface_enabled() {
-            tracing::warn!("OBSERVABILITY_ADMIN_TOKEN 缺失：管理面未启用，/_admin 全返回 404");
+            tracing::warn!(
+                "OBSERVABILITY_ADMIN_TOKEN 缺失：管理面未启用，/_admin 与 /reload 全返回 404"
+            );
         }
     }
     Router::new()
@@ -146,6 +150,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/register-caller", post(handler::register_caller_handler))
         .route("/revoke", post(handler::revoke_handler))
         .route("/revoke/emergency", post(handler::emergency_revoke_handler))
+        .route("/reload", post(handler::reload_handler))
         .route(
             "/approve-hash-change",
             post(handler::approve_hash_change_handler),

@@ -93,7 +93,7 @@ fn classify_sse_recv(recv: Result<String, tokio::sync::broadcast::error::RecvErr
 }
 
 /// 未鉴权响应（401 + `E_UNAUTHORIZED`；调用方不区分失败细节，防探测）。
-fn unauthorized(message: &str) -> Response {
+pub(crate) fn unauthorized(message: &str) -> Response {
     with_security_headers(
         (
             StatusCode::UNAUTHORIZED,
@@ -240,7 +240,7 @@ fn forwarded_proto_https(raw: &str) -> bool {
 /// 超限响应（自 `service::admin::ratelimit` 搬入）：429 + `Retry-After`（秒）
 /// 与错误码 `E_RATE_LIMITED`（锁定；头名小写 `retry-after`，HTTP 头
 /// 大小写不敏感）。响应构造属 handler 层，`service` 仅返回重试秒数。
-fn rate_limited(retry_after: u64) -> Response {
+pub(crate) fn rate_limited(retry_after: u64) -> Response {
     let mut resp = (
         StatusCode::TOO_MANY_REQUESTS,
         Json(json!({"error": {"code": "E_RATE_LIMITED", "message": format!("请求过于频繁，请 {retry_after}s 后重试")}})),

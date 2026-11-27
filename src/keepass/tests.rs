@@ -348,3 +348,471 @@ async fn unlock_chain_lock_clears_cache_and_reunseals() {
     assert_eq!(backend.open_count(), 2, "lock 后须重开库");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn mock_reload_is_noop_success() {
+    let backend = MockKeePass::unlocked();
+    assert_eq!(backend.reload().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn reload_redecrypts_cached_snapshot() {
+    let dir = unique_temp_dir("reload-decrypt");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "old-secret", "", vec![])]);
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(db_path.clone(), None, provider);
+    let first = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(first.password, "old-secret");
+    assert_eq!(backend.open_count(), 1);
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "new-secret", "", vec![])]);
+    let outcome = backend
+        .reload()
+        .await
+        .unwrap()
+        .expect("真实后端须返回重载结果");
+    assert_eq!(
+        outcome,
+        ReloadOutcome {
+            db_path: db_path.clone(),
+            open_count: 2,
+        }
+    );
+    let second = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(second.password, "new-secret");
+    assert_eq!(backend.open_count(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_failure_keeps_old_snapshot() {
+    let dir = unique_temp_dir("reload-fail");
+    let backend = fixture_backend(&dir);
+    let before = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(before.password, "mail-secret-001");
+    assert_eq!(backend.open_count(), 1);
+    std::fs::write(dir.join("vault.kdbx"), b"not-a-kdbx").unwrap();
+    let err = backend.reload().await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(matches!(err, VeilError::KeePass { .. }));
+    let after = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(after.password, "mail-secret-001");
+    assert!(backend.is_cached(), "失败重载不得清空旧快照");
+    assert_eq!(backend.open_count(), 1);
+    build_test_kdbx(
+        &dir.join("vault.kdbx"),
+        b"fixture-master-pw",
+        &[("网易", "u", "recovered", "", vec![])],
+    );
+    let recovered = backend
+        .reload()
+        .await
+        .unwrap()
+        .expect("500 失败后单飞标志须复位");
+    assert_eq!(recovered.open_count, 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_uses_new_master_password() {
+    let dir = unique_temp_dir("reload-newpw");
+    let db_path = dir.join("vault.kdbx");
+    let password = std::sync::Arc::new(Mutex::new(b"pw-old".to_vec()));
+    let provider: PasswordProvider = {
+        let password = password.clone();
+        std::sync::Arc::new(move || {
+            let pw = password.lock().expect("测试口令锁").clone();
+            Ok(Zeroizing::new(pw))
+        })
+    };
+    build_test_kdbx(
+        &db_path,
+        b"pw-old",
+        &[("网易", "u", "old-secret", "", vec![])],
+    );
+    let backend = RealKeePass::new(db_path.clone(), None, provider);
+    let first = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(first.password, "old-secret");
+    build_test_kdbx(
+        &db_path,
+        b"pw-new",
+        &[("网易", "u", "new-secret", "", vec![])],
+    );
+    *password.lock().expect("测试口令锁") = b"pw-new".to_vec();
+    let outcome = backend.reload().await.unwrap().expect("换密后重载须成功");
+    assert_eq!(outcome.open_count, 2);
+    let second = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(second.password, "new-secret");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn blocking_provider() -> (
+    PasswordProvider,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let provider: PasswordProvider = std::sync::Arc::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.lock().map(|rx| rx.recv());
+        Ok(Zeroizing::new(b"pw".to_vec()))
+    });
+    (provider, started_rx, release_tx)
+}
+
+async fn await_provider_entered(started: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || {
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("provider 须在限时内被调用")
+    })
+    .await
+    .expect("等待 provider 的任务须完成");
+}
+
+#[tokio::test]
+async fn concurrent_reload_conflicts_without_queueing() {
+    let dir = unique_temp_dir("reload-inflight");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
+    let (provider, started, release) = blocking_provider();
+    let backend = std::sync::Arc::new(RealKeePass::new(db_path, None, provider));
+    let first = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.reload().await })
+    };
+    await_provider_entered(started).await;
+    let err = tokio::time::timeout(std::time::Duration::from_secs(2), backend.reload())
+        .await
+        .expect("并发重载须立即返回而非排队")
+        .unwrap_err();
+    assert!(matches!(err, VeilError::Conflict { .. }));
+    release.send(()).expect("释放 provider");
+    drop(release);
+    let first_outcome = first
+        .await
+        .expect("首个重载须完成")
+        .unwrap()
+        .expect("须有重载结果");
+    assert_eq!(first_outcome.open_count, 1);
+    let next = backend.reload().await.unwrap().expect("单飞标志须复位");
+    assert_eq!(next.open_count, 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_aborts_when_lock_races_decrypt() {
+    let dir = unique_temp_dir("reload-lock-race");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
+    let (provider, started, release) = blocking_provider();
+    let backend = std::sync::Arc::new(RealKeePass::new(db_path, None, provider));
+    let handle = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.reload().await })
+    };
+    await_provider_entered(started).await;
+    backend.clear_cache();
+    release.send(()).expect("释放 provider");
+    let err = handle.await.expect("重载任务须完成").unwrap_err();
+    assert!(matches!(err, VeilError::Conflict { .. }));
+    assert!(err.to_string().contains("lock"));
+    assert!(!backend.is_cached(), "lock 竞争后不得复活快照");
+    assert_eq!(backend.open_count(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn lock_during_cold_fetch_aborts_writeback() {
+    let dir = unique_temp_dir("fetch-lock-race");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
+    let (provider, started, release) = blocking_provider();
+    let backend = std::sync::Arc::new(RealKeePass::new(db_path, None, provider));
+    let handle = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.fetch_entry("网易".to_string()).await })
+    };
+    await_provider_entered(started).await;
+    backend.clear_cache();
+    release.send(()).expect("释放 provider");
+    let err = handle.await.expect("取用任务须完成").unwrap_err();
+    assert!(matches!(err, VeilError::Unavailable { .. }));
+    assert!(err.to_string().contains("KeePass 已锁定"));
+    assert!(!backend.is_cached(), "lock 竞争后不得回填快照");
+    assert_eq!(backend.open_count(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_empty_dir_unavailable() {
+    let dir = unique_temp_dir("reload-empty-dir");
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(dir.join("veil.kdbx"), None, provider);
+    let err = backend.reload().await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(err.to_string().contains("密码库未配置"));
+    assert_eq!(backend.open_count(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_ambiguous_dir_conflict() {
+    let dir = unique_temp_dir("reload-ambiguous");
+    std::fs::write(dir.join("a.kdbx"), b"a").unwrap();
+    std::fs::write(dir.join("z.kdbx"), b"z").unwrap();
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(dir.join("a.kdbx"), None, provider);
+    let err = backend.reload().await.unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::CONFLICT);
+    let message = err.to_string();
+    assert!(matches!(err, VeilError::Conflict { .. }));
+    assert!(
+        message.contains("a.kdbx") && message.contains("z.kdbx"),
+        "冲突信息须指名全部候选: {message}"
+    );
+    assert_eq!(backend.open_count(), 0, "多库不得触发解密");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_single_db_with_keyfile_succeeds() {
+    let dir = unique_temp_dir("reload-keyfile");
+    let db_path = dir.join("vault.kdbx");
+    let keyfile = dir.join("vault.key");
+    let key_bytes = b"bare-test-keyfile-material";
+    build_test_kdbx_with_keyfile(
+        &db_path,
+        b"pw",
+        key_bytes,
+        &[("网易", "u", "key-secret", "", vec![])],
+    );
+    std::fs::write(&keyfile, key_bytes).unwrap();
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(db_path.clone(), None, provider);
+    let outcome = backend
+        .reload()
+        .await
+        .unwrap()
+        .expect("单库带 keyfile 须重载成功");
+    assert_eq!(outcome.db_path, db_path);
+    let snapshot = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(snapshot.password, "key-secret");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn cached_fetch_survives_missing_file() {
+    let dir = unique_temp_dir("cached-rename");
+    let backend = fixture_backend(&dir);
+    let first = backend.fetch_entry("备用".to_string()).await.unwrap();
+    assert_eq!(first.password, "backup-secret-002");
+    let db_path = dir.join("vault.kdbx");
+    let moved = dir.join("vault.kdbx.bak");
+    std::fs::rename(&db_path, &moved).unwrap();
+    let cached = backend.fetch_entry("备用".to_string()).await.unwrap();
+    assert_eq!(cached.password, "backup-secret-002");
+    assert_eq!(backend.open_count(), 1);
+    backend.clear_cache();
+    let err = backend.fetch_entry("备用".to_string()).await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(err.to_string().contains("密码库未配置"));
+    std::fs::rename(&moved, &db_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_empty_database_then_fetch_not_found() {
+    let dir = unique_temp_dir("reload-empty-db");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(&db_path, b"pw", &[]);
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(db_path, None, provider);
+    let outcome = backend.reload().await.unwrap().expect("空库重载须成功");
+    assert_eq!(outcome.open_count, 1);
+    let err = backend
+        .fetch_entry("任意条目".to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+    assert!(backend.is_cached(), "空库也须替换为已解密快照");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn clear_cache_advances_lock_epoch() {
+    let dir = unique_temp_dir("lock-epoch");
+    let backend = fixture_backend(&dir);
+    let before = backend.lock_epoch.load(Ordering::SeqCst);
+    backend.clear_cache();
+    assert_eq!(backend.lock_epoch.load(Ordering::SeqCst), before + 1);
+    backend.clear_cache();
+    assert_eq!(backend.lock_epoch.load(Ordering::SeqCst), before + 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_provider_failure_keeps_old_snapshot() {
+    let dir = unique_temp_dir("reload-provider-fail");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "old-secret", "", vec![])]);
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    let provider: PasswordProvider = {
+        let fail = fail.clone();
+        std::sync::Arc::new(move || {
+            if fail.load(Ordering::SeqCst) {
+                anyhow::bail!("TPM 解封失败（测试）");
+            }
+            Ok(Zeroizing::new(b"pw".to_vec()))
+        })
+    };
+    let backend = RealKeePass::new(db_path, None, provider);
+    let first = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(first.password, "old-secret");
+    fail.store(true, Ordering::SeqCst);
+    let err = backend.reload().await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(matches!(err, VeilError::KeePass { .. }));
+    let after = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(after.password, "old-secret", "解封失败不得影响旧快照");
+    assert!(backend.is_cached());
+    assert_eq!(backend.open_count(), 1, "失败重载不得推进打开计数");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_inflight_resets_after_failure() {
+    let dir = unique_temp_dir("reload-inflight-reset");
+    let db_path = dir.join("vault.kdbx");
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(db_path.clone(), None, provider);
+    let err = backend.reload().await.unwrap_err();
+    assert!(matches!(err, VeilError::Unavailable { .. }));
+    build_test_kdbx(&db_path, b"pw", &[("网易", "u", "s", "", vec![])]);
+    let ok = backend
+        .reload()
+        .await
+        .unwrap()
+        .expect("失败后单飞标志须复位");
+    assert_eq!(ok.open_count, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_switches_to_renamed_single_database() {
+    let dir = unique_temp_dir("reload-rename");
+    let old = dir.join("a.kdbx");
+    build_test_kdbx(&old, b"pw", &[("网易", "u", "old-secret", "", vec![])]);
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(old.clone(), None, provider);
+    let first = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(first.password, "old-secret");
+    std::fs::rename(&old, dir.join("a.kdbx.bak")).unwrap();
+    let new = dir.join("b.kdbx");
+    build_test_kdbx(&new, b"pw", &[("网易", "u", "new-secret", "", vec![])]);
+    let outcome = backend.reload().await.unwrap().expect("换名单库须成功");
+    assert_eq!(outcome.db_path, new);
+    let after = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(after.password, "new-secret");
+    assert_eq!(
+        backend
+            .fetch_entry("备用".to_string())
+            .await
+            .unwrap_err()
+            .status_code(),
+        axum::http::StatusCode::NOT_FOUND,
+        "换名后旧条目不得残留"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_rereads_updated_keyfile() {
+    let dir = unique_temp_dir("reload-keyfile-update");
+    let db_path = dir.join("vault.kdbx");
+    let key_path = dir.join("vault.key");
+    build_test_kdbx_with_keyfile(
+        &db_path,
+        b"pw",
+        b"key-one",
+        &[("网易", "u", "old-secret", "", vec![])],
+    );
+    std::fs::write(&key_path, b"key-one").unwrap();
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(db_path.clone(), Some(key_path.clone()), provider);
+    let first = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(first.password, "old-secret");
+    build_test_kdbx_with_keyfile(
+        &db_path,
+        b"pw",
+        b"key-two",
+        &[("网易", "u", "new-secret", "", vec![])],
+    );
+    std::fs::write(&key_path, b"key-two").unwrap();
+    backend
+        .reload()
+        .await
+        .unwrap()
+        .expect("更新 keyfile 后须成功");
+    let after = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(
+        after.password, "new-secret",
+        "重载须重新读取磁盘上的 keyfile"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_clears_stale_master_password_and_uses_new_secret() {
+    let dir = unique_temp_dir("reload-clear-pwcache");
+    let db_path = dir.join("vault.kdbx");
+    build_test_kdbx(
+        &db_path,
+        b"new-pw",
+        &[("网易", "u", "new-secret", "", vec![])],
+    );
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"new-pw".to_vec())));
+    let cache = MasterPasswordCache::default();
+    cache.seed(b"old-pw".to_vec());
+    let backend = RealKeePass::new(db_path, None, provider).with_master_password_cache(cache);
+    assert!(backend.master_password_cached(), "前置：缓存须有旧派生值");
+    let outcome = backend.reload().await.unwrap().expect("按新密码须成功");
+    assert_eq!(outcome.open_count, 1);
+    assert!(
+        !backend.master_password_cached(),
+        "重载须清除旧派生值，不得沿用缓存"
+    );
+    let snapshot = backend.fetch_entry("网易".to_string()).await.unwrap();
+    assert_eq!(snapshot.password, "new-secret");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reload_unreadable_directory_maps_to_keepass_500() {
+    let dir = unique_temp_dir("reload-dir-io");
+    let not_a_dir = dir.join("not-a-dir");
+    std::fs::write(&not_a_dir, b"x").unwrap();
+    let provider: PasswordProvider = std::sync::Arc::new(|| Ok(Zeroizing::new(b"pw".to_vec())));
+    let backend = RealKeePass::new(dir.join("vault.kdbx"), None, provider).with_db_dir(not_a_dir);
+    let err = backend.reload().await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(matches!(err, VeilError::KeePass { .. }));
+    std::fs::remove_dir_all(&dir).ok();
+}

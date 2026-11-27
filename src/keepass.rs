@@ -3,14 +3,17 @@
 //! 只在同步小临界区内加锁，拿完快照立即释放。
 
 use {
-    crate::error::{Result, VeilError},
+    crate::{
+        config::{ResolveKdbxError, resolve_kdbx_strict},
+        error::{Result, VeilError},
+    },
     std::{
         future::Future,
         path::PathBuf,
         pin::Pin,
         sync::{
             Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
     },
     zeroize::Zeroizing,
@@ -39,12 +42,23 @@ impl EntrySnapshot {
     }
 }
 
+/// 一次真实后端重载的结果：生效库路径与累计打开计数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    pub db_path: PathBuf,
+    pub open_count: usize,
+}
+
 pub trait KeePassBackend: Send + Sync + std::fmt::Debug {
     fn is_unlocked(&self) -> bool;
     fn fetch_entry(
         &self,
         title: String,
     ) -> Pin<Box<dyn Future<Output = Result<EntrySnapshot>> + Send + '_>>;
+    /// 重新解析并解密库文件，成功才替换内存快照；默认实现表示无持久后端。
+    fn reload(&self) -> Pin<Box<dyn Future<Output = Result<Option<ReloadOutcome>>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
     fn open_count(&self) -> usize { 0 }
     fn clear_cache(&self) {}
     /// 清除并零化 TPM 派生主密码缓存；无该缓存的实现默认 no-op。
@@ -140,6 +154,14 @@ impl MasterPasswordCache {
 
     /// 缓存是否非空（观测/测试用）。
     pub fn has_cached(&self) -> bool { self.slot.lock().is_ok_and(|slot| slot.is_some()) }
+
+    /// 测试用：注入派生值，模拟重载前已解封的缓存。
+    #[cfg(test)]
+    pub(crate) fn seed(&self, value: Vec<u8>) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(Zeroizing::new(value));
+        }
+    }
 }
 
 pub fn tpm_password_provider(tpm_dir: PathBuf, allow_mock: bool) -> PasswordProvider {
@@ -177,21 +199,54 @@ pub fn tpm_password_provider_with_cache(
     (provider, cache)
 }
 
-pub struct RealKeePass {
+#[derive(Debug, Clone)]
+struct ActivePaths {
     db_path: PathBuf,
     keyfile_path: Option<PathBuf>,
+}
+
+/// 重载单飞：抢占失败立即 409，不排队等待 permit（D7/任务 1.6）。
+struct ReloadGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> ReloadGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Result<Self> {
+        if flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(VeilError::Conflict {
+                message: "已有重载进行中，拒绝并发重载".to_string(),
+            });
+        }
+        Ok(Self { flag })
+    }
+}
+
+impl Drop for ReloadGuard<'_> {
+    fn drop(&mut self) { self.flag.store(false, Ordering::SeqCst); }
+}
+
+pub struct RealKeePass {
+    db_dir: PathBuf,
+    active: Mutex<ActivePaths>,
     password_provider: PasswordProvider,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     cache: Mutex<Option<keepass::Database>>,
+    lock_epoch: AtomicU64,
+    reload_inflight: AtomicBool,
     password_cache: Option<MasterPasswordCache>,
     open_count: AtomicUsize,
 }
 
 impl std::fmt::Debug for RealKeePass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let active = self.active_paths();
         f.debug_struct("RealKeePass")
-            .field("db_path", &self.db_path)
-            .field("keyfile_path", &self.keyfile_path)
+            .field("db_dir", &self.db_dir)
+            .field("db_path", &active.db_path)
+            .field("keyfile_path", &active.keyfile_path)
             .field("open_count", &self.open_count.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
@@ -203,15 +258,31 @@ impl RealKeePass {
         keyfile_path: Option<PathBuf>,
         password_provider: PasswordProvider,
     ) -> Self {
+        // 裸文件名（`parent()` 为空）回退到 "."，避免空父路径使严格扫描失效。
+        let db_dir = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
         Self {
-            db_path,
-            keyfile_path,
+            db_dir,
+            active: Mutex::new(ActivePaths {
+                db_path,
+                keyfile_path,
+            }),
             password_provider,
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             cache: Mutex::new(None),
+            lock_epoch: AtomicU64::new(0),
+            reload_inflight: AtomicBool::new(false),
             password_cache: None,
             open_count: AtomicUsize::new(0),
         }
+    }
+
+    /// 显式指定重载扫描目录（生产取 `config.db_dir`）；`new` 的签名保持不变。
+    pub fn with_db_dir(mut self, db_dir: PathBuf) -> Self {
+        self.db_dir = db_dir;
+        self
     }
 
     /// 挂接 TPM 主密码缓存可清理句柄，使 `lock` 可清除并零化该缓存。
@@ -220,14 +291,16 @@ impl RealKeePass {
         self
     }
 
-    pub fn db_path(&self) -> &std::path::Path { &self.db_path }
+    /// 克隆活动路径并在返回前释放锁；poison 时取回内部值，不 panic。
+    fn active_paths(&self) -> ActivePaths {
+        match self.active.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
 
     async fn fetch_entry_async(&self, title: String) -> Result<EntrySnapshot> {
-        if !self.db_path.is_file() {
-            return Err(VeilError::Unavailable {
-                message: "密码库未配置".to_string(),
-            });
-        }
+        // 串行点先于一切判断：缓存命中不得因库文件暂时缺席（换名/替换窗口）误报 503。
         // 单飞许可（tokio 信号量）可跨 await 持有；下方缓存锁（std Mutex）
         // 绝不跨 await：每次只在同步小临界区内加锁，拿完快照立即释放。
         let _permit = self
@@ -237,21 +310,24 @@ impl RealKeePass {
             .map_err(|e| VeilError::KeePass {
                 message: format!("KeePass 内部错误: 信号量获取失败: {e}"),
             })?;
-        {
-            if let Some(snapshot) = self.lookup_cached(&title) {
-                return Ok(snapshot);
-            }
-            if self.is_cached() {
-                return Err(VeilError::NotFound {
-                    message: format!("条目未找到: {title}"),
-                });
-            }
+        if let Some(snapshot) = self.lookup_cached(&title) {
+            return Ok(snapshot);
         }
-        let db_path = self.db_path.clone();
-        let keyfile_path = self.keyfile_path.clone();
+        if self.is_cached() {
+            return Err(VeilError::NotFound {
+                message: format!("条目未找到: {title}"),
+            });
+        }
+        let active = self.active_paths();
+        if !active.db_path.is_file() {
+            return Err(VeilError::Unavailable {
+                message: "密码库未配置".to_string(),
+            });
+        }
+        let epoch = self.lock_epoch.load(Ordering::SeqCst);
         let provider = self.password_provider.clone();
         let db = tokio::task::spawn_blocking(move || {
-            open_blocking(&db_path, keyfile_path.as_deref(), &provider)
+            open_blocking(&active.db_path, active.keyfile_path.as_deref(), &provider)
         })
         .await
         .map_err(|e| VeilError::KeePass {
@@ -260,36 +336,111 @@ impl RealKeePass {
         let snapshot = snapshot_of(&db, &title).ok_or_else(|| VeilError::NotFound {
             message: format!("条目未找到: {title}"),
         })?;
-        self.open_count.fetch_add(1, Ordering::SeqCst);
-        match self.cache.lock() {
-            Ok(mut guard) => {
-                *guard = Some(db);
-            }
-            Err(_) => {
-                return Err(VeilError::KeePass {
-                    message: "KeePass 内部错误: 缓存锁定失败".to_string(),
-                });
-            }
+        let mut guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.lock_epoch.load(Ordering::SeqCst) != epoch {
+            return Err(VeilError::Unavailable {
+                message: "KeePass 已锁定".to_string(),
+            });
         }
+        *guard = Some(db);
+        drop(guard);
+        self.open_count.fetch_add(1, Ordering::SeqCst);
         Ok(snapshot)
     }
 
-    fn is_cached(&self) -> bool { self.cache.lock().is_ok_and(|g| g.is_some()) }
+    /// 真实重载：全程持 permit，成功才交换快照；`lock` 竞争经 epoch 中止。
+    async fn reload_async(&self) -> Result<Option<ReloadOutcome>> {
+        let _inflight = ReloadGuard::acquire(&self.reload_inflight)?;
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| VeilError::KeePass {
+                message: format!("KeePass 内部错误: 信号量获取失败: {e}"),
+            })?;
+        let resolved = resolve_kdbx_strict(&self.db_dir).map_err(|error| match error {
+            ResolveKdbxError::Empty => VeilError::Unavailable {
+                message: "密码库未配置".to_string(),
+            },
+            ResolveKdbxError::Ambiguous(paths) => VeilError::Conflict {
+                message: format!(
+                    "DB_DIR 存在多个 .kdbx，拒绝重载: {}",
+                    paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+            ResolveKdbxError::Io(e) => VeilError::KeePass {
+                message: format!("KeePass 内部错误: 库目录不可读: {e}"),
+            },
+        })?;
+        let epoch0 = self.lock_epoch.load(Ordering::SeqCst);
+        // 按当前 TPM seal 重新解封主密码，避免沿用重载前的旧派生值；无缓存不报错。
+        let _ = self.clear_master_password();
+        let db_path = resolved.db_path.clone();
+        let keyfile_path = resolved.keyfile_path.clone();
+        let provider = self.password_provider.clone();
+        let db = tokio::task::spawn_blocking(move || {
+            open_blocking(&db_path, keyfile_path.as_deref(), &provider)
+        })
+        .await
+        .map_err(|e| VeilError::KeePass {
+            message: format!("KeePass 内部错误: 解密任务异常: {e}"),
+        })??;
+        let mut cache_guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.lock_epoch.load(Ordering::SeqCst) != epoch0 {
+            return Err(VeilError::Conflict {
+                message: "重载期间已执行 lock，已放弃本次重载".to_string(),
+            });
+        }
+        // 固定 cache → active 锁序：交换快照与切换活动路径同临界区，
+        // 避免 is_unlocked() 在两者之间读到旧路径。
+        let mut active = match self.active.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *cache_guard = Some(db);
+        *active = ActivePaths {
+            db_path: resolved.db_path.clone(),
+            keyfile_path: resolved.keyfile_path.clone(),
+        };
+        drop(active);
+        drop(cache_guard);
+        let open_count = self.open_count.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(ReloadOutcome {
+            db_path: resolved.db_path,
+            open_count,
+        }))
+    }
+
+    fn is_cached(&self) -> bool {
+        match self.cache.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
 
     fn lookup_cached(&self, title: &str) -> Option<EntrySnapshot> {
-        self.cache
-            .lock()
-            .ok()
-            .as_ref()
-            .and_then(|guard| guard.as_ref())
-            .and_then(|db| snapshot_of(db, title))
+        let guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.as_ref().and_then(|db| snapshot_of(db, title))
     }
 }
 
 impl KeePassBackend for RealKeePass {
-    /// 快检：库文件存在即视为配置就绪（`/health` 用，不触发解密、无副作用）。
+    /// 快检：活动库文件存在即视为配置就绪（`/health` 用，不触发解密、无副作用）。
     /// 取用路径失败仍以 `fetch_entry` 的实时错误为准，本函数不做解锁承诺。
-    fn is_unlocked(&self) -> bool { self.db_path.is_file() }
+    fn is_unlocked(&self) -> bool { self.active_paths().db_path.is_file() }
 
     fn fetch_entry(
         &self,
@@ -298,12 +449,19 @@ impl KeePassBackend for RealKeePass {
         Box::pin(self.fetch_entry_async(title))
     }
 
+    fn reload(&self) -> Pin<Box<dyn Future<Output = Result<Option<ReloadOutcome>>> + Send + '_>> {
+        Box::pin(self.reload_async())
+    }
+
     fn open_count(&self) -> usize { self.open_count.load(Ordering::SeqCst) }
 
     fn clear_cache(&self) {
-        if let Ok(mut guard) = self.cache.lock() {
-            *guard = None;
-        }
+        let mut guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.lock_epoch.fetch_add(1, Ordering::SeqCst);
+        *guard = None;
     }
 
     fn clear_master_password(&self) -> bool {
@@ -409,6 +567,26 @@ pub type FixtureEntry = (
 
 #[cfg(test)]
 pub fn build_test_kdbx(path: &std::path::Path, password: &[u8], entries: &[FixtureEntry]) {
+    build_test_kdbx_inner(path, password, None, entries);
+}
+
+#[cfg(test)]
+pub fn build_test_kdbx_with_keyfile(
+    path: &std::path::Path,
+    password: &[u8],
+    keyfile: &[u8],
+    entries: &[FixtureEntry],
+) {
+    build_test_kdbx_inner(path, password, Some(keyfile), entries);
+}
+
+#[cfg(test)]
+fn build_test_kdbx_inner(
+    path: &std::path::Path,
+    password: &[u8],
+    keyfile: Option<&[u8]>,
+    entries: &[FixtureEntry],
+) {
     use keepass::{
         Database,
         DatabaseKey,
@@ -434,7 +612,13 @@ pub fn build_test_kdbx(path: &std::path::Path, password: &[u8], entries: &[Fixtu
             }
         }
     }
-    let key = DatabaseKey::new().with_password(&String::from_utf8_lossy(password));
+    let mut key = DatabaseKey::new().with_password(&String::from_utf8_lossy(password));
+    if let Some(bytes) = keyfile {
+        let mut cursor = std::io::Cursor::new(bytes);
+        key = key
+            .with_keyfile(&mut cursor)
+            .expect("测试固件 keyfile 构建须成功");
+    }
     let mut bytes = Vec::new();
     db.save(&mut bytes, key).expect("测试固件 kdbx 构建须成功");
     std::fs::write(path, bytes).expect("测试固件 kdbx 落盘须成功");

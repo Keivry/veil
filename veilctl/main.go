@@ -28,6 +28,8 @@ func main() {
 		cmd.ListRegistrations(args)
 	case "status":
 		cmd.Status(args)
+	case "reload":
+		cmd.Reload(args)
 	default:
 		usage()
 		os.Exit(1)
@@ -41,6 +43,7 @@ func usage() {
   veilctl revoke --name <名称> [--no-wait]      吊销注册
   veilctl list                                  列出注册
   veilctl status                                Proxy 状态
+  veilctl reload                                重载 KeePass 库（管理面需启用）
 
 环境变量:
   PROXY_URL                Proxy 地址（默认 http://127.0.0.1:8877）
@@ -48,6 +51,7 @@ func usage() {
   PROXY_APPROVAL_WAIT      是否等待审批终态（默认 1；0 立即返回待审批）
   PROXY_APPROVAL_TIMEOUT   等待审批终态总时限（默认 300s，支持 5m / 300 两种写法）
   PROXY_APPROVAL_POLL      审批轮询起始间隔（默认 500ms，逐次翻倍至 10s；须带单位）
+  PROXY_ADMIN_TOKEN        管理面 token（仅 veilctl reload 使用；作为 X-Admin-Token 发送，不打印）
 
 退出码:
   0  动作已完成

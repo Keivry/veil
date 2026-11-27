@@ -1002,3 +1002,28 @@ fn release_frame_payload_restore_and_identity_branch() {
         "部分前缀不得被判为完整 token（走恒等回吐）"
     );
 }
+
+#[tokio::test]
+async fn old_cred_token_passes_through_after_vault_clear() {
+    let vault = vault_with_secret("reload-rotate-secret-001");
+    let detector = PiiDetector::new();
+    let scope = Scope::new();
+    let redacted = scope
+        .redact_request(&vault, &detector, r#"{"pwd":"reload-rotate-secret-001"}"#)
+        .await;
+    let token = vault
+        .snapshot_p2t()
+        .remove("reload-rotate-secret-001")
+        .expect("请求侧须已铸造 token");
+    vault.clear();
+    assert_eq!(
+        scope.restore_response_one(&vault, &token),
+        token,
+        "已铸造但映射被重载清空的 token 须原样透传"
+    );
+    let restored = scope.restore_response(&vault, &redacted);
+    assert!(
+        restored.contains(&token) && !restored.contains("reload-rotate-secret-001"),
+        "响应侧不得还原重载后的旧 token: {restored}"
+    );
+}
