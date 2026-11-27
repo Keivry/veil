@@ -538,7 +538,8 @@ fn custom_pii_runtime_injected() {
         state
             .detector
             .custom_names_snapshot()
-            .contains(&"emp_no".to_string()),
+            .iter()
+            .any(|i| i == "emp_no"),
         "配置的自定义规则须在运行时注入生效"
     );
     std::fs::remove_dir_all(&dir).ok();

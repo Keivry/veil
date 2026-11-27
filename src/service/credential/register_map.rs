@@ -89,14 +89,14 @@ pub fn parse_register_entries(
             match fv {
                 Value::String(s) => {
                     let s = s.trim();
-                    if !s.is_empty() && !merged.contains(&s.to_string()) {
+                    if !s.is_empty() && !merged.iter().any(|i| i == s) {
                         merged.push(s.to_string());
                     }
                 }
                 Value::Array(items) => {
                     for i in items {
                         if let Some(s) = i.as_str().map(str::trim).filter(|s| !s.is_empty())
-                            && !merged.contains(&s.to_string())
+                            && !merged.iter().any(|i| i == s)
                         {
                             merged.push(s.to_string());
                         }

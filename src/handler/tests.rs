@@ -150,7 +150,8 @@ async fn health_pii_custom_disabled() {
         state
             .detector
             .disabled_snapshot()
-            .contains(&"slow".to_string())
+            .iter()
+            .any(|i| i == "slow")
     );
     let Json(body) = health_handler(State(state)).await;
     assert!(

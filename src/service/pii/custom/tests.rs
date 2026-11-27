@@ -54,7 +54,7 @@ async fn malicious_pattern_fast_reject_and_disable_after_three_timeouts() {
     // 引擎层：`^(a+)+$` 对抗性输入微秒级返回，远快于 100ms 预算（不挂起主链）。
     let d = detector();
     d.load_custom_patterns(&[("evil".to_string(), r"^(a+)+$".to_string())]);
-    assert!(d.custom_names_snapshot().contains(&"evil".to_string()));
+    assert!(d.custom_names_snapshot().iter().any(|i| i == "evil"));
     assert_eq!(RE_DOS_BUDGET_MS, 100);
     let input = "a".repeat(2000) + "b";
     let start = std::time::Instant::now();
@@ -67,18 +67,18 @@ async fn malicious_pattern_fast_reject_and_disable_after_three_timeouts() {
     // 状态机层：连续 3 次超时停用（确定性单测记账逻辑）。
     let d2 = detector();
     d2.load_custom_patterns(&[("slow".to_string(), r"slow\d+".to_string())]);
-    assert!(!d2.disabled_snapshot().contains(&"slow".to_string()));
+    assert!(!d2.disabled_snapshot().iter().any(|i| i == "slow"));
     d2.account_rules_batch(&[("slow", true), ("slow", true)]);
-    assert!(!d2.disabled_snapshot().contains(&"slow".to_string()));
+    assert!(!d2.disabled_snapshot().iter().any(|i| i == "slow"));
     d2.account_rules_batch(&[("slow", true)]);
-    assert!(d2.disabled_snapshot().contains(&"slow".to_string()));
+    assert!(d2.disabled_snapshot().iter().any(|i| i == "slow"));
     // 成功清零：超时 2 次后成功则计数重置。
     let d3 = detector();
     d3.load_custom_patterns(&[("flaky".to_string(), r"flaky\d+".to_string())]);
     d3.account_rules_batch(&[("flaky", true), ("flaky", true)]);
     d3.account_rules_batch(&[("flaky", false)]);
     d3.account_rules_batch(&[("flaky", true), ("flaky", true)]);
-    assert!(!d3.disabled_snapshot().contains(&"flaky".to_string()));
+    assert!(!d3.disabled_snapshot().iter().any(|i| i == "flaky"));
 }
 
 #[tokio::test]
@@ -98,7 +98,7 @@ async fn redos_wall_clock_absolute_ceiling_beyond_budget_assertion() {
     );
     assert!(hits.iter().all(|h| h.0 != "evil-abs"), "{hits:?}");
     assert!(
-        !d.disabled_snapshot().contains(&"evil-abs".to_string()),
+        !d.disabled_snapshot().iter().any(|i| i == "evil-abs"),
         "单次超时不得触发三连禁用记账（上界与记账解耦）"
     );
 }
@@ -189,7 +189,7 @@ fn named_group_inner_mismatch_uses_outer_name() {
         "(?P<other>(?<![\\d])AB\\d{6}(?![\\d]))".to_string(),
     )]);
     assert_eq!(n, 1, "内命名组失配放行");
-    assert!(d.custom_names_snapshot().contains(&"emp_no".to_string()));
+    assert!(d.custom_names_snapshot().iter().any(|i| i == "emp_no"));
     let n = d.load_custom_patterns(&[("plain".to_string(), "ZZ-\\d{6}".to_string())]);
     assert_eq!(n, 1, "无命名组必须放行");
 }
@@ -231,7 +231,7 @@ async fn custom_overlap_placeholder_skipped_and_disabled_skipped() {
         "与 data URL 保护区间重叠必须跳过: {hits:?}"
     );
     d.account_rules_batch(&[("tag", true), ("tag", true), ("tag", true)]);
-    assert!(d.disabled_snapshot().contains(&"tag".to_string()));
+    assert!(d.disabled_snapshot().iter().any(|i| i == "tag"));
     let hits = d.scan_custom("TAG-77 独立出现", &empty_cred()).await;
     assert!(
         hits.iter().all(|h| h.0 != "tag"),
@@ -262,7 +262,7 @@ fn named_group_mismatch_relaxed_to_legacy() {
         r"(?P<inner>(?<![\d])工号\d{6}(?![\d]))".to_string(),
     )]);
     assert_eq!(n, 1);
-    assert!(d.custom_names_snapshot().contains(&"outer".to_string()));
+    assert!(d.custom_names_snapshot().iter().any(|i| i == "outer"));
 }
 
 #[test]
@@ -357,8 +357,8 @@ async fn pii_lock_poison_scan_no_panic() {
     let hits = d.scan_custom("TAG-99", &empty_cred()).await;
     assert!(hits.iter().any(|h| h.1 == "TAG-99"), "{hits:?}");
     d.account_rules_batch(&[("tag", true)]);
-    assert!(d.custom_names_snapshot().contains(&"tag".to_string()));
-    assert!(!d.disabled_snapshot().contains(&"tag".to_string()));
+    assert!(d.custom_names_snapshot().iter().any(|i| i == "tag"));
+    assert!(!d.disabled_snapshot().iter().any(|i| i == "tag"));
 }
 
 #[tokio::test]
@@ -416,10 +416,10 @@ fn partial_prefix_hints_cap_desc_dedup_and_dict() {
         ("张三".to_string(), "person".to_string()),
     ]);
     let hints = d.partial_prefix_hints();
-    assert!(hints.contains(&"TAG-".to_string()), "{hints:?}");
-    assert!(hints.contains(&"工号".to_string()), "{hints:?}");
+    assert!(hints.iter().any(|i| i == "TAG-"), "{hints:?}");
+    assert!(hints.iter().any(|i| i == "工号"), "{hints:?}");
     assert!(
-        hints.contains(&"张三".to_string()),
+        hints.iter().any(|i| i == "张三"),
         "字典全名须在内: {hints:?}"
     );
     assert!(hints.iter().all(|h| h.chars().count() <= 64), "{hints:?}");
@@ -454,11 +454,11 @@ fn prefix_hints_capped_64() {
     assert_eq!(hints.len(), 64, "hint 总条数须截断至 64: {}", hints.len());
     // 各前缀等长，按 (长度降序, 字典序) 保留前 64——最长前缀集合内有界。
     assert!(
-        hints.contains(&"PREFIX00-".to_string()),
+        hints.iter().any(|i| i == "PREFIX00-"),
         "保留集须含最优前缀: {hints:?}"
     );
     assert!(
-        !hints.contains(&"PREFIX79-".to_string()),
+        !hints.iter().any(|i| i == "PREFIX79-"),
         "超出 64 条的前缀须被截断: {hints:?}"
     );
     let mut uniq = hints.clone();
@@ -527,7 +527,7 @@ fn custom_aggregate_timeout_no_strike() {
     let d = detector();
     d.load_custom_patterns(&[("tag".to_string(), r"TAG-\d+".to_string())]);
     d.account_rules_batch(&[("tag", true), ("tag", true)]);
-    assert!(!d.disabled_snapshot().contains(&"tag".to_string()));
+    assert!(!d.disabled_snapshot().iter().any(|i| i == "tag"));
     // 单阻塞线程运行时 + 占位任务钉死唯一阻塞线程：扫描的 `spawn_blocking` 任务
     // 在聚合预算（100ms）内排不上队 → 确定性触发超时臂，不依赖机器速度。
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -544,7 +544,7 @@ fn custom_aggregate_timeout_no_strike() {
     let hits = rt.block_on(d.scan_custom("TAG-99", &empty_cred()));
     assert!(hits.is_empty(), "聚合超时须零命中: {hits:?}");
     assert!(
-        !d.disabled_snapshot().contains(&"tag".to_string()),
+        !d.disabled_snapshot().iter().any(|i| i == "tag"),
         "聚合超时不得逐规则记账（2 次既有超时 + 1 次聚合超时 ≠ 三连停用）"
     );
     drop(tx);
@@ -587,7 +587,7 @@ fn custom_ruleset_arc_no_deep_clone() {
     );
     let hits = rt.block_on(scan).expect("扫描任务须完成");
     assert!(hits.is_empty(), "聚合超时须零命中: {hits:?}");
-    assert!(!d.disabled_snapshot().contains(&"tag".to_string()));
+    assert!(!d.disabled_snapshot().iter().any(|i| i == "tag"));
     drop(tx);
     rt.shutdown_timeout(Duration::from_millis(200));
 }
@@ -601,28 +601,28 @@ fn custom_account_rules_batch_lock_order() {
     d.account_rules_batch(&[("a", true), ("b", false)]);
     d.account_rules_batch(&[("a", true), ("b", false)]);
     assert!(
-        d.disabled_snapshot().contains(&"a".to_string()),
+        d.disabled_snapshot().iter().any(|i| i == "a"),
         "三连超时须停用"
     );
     assert!(
-        !d.disabled_snapshot().contains(&"b".to_string()),
+        !d.disabled_snapshot().iter().any(|i| i == "b"),
         "中途成功须清零"
     );
     // 已停用者跳过；同批同名多元素继续累计未停用者。
     d.account_rules_batch(&[("a", true), ("b", true), ("b", true)]);
-    assert!(d.disabled_snapshot().contains(&"a".to_string()));
+    assert!(d.disabled_snapshot().iter().any(|i| i == "a"));
     assert!(
-        !d.disabled_snapshot().contains(&"b".to_string()),
+        !d.disabled_snapshot().iter().any(|i| i == "b"),
         "b 累计 2 次未达阈值"
     );
     d.account_rules_batch(&[("b", true)]);
     assert!(
-        d.disabled_snapshot().contains(&"b".to_string()),
+        d.disabled_snapshot().iter().any(|i| i == "b"),
         "b 第三连须停用"
     );
     d.account_rules_batch(&[("b", false)]);
     assert!(
-        d.disabled_snapshot().contains(&"b".to_string()),
+        d.disabled_snapshot().iter().any(|i| i == "b"),
         "停用后再成功不清状态（跳过已停用）"
     );
     // 锁序源码守护：`account_rules_batch` 函数体内 `strikes` 先于 `disabled`。

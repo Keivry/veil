@@ -728,7 +728,7 @@ async fn window_cross_digit_ordering() {
                 "须按整数序保留最 d{i}: {windows:?}"
             );
         }
-        assert!(!windows.contains(&"d8".to_string()), "最旧 d8 须被驱逐");
+        assert!(!windows.iter().any(|i| i == "d8"), "最旧 d8 须被驱逐");
     }
     // five_min 保留最新 13 个窗口：内存含 m10，库中另注 m9，flush 后两窗均在。
     store.record_aux_counts(Protocol::Chat, 10 * 300, 0, 0, 1);
