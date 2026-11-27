@@ -246,18 +246,19 @@ env 一律不做别名：不在白名单的名字（含 0.2.0 改名前的 4 个
   后两条映射到容器内同名端口（与专用监听一一对应，宿主机端口可经 `PORT_8878/8879` 覆盖）；
   `docker-compose.yml` 只发布这三条，`Dockerfile` `EXPOSE 8877 8878 8879`。
 
-### 管理控制台说明（三段静态资产）
+### 管理控制台说明（四段静态资产）
 
 - 接入方式：浏览器直接访问 `/_admin/`（或 `/_admin`）即得控制台 HTML（入口按 `Accept` 协商；脚本/`curl` 仍得 JSON 索引）；控制台自身**未鉴权**（壳内无数据）。
 - 登录方式：页面向 `/_admin/health` 提交 `X-Admin-Token`，成功后由服务端 `Set-Cookie` 持久化（Cookie 模式后续免重复提交）；token 不落任何浏览器存储。
 - 缓存语义：管理面统一 `Cache-Control: no-store`；不返回 `ETag`，不参与 304 协商。
 - 数据来源：复用管理面八路由（含 `/_admin/commands` 与 `/_admin/requests`）；实时大盘走 `/_admin/events/stream` 的 SSE 快照事件 `event: metrics`（15s 周期，与 `/_admin/metrics` 同字段集）；审计事件事件名为 `event`，并含 `done` 终止帧。
 - 图表：仅内联 SVG 渲染，不加载 Chart.js，无任何外部资源。
-- 资产形态：控制台 HTML 由三段片段在**编译期**拼接（`src/handler/admin/console.rs::CONSOLE_HTML` 的 `concat!` + 三处 `include_str!`：`console.head.html` 骨架与样式、`console.app.js` 脚本、`console.tail.html` 收尾）；对外仍是**一个响应、一个 URL、零外部引用**，运行期无文件读取、无 `OnceLock`、无 `String` 分配。
+- 资产形态：控制台 HTML 由四段片段在**编译期**拼接（`src/handler/admin/console.rs::CONSOLE_HTML` 的 `concat!` + 四处 `include_str!`：`console.head.html` 骨架与样式、`console.app.js` 主脚本、`console.columns.js` 记录表列宽引擎、`console.tail.html` 收尾）；对外仍是**一个响应、一个 URL、零外部引用**，运行期无文件读取、无 `OnceLock`、无 `String` 分配。
+- 记录表列宽：事件/命令/LLM 请求三表表头右缘可拖动调宽（键盘 `ArrowLeft`/`ArrowRight` ±8px、`Home` 重置、双击手柄恢复默认），调整结果写入 `veil_cols` Cookie（与 `veil_theme` 同机制，不写 `localStorage`/`sessionStorage`）；被截断的字段以 `title` 展示完整值，事件表沿用整行悬停 tooltip。默认列宽为合计 100% 的比例，1280×900 下不横向溢出；手动加宽后仅表格容器内部滚动。
 - 界面结构：控制台采用左侧分区导航（概览 / 脱敏 / 性能 / 事件 / 命令调用 / LLM 请求）与明暗双主题。首屏默认跟随系统 `prefers-color-scheme`，侧栏按钮手动切换并以 `veil_theme` Cookie 记忆（不写 `localStorage`/`sessionStorage`）；窄屏（<860px）下侧栏折叠为顶部横排。
 - 事件过滤：按 `kind`（可附 `since`）与 `limit`（默认 50、上限 200）；不提供 `model`/`upstream` 过滤。
 - 范围切换：`?range=1h|24h|7d|30d`，同时作用于 SSE 重连与当前分区的数据请求。
-- 「LLM 请求」分区：消费 `/_admin/requests`，十二列（时间 / 模型 / 协议 / 上游 / 会话 / 状态 / 输入·输出 / 命中率 / 耗时 / TTFT / TPS / 摘要）；会话列只展示 16-hex 摘要的前 12 位，并附人类可读的来源说明（`title`，例如「来源：显式会话头」）与作用域徽标（「会话」/「用户」，`none` 不渲染徽标）；来源文案恰为 `header`→显式会话头、`conversation`→Responses 会话对象、`prev_response`→前驱响应、`cache_key`→prompt_cache_key、`user_id`→用户标识、`safety_identifier`→安全标识、`user`→用户、`none`→无来源，旧库中被废弃的来源值回退为「历史来源」；`title` 只含人类可读说明，不输出原枚举、原始会话头值、上游 `conversation.id`/`response.id` 或 64-hex 键；`request` 模式下提示行明示 PII 逐请求隔离，不暗示跨请求共享；`null` 一律渲染 `—`；分页并给出「共 N 条」，空态区分「记录功能未启用」与「范围内无请求」。全部单元格先经 `esc()` 转义再拼接（含 `title` 属性位），不对未转义文本直接拼 `innerHTML`。
+- 「LLM 请求」分区：消费 `/_admin/requests`，十二列（时间 / 模型 / 协议 / 上游 / 会话 / 状态 / 输入·输出 / 命中率 / 耗时 / TTFT / TPS / 摘要）；会话列只展示 16-hex 摘要的前 12 位，并附人类可读的来源说明（`title` 组合「12 位摘要 + 来源说明」，例如「会话摘要：9f2c8a1b4d5e\n来源：显式会话头」）与作用域徽标（「会话」/「用户」，`none` 不渲染徽标）；来源文案恰为 `header`→显式会话头、`conversation`→Responses 会话对象、`prev_response`→前驱响应、`cache_key`→prompt_cache_key、`user_id`→用户标识、`safety_identifier`→安全标识、`user`→用户、`none`→无来源，旧库中被废弃的来源值回退为「历史来源」；`title` 只含前 12 位摘要与人类可读说明，不输出原枚举、原始会话头值、上游 `conversation.id`/`response.id`、16 位完整摘要或 64-hex 键；`request` 模式下提示行明示 PII 逐请求隔离，不暗示跨请求共享；`null` 一律渲染 `—`；分页并给出「共 N 条」，空态区分「记录功能未启用」与「范围内无请求」。全部单元格先经 `esc()` 转义再拼接（含 `title` 属性位），不对未转义文本直接拼 `innerHTML`。
 - 数据绑定（时间轴与 KPI）：图表 X 轴与 tooltip 以 series 点的 `ts_start`（窗口起始 Unix 秒）按浏览器本地时间渲染，`window` 仅作内部键、不作可读标签；KPI 总量取自 `/_admin/metrics` 与 SSE `metrics` 快照的 `pii_hits`/`pii_miss`/`cred_hits` 三个 additive 字段（命中率 = `pii_hits/(pii_hits+pii_miss)`，分母为 0 显示 `—`）。
 - 指标字段兼容：上述新增字段只增不改；控制台不依赖任何字段的移除或改名，旧调用方可忽略新字段。新增的「LLM 请求」分区消费 `/_admin/requests`，不改变既有分区的取数路径。
 - 事件空态说明：事件表为空且 `[audit].mode` 为默认 `off` 时，页面展示说明性空态文案——审计默认关闭时事件环仅承载截断/故障类事件，属设计语义而非故障。
@@ -1493,8 +1494,8 @@ MUST NOT 声称已实现或已验证。残余限制（三项）：① 网关**�
   生产 `.rs`（非测试）限 800 行、测试 `.rs` 限 1200 行，静态资产 `src/**/*.html` **与
   `src/**/*.js`** 同为 1600 行。`.js` 单列分类是本版新增的红线：控制台脚本拆出为独立片段后
   不再借 HTML 的预算池；超线即非零退出并列文件、类别、行数与红线，无白名单（全仓强制）。
-  控制台资产三段（`console.head.html` / `console.app.js` / `console.tail.html`）各自受
-  1600 行约束，编译期由 `src/handler/admin/console.rs::CONSOLE_HTML` 的 `concat!` 拼成一个响应，
+  控制台资产四段（`console.head.html` / `console.app.js` / `console.columns.js` / `console.tail.html`）
+  各自受 1600 行约束，编译期由 `src/handler/admin/console.rs::CONSOLE_HTML` 的 `concat!` 拼成一个响应，
   对外仍是一个 URL、零外部引用。
 
 ### 8.6 空流三协议语义
