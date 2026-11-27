@@ -239,29 +239,36 @@
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--dim); font-weight: 600; font-size: 11px; letter-spacing: .02em; }
   td.num, th.num { text-align: right; font-family: var(--mono); }
-  /* 摘要列上限 MUST 保持「定长值 + white-space:nowrap」这一组合：百分比相对 auto-layout
-     的表格宽度解析，会与内容驱动的列宽形成循环依赖而静默失效；去掉 nowrap 同理。
-     预算（1280px 实测，滚动容器内宽 924px）：9 列时上限 20vw 尚可；新增「上游 / TTFT /
-     TPS」三列后摘要列收到 8vw（上限 240px），配合下方文本列定长截断与更紧的数值列
-     内边距，实测 12 列总宽 924px（含 12.3 万 token、120s 耗时的极端行），不横向溢出。 */
-  td.sum { max-width: clamp(96px, 8vw, 240px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  /* 12 列后单元格内边距收紧：8px 10px 的横向内边距乘以 24 个边会吃掉约 100px，
-     收至 6px（数值列 4px）后仍保持 tabular-nums 对齐可读。 */
-  #req-table th, #req-table td { padding-left: 6px; padding-right: 6px; }
-  #req-table td.num, #req-table th.num { padding-left: 4px; padding-right: 4px; }
-  /* 文本列定长截断：模型名（第 2 列）、上游主机名（第 4 列）、错误状态（第 6 列）都可能
-     很长，不限宽会挤压数值列并把表格撑出容器。统一 ellipsis + nowrap，完整值由 JS 写进
-     title；用列位选择器以免给单元格加类而改动既有渲染字面量。 */
-  #req-table td.up,
-  #req-table td:nth-child(2),
-  #req-table td:nth-child(6) {
+  /* 三张记录表统一固定列宽：列宽由 JS 注入的 `<colgroup>` 轨道控制，内容不再撑开列；
+     单元格统一省略号截断，完整值由渲染层写入 `title`。默认列宽为合计 100% 的比例，
+     1280×900 下不横向溢出；手动加宽后由外层 `overflow:auto` 容器内部滚动承载。 */
+  #ev-table, #cmd-table, #req-table { table-layout: fixed; width: 100%; }
+  #ev-table th, #ev-table td,
+  #cmd-table th, #cmd-table td,
+  #req-table th, #req-table td {
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  #req-table td:nth-child(2) { max-width: 104px; }
-  #req-table td.up { max-width: 104px; }
-  #req-table td:nth-child(6) { max-width: 88px; }
-  #req-table th { white-space: nowrap; }
-  #req-table td.num { white-space: nowrap; }
+  #ev-table th, #cmd-table th, #req-table th { position: relative; padding-right: 14px; }
+  /* 12 列后单元格内边距收紧：8px 10px 的横向内边距乘以 24 个边会吃掉约 100px，
+     收至 6px（数值列 4px）后仍保持 tabular-nums 对齐可读；表头右内边距留 14px
+     给列宽手柄，避免文字压住拖动区。 */
+  #req-table th, #req-table td { padding-left: 6px; padding-right: 6px; }
+  #req-table th { padding-right: 14px; }
+  #req-table td.num, #req-table th.num { padding-left: 4px; padding-right: 4px; }
+  #req-table th.num { padding-right: 14px; }
+  #req-table td.num { padding-right: 14px; }
+  .col-resizer {
+    position: absolute; top: 0; right: 0; width: 8px; height: 100%;
+    cursor: col-resize; z-index: 2; touch-action: none;
+  }
+  .col-resizer::after {
+    content: ''; position: absolute; top: 20%; bottom: 20%; right: 3px; width: 1px;
+    background: var(--border2);
+  }
+  .col-resizer:hover::after { background: var(--accent); }
+  .col-resizer:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+  .col-resizer:focus-visible::after { background: var(--accent); }
+  body.col-resizing { cursor: col-resize; user-select: none; }
   tr.clickable { cursor: pointer; transition: background .12s; }
   tr.clickable:hover { background: var(--panel2); }
   tr.clickable:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
@@ -530,7 +537,7 @@
 
       <section class="sec" id="sec-requests" hidden>
         <div class="panel">
-          <h2>逐请求记录 <span class="h2-sub">悬停摘要列查看全文</span></h2>
+          <h2>逐请求记录 <span class="h2-sub">悬停任意单元格查看全文（事件表悬停整行）</span></h2>
           <div class="toolbar" style="margin-bottom:12px">
             <div class="tb-group">
               <input id="req-model" placeholder="模型">

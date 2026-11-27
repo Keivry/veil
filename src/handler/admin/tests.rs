@@ -12,6 +12,7 @@ use {
 
 mod console;
 mod console_accept;
+mod console_columns;
 mod console_sources;
 mod observability;
 mod requests;

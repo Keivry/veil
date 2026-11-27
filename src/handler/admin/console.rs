@@ -7,13 +7,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// 控制台静态壳（三段 `include_str!` 编译期拼接进二进制，无运行时文件依赖，Dockerfile 零改动）：
-/// `console.head.html`（doctype/head/style/markup + 起始 `<script>`）、`console.app.js`（脚本正文）
-/// 与 `console.tail.html`（`</script>` 与收尾 markup）依次拼接。拼接结果与拆分前单文件逐字节一致，
-/// 仍是一次响应、一个 URL、零外部 URL 的 `&'static str` 常量（编译期拼接，无运行时构造）。
+/// 控制台静态壳（四段 `include_str!` 编译期拼接进二进制，无运行时文件依赖，Dockerfile 零改动）：
+/// `console.head.html`（doctype/head/style/markup + 起始
+/// `<script>`）、`console.app.js`（脚本正文）、 `console.columns.js`（记录表列宽引擎）与
+/// `console.tail.html`（`</script>` 与收尾 markup）依次拼接。 拼接结果与拆分前单文件逐字节一致，
+/// 仍是一次响应、一个 URL、零外部 URL 的 `&'static str` 常量 （编译期拼接，无运行时构造）。
 pub const CONSOLE_HTML: &str = concat!(
     include_str!("console.head.html"),
     include_str!("console.app.js"),
+    include_str!("console.columns.js"),
     include_str!("console.tail.html")
 );
 

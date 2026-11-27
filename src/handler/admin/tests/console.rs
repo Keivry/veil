@@ -243,21 +243,25 @@ fn console_html_requests_next_page_respects_offset_cap_and_surfaces_errors() {
 fn console_html_request_cells_use_escaping_helper() {
     // 每个单元格都经 esc()：模型/摘要/会话等均为不可信输入，不拼接原始值。
     for needle in [
-        "'<td>' + esc(x.ts) + '</td>'",
-        "'<td>' + esc(x.model) + '</td>'",
-        "'<td>' + esc(x.protocol) + '</td>'",
-        "'<td>' + esc(x.status) + '</td>'",
-        "'<td class=\"num\">' + esc(x.io) + '</td>'",
-        "'<td class=\"num\" title=\"' + esc(x.hitTitle) + '\">' + esc(x.hit) + '</td>'",
-        "'<td class=\"num\">' + esc(x.latency) + '</td>'",
-        "'<td class=\"sum\" title=\"' + esc(x.summary) + '\">' + esc(x.summary) + '</td>'",
-        "'<span class=\"badge\" title=\"' + esc(x.sourceTitle) + '\">' + esc(x.scope) + '</span>'",
+        "'<td' + cellTitle(x.ts) + '>' + esc(x.ts) + '</td>'",
+        "'<td' + cellTitle(x.model) + '>' + esc(x.model) + '</td>'",
+        "'<td' + cellTitle(x.protocol) + '>' + esc(x.protocol) + '</td>'",
+        "'<td' + cellTitle(x.status) + '>' + esc(x.status) + '</td>'",
+        "'<td class=\"num\"' + cellTitle(x.io) + '>' + esc(x.io) + '</td>'",
+        "'<td class=\"num\" title=\"' + esc('命中率 ' + x.hit + '\\n' + x.hitTitle) + '\">' + esc(x.hit) + '</td>'",
+        "'<td class=\"num\"' + cellTitle(x.latency) + '>' + esc(x.latency) + '</td>'",
+        "'<td class=\"num\"' + cellTitle(x.ttft) + '>' + esc(x.ttft) + '</td>'",
+        "'<td class=\"num\"' + cellTitle(x.tps) + '>' + esc(x.tps) + '</td>'",
+        "'<td class=\"up\"' + cellTitle(x.upstream) + '>' + esc(x.upstreamShort) + '</td>'",
+        "'<td class=\"sum\"' + cellTitle(x.summary) + '>' + esc(x.summary) + '</td>'",
+        "'<span class=\"badge\"' + cellTitle(x.sourceTitle) + '>' + esc(x.scope) + '</span>'",
     ] {
         assert!(CONSOLE_HTML.contains(needle), "壳须含 {needle:?}");
     }
-    // 会话单元格的 title 用人类可读来源说明，不用原枚举。
+    // 会话单元格的 title 组合 12 位摘要与人类可读来源说明，不用原枚举。
     for needle in [
-        "var titleAttr = x.sourceTitle ? ' title=\"' + esc(x.sourceTitle) + '\"' : '';",
+        "var sessTitle = sessionTitle(x.session, x.sourceTitle);",
+        "var titleAttr = sessTitle ? ' title=\"' + esc(sessTitle) + '\"' : '';",
         "var badge = (x.session && x.scope)",
         "'<td class=\"sess\"' + titleAttr + '>' + esc(x.session) + badge",
     ] {
@@ -971,19 +975,23 @@ fn console_html_layout_dist_panel_equal_height() {
 
 #[test]
 fn console_html_layout_summary_column_is_elastic() {
-    // 摘要列上限随视口弹性收缩；定长 + white-space:nowrap 的组合是上限生效的前提。
-    // 12 列表头后上限收到 8vw（≤240px），保证 1280px 下不横向溢出。
+    // 三表改为固定列宽 + 显式列宽轨道；摘要列不再用 clamp 独占容器，统一省略号截断。
     assert!(
-        CONSOLE_HTML.contains("td.sum { max-width: clamp(96px, 8vw, 240px);"),
-        "摘要列须为 clamp 弹性上限"
+        CONSOLE_HTML
+            .contains("#ev-table, #cmd-table, #req-table { table-layout: fixed; width: 100%; }"),
+        "三张记录表须为固定列宽布局"
     );
     assert!(
-        !CONSOLE_HTML.contains("td.sum { max-width: 420px;"),
-        "固定 420px 上限会让表格在 1280px 下超出容器"
+        !CONSOLE_HTML.contains("td.sum { max-width: clamp(96px, 8vw, 240px);"),
+        "摘要列不得再使用 clamp 上限"
     );
     assert!(
-        CONSOLE_HTML.contains("overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"),
-        "摘要列的省略号截断与 nowrap 须保留"
+        !CONSOLE_HTML.contains("td:nth-child(2) { max-width"),
+        "模型列不得再由列位固定 max-width 约束"
+    );
+    assert!(
+        CONSOLE_HTML.contains("overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"),
+        "单元格省略号截断与 nowrap 须保留"
     );
 }
 

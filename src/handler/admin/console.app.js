@@ -31,6 +31,12 @@
     return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  // 记录表单元格的完整值提示：空值不输出空 title，避免出现空浮层。
+  function cellTitle(v) {
+    var s = v == null ? '' : String(v);
+    return s ? ' title="' + esc(s) + '"' : '';
+  }
+
   function fmtTs(ts) {
     if (ts == null || ts === '') return '';
     var d = new Date(Number(ts) * 1000);
@@ -150,8 +156,16 @@
     // 分区可见后按真实宽度重绘依赖 clientWidth 的图表（横向条形 / 趋势）。
     if (sec === 'redaction' && state.metrics) renderDist(state.metrics);
     if (sec === 'overview' && state.series) renderTrend(state.series);
-    if (sec === 'commands') reloadCommands(true);
+    // 记录表列宽在手柄初始化前不可测量：分区可见后先把三表接入列宽引擎。
+    if (sec === 'events') {
+      if (window.VEIL_COLUMNS) window.VEIL_COLUMNS.init('ev');
+    }
+    if (sec === 'commands') {
+      if (window.VEIL_COLUMNS) window.VEIL_COLUMNS.init('cmd');
+      reloadCommands(true);
+    }
     if (sec === 'requests') {
+      if (window.VEIL_COLUMNS) window.VEIL_COLUMNS.init('req');
       // 先回放上一页避免闪空，再拉取一次（分区打开即取数）。
       if (state.requests.last) renderRequests(state.requests.last);
       reloadRequests(true);
@@ -769,7 +783,7 @@
       '<td>' + esc(e.id == null ? '' : e.id) + '</td>' +
       '<td>' + esc(e.kind || '') + '</td>' +
       '<td>' + esc(e.protocol || '') + '</td>' +
-      '<td class="sum" title="' + esc(e.summary || '') + '">' + esc(e.summary || '') + '</td>';
+      '<td class="sum">' + esc(e.summary || '') + '</td>';
   }
 
   function renderEvents(list) {
@@ -1023,14 +1037,14 @@
     }
     tbody.innerHTML = rows.map(function (r) {
       return '<tr>' +
-        '<td>' + esc(r.ts) + '</td>' +
-        '<td>' + esc(r.downstream) + '</td>' +
-        '<td>' + esc(r.command) + '</td>' +
-        '<td>' + esc(r.host) + '</td>' +
-        '<td>' + esc(r.approval) + '</td>' +
-        '<td>' + esc(r.exec) + '</td>' +
-        '<td>' + esc(r.exit) + '</td>' +
-        '<td>' + esc(r.duration) + '</td>' +
+        '<td' + cellTitle(r.ts) + '>' + esc(r.ts) + '</td>' +
+        '<td' + cellTitle(r.downstream) + '>' + esc(r.downstream) + '</td>' +
+        '<td' + cellTitle(r.command) + '>' + esc(r.command) + '</td>' +
+        '<td' + cellTitle(r.host) + '>' + esc(r.host) + '</td>' +
+        '<td' + cellTitle(r.approval) + '>' + esc(r.approval) + '</td>' +
+        '<td' + cellTitle(r.exec) + '>' + esc(r.exec) + '</td>' +
+        '<td' + cellTitle(r.exit) + '>' + esc(r.exit) + '</td>' +
+        '<td' + cellTitle(r.duration) + '>' + esc(r.duration) + '</td>' +
         '</tr>';
     }).join('');
   }
@@ -1156,6 +1170,14 @@
     return title;
   }
 
+  // 会话列 tooltip：只组合 12 位摘要与来源说明，不扩展为 16 位/原始标识。
+  function sessionTitle(session, sourceTitle) {
+    var s = session == null ? '' : String(session).slice(0, 12);
+    var src = sourceTitle == null ? '' : String(sourceTitle);
+    if (!s) return src;
+    return '会话摘要：' + s + (src ? '\n' + src : '');
+  }
+
   function requestRowModel(item, piiMode) {
     var it = item || {};
     var sid = it.session_id == null ? '' : String(it.session_id);
@@ -1260,24 +1282,25 @@
       return;
     }
     setReqTbody(rows.map(function (x) {
-      var titleAttr = x.sourceTitle ? ' title="' + esc(x.sourceTitle) + '"' : '';
+      var sessTitle = sessionTitle(x.session, x.sourceTitle);
+      var titleAttr = sessTitle ? ' title="' + esc(sessTitle) + '"' : '';
       var badge = (x.session && x.scope)
-        ? '<span class="badge" title="' + esc(x.sourceTitle) + '">' + esc(x.scope) + '</span>'
+        ? '<span class="badge"' + cellTitle(x.sourceTitle) + '>' + esc(x.scope) + '</span>'
         : '';
       return '<tr>' +
-        '<td>' + esc(x.ts) + '</td>' +
-        '<td>' + esc(x.model) + '</td>' +
-        '<td>' + esc(x.protocol) + '</td>' +
-        '<td class="up" title="' + esc(x.upstream) + '">' + esc(x.upstreamShort) + '</td>' +
+        '<td' + cellTitle(x.ts) + '>' + esc(x.ts) + '</td>' +
+        '<td' + cellTitle(x.model) + '>' + esc(x.model) + '</td>' +
+        '<td' + cellTitle(x.protocol) + '>' + esc(x.protocol) + '</td>' +
+        '<td class="up"' + cellTitle(x.upstream) + '>' + esc(x.upstreamShort) + '</td>' +
         '<td class="sess"' + titleAttr + '>' + esc(x.session) + badge +
         '</td>' +
-        '<td>' + esc(x.status) + '</td>' +
-        '<td class="num">' + esc(x.io) + '</td>' +
-        '<td class="num" title="' + esc(x.hitTitle) + '">' + esc(x.hit) + '</td>' +
-        '<td class="num">' + esc(x.latency) + '</td>' +
-        '<td class="num">' + esc(x.ttft) + '</td>' +
-        '<td class="num">' + esc(x.tps) + '</td>' +
-        '<td class="sum" title="' + esc(x.summary) + '">' + esc(x.summary) + '</td>' +
+        '<td' + cellTitle(x.status) + '>' + esc(x.status) + '</td>' +
+        '<td class="num"' + cellTitle(x.io) + '>' + esc(x.io) + '</td>' +
+        '<td class="num" title="' + esc('命中率 ' + x.hit + '\n' + x.hitTitle) + '">' + esc(x.hit) + '</td>' +
+        '<td class="num"' + cellTitle(x.latency) + '>' + esc(x.latency) + '</td>' +
+        '<td class="num"' + cellTitle(x.ttft) + '>' + esc(x.ttft) + '</td>' +
+        '<td class="num"' + cellTitle(x.tps) + '>' + esc(x.tps) + '</td>' +
+        '<td class="sum"' + cellTitle(x.summary) + '>' + esc(x.summary) + '</td>' +
         '</tr>';
     }).join(''));
     updateReqPager(rows.length);
